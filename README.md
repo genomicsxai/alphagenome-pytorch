@@ -6,6 +6,14 @@ We strive to make it an accessible, readable, and hackable implementation — fo
 
 ## Installation
 
+Installation from PyPI:
+
+```bash
+pip install alphagenome-pytorch
+```
+
+Installation from repo: 
+
 ```bash
 pip install git+https://github.com/genomicsxai/alphagenome-pytorch
 ```
@@ -111,6 +119,7 @@ See more information about model outputs [in the official AlphaGenome documentat
 - [Demo](examples/notebooks/alphagenome_pytorch_demo.ipynb) — Basic inference
 - [Variant Scoring](examples/notebooks/variant_scoring.ipynb) — Effect prediction
 - [In Silico Mutagenesis](examples/notebooks/in_silico_mutagenesis.ipynb) — ISM analysis
+- [TAL1 Mutation Example](examples/notebooks/TAL1_variant_effect_and_ISM.ipynb) - TAL1 variant effect and ISM (Figure 6 from AlphaGenome)
 - [Fine-tuning](examples/notebooks/finetuning_gm12878_demo.ipynb) — ATAC-seq linear probing
 - [Fine-tuning](examples/notebooks/finetune_encoder_only_mpra.ipynb) — MPRA (encoder-only)
 
@@ -143,6 +152,10 @@ See more information about model outputs [in the official AlphaGenome documentat
 ```
 
 </details>
+
+## Acknowledgements
+
+We acknowledge [Phil Wang](https://gitlab.com/lucidrains), [Miquel Anglada-Girotto](https://github.com/MiqG), and [Xinming Tu](https://github.com/XinmingTu) as developers of the initial AlphaGenome PyTorch port. Note that PyPI is now updated to release from this repo.
 
 ## License
 
