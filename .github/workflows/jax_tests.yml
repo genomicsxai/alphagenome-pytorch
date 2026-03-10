@@ -28,11 +28,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup SSH for private repo access
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.ALPHAGENOME_RESEARCH_SSH_KEY }}
-
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
@@ -45,8 +40,8 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           # Install JAX dependencies
           pip install jax jaxlib dm-haiku orbax-checkpoint
-          # Install alphagenome_research from private repo
-          pip install git+ssh://git@github.com/google-deepmind/alphagenome_research.git
+          # Install alphagenome_research
+          pip install git+https://github.com/google-deepmind/alphagenome_research.git
           pip install -e ".[test]"
 
       - name: Run JAX comparison tests
