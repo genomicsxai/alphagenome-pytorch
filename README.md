@@ -155,7 +155,7 @@ See more information about model outputs [in the official AlphaGenome documentat
 
 ## Acknowledgements
 
-We acknowledge [Phil Wang](https://gitlab.com/lucidrains), [Miquel Anglada-Girotto](https://github.com/MiqG), and [Xinming Tu](https://github.com/XinmingTu) as developers of the initial AlphaGenome PyTorch port. Note that PyPI is now updated to release from this repo.
+We acknowledge [Phil Wang](https://gitlab.com/lucidrains), [Miquel Anglada-Girotto](https://github.com/MiqG), and [Xinming Tu](https://github.com/XinmingTu) as developers of the initial AlphaGenome PyTorch port. Note that the PyPI namespace is now linked to this repo.
 
 ## License
 
