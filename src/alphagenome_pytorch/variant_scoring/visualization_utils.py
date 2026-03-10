@@ -417,6 +417,9 @@ def extract_ism_logo(
             i.e. ``variant.start - interval.start``.
         half_window: Half-width of the ISM window in base pairs.  The logo will
             cover ``2 * half_window + 1`` positions centred on ``center_rel``.
+        interval: The genomic ``Interval`` over which ISM was performed.  Used
+            to convert absolute genomic coordinates in score objects to relative
+            positions via ``variant.start - interval.start``.
         is_gene_scorer: If True, the score object at ``scorer_idx`` is expected
             to be a list of per-gene scores (as returned by
             ``GeneMaskLFCScorer``).  The function will search this list for a
@@ -487,20 +490,30 @@ def build_ism_logos(
     """Build and normalize REF and ALT ISM logos.
 
     Args:
-        ism_ref: ISM results on the reference background sequence, as returned
-            by ``scoring_model.score_ism_variants`` or an equivalent loop.
-        ism_alt: ISM results on the ALT background sequence (variant applied).
+    Args:
+        ism_ref: List of per-variant score lists from ISM on the reference
+            background sequence, as returned by
+            ``scoring_model.score_ism_variants`` or an equivalent loop.
+        ism_alt: List of per-variant score lists from ISM on the ALT background
+            sequence (variant applied).
         ref_seq: Full reference nucleotide sequence string spanning the interval.
         alt_seq: Full ALT nucleotide sequence string (with the variant applied)
             spanning the interval, truncated to ``interval.width``.
+        interval: The genomic ``Interval`` over which ISM was performed.  Used
+            to convert absolute genomic coordinates in score objects to relative
+            positions via ``variant.start - interval.start``.
         track_configs: List of ``(scorer_idx, track_idx, label)`` tuples
             identifying which scorer/track combinations to build logos for (e.g.
             ``[(0, 44, 'DNase'), (1, 206, 'H3K27ac'), (2, 561, 'TAL1 RNA-seq')]``).
-            Scorer index 2 is treated as a gene scorer.
+            Whether a scorer is a gene scorer is auto-detected from the score
+            object type (list vs scalar).
         center_rel: Relative position of the variant center inside the interval,
             i.e. ``variant.start - interval.start``.
-        half_window: Half-width of the ISM window in base pairs.
-        gene_id: Gene ID for gene in locus.
+        half_window: Half-width of the ISM window in base pairs.  The logo will
+            cover ``2 * half_window + 1`` positions centred on ``center_rel``.
+        gene_id: Ensembl gene ID without version suffix (e.g.
+            ``'ENSG00000162367'``), passed to ``extract_ism_logo`` for gene
+            scorer lookup.
 
     Returns:
         tuple[dict, dict]: ``(ref_logos, alt_logos)`` where each dict is keyed
