@@ -1,0 +1,54 @@
+name: JAX Comparison Tests
+
+on:
+  # Manual trigger with optional parameters
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Really want to run JAX comparison tests manually'
+        required: false
+        default: 'Manual rerun'
+      test_markers:
+        description: 'Pytest markers to run'
+        required: false
+        default: 'jax_comparison'
+        type: string
+  # Weekly schedule (Sunday midnight UTC)
+  schedule:
+    - cron: '0 0 * * 0'
+
+jobs:
+  jax-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH for private repo access
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.ALPHAGENOME_RESEARCH_SSH_KEY }}
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install CPU-only PyTorch
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # Install JAX dependencies
+          pip install jax jaxlib dm-haiku orbax-checkpoint
+          # Install alphagenome_research from private repo
+          pip install git+ssh://git@github.com/google-deepmind/alphagenome_research.git
+          pip install -e ".[test]"
+
+      - name: Run JAX comparison tests
+        run: |
+          pytest -m "${{ inputs.test_markers || 'jax_comparison' }}" --tb=short -v

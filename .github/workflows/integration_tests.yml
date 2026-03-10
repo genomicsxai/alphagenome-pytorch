@@ -1,0 +1,47 @@
+name: Integration Tests
+
+on:
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Really want to run integration tests manually'
+        required: false
+        default: 'Manual rerun'
+  # Weekly schedule (Wednesday midnight UTC)
+  schedule:
+    - cron: '0 0 * * 3'
+
+jobs:
+  integration-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH for private repo access
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.ALPHAGENOME_RESEARCH_SSH_KEY }}
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install CPU-only PyTorch
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # Install alphagenome_research from private repo
+          pip install git+ssh://git@github.com/google-deepmind/alphagenome_research.git
+          pip install -e ".[test]"
+
+      - name: Run integration tests (PyTorch-only)
+        run: |
+          pytest -m "integration and not jax" --tb=short -v

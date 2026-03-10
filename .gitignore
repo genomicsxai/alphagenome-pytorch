@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Model weights and data (large files)
+*.pt
+*.pth
+*.ckpt
+weights/
+*.parquet
+
+# Logs
+*.log
+log.txt
+
+# Test data
+**/mock_data/
+
+# Debug scripts (keep in repo but can be gitignored if desired)
+# debug-import.py
+# test-import.py
+# test-import2.py
+
+# Exploration / experiment outputs
+explore/
+
+# SLURM job outputs
+scripts/*.out
+scripts/*.err
+
+# OS
+.DS_Store
+Thumbs.db
+docs/_build/
+
+# Hatch VCS
+src/alphagenome_pytorch/_version.py

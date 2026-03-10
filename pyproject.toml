@@ -1,0 +1,86 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "alphagenome-pytorch"
+dynamic = ["version"]
+description = "PyTorch implementation of AlphaGenome"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.0.0",
+    "numpy",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0.0",
+    "pytest-xdist",
+    "alphagenome",
+    "chex",
+    "einshape",
+    "pyranges",
+    "tensorflow",
+    "kagglehub",
+    "aiohttp",
+    "requests",
+    "pybigwig",
+    "pysam",
+    "pyfaidx",
+    "tqdm",
+]
+jax = [
+    "jax",
+    "jaxlib",
+    "dm-haiku",
+    "orbax-checkpoint",
+]
+finetuning = [
+    "pybigwig",
+    "pandas",
+    "tqdm",
+    "pyfaidx",
+]
+scoring = [
+    "pyfaidx",
+    "pandas",
+    "tqdm",
+    "pyranges",
+    "alphagenome",
+]
+docs = [
+    "sphinx>=7.0.0",
+    "sphinx-book-theme",
+    "sphinx-design",
+    "myst-parser",
+]
+dev = [
+    "alphagenome-pytorch[test,jax,scoring,docs]",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = ["-v", "--strict-markers"]
+markers = [
+    "unit: Unit tests (no external dependencies)",
+    "integration: Integration tests with full model (PyTorch only, no JAX required)",
+    "integration_jax: Integration tests comparing PyTorch vs JAX (requires --jax-checkpoint)",
+    "jax_comparison: Component-level tests comparing PyTorch vs JAX implementations",
+    "jax: Tests requiring JAX installation",
+    "api: Tests comparing against AlphaGenome API",
+    "finetuning: Fine-tuning pipeline tests (requires --torch-weights but not JAX)",
+    "slow: Slow tests excluded from CI by default",
+]
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/alphagenome_pytorch/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/alphagenome_pytorch"]
