@@ -7,10 +7,15 @@ from .types import OutputType
 import pandas as pd
 import numpy as np
 import torch
+import matplotlib.patches as mpatches
+from matplotlib.colors import to_rgba
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import logomaker
 
 # Cache for transcript extractors
 _transcript_extractor_cache = {}
-
+BASE_TO_IDX = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
 
 def get_transcript_extractors_from_df(gtf_df):
     """Build transcript extractors from a GTF-style DataFrame."""
@@ -378,3 +383,300 @@ def visualize_variant(
         interval=plot_interval,
         annotations=[plot_components.VariantAnnotation([jax_variant])],
     )
+
+
+def extract_ism_logo(
+    ism_results,
+    scorer_idx,
+    track_idx,
+    background_seq,
+    center_rel,
+    half_window,
+    interval,
+    is_gene_scorer=False,
+    gene_id=None
+):
+    """Convert ISM results to a logomaker-compatible (N, 4) DataFrame.
+    Alt columns receive the raw ISM score; the ref-base column is set to 0.
+    Then each row is mean-centred by subtracting the mean of the three alt
+    scores from all four entries (see AlphaGenome Supplementary Methods).
+
+    Args:
+        ism_results: List of per-variant score lists from an ISM run (e.g. the
+            output of ``scoring_model.score_ism_variants`` or an equivalent
+            manual ISM loop).  Each element is a list of score objects, one per
+            scorer.
+        scorer_idx: Index into each variant's score list selecting which scorer
+            to read (e.g. 0 for DNase, 1 for ChIP-histone, 2 for RNA-seq when
+            using the standard ``ism_scorers`` list).
+        track_idx: Index of the specific output track within the chosen scorer's
+            ``scores`` tensor (e.g. the CMP DNase track index).
+        background_seq: The full nucleotide sequence string (REF or ALT) that
+            was used as the ISM background, spanning the scored ``interval``.
+        center_rel: Relative position of the variant center inside the interval,
+            i.e. ``variant.start - interval.start``.
+        half_window: Half-width of the ISM window in base pairs.  The logo will
+            cover ``2 * half_window + 1`` positions centred on ``center_rel``.
+        is_gene_scorer: If True, the score object at ``scorer_idx`` is expected
+            to be a list of per-gene scores (as returned by
+            ``GeneMaskLFCScorer``).  The function will search this list for a
+            matching ``gene_id``.
+        gene_id: Ensembl gene ID without version suffix (e.g.
+            ``'ENSG00000162367'``) used to select the correct gene score when
+            ``is_gene_scorer`` is True.
+
+    Returns:
+        pd.DataFrame: Shape ``(2 * half_window + 1, 4)`` with columns
+        ``['A', 'C', 'G', 'T']``, mean-centred per row.
+    """
+    n_pos = 2 * half_window + 1
+    scores = np.zeros((n_pos, 4))
+    window_start = center_rel - half_window
+
+    for variant_scores in ism_results:
+        score_result = variant_scores[scorer_idx]
+        if is_gene_scorer:
+            if not isinstance(score_result, list):
+                score_result = [score_result]
+            score_obj = None
+            for gs in score_result:
+                if gs.gene_id and gs.gene_id.split('.')[0] == gene_id:
+                    score_obj = gs
+                    break
+            if score_obj is None:
+                continue
+        else:
+            score_obj = score_result
+
+        v = score_obj.variant
+        rel_pos = v.start - interval.start
+        win_idx = rel_pos - window_start
+        if not (0 <= win_idx < n_pos):
+            continue
+
+        alt_idx = BASE_TO_IDX.get(v.alternate_bases.upper())
+        if alt_idx is not None:
+            scores[win_idx, alt_idx] = score_obj.scores[track_idx].item()
+
+    # Mean center each row: subtract mean of the 3 alt scores
+    for i in range(n_pos):
+        rp = window_start + i
+        if 0 <= rp < len(background_seq):
+            ref_base = background_seq[rp].upper()
+            ref_idx = BASE_TO_IDX.get(ref_base)
+            if ref_idx is not None:
+                alt_indices = [j for j in range(4) if j != ref_idx]
+                mean_alts = np.mean([scores[i, j] for j in alt_indices])
+                for j in range(4):
+                    scores[i, j] -= mean_alts
+
+    return pd.DataFrame(scores, columns=list('ACGT'))
+
+
+def build_ism_logos(
+    ism_ref,
+    ism_alt,
+    ref_seq,
+    alt_seq,
+    interval,
+    track_configs,
+    center_rel,
+    half_window,
+    gene_id,
+):
+    """Build and normalize REF and ALT ISM logos.
+
+    Args:
+        ism_ref: ISM results on the reference background sequence, as returned
+            by ``scoring_model.score_ism_variants`` or an equivalent loop.
+        ism_alt: ISM results on the ALT background sequence (variant applied).
+        ref_seq: Full reference nucleotide sequence string spanning the interval.
+        alt_seq: Full ALT nucleotide sequence string (with the variant applied)
+            spanning the interval, truncated to ``interval.width``.
+        track_configs: List of ``(scorer_idx, track_idx, label)`` tuples
+            identifying which scorer/track combinations to build logos for (e.g.
+            ``[(0, 44, 'DNase'), (1, 206, 'H3K27ac'), (2, 561, 'TAL1 RNA-seq')]``).
+            Scorer index 2 is treated as a gene scorer.
+        center_rel: Relative position of the variant center inside the interval,
+            i.e. ``variant.start - interval.start``.
+        half_window: Half-width of the ISM window in base pairs.
+        gene_id: Gene ID for gene in locus.
+
+    Returns:
+        tuple[dict, dict]: ``(ref_logos, alt_logos)`` where each dict is keyed
+        by track label and maps to a ``pd.DataFrame`` of shape
+        ``(2 * half_window + 1, 4)``.  Values are normalized so the peak
+        absolute value across both REF and ALT logos equals 1.
+    """
+    ref_logos, alt_logos = {}, {}
+    for scorer_idx, track_idx, label in track_configs:
+        is_gene = isinstance(ism_ref[0][scorer_idx], list)
+        ref_logos[label] = extract_ism_logo(
+            ism_ref,
+            scorer_idx,
+            track_idx,
+            ref_seq,
+            center_rel,
+            half_window,
+            interval,
+            is_gene_scorer=is_gene,
+            gene_id=gene_id,
+        )
+        alt_logos[label] = extract_ism_logo(
+            ism_alt,
+            scorer_idx,
+            track_idx,
+            alt_seq,
+            center_rel,
+            half_window,
+            interval,
+            is_gene_scorer=is_gene,
+            gene_id=gene_id,
+        )
+
+    # Normalize: divide by max |value| across REF+ALT so peak = 1
+    for _, _, label in track_configs:
+        combined = pd.concat([ref_logos[label], alt_logos[label]])
+        max_abs = np.abs(combined.values).max()
+        if max_abs > 0:
+            ref_logos[label] = ref_logos[label] / max_abs
+            alt_logos[label] = alt_logos[label] / max_abs
+
+    return ref_logos, alt_logos
+
+
+def plot_ism_logos(
+    ref_logos,
+    alt_logos,
+    track_configs,
+    variant,
+    half_window,
+    title='ISM sequence logos — REF vs ALT background',
+    display_names=None,
+    savepath=None,
+):
+    """Plot ISM sequence logos.
+
+    Renders a two-panel figure (REF on top, ALT on bottom) with one column of
+    logomaker sequence logos per track, separated by a variant annotation row.
+
+    Args:
+        ref_logos: Dict mapping track label → ``pd.DataFrame`` of shape
+            ``(2 * half_window + 1, 4)`` with columns ``['A', 'C', 'G', 'T']``,
+            as returned by ``build_logos``.
+        alt_logos: Same structure as ``ref_logos`` but computed on the ALT
+            background sequence.
+        track_configs: List of ``(scorer_idx, track_idx, label)`` tuples.  Only
+            the ``label`` element is used for axis labelling and dict lookup.
+        variant: A ``Variant`` object (or equivalent) with ``.position``,
+            ``.reference_bases``, and ``.alternate_bases`` attributes, used for
+            the annotation marker and genomic-coordinate x-axis labels.
+        half_window: Half-width of the ISM window in base pairs.  Determines
+            the x-axis range: ``variant.position ± half_window``.
+        title: Figure suptitle string.
+        display_names: Optional dict mapping track config labels to shorter
+            y-axis display names.
+        savepath: If not None, the figure is saved to this path at 150 dpi.
+
+    Returns:
+        matplotlib.figure.Figure: The rendered figure.
+    """
+    track_labels   = [label for _, _, label in track_configs]
+
+    ylims = {}
+    for label in track_labels:
+        all_vals = pd.concat([ref_logos[label], alt_logos[label]])
+        vmin, vmax = all_vals.values.min(), all_vals.values.max()
+        pad = (vmax - vmin) * 0.05
+        ylims[label] = (vmin - pad, vmax + pad)
+
+    window_positions = list(range(
+        variant.position - half_window,
+        variant.position + half_window + 1,
+    ))
+    alt_len = len(variant.alternate_bases)
+
+    fig = plt.figure(figsize=(10, 7))
+    gs = gridspec.GridSpec(
+        7, 1,
+        height_ratios=[1, 1, 1, 0.3, 1, 1, 1],
+        hspace=0.05,
+    )
+    row_map = {
+        (0, 0): 0, (0, 1): 1, (0, 2): 2,
+        (1, 0): 4, (1, 1): 5, (1, 2): 6,
+    }
+    first_ax = None
+    axes = {}
+    for key, row in row_map.items():
+        if first_ax is None:
+            axes[key] = fig.add_subplot(gs[row])
+            first_ax = axes[key]
+        else:
+            axes[key] = fig.add_subplot(gs[row], sharex=first_ax)
+
+    ax_gap = fig.add_subplot(gs[3])
+    ax_gap.set_xlim(-0.5, 2 * half_window + 0.5)
+    ax_gap.set_ylim(0, 1)
+    ax_gap.axis('off')
+    ax_gap.plot(half_window + (alt_len - 1) / 2, 0.9, marker='v',
+                color='darkorange', markersize=12, zorder=5, clip_on=False)
+    ax_gap.text(
+        half_window + alt_len + 1, 0.45,
+        f'Chr. 1: {variant.position}: {variant.reference_bases} > {variant.alternate_bases}',
+        fontsize=9, color='darkorange', va='center',
+    )
+
+    for group_idx, (logo_dict, bg_label) in enumerate(
+        [(ref_logos, 'REF'), (alt_logos, 'ALT')]
+    ):
+        for tidx, label in enumerate(track_labels):
+            ax = axes[(group_idx, tidx)]
+            df = logo_dict[label].copy()
+            ylo, yhi = ylims[label]
+            df = df.clip(lower=ylo, upper=yhi)
+            df.index = range(len(df))
+
+            logomaker.Logo(
+                df, ax=ax, shade_below=0.5, fade_below=0.5,
+                color_scheme='classic',
+            )
+            ax.axvspan(
+                half_window - 0.5, half_window + alt_len - 0.5,
+                color='#f5deb3', alpha=0.5, zorder=0,
+            )
+            ax.set_xlim(-0.5, len(df) - 0.5)
+            ax.set_ylim(ylo - 0.25, yhi + 0.25)
+            ax.axhline(0, color='grey', linewidth=0.3)
+            ax.set_ylabel((display_names or {}).get(label, label), fontsize=9, rotation=0,
+                          labelpad=55, va='center')
+
+            if group_idx == 1 and tidx == len(track_labels) - 1:
+                tick_step = 10
+                tick_idx = list(range(0, len(df), tick_step))
+                ax.set_xticks(tick_idx)
+                ax.set_xticklabels(
+                    [f'{window_positions[i]:,}' for i in tick_idx],
+                    rotation=45, ha='right', fontsize=7,
+                )
+                ax.set_xlabel('Genomic position (chr1)', fontsize=9)
+            else:
+                plt.setp(ax.get_xticklabels(), visible=False)
+
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+
+    for group_idx, bg_label in enumerate(['REF', 'ALT']):
+        ax = axes[(group_idx, 1)]
+        ax.annotate(
+            bg_label, xy=(0, 0.5), xycoords='axes fraction',
+            xytext=(-100, 0), textcoords='offset points',
+            fontsize=13, rotation=90,
+            va='center', ha='center',
+        )
+
+    fig.suptitle(title, fontsize=14)
+    if savepath:
+        plt.savefig(savepath, dpi=150, bbox_inches='tight')
+    plt.show()
+    return fig
