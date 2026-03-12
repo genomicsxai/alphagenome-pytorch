@@ -1622,6 +1622,252 @@ def validate_multihead(
     return avg_loss, metrics
 
 
+def train_epoch_sequence_parallel(
+    model: nn.Module,
+    heads: dict[str, nn.Module],
+    train_loader: DataLoader,
+    optimizer: Optimizer,
+    scheduler: LambdaLR,
+    device: torch.device,
+    modality_weights: dict[str, float],
+    resolution_weights: dict[str, dict[int, float]],
+    positional_weight: float,
+    count_weight: float,
+    sequence_parallel: Any,
+    epoch: int,
+    log_every: int,
+    use_amp: bool = True,
+    accumulation_steps: int = 1,
+    frozen_backbone: bool = False,
+    num_segments: int = NUM_SEGMENTS,
+    min_segment_size: int | None = None,
+    train_sampler: DistributedSampler | None = None,
+    rank: int = 0,
+    world_size: int = 1,
+    max_grad_norm: float = 1.0,
+    profile_batches: int = 0,
+    log_fn: Any | None = None,
+    encoder_only: bool = False,
+) -> tuple[float, dict[str, float]]:
+    """Train for one epoch with sequence parallelism.
+
+    Splits the input sequence across GPUs instead of splitting the batch (DDP).
+    This enables training on longer sequences by keeping per-GPU memory constant
+    regardless of world size.
+
+    Follows the same structure as train_epoch_multihead, replacing the backbone
+    forward pass with sequence_parallel.forward() which performs the distributed
+    encode step and returns per-rank local embeddings in NCL format.
+
+    Args:
+        model: AlphaGenome model (may be DDP-wrapped).
+        heads: Dict mapping modality name to output head module.
+        train_loader: Training data loader (yields sequences, modality_targets).
+        optimizer: Optimizer.
+        scheduler: Learning rate scheduler.
+        device: Torch device.
+        modality_weights: Weight for each modality's loss.
+        resolution_weights: Per-modality resolution weights dict.
+        positional_weight: Weight for positional component of multinomial loss.
+        count_weight: Weight for count component of multinomial loss.
+        sequence_parallel: SequenceParallelism instance.
+        epoch: Current epoch number.
+        log_every: Log frequency in steps.
+        use_amp: Whether to use automatic mixed precision.
+        accumulation_steps: Number of batches to accumulate gradients over.
+        frozen_backbone: If True, run backbone under torch.no_grad().
+        num_segments: Number of segments for multinomial loss.
+        min_segment_size: Minimum segment size for multinomial loss.
+        train_sampler: DistributedSampler for shuffling across epochs.
+        rank: Process rank for DDP.
+        world_size: Total number of processes.
+        max_grad_norm: Maximum gradient norm for clipping.
+        profile_batches: Number of batches to profile (0 = disabled).
+        log_fn: Optional step logging function.
+        encoder_only: Not used in SP mode (full backbone always runs).
+
+    Returns:
+        Tuple of (avg_total_loss, per_modality_train_loss).
+    """
+    from alphagenome_pytorch.extensions.finetuning.distributed import (
+        is_main_process,
+        reduce_tensor,
+    )
+    from alphagenome_pytorch.sequence_parallel import SequenceParallelism
+
+    if not isinstance(sequence_parallel, SequenceParallelism):
+        raise ValueError("sequence_parallel must be a SequenceParallelism instance")
+
+    model_module = model.module if hasattr(model, "module") else model
+    model_module.train()
+
+    if train_sampler is not None:
+        train_sampler.set_epoch(epoch)
+
+    # Collect all needed resolutions across modalities (same as train_epoch_multihead)
+    all_resolutions: set[int] = set()
+    for modality in heads:
+        all_resolutions.update(resolution_weights.get(modality, {}).keys())
+    resolutions = tuple(all_resolutions)
+
+    total_loss_accum = 0.0
+    modality_loss_accum: dict[str, float] = {m: 0.0 for m in heads}
+    n_batches = 0
+    running_loss = 0.0
+    accumulated_batches = 0
+
+    if is_main_process(rank):
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch} [SP]")
+    else:
+        pbar = train_loader
+
+    for batch_idx, (sequences, modality_targets) in enumerate(pbar):
+        sequences = sequences.to(device)
+        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+
+        # ===== BACKBONE: sequence-parallel forward =====
+        # Returns embeddings_dict in NCL format - same as model.encode(channels_last=False)
+        if frozen_backbone:
+            with torch.no_grad():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    embeddings_dict, _ = sequence_parallel.forward(
+                        model=model_module,
+                        sequence=sequences,
+                        organism_index=organism_idx,
+                        resolutions=resolutions,
+                    )
+            embeddings_dict = {res: emb.detach() for res, emb in embeddings_dict.items()}
+        else:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                embeddings_dict, _ = sequence_parallel.forward(
+                    model=model_module,
+                    sequence=sequences,
+                    organism_index=organism_idx,
+                    resolutions=resolutions,
+                )
+
+        # ===== HEADS + LOSS (mirrors train_epoch_multihead exactly) =====
+        loss = torch.tensor(0.0, device=device)
+        loss_components: dict[str, float] = {}
+
+        for modality, head in heads.items():
+            if modality not in modality_targets:
+                continue
+
+            modality_weight = modality_weights.get(modality, 1.0)
+            res_weights = resolution_weights.get(modality, {})
+            targets_dict = modality_targets[modality]
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                predictions = head(
+                    embeddings_dict, organism_idx, return_scaled=True, channels_last=True
+                )
+
+            modality_loss = torch.tensor(0.0, device=device)
+
+            for res, weight in res_weights.items():
+                if res not in predictions or res not in targets_dict:
+                    continue
+
+                pred = predictions[res]
+                targets = targets_dict[res].to(device)
+
+                head_module = head.module if hasattr(head, "module") else head
+                targets = head_module.scale(
+                    targets, organism_idx, resolution=res, channels_last=True
+                )
+                mask = torch.ones(pred.shape[0], 1, pred.shape[-1], dtype=torch.bool, device=device)
+
+                current_seq_len = pred.shape[-2]
+                multinomial_res = _compute_multinomial_resolution(
+                    current_seq_len, num_segments, min_segment_size
+                )
+
+                loss_dict = multinomial_loss(
+                    y_pred=pred,
+                    y_true=targets,
+                    mask=mask,
+                    multinomial_resolution=multinomial_res,
+                    positional_weight=positional_weight,
+                    count_weight=count_weight,
+                    channels_last=True,
+                )
+
+                res_loss = loss_dict["loss"] * weight
+                modality_loss = modality_loss + res_loss
+                loss_components[f"{modality}_loss_{res}bp"] = res_loss.item()
+
+            weighted_modality_loss = modality_loss * modality_weight
+            loss = loss + weighted_modality_loss
+            loss_components[f"{modality}_loss"] = modality_loss.item()
+            modality_loss_accum[modality] += modality_loss.item()
+
+        # ===== BACKWARD + OPTIMIZER =====
+        scaled_loss = loss / accumulation_steps
+        scaled_loss.backward()
+
+        is_accumulation_step = (batch_idx + 1) % accumulation_steps == 0
+        is_last_batch = batch_idx == len(train_loader) - 1
+
+        if is_accumulation_step or is_last_batch:
+            trainable_params = []
+            for head in heads.values():
+                trainable_params.extend([p for p in head.parameters() if p.requires_grad])
+            trainable_params.extend([p for p in model.parameters() if p.requires_grad])
+
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        # ===== LOGGING =====
+        raw_loss = loss.item()
+        total_loss_accum += raw_loss
+        n_batches += 1
+        running_loss += raw_loss
+        accumulated_batches += 1
+
+        current_lr = scheduler.get_last_lr()[0]
+
+        if is_main_process(rank) and batch_idx % log_every == 0:
+            avg_running_loss = running_loss / accumulated_batches
+            if hasattr(pbar, "set_postfix"):
+                pbar.set_postfix({
+                    "loss": f"{raw_loss:.4f}",
+                    "run_loss": f"{avg_running_loss:.4f}",
+                    "lr": f"{current_lr:.2e}",
+                })
+
+            if log_fn is not None:
+                log_fn({
+                    "batch": batch_idx,
+                    "epoch": epoch,
+                    "loss": raw_loss,
+                    "running_loss": avg_running_loss,
+                    "learning_rate": current_lr,
+                    **loss_components,
+                })
+
+            running_loss = 0.0
+            accumulated_batches = 0
+
+    # Reduce across processes
+    avg_loss = total_loss_accum / max(1, n_batches)
+    per_modality_loss = {m: v / max(1, n_batches) for m, v in modality_loss_accum.items()}
+
+    if world_size > 1:
+        avg_loss_tensor = torch.tensor(avg_loss, device=device)
+        avg_loss_tensor = reduce_tensor(avg_loss_tensor, world_size)
+        avg_loss = avg_loss_tensor.item()
+
+        for m in per_modality_loss:
+            m_tensor = torch.tensor(per_modality_loss[m], device=device)
+            m_tensor = reduce_tensor(m_tensor, world_size)
+            per_modality_loss[m] = m_tensor.item()
+
+    return avg_loss, per_modality_loss
+
+
 __all__ = [
     "collate_genomic",
     "ModalityConfig",
@@ -1638,4 +1884,6 @@ __all__ = [
     # Multi-head training
     "train_epoch_multihead",
     "validate_multihead",
+    # Sequence parallel training
+    "train_epoch_sequence_parallel",
 ]
