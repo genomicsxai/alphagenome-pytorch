@@ -88,7 +88,7 @@ python scripts/finetune.py --mode lora --lora-rank 8 \
 torchrun --nproc_per_node=4 scripts/finetune.py --mode lora ...
 ```
 
-See [`examples/notebooks/finetuning_gm12878_demo.ipynb`](examples/notebooks/finetuning_gm12878_demo.ipynb) for an example of linear probing on ATAC-seq data.
+See [`examples/notebooks/finetune_linear_probe.ipynb`](examples/notebooks/finetune_linear_probe.ipynb) for an example of linear probing on ATAC-seq data.
 
 ## Numerical Parity with JAX
 
