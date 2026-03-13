@@ -81,6 +81,7 @@ torch._dynamo.config.suppress_errors = True
 # AlphaGenome imports
 from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.config import DtypePolicy
+from alphagenome_pytorch.sequence_parallel import SequenceParallelism
 from alphagenome_pytorch.extensions.finetuning import (
     # Data
     CachedGenome,
@@ -98,6 +99,7 @@ from alphagenome_pytorch.extensions.finetuning import (
     validate_ddp,
     train_epoch_multihead,
     validate_multihead,
+    train_epoch_sequence_parallel,
     # Distributed
     setup_distributed,
     cleanup_distributed,
@@ -301,6 +303,26 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--profile-batches", type=int, default=0, help="Profile first N batches")
     train.add_argument("--compile", action="store_true", help="Use torch.compile")
     train.add_argument("--seed", type=int, default=None, help="Random seed")
+
+    # Distributed/Sequence Parallel arguments
+    dist = parser.add_argument_group("Distributed")
+    dist.add_argument(
+        "--sequence-parallel",
+        action="store_true",
+        help="Enable sequence parallelism (split sequence across GPUs)",
+    )
+    dist.add_argument(
+        "--overlap-highres",
+        type=int,
+        default=1024,
+        help="Overlap for high-resolution (1bp) sequence splits",
+    )
+    dist.add_argument(
+        "--overlap-lowres",
+        type=int,
+        default=32,
+        help="Overlap for low-resolution (128bp) transformer splits",
+    )
 
     # Logging arguments
     log = parser.add_argument_group("Logging")
@@ -945,6 +967,25 @@ def main() -> None:
     )
     model_module = model.module if isinstance(model, DDP) else model
 
+    # Sequence parallelism setup
+    sequence_parallel = None
+    if args.sequence_parallel:
+        if world_size == 1:
+            print_rank0(
+                "Warning: --sequence-parallel requires multiple GPUs. Running with single GPU.",
+                rank,
+            )
+        else:
+            sequence_parallel = SequenceParallelism(
+                overlap_highres=args.overlap_highres,
+                overlap_lowres=args.overlap_lowres,
+            )
+            print_rank0(
+                f"Sequence parallelism enabled: overlap_highres={args.overlap_highres}, "
+                f"overlap_lowres={args.overlap_lowres}",
+                rank,
+            )
+
     # Optimizer
     optimizer = torch.optim.AdamW(
         trainable_params,
@@ -1119,31 +1160,60 @@ def main() -> None:
             else:
                 # Single modality: use the standard train_epoch_ddp
                 primary_modality = args.modalities[0]
-                train_loss = train_epoch_ddp(
-                    model=model,
-                    head=heads[primary_modality],
-                    train_loader=train_loader,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    device=device,
-                    resolution_weights=resolution_weights_per_modality[primary_modality],
-                    positional_weight=args.positional_weight,
-                    count_weight=args.count_weight,
-                    epoch=epoch,
-                    log_every=args.log_every,
-                    use_amp=use_amp,
-                    accumulation_steps=args.gradient_accumulation_steps,
-                    frozen_backbone=frozen_backbone,
-                    train_sampler=train_sampler,
-                    rank=rank,
-                    world_size=world_size,
-                    max_grad_norm=args.max_grad_norm,
-                    num_segments=args.num_segments,
-                    min_segment_size=args.min_segment_size,
-                    profile_batches=args.profile_batches if epoch == start_epoch else 0,
-                    log_fn=logger.log_step if is_main_process(rank) else None,
-                    encoder_only=encoder_only,
-                )
+                if args.sequence_parallel and sequence_parallel is not None:
+                    train_loss, per_modality_train_loss = train_epoch_sequence_parallel(
+                        model=model,
+                        heads=heads,
+                        train_loader=train_loader,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        device=device,
+                        modality_weights=args.modality_weight_dict,
+                        resolution_weights=resolution_weights_per_modality,
+                        positional_weight=args.positional_weight,
+                        count_weight=args.count_weight,
+                        sequence_parallel=sequence_parallel,
+                        epoch=epoch,
+                        log_every=args.log_every,
+                        use_amp=use_amp,
+                        accumulation_steps=args.gradient_accumulation_steps,
+                        frozen_backbone=frozen_backbone,
+                        num_segments=args.num_segments,
+                        min_segment_size=args.min_segment_size,
+                        train_sampler=train_sampler,
+                        rank=rank,
+                        world_size=world_size,
+                        max_grad_norm=args.max_grad_norm,
+                        profile_batches=args.profile_batches if epoch == start_epoch else 0,
+                        log_fn=logger.log_step if is_main_process(rank) else None,
+                        encoder_only=encoder_only,
+                    )
+                else:
+                    train_loss = train_epoch_ddp(
+                        model=model,
+                        head=heads[primary_modality],
+                        train_loader=train_loader,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        device=device,
+                        resolution_weights=resolution_weights_per_modality[primary_modality],
+                        positional_weight=args.positional_weight,
+                        count_weight=args.count_weight,
+                        epoch=epoch,
+                        log_every=args.log_every,
+                        use_amp=use_amp,
+                        accumulation_steps=args.gradient_accumulation_steps,
+                        frozen_backbone=frozen_backbone,
+                        train_sampler=train_sampler,
+                        rank=rank,
+                        world_size=world_size,
+                        max_grad_norm=args.max_grad_norm,
+                        num_segments=args.num_segments,
+                        min_segment_size=args.min_segment_size,
+                        profile_batches=args.profile_batches if epoch == start_epoch else 0,
+                        log_fn=logger.log_step if is_main_process(rank) else None,
+                        encoder_only=encoder_only,
+                    )
 
             if handler.preempted:
                 print_rank0("Preemption flag set - saving and exiting.", rank)
