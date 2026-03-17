@@ -37,6 +37,11 @@ jax = [
     "dm-haiku",
     "orbax-checkpoint",
 ]
+inference = [
+    "pybigwig",
+    "pyfaidx",
+    "tqdm",
+]
 finetuning = [
     "pybigwig",
     "pandas",

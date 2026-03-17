@@ -38,18 +38,18 @@ from tqdm import tqdm
 
 # Lazy imports
 pyBigWig = None
-pysam = None
+pyfaidx = None
 
 
 def _ensure_deps():
-    """Lazily import pyBigWig and pysam."""
-    global pyBigWig, pysam
+    """Lazily import pyBigWig and pyfaidx."""
+    global pyBigWig, pyfaidx
     if pyBigWig is None:
         import pyBigWig as _pyBigWig
         pyBigWig = _pyBigWig
-    if pysam is None:
-        import pysam as _pysam
-        pysam = _pysam
+    if pyfaidx is None:
+        import pyfaidx as _pyfaidx
+        pyfaidx = _pyfaidx
 
 
 # Head configurations: name -> (num_tracks, supported_resolutions)
@@ -122,6 +122,7 @@ class GenomeSequenceProvider:
     """Provides one-hot encoded sequences with padding for out-of-bounds regions.
 
     Can use either a CachedGenome instance or load directly from FASTA.
+    Uses pyfaidx for efficient indexed FASTA access.
     """
 
     def __init__(
@@ -143,22 +144,26 @@ class GenomeSequenceProvider:
         self._cache: dict[str, np.ndarray] = {}
         self._fasta_path = str(source)
         self._cache_enabled = cache
+        self._fasta = None  # Lazy-loaded pyfaidx.Fasta instance
 
         # Load chromosome sizes and optionally cache sequences
         print(f"Loading genome from {source}...")
-        with pysam.FastaFile(self._fasta_path) as fasta:
-            for ref in fasta.references:
-                self.chrom_sizes[ref] = fasta.get_reference_length(ref)
+        fasta = pyfaidx.Fasta(self._fasta_path)
+        try:
+            for ref in fasta.keys():
+                self.chrom_sizes[ref] = len(fasta[ref])
 
             if cache:
-                refs_to_load = chromosomes if chromosomes else set(fasta.references)
+                refs_to_load = chromosomes if chromosomes else set(fasta.keys())
                 for ref in refs_to_load:
                     if ref in self.chrom_sizes:
-                        seq_str = fasta.fetch(ref)
+                        seq_str = str(fasta[ref][:])
                         self._cache[ref] = _sequence_to_onehot(seq_str)
 
                 cached_mb = sum(arr.nbytes for arr in self._cache.values()) / 1e6
                 print(f"Cached {len(self._cache)} chromosomes ({cached_mb:.1f} MB)")
+        finally:
+            fasta.close()
 
     def fetch(self, chrom: str, start: int, end: int) -> np.ndarray:
         """Fetch one-hot encoded sequence, padding out-of-bounds with N (0.25).
@@ -201,9 +206,11 @@ class GenomeSequenceProvider:
 
     def _fetch_from_fasta(self, chrom: str, start: int, end: int) -> np.ndarray:
         """Fetch and encode sequence directly from FASTA."""
-        with pysam.FastaFile(self._fasta_path) as fasta:
-            seq_str = fasta.fetch(chrom, start, end)
-            return _sequence_to_onehot(seq_str)
+        # Lazy-load pyfaidx.Fasta for non-cached access
+        if self._fasta is None:
+            self._fasta = pyfaidx.Fasta(self._fasta_path)
+        seq_str = str(self._fasta[chrom][start:end])
+        return _sequence_to_onehot(seq_str)
 
 
 def _sequence_to_onehot(seq: str) -> np.ndarray:
@@ -342,9 +349,27 @@ def predict_full_chromosome(
     model.eval()
     device = torch.device(device)
 
+    n_batches = (len(tiles) + config.batch_size - 1) // config.batch_size
+
+    if show_progress:
+        output_mb = predictions.nbytes / 1e6
+        # Estimate GPU memory per batch:
+        # - Trunk positions = window_size / 128
+        # - Pair activations dominate: trunk_len^2 * 128 features * bytes_per_element
+        # - Decoder (1bp only): ~window_size * 1536 * bytes_per_element
+        # - Model weights: ~2.5 GB
+        trunk_len = config.window_size // 128
+        bpe = 2  # bfloat16/float16 = 2 bytes, float32 = 4
+        pair_mb = config.batch_size * trunk_len * trunk_len * 128 * bpe / 1e6
+        decoder_mb = config.batch_size * config.window_size * 1536 * bpe / 1e6 if config.resolution == 1 else 0
+        model_mb = 2500  # ~2.5 GB for model weights
+        gpu_est_mb = pair_mb + decoder_mb + model_mb
+        print(f"  Tiles: {len(tiles)}, Batches: {n_batches}")
+        print(f"  Output array: {output_mb:.1f} MB ({output_length:,} x {n_output_tracks} float32)")
+        print(f"  Est. GPU memory per batch: ~{gpu_est_mb / 1000:.1f} GB")
+
     iterator = range(0, len(tiles), config.batch_size)
     if show_progress:
-        n_batches = (len(tiles) + config.batch_size - 1) // config.batch_size
         iterator = tqdm(iterator, total=n_batches, desc=f"Predicting {chrom}")
 
     for batch_start in iterator:
@@ -369,12 +394,18 @@ def predict_full_chromosome(
                 batch_seq,
                 batch_org,
                 resolutions=(config.resolution,),
+                heads=(head,),
             )
 
         # Extract predictions for the requested head
         # Output shape: (batch, seq_len_at_res, n_tracks)
         head_preds = preds[head][config.resolution]
         head_preds = head_preds[:, :, track_indices].cpu().numpy()
+
+        # Free GPU memory from unused heads
+        del preds, batch_seq, batch_org
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
         # Place kept regions into output
         for i, (window_start, window_end, keep_start, keep_end) in enumerate(batch_tiles):
@@ -446,24 +477,20 @@ def write_bigwig(
         track_data = predictions[:, i].astype(np.float64)
         chrom_len = chrom_sizes[chrom]
 
-        # Build coordinate arrays
-        n_bins = len(track_data)
-        starts = np.arange(n_bins, dtype=np.int64) * resolution
-        ends = np.minimum(starts + resolution, chrom_len)
-
         # Filter to valid range
-        valid_mask = starts < chrom_len
-        starts = starts[valid_mask]
-        ends = ends[valid_mask]
-        values = track_data[valid_mask]
+        n_valid = min(len(track_data), chrom_len // resolution)
 
-        # Write entries
-        bw.addEntries(
-            [chrom] * len(starts),
-            starts.tolist(),
-            ends=ends.tolist(),
-            values=values.tolist(),
-        )
+        # Write in chunks using fixed-step format to avoid
+        # materializing huge Python lists (critical at 1bp resolution
+        # where n_valid can be ~46.7M for chr21)
+        CHUNK_SIZE = 1_000_000
+        for chunk_start in range(0, n_valid, CHUNK_SIZE):
+            chunk_end = min(chunk_start + CHUNK_SIZE, n_valid)
+            bw.addEntries(
+                chrom, chunk_start * resolution,
+                values=track_data[chunk_start:chunk_end].tolist(),
+                span=resolution, step=resolution,
+            )
 
         bw.close()
         written_paths.append(bw_path)
