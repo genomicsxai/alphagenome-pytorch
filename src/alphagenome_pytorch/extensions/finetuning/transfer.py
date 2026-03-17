@@ -151,7 +151,11 @@ def load_trunk(
         >>> model = AlphaGenome()
         >>> model = load_trunk(model, 'alphagenome_pretrained.pt')
     """
-    state_dict = torch.load(weights_path, map_location='cpu', weights_only=True)
+    if Path(weights_path).suffix == '.safetensors':
+        from safetensors.torch import load_file
+        state_dict = load_file(weights_path, device="cpu")
+    else:
+        state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
     
     # All head-related prefixes
     head_prefixes = (
