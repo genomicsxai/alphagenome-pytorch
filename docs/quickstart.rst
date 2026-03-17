@@ -154,6 +154,27 @@ Each output type has predictions at one or more resolutions (1bp and/or 128bp):
    print(f"ATAC 1bp shape: {atac_1bp.shape}")
    print(f"ATAC 128bp shape: {atac_128bp.shape}")
 
+Named Outputs (Metadata-Aware Filtering)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+You can use named outputs to filter outputs based on track metadata:
+
+.. code-block:: python
+
+   from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
+   catalog = TrackMetadataCatalog.load_builtin()
+   model.set_track_metadata_catalog(catalog)
+
+   out = model.predict(
+       dna_onehot,
+       organism_index=0,  # human
+       named_outputs=True,
+   )
+
+   # Query by ontology directly (no manual mask construction)
+   liver_rna = out.rna_seq[1].select(ontology_curie="UBERON:0002107")
+   liver_tensor = liver_rna.tensor
+   liver_track_names = [track.track_name for track in liver_rna.tracks]
 
 .. list-table:: Output Types
    :header-rows: 1

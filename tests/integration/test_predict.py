@@ -9,6 +9,7 @@ import torch
 
 from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.config import DtypePolicy
+from alphagenome_pytorch.named_outputs import NamedOutputs
 
 
 @pytest.mark.integration
@@ -194,3 +195,16 @@ class TestPredict:
                     pred_outputs[key], manual_outputs[key]
                 )
 
+    def test_return_named_outputs(self, model_fp32):
+        """predict() can return metadata-aware named output wrappers."""
+        x = torch.randn(1, 2048, 4)
+        named = model_fp32.predict(
+            x,
+            0,
+            named_outputs=True,
+            resolutions=(128,),
+        )
+
+        assert isinstance(named, NamedOutputs)
+        assert "atac" in named.heads()
+        assert named.atac[128].tensor.shape[-1] == 256
