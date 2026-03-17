@@ -40,3 +40,14 @@ Adapters
 .. autoclass:: alphagenome_pytorch.extensions.finetuning.adapters.AdapterHoulsby
    :members:
    :undoc-members:
+
+Trainer
+-------
+
+.. autoclass:: alphagenome_pytorch.extensions.finetuning.trainer.TrainerConfig
+   :members:
+   :undoc-members:
+
+.. autoclass:: alphagenome_pytorch.extensions.finetuning.trainer.Trainer
+   :members:
+   :undoc-members:

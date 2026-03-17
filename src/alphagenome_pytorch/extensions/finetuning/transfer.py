@@ -302,9 +302,11 @@ def prepare_for_transfer(
     
     # 3. Apply adapter/freezing based on mode
     modes = config.mode if isinstance(config.mode, list) else [config.mode]
-    
+
     # Validate modes
-    valid_modes = {'full', 'linear', 'lora', 'locon', 'ia3', 'houlsby'}
+    # 'linear-probe' is an alias for 'linear' (frozen trunk, train heads only)
+    # 'encoder-only' freezes trunk but is handled specially by Trainer (CNN encoder only, no transformer)
+    valid_modes = {'full', 'linear', 'linear-probe', 'encoder-only', 'lora', 'locon', 'ia3', 'houlsby'}
     for m in modes:
         if m not in valid_modes:
             raise ValueError(

@@ -92,12 +92,10 @@ from alphagenome_pytorch.extensions.finetuning import (
     # Model
     MODALITY_CONFIGS,
     TransferConfig,
+    Trainer,
+    TrainerConfig,
     # Training
     create_lr_scheduler,
-    train_epoch_ddp,
-    validate_ddp,
-    train_epoch_multihead,
-    validate_multihead,
     # Distributed
     setup_distributed,
     cleanup_distributed,
@@ -112,7 +110,6 @@ from alphagenome_pytorch.extensions.finetuning import (
     setup_preemption_handler,
 )
 from alphagenome_pytorch.extensions.finetuning.adapters import get_adapter_params
-from alphagenome_pytorch.extensions.finetuning.checkpointing import save_checkpoint, load_checkpoint
 from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head
 from alphagenome_pytorch.extensions.finetuning.transfer import (
     load_trunk,
@@ -961,6 +958,42 @@ def main() -> None:
     print_rank0(f"Total optimizer steps: {total_steps:,}", rank)
     print_rank0(f"LR schedule: {args.lr_schedule} (warmup: {args.warmup_steps} steps)", rank)
 
+    # Trainer API configuration
+    trainer_config = TrainerConfig(
+        positional_weight=args.positional_weight,
+        count_weight=args.count_weight,
+        max_grad_norm=args.max_grad_norm,
+        num_segments=args.num_segments,
+        min_segment_size=args.min_segment_size,
+        use_amp=not args.no_amp,
+        log_every=args.log_every,
+    )
+    if args.mode == "linear-probe":
+        trainer_transfer_config = TransferConfig(mode="linear-probe")
+    elif args.mode == "encoder-only":
+        trainer_transfer_config = TransferConfig(mode="encoder-only")
+    elif args.mode == "full":
+        trainer_transfer_config = TransferConfig(mode="full")
+    else:
+        trainer_transfer_config = TransferConfig(
+            mode="lora",
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_targets=[t.strip() for t in args.lora_targets.split(",")],
+        )
+
+    trainer = Trainer(
+        model=model,
+        heads=heads,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        trainer_config=trainer_config,
+        transfer_config=trainer_transfer_config,
+        device=device,
+        rank=rank,
+        world_size=world_size,
+    )
+
     # Resume from checkpoint
     start_epoch = 1
     best_val_loss = float("inf")
@@ -968,13 +1001,7 @@ def main() -> None:
 
     if resume_path and resume_path.exists():
         print_rank0(f"Resuming from: {resume_path}", rank)
-        ckpt = load_checkpoint(
-            resume_path,
-            model=model_module,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            device="cpu",
-        )
+        ckpt = trainer.load_state(resume_path, device="cpu")
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf")))
         wandb_run_id = ckpt.get("wandb_run_id")
@@ -1034,24 +1061,19 @@ def main() -> None:
         resume_id=wandb_run_id if resume_path else None,
     )
 
-    use_amp = not args.no_amp
-
     # Preemption handler state
     current_epoch = start_epoch
 
     def _save_preempt():
         """Save preemption checkpoint."""
         if is_main_process(rank):
-            save_checkpoint(
+            trainer.save_state(
                 path=output_dir / "checkpoint_preempt.pth",
                 epoch=max(0, current_epoch - 1),  # Last completed epoch
-                model=model_module,
-                optimizer=optimizer,
                 val_loss=best_val_loss,
                 track_names=modality_track_names,
                 modality=args.modalities,
                 resolutions=modality_resolutions,
-                scheduler=scheduler,
                 best_val_loss=best_val_loss,
                 wandb_run_id=logger.wandb_run_id,
             )
@@ -1063,17 +1085,6 @@ def main() -> None:
     print_rank0("\n" + "=" * 60, rank)
     print_rank0(f"Starting training (epoch {start_epoch} to {args.epochs})", rank)
     print_rank0("=" * 60, rank)
-
-    # Freeze backbone (use torch.no_grad) when no backbone params need gradients.
-    # - linear-probe: only heads train
-    # - encoder-only: only heads train (backbone always frozen; uses encoder_only forward)
-    # - lora with rank=0: only heads train (no LoRA adapters)
-    # - lora with rank>0: LoRA adapters need gradients, can't freeze
-    # - full: all params need gradients
-    frozen_backbone = args.mode in ("linear-probe", "encoder-only") or (
-        args.mode == "lora" and args.lora_rank == 0
-    )
-    encoder_only = args.mode == "encoder-only"
 
     try:
         for epoch in range(start_epoch, args.epochs + 1):
@@ -1089,61 +1100,16 @@ def main() -> None:
                 torch.cuda.empty_cache()
 
             # Training
-            if args.is_multimodal:
-                train_loss, per_modality_train_loss = train_epoch_multihead(
-                    model=model,
-                    heads=heads,
-                    train_loader=train_loader,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    device=device,
-                    modality_weights=args.modality_weight_dict,
-                    resolution_weights=resolution_weights_per_modality,
-                    positional_weight=args.positional_weight,
-                    count_weight=args.count_weight,
-                    epoch=epoch,
-                    log_every=args.log_every,
-                    use_amp=use_amp,
-                    accumulation_steps=args.gradient_accumulation_steps,
-                    frozen_backbone=frozen_backbone,
-                    train_sampler=train_sampler,
-                    rank=rank,
-                    world_size=world_size,
-                    max_grad_norm=args.max_grad_norm,
-                    num_segments=args.num_segments,
-                    min_segment_size=args.min_segment_size,
-                    profile_batches=args.profile_batches if epoch == start_epoch else 0,
-                    log_fn=logger.log_step if is_main_process(rank) else None,
-                    encoder_only=encoder_only,
-                )
-            else:
-                # Single modality: use the standard train_epoch_ddp
-                primary_modality = args.modalities[0]
-                train_loss = train_epoch_ddp(
-                    model=model,
-                    head=heads[primary_modality],
-                    train_loader=train_loader,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    device=device,
-                    resolution_weights=resolution_weights_per_modality[primary_modality],
-                    positional_weight=args.positional_weight,
-                    count_weight=args.count_weight,
-                    epoch=epoch,
-                    log_every=args.log_every,
-                    use_amp=use_amp,
-                    accumulation_steps=args.gradient_accumulation_steps,
-                    frozen_backbone=frozen_backbone,
-                    train_sampler=train_sampler,
-                    rank=rank,
-                    world_size=world_size,
-                    max_grad_norm=args.max_grad_norm,
-                    num_segments=args.num_segments,
-                    min_segment_size=args.min_segment_size,
-                    profile_batches=args.profile_batches if epoch == start_epoch else 0,
-                    log_fn=logger.log_step if is_main_process(rank) else None,
-                    encoder_only=encoder_only,
-                )
+            train_loss, per_modality_train_loss = trainer.train_epoch(
+                train_loader=train_loader,
+                epoch=epoch,
+                accumulation_steps=args.gradient_accumulation_steps,
+                modality_weights=args.modality_weight_dict,
+                resolution_weights=resolution_weights_per_modality,
+                train_sampler=train_sampler,
+                log_fn=logger.log_step if is_main_process(rank) else None,
+                profile_batches=args.profile_batches if epoch == start_epoch else 0,
+            )
 
             if handler.preempted:
                 print_rank0("Preemption flag set - saving and exiting.", rank)
@@ -1151,42 +1117,12 @@ def main() -> None:
                 break
 
             # Validation
-            if args.is_multimodal:
-                val_loss, val_metrics = validate_multihead(
-                    model=model,
-                    heads=heads,
-                    val_loader=val_loader,
-                    device=device,
-                    modality_weights=args.modality_weight_dict,
-                    resolution_weights=resolution_weights_per_modality,
-                    positional_weight=args.positional_weight,
-                    count_weight=args.count_weight,
-                    use_amp=use_amp,
-                    num_segments=args.num_segments,
-                    min_segment_size=args.min_segment_size,
-                    compute_pearson=True,
-                    rank=rank,
-                    world_size=world_size,
-                    encoder_only=encoder_only,
-                )
-            else:
-                primary_modality = args.modalities[0]
-                val_loss, val_metrics = validate_ddp(
-                    model=model,
-                    head=heads[primary_modality],
-                    val_loader=val_loader,
-                    device=device,
-                    resolution_weights=resolution_weights_per_modality[primary_modality],
-                    positional_weight=args.positional_weight,
-                    count_weight=args.count_weight,
-                    use_amp=use_amp,
-                    num_segments=args.num_segments,
-                    min_segment_size=args.min_segment_size,
-                    compute_pearson=True,
-                    rank=rank,
-                    world_size=world_size,
-                    encoder_only=encoder_only,
-                )
+            val_loss, val_metrics = trainer.validate(
+                val_loader=val_loader,
+                modality_weights=args.modality_weight_dict,
+                resolution_weights=resolution_weights_per_modality,
+                compute_pearson=True,
+            )
 
             # Synchronize CUDA to ensure all validation ops complete before next epoch
             if torch.cuda.is_available():
@@ -1225,32 +1161,26 @@ def main() -> None:
             if is_main_process(rank):
                 if is_best:
                     best_val_loss = val_loss
-                    save_checkpoint(
+                    trainer.save_state(
                         path=output_dir / "best_model.pth",
                         epoch=epoch,
-                        model=model_module,
-                        optimizer=optimizer,
                         val_loss=val_loss,
                         track_names=modality_track_names,
                         modality=args.modalities,
                         resolutions=modality_resolutions,
-                        scheduler=scheduler,
                         best_val_loss=best_val_loss,
                         wandb_run_id=logger.wandb_run_id,
                     )
                     print(f"  Saved best model (val_loss={val_loss:.4f})")
 
                 if epoch % args.save_every == 0:
-                    save_checkpoint(
+                    trainer.save_state(
                         path=output_dir / f"checkpoint_epoch{epoch}.pth",
                         epoch=epoch,
-                        model=model_module,
-                        optimizer=optimizer,
                         val_loss=val_loss,
                         track_names=modality_track_names,
                         modality=args.modalities,
                         resolutions=modality_resolutions,
-                        scheduler=scheduler,
                         best_val_loss=best_val_loss,
                         wandb_run_id=logger.wandb_run_id,
                     )
