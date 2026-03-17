@@ -1,7 +1,7 @@
 Python API
 ==========
 
-Python API can be used directly. Key functions:
+Python API can be used directly. Key APIs:
 
 - :func:`~alphagenome_pytorch.extensions.finetuning.transfer.load_trunk` — load pretrained trunk weights (excluding heads)
 - :func:`~alphagenome_pytorch.extensions.finetuning.transfer.add_head` — add a new prediction head to the model
@@ -10,6 +10,9 @@ Python API can be used directly. Key functions:
 - :func:`~alphagenome_pytorch.extensions.finetuning.transfer.count_trainable_params` — count trainable parameters by component
 - :func:`~alphagenome_pytorch.extensions.finetuning.adapters.get_adapter_params` — get adapter parameters for optimizer param groups
 - :func:`~alphagenome_pytorch.extensions.finetuning.adapters.merge_adapters` — fold adapter weights into base layers for inference
+- :class:`~alphagenome_pytorch.extensions.finetuning.trainer.TrainerConfig` — training hyperparameters (loss weights, gradient clipping, AMP, logging frequency)
+- :class:`~alphagenome_pytorch.extensions.finetuning.trainer.Trainer` — unified training interface for single- and multi-modality fine-tuning
+- :meth:`~alphagenome_pytorch.extensions.finetuning.trainer.Trainer.forward_backward` and :meth:`~alphagenome_pytorch.extensions.finetuning.trainer.Trainer.optim_step` — low-level primitives for custom loops
 
 Loading Pretrained Weights
 --------------------------
@@ -86,19 +89,23 @@ Configure which heads to remove and add via :class:`~alphagenome_pytorch.extensi
 Each new head predicts at the specified resolutions. The output will be accessible
 as ``outputs['my_atac'][1]`` and ``outputs['my_atac'][128]``.
 
-Complete Example
-----------------
+Training with Trainer (Recommended)
+-----------------------------------
 
-End-to-end finetuning with LoRA adapters:
+Use ``Trainer`` for a unified training/validation/checkpoint API.
+Mode semantics (for example, ``linear-probe`` and ``encoder-only`` behavior)
+are inferred from :class:`~alphagenome_pytorch.extensions.finetuning.transfer.TransferConfig`.
 
 .. code-block:: python
 
    import torch
    from alphagenome_pytorch import AlphaGenome
+   from alphagenome_pytorch.extensions.finetuning import Trainer, TrainerConfig
    from alphagenome_pytorch.extensions.finetuning.transfer import (
        TransferConfig, load_trunk, prepare_for_transfer, count_trainable_params
    )
    from alphagenome_pytorch.extensions.finetuning.adapters import get_adapter_params, merge_adapters
+   from alphagenome_pytorch.extensions.finetuning.training import create_lr_scheduler
 
    # 1. Create model with gradient checkpointing
    model = AlphaGenome(gradient_checkpointing=True)
@@ -125,35 +132,77 @@ End-to-end finetuning with LoRA adapters:
    params = count_trainable_params(model)
    print(f"Trainable: {params['total']:,} (heads: {params['heads']:,}, adapters: {params['adapters']:,})")
 
-   # 5. Set up optimizer (only adapter + head params)
+   # 5. Set up optimizer + scheduler
    optimizer = torch.optim.AdamW([
        {'params': get_adapter_params(model), 'lr': 1e-4},
        {'params': model.heads.parameters(), 'lr': 1e-3},
    ])
+   scheduler = create_lr_scheduler(optimizer, warmup_steps=500, total_steps=10_000)
 
-   # 6. Training loop
-   model.train()
-   model = model.cuda()
+   # 6. Build trainer
+   trainer = Trainer(
+       model=model,
+       heads=dict(model.heads),
+       optimizer=optimizer,
+       scheduler=scheduler,
+       trainer_config=TrainerConfig(
+           positional_weight=5.0,
+           count_weight=1.0,
+           max_grad_norm=1.0,
+           use_amp=True,
+           log_every=50,
+       ),
+       transfer_config=config,
+       device=torch.device("cuda"),
+   )
 
-   for batch in dataloader:
-       sequences = batch['sequence'].cuda()     # (B, L, 4) one-hot
-       organism_idx = batch['organism'].cuda()  # (B,) 0=human, 1=mouse
-       targets = batch['targets'].cuda()
+   # 7. Train + validate
+   train_loss, per_modality = trainer.train_epoch(
+       train_loader=train_loader,
+       epoch=1,
+       accumulation_steps=4,
+       modality_weights={"my_atac": 1.0},
+       resolution_weights={"my_atac": {1: 1.0, 128: 1.0}},
+   )
+   val_loss, val_metrics = trainer.validate(
+       val_loader=val_loader,
+       modality_weights={"my_atac": 1.0},
+       resolution_weights={"my_atac": {1: 1.0, 128: 1.0}},
+       compute_pearson=True,
+   )
 
-       optimizer.zero_grad()
-       outputs = model(sequences, organism_idx)
+   # 8. Save trainer state
+   trainer.save_state(
+       path="checkpoint_epoch1.pth",
+       epoch=1,
+       val_loss=val_loss,
+       track_names=["track_0", "track_1"],
+       modality="my_atac",
+       resolutions=(1, 128),
+   )
 
-       # Access your custom head outputs
-       predictions = outputs['my_atac'][128]  # (B, L/128, 10)
-       loss = your_loss_fn(predictions, targets)
+Custom Optimization Loops
+-------------------------
 
-       loss.backward()
-       optimizer.step()
+For custom optimization behavior, use ``forward_backward`` and ``optim_step``:
 
-   # 7. Merge adapters for efficient inference
+.. code-block:: python
+
+   grad_accum = 4
+   for batch_idx, batch in enumerate(train_loader):
+       losses = trainer.forward_backward(
+           batch=batch,
+           modality_weights={"my_atac": 1.0},
+           resolution_weights={"my_atac": {1: 1.0, 128: 1.0}},
+           accumulation_steps=grad_accum,
+       )
+       if (batch_idx + 1) % grad_accum == 0:
+           step_metrics = trainer.optim_step()
+
+   # Merge adapters for efficient inference
    model.eval()
-   model = merge_adapters(model)  # Folds adapter weights into base layers
-   torch.save(model.state_dict(), 'finetuned_model.pt')
+   model = merge_adapters(model)
+   torch.save(model.state_dict(), "finetuned_model.pt")
 
 Extracting Embeddings for Custom Heads
 --------------------------------------

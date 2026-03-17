@@ -16,10 +16,16 @@ For unit tests (dataset loading, head creation), see tests/unit/test_finetuning_
 
 import pytest
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from alphagenome_pytorch import AlphaGenome
+from alphagenome_pytorch.extensions.finetuning import (
+    MODALITY_CONFIGS,
+    Trainer,
+    TrainerConfig,
+    collate_genomic,
+    create_lr_scheduler,
+)
 from alphagenome_pytorch.extensions.finetuning.transfer import (
     load_trunk,
     count_trainable_params,
@@ -29,13 +35,6 @@ from alphagenome_pytorch.extensions.finetuning.transfer import (
 )
 from alphagenome_pytorch.extensions.finetuning.datasets import RNASeqDataset, ATACDataset
 from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head
-from alphagenome_pytorch.extensions.finetuning.training import (
-    MODALITY_CONFIGS,
-    collate_genomic,
-    train_epoch,
-    save_checkpoint,
-    create_lr_scheduler,
-)
 from alphagenome_pytorch.extensions.finetuning.adapters import get_adapter_params, LoRA
 
 
@@ -135,30 +134,38 @@ class TestFinetuningPipeline:
         optimizer = torch.optim.AdamW(trainable_params, lr=1e-4)
         scheduler = create_lr_scheduler(optimizer, warmup_steps=0, total_steps=len(train_loader))
 
-        # Train 1 epoch
-        train_loss = train_epoch(
+        trainer = Trainer(
             model=model,
-            head=head,
-            train_loader=train_loader,
+            heads={modality: model.heads[modality]},
             optimizer=optimizer,
             scheduler=scheduler,
+            trainer_config=TrainerConfig(
+                positional_weight=5.0,
+                count_weight=1.0,
+                use_amp=torch.cuda.is_available(),
+                log_every=1,
+            ),
+            transfer_config=config,
             device=device,
-            resolution_weights=modality_config.default_resolution_weights,
-            positional_weight=5.0,
+        )
+
+        # Train 1 epoch through the unified trainer API
+        train_loss, _ = trainer.train_epoch(
+            train_loader=train_loader,
             epoch=1,
-            log_every=1,
+            accumulation_steps=1,
+            modality_weights={modality: 1.0},
+            resolution_weights=modality_config.default_resolution_weights,
         )
 
         # Verify loss is finite
         assert torch.isfinite(torch.tensor(train_loss)), f"Loss is not finite: {train_loss}"
 
-        # Test checkpoint saving
+        # Test checkpoint saving through trainer API
         checkpoint_path = tmp_path / f"test_checkpoint_{modality}.pth"
-        save_checkpoint(
+        trainer.save_state(
             path=checkpoint_path,
             epoch=1,
-            model=model,
-            optimizer=optimizer,
             val_loss=train_loss,
             track_names=["track1", "track2"],
             modality=modality,
