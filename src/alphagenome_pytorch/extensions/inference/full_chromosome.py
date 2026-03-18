@@ -353,20 +353,8 @@ def predict_full_chromosome(
 
     if show_progress:
         output_mb = predictions.nbytes / 1e6
-        # Estimate GPU memory per batch:
-        # - Trunk positions = window_size / 128
-        # - Pair activations dominate: trunk_len^2 * 128 features * bytes_per_element
-        # - Decoder (1bp only): ~window_size * 1536 * bytes_per_element
-        # - Model weights: ~2.5 GB
-        trunk_len = config.window_size // 128
-        bpe = 2  # bfloat16/float16 = 2 bytes, float32 = 4
-        pair_mb = config.batch_size * trunk_len * trunk_len * 128 * bpe / 1e6
-        decoder_mb = config.batch_size * config.window_size * 1536 * bpe / 1e6 if config.resolution == 1 else 0
-        model_mb = 2500  # ~2.5 GB for model weights
-        gpu_est_mb = pair_mb + decoder_mb + model_mb
         print(f"  Tiles: {len(tiles)}, Batches: {n_batches}")
         print(f"  Output array: {output_mb:.1f} MB ({output_length:,} x {n_output_tracks} float32)")
-        print(f"  Est. GPU memory per batch: ~{gpu_est_mb / 1000:.1f} GB")
 
     iterator = range(0, len(tiles), config.batch_size)
     if show_progress:
