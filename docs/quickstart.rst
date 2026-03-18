@@ -176,6 +176,17 @@ You can use named outputs to filter outputs based on track metadata:
    liver_tensor = liver_rna.tensor
    liver_track_names = [track.track_name for track in liver_rna.tracks]
 
+   # Access track metadata fields directly
+   for track in liver_rna.tracks:
+       print(track.biosample_name)        # Direct attribute access
+       print(track.get('assay_title'))    # Safe access with default
+
+   # Filter by multiple criteria, including null checks
+   ctcf_tracks = out.chip_tf[128].select(
+       transcription_factor='CTCF',
+       genetically_modified=None,  # Only unmodified samples
+   )
+
 .. list-table:: Output Types
    :header-rows: 1
    :widths: 15 15 50

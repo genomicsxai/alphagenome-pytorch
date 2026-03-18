@@ -98,9 +98,10 @@ output_rna_seq = named.rna_seq[1].select(assay_title='total RNA-seq')
 output_chip_histone = named.chip_histone[128].select(histone_mark='H3K27ac')
 
 # Multiple conditions (combined in single select call)
+# Use field=None to match missing/null fields
 output_chip_tf = named.chip_tf[128].select(
     transcription_factor='CTCF',
-    predicate=lambda t: t.extras.get('genetically_modified') is None
+    genetically_modified=None  # Match tracks where field is missing/None
 )
 
 # Alternative: use list for "in" matching
@@ -336,7 +337,11 @@ tensors at all resolutions. `NamedTrackTensor.select()` returns a new
 |---------|-----|---------|-------|
 | Load built-in metadata | `model.output_metadata()` | `TrackMetadataCatalog.load_builtin()` | Similar |
 | Filter by field | `.filter_tracks(mask)` | `.select(**criteria)` | PyTorch more ergonomic |
-| Multiple conditions | pandas `&` operator | kwargs + predicate | Both work, different style |
+| Filter null/missing | `metadata['col'].isnull()` | `.select(field=None)` | PyTorch cleaner |
+| Access metadata field | `metadata['field']` | `track.field` | PyTorch uses attribute access |
+| Safe field access | N/A | `track.get('field', default)` | PyTorch only |
+| Check field exists | N/A | `track.has('field')` | PyTorch only |
+| Multiple conditions | pandas `&` operator | kwargs | PyTorch cleaner |
 | Strand filtering | `.filter_to_strand('+')` | `.select(strand='+')` | PyTorch uses generic `.select()` |
 | Tissue filtering | `.filter_by_tissue()` | `.select(gtex_tissue=...)` | PyTorch uses generic `.select()` |
 | Get indices | N/A (use numpy) | `.indices()` | PyTorch has dedicated method |
@@ -345,7 +350,7 @@ tensors at all resolutions. `NamedTrackTensor.select()` returns a new
 | Arithmetic | Direct on objects | Direct on objects | Identical |
 | List organisms | N/A | `.organisms` property | PyTorch only |
 | List outputs | N/A | `.outputs(organism)` | PyTorch only |
-| Check existence | N/A | `.has_tracks()` | PyTorch only |
+| Check catalog entry | N/A | `.has_tracks()` | PyTorch only |
 | Cross-head filtering | N/A | `.select(**criteria)` | PyTorch only |
 | Allow empty results | N/A | `.select(allow_empty=True)` | PyTorch only |
 | Load from DataFrame | N/A | `.from_dataframe(df)` | PyTorch only |
@@ -353,6 +358,24 @@ tensors at all resolutions. `NamedTrackTensor.select()` returns a new
 ---
 
 ## PyTorch-Only Features
+
+### Direct attribute access on TrackMetadata
+```python
+# Access any metadata field directly (no need to use .extras dict)
+track.ontology_curie          # Direct attribute access
+track.biosample_type          # Works for any extras field
+track.get('field', 'default') # Safe access with fallback
+track.has('field')            # Check if field exists and is not None
+```
+
+### Null/missing field filtering
+```python
+# Match tracks where a field is missing or None
+tracks.select(genetically_modified=None)
+
+# Combine with other filters
+tracks.select(transcription_factor='CTCF', genetically_modified=None)
+```
 
 ### Strand and tissue filtering via `.select()`
 ```python

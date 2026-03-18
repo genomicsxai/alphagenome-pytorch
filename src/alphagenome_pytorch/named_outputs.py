@@ -95,7 +95,16 @@ class TrackMetadata:
         organism: Organism index (0=human, 1=mouse).
         track_name: Human-readable track identifier.
         extras: All other metadata fields (ontology_curie, biosample_name, etc.).
-            Use `.select(field=value)` to filter by any field in extras.
+            These can be accessed directly as attributes (e.g., ``track.ontology_curie``)
+            or via ``.get()`` for safe access with defaults.
+
+    Example:
+        >>> track.ontology_curie  # Direct attribute access
+        'UBERON:0002107'
+        >>> track.get('biosample_type', 'unknown')  # Safe access with default
+        'tissue'
+        >>> track.has('genetically_modified')  # Check if field exists and is not None
+        False
     """
 
     track_index: int
@@ -103,6 +112,67 @@ class TrackMetadata:
     organism: int
     track_name: str
     extras: dict[str, Any] = field(default_factory=dict)
+
+    # Core attribute names that should not be looked up in extras
+    _CORE_FIELDS: frozenset[str] = frozenset({
+        "track_index", "output_name", "organism", "track_name", "extras"
+    })
+
+    def __getattr__(self, name: str) -> Any:
+        """Access extras fields as attributes.
+
+        This allows ``track.ontology_curie`` instead of ``track.extras['ontology_curie']``.
+
+        Raises:
+            AttributeError: If the field is not found in extras.
+        """
+        # Avoid infinite recursion during dataclass init
+        if name.startswith("_") or name in TrackMetadata._CORE_FIELDS:
+            raise AttributeError(name)
+        extras = object.__getattribute__(self, "extras")
+        if name in extras:
+            return extras[name]
+        raise AttributeError(
+            f"TrackMetadata has no field '{name}'. "
+            f"Available extras: {list(extras.keys())}"
+        )
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get a field by name, checking core attributes then extras.
+
+        Args:
+            key: Field name to look up.
+            default: Value to return if field is not found.
+
+        Returns:
+            The field value, or default if not found.
+
+        Example:
+            >>> track.get('ontology_curie')
+            'UBERON:0002107'
+            >>> track.get('nonexistent_field', 'fallback')
+            'fallback'
+        """
+        if key in TrackMetadata._CORE_FIELDS and key != "extras":
+            return getattr(self, key)
+        return self.extras.get(key, default)
+
+    def has(self, key: str) -> bool:
+        """Check if a field exists and is not None.
+
+        Args:
+            key: Field name to check.
+
+        Returns:
+            True if the field exists and has a non-None value.
+
+        Example:
+            >>> track.has('ontology_curie')
+            True
+            >>> track.has('genetically_modified')  # Field is None or missing
+            False
+        """
+        return self.get(key) is not None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize metadata to a plain dictionary."""
@@ -457,15 +527,21 @@ class NamedTrackTensor:
         return len(self.tracks)
 
     def _match_track(self, track: TrackMetadata, criteria: dict[str, Any]) -> bool:
-        """Check if a track matches the given criteria."""
-        for key, expected in criteria.items():
-            # Check core attributes first, then extras
-            if hasattr(track, key) and key != "extras":
-                actual = getattr(track, key)
-            else:
-                actual = track.extras.get(key)
+        """Check if a track matches the given criteria.
 
-            if isinstance(expected, (list, tuple, set, frozenset)):
+        Special handling:
+            - ``field=None`` matches tracks where the field is missing or None.
+            - ``field=[val1, val2]`` matches tracks where field is in the list.
+        """
+        for key, expected in criteria.items():
+            # Use track.get() for unified access to core fields and extras
+            actual = track.get(key)
+
+            if expected is None:
+                # Special case: None means "field is missing or None"
+                if actual is not None:
+                    return False
+            elif isinstance(expected, (list, tuple, set, frozenset)):
                 if actual not in expected:
                     return False
             elif actual != expected:
@@ -482,7 +558,11 @@ class NamedTrackTensor:
 
         Args:
             predicate: Optional callable that takes a TrackMetadata and returns bool.
-            **criteria: Field=value filters. Checks core attributes first, then extras.
+            **criteria: Field=value filters. Supports several matching modes:
+
+                - ``field="value"`` - exact match
+                - ``field=["a", "b"]`` - match any value in list
+                - ``field=None`` - match tracks where field is missing or None
 
         Returns:
             List of matching channel indices.
@@ -512,7 +592,11 @@ class NamedTrackTensor:
         Args:
             predicate: Optional callable that takes a TrackMetadata and returns bool.
             device: Device for the mask tensor. Defaults to self.tensor.device.
-            **criteria: Field=value filters. Checks core attributes first, then extras.
+            **criteria: Field=value filters. Supports several matching modes:
+
+                - ``field="value"`` - exact match
+                - ``field=["a", "b"]`` - match any value in list
+                - ``field=None`` - match tracks where field is missing or None
 
         Returns:
             Boolean tensor of shape (num_tracks,) where True indicates a match.
@@ -561,8 +645,11 @@ class NamedTrackTensor:
             predicate: Optional callable that takes a TrackMetadata and returns bool.
             allow_empty: If True, return empty tensor when no tracks match.
                 If False (default), raise ValueError.
-            **criteria: Field=value filters. Checks core attributes first, then extras.
-                Values can be single items or collections (list/set/tuple) for "in" matching.
+            **criteria: Field=value filters. Supports several matching modes:
+
+                - ``field="value"`` - exact match
+                - ``field=["a", "b"]`` - match any value in list
+                - ``field=None`` - match tracks where field is missing or None
 
         Returns:
             A new NamedTrackTensor with only the matching tracks.
@@ -570,6 +657,7 @@ class NamedTrackTensor:
         Example:
             >>> tracks.select(ontology_curie="UBERON:0002107")
             >>> tracks.select(biosample_type=["tissue", "primary cell"])
+            >>> tracks.select(genetically_modified=None)  # Where field is missing
             >>> tracks.select(predicate=lambda t: "liver" in t.track_name.lower())
         """
         matched_indices: list[int] = []

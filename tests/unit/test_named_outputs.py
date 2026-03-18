@@ -325,3 +325,167 @@ def test_named_outputs_cross_head_select():
     assert result[("atac", 128)].tracks[0].track_name == "liver"
     assert result[("dnase", 128)].tracks[0].track_name == "liver_dnase"
 
+
+# -----------------------------------------------------------------------------
+# TrackMetadata attribute access tests
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_track_metadata_attribute_access():
+    """TrackMetadata allows direct attribute access to extras fields."""
+    track = TrackMetadata(
+        track_index=0,
+        output_name="atac",
+        organism=0,
+        track_name="liver_sample",
+        extras={
+            "ontology_curie": "UBERON:0002107",
+            "biosample_type": "tissue",
+        },
+    )
+
+    # Direct attribute access
+    assert track.ontology_curie == "UBERON:0002107"
+    assert track.biosample_type == "tissue"
+
+    # Core attributes still work
+    assert track.track_name == "liver_sample"
+    assert track.organism == 0
+
+
+@pytest.mark.unit
+def test_track_metadata_attribute_error_for_missing():
+    """TrackMetadata raises AttributeError for missing extras fields."""
+    track = TrackMetadata(
+        track_index=0,
+        output_name="atac",
+        organism=0,
+        track_name="sample",
+        extras={"existing": "value"},
+    )
+
+    with pytest.raises(AttributeError, match="no field 'nonexistent'"):
+        _ = track.nonexistent
+
+
+@pytest.mark.unit
+def test_track_metadata_get_method():
+    """TrackMetadata.get() provides safe access with defaults."""
+    track = TrackMetadata(
+        track_index=0,
+        output_name="atac",
+        organism=0,
+        track_name="sample",
+        extras={"ontology_curie": "UBERON:0002107"},
+    )
+
+    # Get existing extras field
+    assert track.get("ontology_curie") == "UBERON:0002107"
+
+    # Get core field
+    assert track.get("track_name") == "sample"
+    assert track.get("organism") == 0
+
+    # Get missing field with default
+    assert track.get("missing_field") is None
+    assert track.get("missing_field", "fallback") == "fallback"
+
+
+@pytest.mark.unit
+def test_track_metadata_has_method():
+    """TrackMetadata.has() checks if field exists and is not None."""
+    track = TrackMetadata(
+        track_index=0,
+        output_name="atac",
+        organism=0,
+        track_name="sample",
+        extras={
+            "ontology_curie": "UBERON:0002107",
+            "genetically_modified": None,  # Explicitly None
+        },
+    )
+
+    # Field exists with value
+    assert track.has("ontology_curie") is True
+    assert track.has("track_name") is True  # Core field
+
+    # Field is None or missing
+    assert track.has("genetically_modified") is False  # Explicitly None
+    assert track.has("nonexistent") is False  # Missing
+
+
+@pytest.mark.unit
+def test_select_with_none_matches_missing_fields():
+    """select(field=None) matches tracks where field is missing or None."""
+    rows = [
+        {
+            "organism": "human",
+            "output_type": "chip_tf",
+            "track_name": "ctcf_unmodified",
+            "transcription_factor": "CTCF",
+            # genetically_modified is missing
+        },
+        {
+            "organism": "human",
+            "output_type": "chip_tf",
+            "track_name": "ctcf_modified",
+            "transcription_factor": "CTCF",
+            "genetically_modified": "Yes",
+        },
+        {
+            "organism": "human",
+            "output_type": "chip_tf",
+            "track_name": "foxa1_unmodified",
+            "transcription_factor": "FOXA1",
+            # genetically_modified is missing
+        },
+    ]
+    catalog = TrackMetadataCatalog.from_rows(rows)
+
+    outputs = {"chip_tf": {128: torch.randn(1, 8, 3)}}
+    named = NamedOutputs.from_raw(outputs, organism=0, catalog=catalog)
+
+    # Select where genetically_modified is None (missing)
+    unmodified = named.chip_tf[128].select(genetically_modified=None)
+    assert unmodified.num_tracks == 2
+    assert [t.track_name for t in unmodified.tracks] == ["ctcf_unmodified", "foxa1_unmodified"]
+
+
+@pytest.mark.unit
+def test_select_with_none_combined_with_other_filters():
+    """select() can combine field=None with other criteria."""
+    rows = [
+        {
+            "organism": "human",
+            "output_type": "chip_tf",
+            "track_name": "ctcf_1",
+            "transcription_factor": "CTCF",
+        },
+        {
+            "organism": "human",
+            "output_type": "chip_tf",
+            "track_name": "ctcf_2",
+            "transcription_factor": "CTCF",
+            "genetically_modified": "Yes",
+        },
+        {
+            "organism": "human",
+            "output_type": "chip_tf",
+            "track_name": "foxa1_1",
+            "transcription_factor": "FOXA1",
+        },
+    ]
+    catalog = TrackMetadataCatalog.from_rows(rows)
+
+    outputs = {"chip_tf": {128: torch.randn(1, 8, 3)}}
+    named = NamedOutputs.from_raw(outputs, organism=0, catalog=catalog)
+
+    # CTCF tracks where genetically_modified is None
+    selected = named.chip_tf[128].select(
+        transcription_factor="CTCF",
+        genetically_modified=None,
+    )
+    assert selected.num_tracks == 1
+    assert selected.tracks[0].track_name == "ctcf_1"
+
