@@ -98,19 +98,21 @@ See a compiled [ARCHITECTURE_COMPARISON.md](ARCHITECTURE_COMPARISON.md) for some
 
 ## Model Outputs
 
-| Head | Tracks | Resolutions | Description |
-|------|--------|-------------|-------------|
-| atac | 256 | 1bp, 128bp | Chromatin accessibility |
-| dnase | 384 | 1bp, 128bp | DNase-seq |
-| procap | 128 | 1bp, 128bp | Transcription initiation |
-| cage | 640 | 1bp, 128bp | 5' cap RNA |
-| rnaseq | 768 | 1bp, 128bp | RNA expression |
-| chip_tf | 1664 | 128bp | TF binding |
-| chip_histone | 1152 | 128bp | Histone modifications |
-| contact_maps | 28 | 64×64 | 3D chromatin contacts |
-| splice_sites | 4 | 1bp | Splice site classification (D+, A+, D−, A−) |
-| splice_junctions | 734 | pairwise | Junction read counts (367 tissues × 2 strands) |
-| splice_site_usage | 734 | 1bp | Fraction of transcripts using splice site |
+| Head | Tracks (human) | Dimension (padded) | Resolutions | Description |
+|------|--------|-----------|-------------|-------------|
+| atac | 167 | 256 | 1bp, 128bp | Chromatin accessibility |
+| dnase | 305 | 384 | 1bp, 128bp | DNase-seq |
+| procap | 12 | 128 | 1bp, 128bp | Transcription initiation |
+| cage | 546 | 640 | 1bp, 128bp | 5' cap RNA |
+| rnaseq | 667 | 768 | 1bp, 128bp | RNA expression |
+| chip_tf | 1617 | 1664 | 128bp | TF binding |
+| chip_histone | 1116 | 1152 | 128bp | Histone modifications |
+| contact_maps | 28 | 28 | 64×64 | 3D chromatin contacts |
+| splice_sites | 4 | 4 | 1bp | Splice site classification (D+, A+, D−, A−) |
+| splice_junctions | 734 | 734 | pairwise | Junction read counts (367 tissues × 2 strands) |
+| splice_site_usage | 734 | 734 | 1bp | Fraction of transcripts using splice site |
+
+Tracks column shows the number of real human tracks (without padding). Dimension is the raw output tensor size — padding fills the gap. When using `named_outputs=True`, padding is stripped by default. See [named outputs guide](docs/named_outputs.rst) for details.
 
 See more information about model outputs [in the official AlphaGenome documentation](https://www.alphagenomedocs.com/exploring_model_metadata.html).
 

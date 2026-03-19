@@ -207,4 +207,20 @@ class TestPredict:
 
         assert isinstance(named, NamedOutputs)
         assert "atac" in named.heads()
+        # Default: padding stripped — only real tracks remain
+        assert named.atac[128].tensor.shape[-1] < 256
+        assert all(not t.is_padding for t in named.atac[128].tracks)
+
+    def test_return_named_outputs_include_padding(self, model_fp32):
+        """predict(include_padding=True) keeps all tracks including padding."""
+        x = torch.randn(1, 2048, 4)
+        named = model_fp32.predict(
+            x,
+            0,
+            named_outputs=True,
+            include_padding=True,
+            resolutions=(128,),
+        )
+
+        assert isinstance(named, NamedOutputs)
         assert named.atac[128].tensor.shape[-1] == 256

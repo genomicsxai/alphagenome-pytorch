@@ -429,8 +429,19 @@ class AlphaGenome(nn.Module):
         strict_metadata: bool = False,
         metadata_catalog: TrackMetadataCatalog | None = None,
         channels_last: bool = True,
+        include_padding: bool = False,
     ) -> NamedOutputs:
-        """Wrap raw model outputs with metadata-aware named views."""
+        """Wrap raw model outputs with metadata-aware named views.
+
+        Args:
+            outputs: Raw model output dict.
+            organism: Organism index or name.
+            strict_metadata: If True, raise on missing/mismatched metadata.
+            metadata_catalog: Override the model's attached catalog.
+            channels_last: If True, track axis is last dimension.
+            include_padding: If True, keep padding tracks. If False
+                (default), padding tracks are stripped.
+        """
         catalog = metadata_catalog if metadata_catalog is not None else self._track_metadata_catalog
         return NamedOutputs.from_raw(
             outputs,
@@ -438,6 +449,7 @@ class AlphaGenome(nn.Module):
             catalog=catalog,
             strict_metadata=strict_metadata,
             channels_last=channels_last,
+            include_padding=include_padding,
         )
 
     def _compute_embeddings_ncl(self, dna_sequence, organism_index, resolutions=None):
@@ -718,6 +730,7 @@ class AlphaGenome(nn.Module):
         organism_index: Union[torch.Tensor, int],
         named_outputs: bool = False,
         strict_metadata: bool = False,
+        include_padding: bool = False,
         **kwargs,
     ) -> dict | NamedOutputs:
         """Inference-mode forward pass with automatic dtype handling.
@@ -740,6 +753,9 @@ class AlphaGenome(nn.Module):
             strict_metadata: If True, raise when metadata is missing or
                 mismatched for named outputs. If False, fallback placeholders
                 are used.
+            include_padding: If True, keep padding tracks in named outputs.
+                If False (default), padding tracks are stripped. Only applies
+                when ``named_outputs=True``.
             **kwargs: Additional arguments passed to forward()
                 (e.g., return_embeddings, resolutions).
 
@@ -771,5 +787,6 @@ class AlphaGenome(nn.Module):
                 organism=organism_index,
                 strict_metadata=strict_metadata,
                 channels_last=kwargs.get("channels_last", True),
+                include_padding=include_padding,
             )
         return upcast_outputs

@@ -174,6 +174,16 @@ class TrackMetadata:
         """
         return self.get(key) is not None
 
+    @property
+    def is_padding(self) -> bool:
+        """Whether this track is a padding (placeholder) track.
+
+        Padding tracks are identified by having ``track_name`` equal to
+        ``"Padding"`` (case-insensitive), matching the convention used by the
+        JAX AlphaGenome implementation.
+        """
+        return self.track_name.lower() == "padding"
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize metadata to a plain dictionary."""
         result = {
@@ -706,6 +716,47 @@ class NamedTrackTensor:
             track_axis=self.track_axis,
         )
 
+    def strip_padding(self) -> "NamedTrackTensor":
+        """Return a new NamedTrackTensor with padding tracks removed.
+
+        Padding tracks are identified by ``TrackMetadata.is_padding``.
+        If there are no padding tracks, returns ``self`` unchanged.
+
+        Returns:
+            A new NamedTrackTensor with only non-padding tracks, or ``self``
+            if no padding tracks are present.
+        """
+        if not any(t.is_padding for t in self.tracks):
+            return self
+        return self.select(
+            predicate=lambda t: not t.is_padding,
+            allow_empty=True,
+        )
+
+    def padding_mask(
+        self,
+        *,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Return a boolean mask where True = real track, False = padding.
+
+        Useful for masking loss contributions during training while keeping
+        the full tensor shape intact.
+
+        Args:
+            device: Device for the mask tensor. Defaults to self.tensor.device.
+
+        Returns:
+            Boolean tensor of shape ``(num_tracks,)``.
+        """
+        if device is None:
+            device = self.tensor.device
+        return torch.tensor(
+            [not t.is_padding for t in self.tracks],
+            dtype=torch.bool,
+            device=device,
+        )
+
     # -------------------------------------------------------------------------
     # Arithmetic operators
     # -------------------------------------------------------------------------
@@ -919,6 +970,33 @@ class NamedOutputHead:
         }
         return NamedOutputHead(self.output_name, filtered)
 
+    def strip_padding(self) -> "NamedOutputHead":
+        """Return a new NamedOutputHead with padding tracks removed at all resolutions.
+
+        Returns:
+            A new NamedOutputHead without padding tracks, or ``self`` if no
+            padding tracks are present.
+        """
+        if not any(t.is_padding for t in self.tracks):
+            return self
+        stripped = {res: ntt.strip_padding() for res, ntt in self._by_resolution.items()}
+        return NamedOutputHead(self.output_name, stripped)
+
+    def padding_mask(
+        self,
+        *,
+        device: "torch.device | str | None" = None,
+    ) -> "torch.Tensor":
+        """Return a boolean mask where True = real track, False = padding.
+
+        Args:
+            device: Device for the mask tensor.
+
+        Returns:
+            Boolean tensor of shape ``(num_tracks,)``.
+        """
+        return self._any_resolution().padding_mask(device=device)
+
     # -----------------------------------------------------------------
 
     def __repr__(self) -> str:
@@ -946,8 +1024,24 @@ class NamedOutputs:
         catalog: TrackMetadataCatalog | None = None,
         strict_metadata: bool = False,
         channels_last: bool = True,
+        include_padding: bool = False,
     ) -> "NamedOutputs":
-        """Build named views from a raw model output dict."""
+        """Build named views from a raw model output dict.
+
+        Args:
+            outputs: Raw model output dict mapping head names to
+                ``{resolution: tensor}`` dicts.
+            organism: Organism index or name (e.g. 0, ``"human"``).
+            catalog: Track metadata catalog. If None, placeholder metadata
+                is generated.
+            strict_metadata: If True, raise when metadata is missing or
+                mismatched.
+            channels_last: If True, the track/channel axis is the last
+                dimension.
+            include_padding: If True, keep padding tracks in the result.
+                If False (default), padding tracks are automatically
+                stripped, matching the behavior of the JAX AlphaGenome API.
+        """
         organism_idx = _resolve_organism_index(organism, default=0)
         named_heads: dict[str, NamedOutputHead] = {}
 
@@ -996,7 +1090,10 @@ class NamedOutputs:
             if by_resolution:
                 named_heads[output_name] = NamedOutputHead(output_name, by_resolution)
 
-        return cls(outputs, named_heads)
+        result = cls(outputs, named_heads)
+        if not include_padding:
+            result = result.strip_padding()
+        return result
 
     def heads(self) -> list[str]:
         """Return output head names that support named/resolution views."""
@@ -1043,6 +1140,17 @@ class NamedOutputs:
 
     def __len__(self) -> int:
         return len(self._raw_outputs)
+
+    def strip_padding(self) -> "NamedOutputs":
+        """Return a new NamedOutputs with padding tracks removed from all heads.
+
+        Returns:
+            A new NamedOutputs without padding tracks.
+        """
+        stripped_heads = {
+            name: head.strip_padding() for name, head in self._named_heads.items()
+        }
+        return NamedOutputs(self._raw_outputs, stripped_heads)
 
     def select(
         self,

@@ -489,3 +489,176 @@ def test_select_with_none_combined_with_other_filters():
     assert selected.num_tracks == 1
     assert selected.tracks[0].track_name == "ctcf_1"
 
+
+# -----------------------------------------------------------------------------
+# Padding tests
+# -----------------------------------------------------------------------------
+
+
+def _make_padding_rows():
+    """Helper: 3 real ATAC tracks + 2 padding tracks."""
+    return [
+        {"organism": "human", "output_type": "atac", "track_name": "liver", "ontology_curie": "UBERON:0002107"},
+        {"organism": "human", "output_type": "atac", "track_name": "brain", "ontology_curie": "UBERON:0000955"},
+        {"organism": "human", "output_type": "atac", "track_name": "heart", "ontology_curie": "UBERON:0000948"},
+        {"organism": "human", "output_type": "atac", "track_name": "Padding"},
+        {"organism": "human", "output_type": "atac", "track_name": "Padding"},
+    ]
+
+
+@pytest.mark.unit
+def test_track_metadata_is_padding():
+    """TrackMetadata.is_padding identifies padding tracks."""
+    real = TrackMetadata(0, "atac", 0, "liver_sample")
+    pad = TrackMetadata(1, "atac", 0, "Padding")
+    pad_lower = TrackMetadata(2, "atac", 0, "padding")
+
+    assert real.is_padding is False
+    assert pad.is_padding is True
+    assert pad_lower.is_padding is True
+
+
+@pytest.mark.unit
+def test_named_track_tensor_strip_padding():
+    """NamedTrackTensor.strip_padding() removes padding channels."""
+    catalog = TrackMetadataCatalog.from_rows(_make_padding_rows())
+
+    tensor = torch.randn(1, 8, 5)
+    outputs = {"atac": {128: tensor}}
+    named = NamedOutputs.from_raw(outputs, organism=0, catalog=catalog, include_padding=True)
+
+    stripped = named.atac[128].strip_padding()
+    assert stripped.num_tracks == 3
+    assert [t.track_name for t in stripped.tracks] == ["liver", "brain", "heart"]
+    assert stripped.tensor.shape[-1] == 3
+    # Verify tensor values match the first 3 channels
+    assert torch.equal(stripped.tensor, tensor[..., :3])
+
+
+@pytest.mark.unit
+def test_named_track_tensor_strip_padding_noop_when_no_padding():
+    """strip_padding() returns self when there are no padding tracks."""
+    rows = [
+        {"organism": "human", "output_type": "atac", "track_name": "liver"},
+        {"organism": "human", "output_type": "atac", "track_name": "brain"},
+    ]
+    catalog = TrackMetadataCatalog.from_rows(rows)
+
+    outputs = {"atac": {128: torch.randn(1, 8, 2)}}
+    named = NamedOutputs.from_raw(outputs, organism=0, catalog=catalog, include_padding=True)
+
+    original = named.atac[128]
+    stripped = original.strip_padding()
+    assert stripped is original  # Same object, not a copy
+
+
+@pytest.mark.unit
+def test_named_track_tensor_padding_mask():
+    """padding_mask() returns True for real tracks, False for padding."""
+    catalog = TrackMetadataCatalog.from_rows(_make_padding_rows())
+
+    outputs = {"atac": {128: torch.randn(1, 8, 5)}}
+    named = NamedOutputs.from_raw(outputs, organism=0, catalog=catalog, include_padding=True)
+
+    mask = named.atac[128].padding_mask()
+    assert mask.tolist() == [True, True, True, False, False]
+    assert mask.dtype == torch.bool
+
+
+@pytest.mark.unit
+def test_named_output_head_strip_padding():
+    """NamedOutputHead.strip_padding() strips padding at all resolutions."""
+    catalog = TrackMetadataCatalog.from_rows(_make_padding_rows())
+
+    outputs = {"atac": {1: torch.randn(1, 128, 5), 128: torch.randn(1, 1, 5)}}
+    named = NamedOutputs.from_raw(outputs, organism=0, catalog=catalog, include_padding=True)
+
+    stripped = named.atac.strip_padding()
+    assert stripped.num_tracks == 3
+    assert stripped[1].tensor.shape[-1] == 3
+    assert stripped[128].tensor.shape[-1] == 3
+    assert [t.track_name for t in stripped.tracks] == ["liver", "brain", "heart"]
+
+
+@pytest.mark.unit
+def test_named_output_head_padding_mask():
+    """NamedOutputHead.padding_mask() works without choosing resolution."""
+    catalog = TrackMetadataCatalog.from_rows(_make_padding_rows())
+
+    outputs = {"atac": {1: torch.randn(1, 128, 5), 128: torch.randn(1, 1, 5)}}
+    named = NamedOutputs.from_raw(outputs, organism=0, catalog=catalog, include_padding=True)
+
+    mask = named.atac.padding_mask()
+    assert mask.tolist() == [True, True, True, False, False]
+
+
+@pytest.mark.unit
+def test_named_outputs_strip_padding():
+    """NamedOutputs.strip_padding() strips padding from all heads."""
+    rows = _make_padding_rows() + [
+        {"organism": "human", "output_type": "dnase", "track_name": "dnase_liver"},
+        {"organism": "human", "output_type": "dnase", "track_name": "Padding"},
+    ]
+    catalog = TrackMetadataCatalog.from_rows(rows)
+
+    outputs = {
+        "atac": {128: torch.randn(1, 1, 5)},
+        "dnase": {128: torch.randn(1, 1, 2)},
+    }
+    named = NamedOutputs.from_raw(outputs, organism=0, catalog=catalog, include_padding=True)
+
+    stripped = named.strip_padding()
+    assert stripped.atac[128].num_tracks == 3
+    assert stripped.dnase[128].num_tracks == 1
+    assert stripped.dnase[128].tracks[0].track_name == "dnase_liver"
+
+
+@pytest.mark.unit
+def test_from_raw_strips_padding_by_default():
+    """NamedOutputs.from_raw() strips padding by default (include_padding=False)."""
+    catalog = TrackMetadataCatalog.from_rows(_make_padding_rows())
+
+    outputs = {"atac": {128: torch.randn(1, 8, 5)}}
+    named = NamedOutputs.from_raw(outputs, organism=0, catalog=catalog)
+
+    # Default: padding stripped
+    assert named.atac[128].num_tracks == 3
+    assert all(not t.is_padding for t in named.atac[128].tracks)
+
+
+@pytest.mark.unit
+def test_from_raw_include_padding_true_keeps_all_tracks():
+    """include_padding=True keeps padding tracks in the result."""
+    catalog = TrackMetadataCatalog.from_rows(_make_padding_rows())
+
+    outputs = {"atac": {128: torch.randn(1, 8, 5)}}
+    named = NamedOutputs.from_raw(outputs, organism=0, catalog=catalog, include_padding=True)
+
+    assert named.atac[128].num_tracks == 5
+    assert sum(t.is_padding for t in named.atac[128].tracks) == 2
+
+
+@pytest.mark.unit
+def test_strip_padding_preserves_raw_dict():
+    """strip_padding() does not modify the raw output dict."""
+    catalog = TrackMetadataCatalog.from_rows(_make_padding_rows())
+
+    tensor = torch.randn(1, 8, 5)
+    outputs = {"atac": {128: tensor}}
+    named = NamedOutputs.from_raw(outputs, organism=0, catalog=catalog)
+
+    # Raw dict still has the original tensor
+    assert named.as_dict()["atac"][128].shape[-1] == 5
+
+
+@pytest.mark.unit
+def test_strip_padding_reindexes_tracks():
+    """After strip_padding(), track_index values are contiguous from 0."""
+    catalog = TrackMetadataCatalog.from_rows(_make_padding_rows())
+
+    outputs = {"atac": {128: torch.randn(1, 8, 5)}}
+    named = NamedOutputs.from_raw(outputs, organism=0, catalog=catalog)
+
+    indices = [t.track_index for t in named.atac[128].tracks]
+    assert indices == [0, 1, 2]
+
