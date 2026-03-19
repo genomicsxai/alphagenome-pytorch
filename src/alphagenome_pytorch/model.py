@@ -8,6 +8,7 @@ from torch.utils.checkpoint import checkpoint
 
 from . import layers, convolutions, attention, embeddings, heads
 from .config import DtypePolicy
+from .named_outputs import NamedOutputs, TrackMetadataCatalog
 from alphagenome_pytorch.utils.splicing import generate_splice_site_positions
 
 class SequenceEncoder(nn.Module):
@@ -301,6 +302,8 @@ class AlphaGenome(nn.Module):
             num_tracks_per_organism=splice_junction_tracks_per_organism,
         )
 
+        self._track_metadata_catalog: TrackMetadataCatalog | None = None
+
         # Convert model parameters to params_dtype
         # JAX keeps params in float32 even when computing in bfloat16
         if self.dtype_policy.params_dtype != torch.float32:
@@ -397,6 +400,57 @@ class AlphaGenome(nn.Module):
                 )
 
         return model
+
+    def set_track_metadata_catalog(self, catalog: TrackMetadataCatalog) -> None:
+        """Attach a metadata catalog used by named output views."""
+        self._track_metadata_catalog = catalog
+
+    def load_track_metadata(
+        self,
+        metadata_path: str | Path,
+        *,
+        default_organism: int = 0,
+        default_output_name: str | None = None,
+    ) -> TrackMetadataCatalog:
+        """Load track metadata (parquet/csv/tsv) and attach it to the model."""
+        catalog = TrackMetadataCatalog.from_file(
+            metadata_path,
+            default_organism=default_organism,
+            default_output_name=default_output_name,
+        )
+        self._track_metadata_catalog = catalog
+        return catalog
+
+    def named_outputs(
+        self,
+        outputs: dict,
+        *,
+        organism: int | str | torch.Tensor | None = None,
+        strict_metadata: bool = False,
+        metadata_catalog: TrackMetadataCatalog | None = None,
+        channels_last: bool = True,
+        include_padding: bool = False,
+    ) -> NamedOutputs:
+        """Wrap raw model outputs with metadata-aware named views.
+
+        Args:
+            outputs: Raw model output dict.
+            organism: Organism index or name.
+            strict_metadata: If True, raise on missing/mismatched metadata.
+            metadata_catalog: Override the model's attached catalog.
+            channels_last: If True, track axis is last dimension.
+            include_padding: If True, keep padding tracks. If False
+                (default), padding tracks are stripped.
+        """
+        catalog = metadata_catalog if metadata_catalog is not None else self._track_metadata_catalog
+        return NamedOutputs.from_raw(
+            outputs,
+            organism=organism,
+            catalog=catalog,
+            strict_metadata=strict_metadata,
+            channels_last=channels_last,
+            include_padding=include_padding,
+        )
 
     def _compute_embeddings_ncl(self, dna_sequence, organism_index, resolutions=None):
         """Internal method to compute embeddings in NCL format.
@@ -674,8 +728,11 @@ class AlphaGenome(nn.Module):
         self,
         dna_sequence: torch.Tensor,
         organism_index: Union[torch.Tensor, int],
+        named_outputs: bool = False,
+        strict_metadata: bool = False,
+        include_padding: bool = False,
         **kwargs,
-    ) -> dict:
+    ) -> dict | NamedOutputs:
         """Inference-mode forward pass with automatic dtype handling.
 
         Wraps forward() with:
@@ -691,11 +748,20 @@ class AlphaGenome(nn.Module):
             dna_sequence: One-hot encoded DNA sequence (B, S, 4). Can be any
                 float dtype — autocast handles weight/input casting.
             organism_index: Organism index per batch (B,). 0=human, 1=mouse.
+            named_outputs: If True, return a ``NamedOutputs`` wrapper instead
+                of a raw dict.
+            strict_metadata: If True, raise when metadata is missing or
+                mismatched for named outputs. If False, fallback placeholders
+                are used.
+            include_padding: If True, keep padding tracks in named outputs.
+                If False (default), padding tracks are stripped. Only applies
+                when ``named_outputs=True``.
             **kwargs: Additional arguments passed to forward()
                 (e.g., return_embeddings, resolutions).
 
         Returns:
-            Dict of predictions with all floating-point tensors in float32.
+            Dict of predictions with all floating-point tensors in float32, or
+            ``NamedOutputs`` when ``named_outputs=True``.
         """
         device_type = "cuda" if dna_sequence.is_cuda else "cpu"
         use_amp = self.dtype_policy.compute_dtype != torch.float32
@@ -714,4 +780,13 @@ class AlphaGenome(nn.Module):
         with torch.autocast(device_type=device_type, dtype=self.dtype_policy.compute_dtype, enabled=use_amp):
             outputs = self.forward(dna_sequence, organism_index, **kwargs)
 
-        return self._upcast_outputs(outputs)
+        upcast_outputs = self._upcast_outputs(outputs)
+        if named_outputs:
+            return self.named_outputs(
+                upcast_outputs,
+                organism=organism_index,
+                strict_metadata=strict_metadata,
+                channels_last=kwargs.get("channels_last", True),
+                include_padding=include_padding,
+            )
+        return upcast_outputs
