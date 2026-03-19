@@ -49,6 +49,7 @@ scoring = [
     "tqdm",
     "pyranges",
     "alphagenome",
+    "safetensors",
 ]
 docs = [
     "sphinx>=7.0.0",
