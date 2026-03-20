@@ -398,6 +398,72 @@ class AlphaGenome(nn.Module):
 
         return model
 
+    @classmethod
+    def from_delta(
+        cls,
+        delta_path: Union[str, Path],
+        base_path: Union[str, Path],
+        dtype_policy: Optional[DtypePolicy] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        **kwargs,
+    ) -> "AlphaGenome":
+        """Load a finetuned AlphaGenome model from delta weights and base weights.
+
+        This is the simplest way to load a finetuned model. It reconstructs the
+        full model from a small delta weights file (adapters + heads) and the
+        base pretrained weights.
+
+        Args:
+            delta_path: Path to the delta weights file (.safetensors or .pth)
+                created by ``export_delta_weights()``.
+            base_path: Path to the base pretrained weights file (.pth or
+                .safetensors) created by ``convert_weights.py``.
+            dtype_policy: DtypePolicy for precision control. Defaults to
+                DtypePolicy.full_float32().
+            device: Device to load the model onto ('cuda', 'cpu', etc.).
+                If None, loads to CPU.
+            **kwargs: Additional arguments passed to AlphaGenome constructor
+                (e.g., num_organisms, gradient_checkpointing).
+
+        Returns:
+            AlphaGenome model with base weights, adapters, and finetuned heads.
+
+        Example:
+            >>> model = AlphaGenome.from_delta(
+            ...     'colleague_lora.safetensors',
+            ...     'alphagenome_pretrained.pth',
+            ...     device='cuda',
+            ... )
+        """
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            load_delta_config,
+            load_delta_weights,
+        )
+        from alphagenome_pytorch.extensions.finetuning.transfer import (
+            load_trunk,
+            prepare_for_transfer,
+        )
+
+        if dtype_policy is None:
+            dtype_policy = DtypePolicy.default()
+
+        # 1. Create base model and load pretrained trunk
+        model = cls(dtype_policy=dtype_policy, **kwargs)
+        model = load_trunk(model, base_path, exclude_heads=True)
+
+        # 2. Read config and set up adapters/heads
+        config = load_delta_config(delta_path)
+        model = prepare_for_transfer(model, config)
+
+        # 3. Load delta weights
+        load_delta_weights(model, delta_path)
+
+        # 4. Move to target device
+        if device:
+            model.to(device)
+
+        return model
+
     def _compute_embeddings_ncl(self, dna_sequence, organism_index, resolutions=None):
         """Internal method to compute embeddings in NCL format.
 

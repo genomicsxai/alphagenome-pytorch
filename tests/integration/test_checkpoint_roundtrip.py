@@ -8,6 +8,7 @@ and that partial loading (missing heads) works correctly.
 import gc
 import os
 import tempfile
+from pathlib import Path
 
 import pytest
 import torch
@@ -199,3 +200,120 @@ class TestStateDictKeys:
         keys2 = sorted(model.state_dict().keys())
 
         assert keys1 == keys2, "State dict keys should be stable"
+
+
+@pytest.mark.integration
+class TestFromDelta:
+    """Tests for AlphaGenome.from_delta() classmethod."""
+
+    @pytest.fixture(autouse=True)
+    def cleanup(self):
+        """Force garbage collection after each test."""
+        yield
+        gc.collect()
+
+    def test_from_delta_reconstructs_model(self):
+        """from_delta should produce a model with correct adapters and heads."""
+        from alphagenome_pytorch.extensions.finetuning.transfer import (
+            TransferConfig,
+            prepare_for_transfer,
+        )
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            export_delta_weights,
+        )
+
+        torch.manual_seed(42)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir) / "base.pth"
+            delta_path = Path(tmpdir) / "delta.pth"
+
+            # 1. Create base model and save its weights
+            base_model = AlphaGenome(
+                num_organisms=1,
+                dtype_policy=DtypePolicy.full_float32(),
+            )
+            torch.save(base_model.state_dict(), base_path)
+
+            # 2. Set up adapters and a new head on a copy
+            config = TransferConfig(
+                mode="lora",
+                lora_rank=4,
+                lora_alpha=8,
+                lora_targets=["q_proj", "v_proj"],
+                remove_heads=list(base_model.heads.keys()),
+                new_heads={
+                    "my_atac": {
+                        "modality": "atac",
+                        "num_tracks": 4,
+                        "resolutions": [128],
+                    },
+                },
+            )
+            adapted = AlphaGenome(
+                num_organisms=1,
+                dtype_policy=DtypePolicy.full_float32(),
+            )
+            adapted.load_state_dict(torch.load(base_path, weights_only=True), strict=False)
+            adapted = prepare_for_transfer(adapted, config)
+
+            # Set recognizable adapter weights
+            with torch.no_grad():
+                for name, param in adapted.named_parameters():
+                    if "lora_A" in name:
+                        param.fill_(1.0)
+                    elif "lora_B" in name:
+                        param.fill_(2.0)
+
+            # 3. Export delta weights
+            export_delta_weights(adapted, config, delta_path, format="pth")
+
+            # 4. Reconstruct via from_delta
+            loaded = AlphaGenome.from_delta(
+                delta_path,
+                base_path,
+                dtype_policy=DtypePolicy.full_float32(),
+                num_organisms=1,
+            )
+
+            # 5. Verify structure
+            assert "my_atac" in loaded.heads
+            # Original heads should have been removed
+            assert "atac" not in loaded.heads
+
+            # 6. Verify LoRA adapters are present
+            lora_params = [
+                n for n, _ in loaded.named_parameters()
+                if "lora_A" in n or "lora_B" in n
+            ]
+            assert len(lora_params) > 0, "LoRA adapters should be present"
+
+            # 7. Verify adapter weights were loaded correctly
+            for name, param in loaded.named_parameters():
+                if "lora_A" in name:
+                    assert torch.allclose(param, torch.ones_like(param))
+                elif "lora_B" in name:
+                    assert torch.allclose(param, torch.full_like(param, 2.0))
+
+            # 8. Verify trunk weights match the base model
+            #    LoRA wraps layers as .original_layer.weight, so normalize
+            #    back to the base model key format for comparison.
+            head_prefixes = (
+                "heads.", "contact_maps_head.",
+                "splice_sites_classification_head.",
+                "splice_sites_usage_head.",
+                "splice_sites_junction_head.",
+            )
+            base_state = base_model.state_dict()
+            matched = 0
+            for name, param in loaded.named_parameters():
+                if name.startswith(head_prefixes) or "lora_" in name:
+                    continue
+                base_key = name.replace(".original_layer.", ".")
+                if base_key in base_state:
+                    torch.testing.assert_close(
+                        param, base_state[base_key], atol=0, rtol=0,
+                        msg=f"Trunk param {name} should match base model",
+                    )
+                    matched += 1
+            assert matched > 0, "Should have matched at least some trunk params"

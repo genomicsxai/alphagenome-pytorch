@@ -155,6 +155,153 @@ End-to-end finetuning with LoRA adapters:
    model = merge_adapters(model)  # Folds adapter weights into base layers
    torch.save(model.state_dict(), 'finetuned_model.pt')
 
+Saving and Loading Finetuned Models
+------------------------------------
+
+After training, only the adapter and head weights need to be saved (~5-10MB)
+instead of the full model (~1GB). There are three API levels for working with
+these delta weights, from simplest to most flexible:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 40 40
+
+   * - Level
+     - When to use
+     - Key functions
+   * - **High-level**
+     - Loading a finetuned model for inference
+     - :meth:`AlphaGenome.from_delta`
+   * - **Mid-level**
+     - Custom setup before loading (e.g. inspecting config, modifying heads)
+     - :func:`load_delta_config`, :func:`prepare_for_transfer`, :func:`load_delta_weights`
+   * - **Low-level**
+     - Resuming training (includes optimizer/scheduler state)
+     - :func:`save_delta_checkpoint`, :func:`load_delta_checkpoint`
+
+Exporting Delta Weights
+^^^^^^^^^^^^^^^^^^^^^^^
+
+Use :func:`~alphagenome_pytorch.extensions.finetuning.export_delta_weights` to
+export the adapter and head weights for sharing. Must be called *before*
+``merge_adapters``. The exported file embeds the ``TransferConfig``, so
+recipients only need the delta file plus the base pretrained weights:
+
+.. code-block:: python
+
+   from alphagenome_pytorch.extensions.finetuning import export_delta_weights
+
+   # After training, export for sharing
+   export_delta_weights(model, config, "my_lora.safetensors")
+
+Loading Delta Weights (High-level)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The simplest way to load a finetuned model — one line, like ``from_pretrained``:
+
+.. code-block:: python
+
+   from alphagenome_pytorch import AlphaGenome
+
+   model = AlphaGenome.from_delta(
+       "my_lora.safetensors",           # delta weights (adapters + heads)
+       "alphagenome_pretrained.pth",    # base pretrained weights
+       device="cuda",
+   )
+
+.. note::
+
+   ``from_delta()`` and ``load_delta_weights()`` load files created by
+   ``export_delta_weights()``, not checkpoint files created by
+   ``save_delta_checkpoint()`` or ``--save-delta``. To resume training from a
+   checkpoint, use ``load_delta_checkpoint()`` instead (see below).
+
+Loading Delta Weights (Mid-level)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Use the step-by-step API when you need to inspect or modify the config before
+loading, for example to check what adapters or heads a colleague's delta file
+contains:
+
+.. code-block:: python
+
+   from alphagenome_pytorch import AlphaGenome
+   from alphagenome_pytorch.extensions.finetuning import (
+       load_trunk, load_delta_config, load_delta_weights
+   )
+   from alphagenome_pytorch.extensions.finetuning.transfer import prepare_for_transfer
+
+   # 1. Inspect the delta file
+   config = load_delta_config("colleague_lora.safetensors")
+   print(config.mode, config.lora_rank, list(config.new_heads.keys()))
+
+   # 2. Create base model and load pretrained trunk
+   model = AlphaGenome()
+   model = load_trunk(model, "alphagenome_pretrained.pth", exclude_heads=True)
+
+   # 3. Apply config to set up adapters and heads
+   model = prepare_for_transfer(model, config)
+
+   # 4. Load the delta weights
+   load_delta_weights(model, "colleague_lora.safetensors")
+
+Delta Checkpoints (Low-level)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Delta checkpoints include the full training state (optimizer, scheduler,
+metadata) for resuming training. Use these during training, and
+``export_delta_weights`` when you're ready to share the final result.
+
+**Saving** (must be done *before* ``merge_adapters``):
+
+.. code-block:: python
+
+   from alphagenome_pytorch.extensions.finetuning import save_delta_checkpoint
+
+   save_delta_checkpoint(
+       'my_model.delta.pth',
+       model,
+       config,
+       epoch=10,
+       val_loss=0.05,
+       track_names=['ATAC_GM12878', 'ATAC_K562'],
+   )
+
+**Loading** (to resume training):
+
+.. code-block:: python
+
+   from alphagenome_pytorch import AlphaGenome
+   from alphagenome_pytorch.extensions.finetuning import (
+       load_trunk, load_delta_checkpoint
+   )
+
+   model = AlphaGenome()
+   model = load_trunk(model, 'alphagenome_pretrained.pth', exclude_heads=True)
+
+   config, metadata = load_delta_checkpoint('my_model.delta.pth', model)
+   print(f"Resuming from epoch {metadata.get('epoch')}")
+
+.. note::
+
+   Delta checkpoints include a hash of the base model structure. If you try to
+   load a delta checkpoint with incompatible base weights, you'll get an error.
+   Use ``verify_hash=False`` to skip this check if needed.
+
+Exporting Full Model Weights
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+After merging adapters, you can export the full model weights (no longer a delta):
+
+.. code-block:: python
+
+   from alphagenome_pytorch.extensions.finetuning import (
+       export_model_weights, merge_adapters
+   )
+
+   model = merge_adapters(model)
+   export_model_weights(model, "finetuned_model.safetensors")
+
 Extracting Embeddings for Custom Heads
 --------------------------------------
 
