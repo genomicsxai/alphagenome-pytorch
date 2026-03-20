@@ -112,7 +112,10 @@ from alphagenome_pytorch.extensions.finetuning import (
     setup_preemption_handler,
 )
 from alphagenome_pytorch.extensions.finetuning.adapters import get_adapter_params
-from alphagenome_pytorch.extensions.finetuning.checkpointing import save_checkpoint, load_checkpoint
+from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+    save_checkpoint, load_checkpoint, save_delta_checkpoint,
+    load_delta_checkpoint, is_delta_checkpoint,
+)
 from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head
 from alphagenome_pytorch.extensions.finetuning.transfer import (
     load_trunk,
@@ -322,6 +325,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Checkpoint path or 'auto' to find latest",
+    )
+    resume.add_argument(
+        "--save-delta",
+        action="store_true",
+        help="Save delta checkpoints (adapter + head weights only, much smaller). "
+             "Delta files saved as best_model.delta.pth",
     )
 
     args = parser.parse_args()
@@ -774,13 +783,26 @@ def create_model(
         head_resolutions = (128,) if is_encoder_only else resolutions
         print_rank0(f"Created {modality} head with {n_tracks} tracks at resolutions {head_resolutions}", rank)
 
+    # Build new_heads dict for TransferConfig (used for delta checkpoints)
+    new_heads_config: dict[str, dict] = {}
+    for modality in heads:
+        head_res = (128,) if is_encoder_only else modality_resolutions[modality]
+        new_heads_config[modality] = {
+            "modality": modality,
+            "num_tracks": len(modality_track_names[modality]),
+            "resolutions": list(head_res),
+            "encoder_only": is_encoder_only,
+        }
+
     # Configure trainable params based on mode
     trainable_params: list[torch.nn.Parameter] = []
+    transfer_config: TransferConfig | None = None  # For delta checkpoints
 
     if args.mode == "linear-probe":
         # Heads already have requires_grad=True (created after freeze)
         for head in heads.values():
             trainable_params.extend(list(head.parameters()))
+        transfer_config = TransferConfig(mode="linear", new_heads=new_heads_config)
         print_rank0("Mode: linear-probe (frozen backbone)", rank)
 
     elif args.mode == "encoder-only":
@@ -789,6 +811,7 @@ def create_model(
         # transformer, or when global attention context is not needed.
         for head in heads.values():
             trainable_params.extend(list(head.parameters()))
+        transfer_config = TransferConfig(mode="encoder-only", new_heads=new_heads_config)
         print_rank0("Mode: encoder-only (frozen backbone, raw CNN encoder output to head)", rank)
 
     elif args.mode == "lora":
@@ -797,13 +820,14 @@ def create_model(
             print_rank0(f"Applying LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}", rank)
             print_rank0(f"  Target modules: {lora_targets}", rank)
 
-            config = TransferConfig(
+            transfer_config = TransferConfig(
                 mode="lora",
                 lora_targets=lora_targets,
                 lora_rank=args.lora_rank,
                 lora_alpha=args.lora_alpha,
+                new_heads=new_heads_config,
             )
-            model = prepare_for_transfer(model, config)
+            model = prepare_for_transfer(model, transfer_config)
             # LoRA adapters + heads (heads already have requires_grad=True)
             trainable_params = get_adapter_params(model)
             for head in heads.values():
@@ -812,11 +836,15 @@ def create_model(
             # LoRA rank 0 means just train heads
             for head in heads.values():
                 trainable_params.extend(list(head.parameters()))
+            transfer_config = TransferConfig(mode="linear", new_heads=new_heads_config)
             print_rank0("Mode: lora (rank=0, heads only)", rank)
 
     elif args.mode == "full":
         # All parameters trainable (model was not frozen above)
         trainable_params = list(model.parameters())
+        # Delta checkpoints don't make sense for full mode (all weights change)
+        if args.save_delta:
+            print_rank0("Warning: --save-delta ignored for --mode full (all weights trained)", rank)
         print_rank0("Mode: full (all parameters trainable)", rank)
 
     else:
@@ -968,17 +996,35 @@ def main() -> None:
 
     if resume_path and resume_path.exists():
         print_rank0(f"Resuming from: {resume_path}", rank)
-        ckpt = load_checkpoint(
-            resume_path,
-            model=model_module,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            device="cpu",
-        )
-        start_epoch = ckpt["epoch"] + 1
-        best_val_loss = ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf")))
-        wandb_run_id = ckpt.get("wandb_run_id")
-        print_rank0(f"  Resumed at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}", rank)
+
+        # Check if it's a delta checkpoint
+        if is_delta_checkpoint(resume_path):
+            # Delta checkpoint - load adapter + head weights only
+            # skip_prepare=True because create_model already set up adapters/heads
+            _, metadata = load_delta_checkpoint(
+                resume_path,
+                model=model_module,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                skip_prepare=True,
+            )
+            start_epoch = metadata.get("epoch", 0) + 1
+            best_val_loss = metadata.get("best_val_loss", metadata.get("val_loss", float("inf")))
+            wandb_run_id = metadata.get("wandb_run_id")
+            print_rank0(f"  Resumed from delta checkpoint at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}", rank)
+        else:
+            # Full checkpoint
+            ckpt = load_checkpoint(
+                resume_path,
+                model=model_module,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                device="cpu",
+            )
+            start_epoch = ckpt["epoch"] + 1
+            best_val_loss = ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf")))
+            wandb_run_id = ckpt.get("wandb_run_id")
+            print_rank0(f"  Resumed at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}", rank)
 
     # Config for logging
     config = {
@@ -1239,6 +1285,23 @@ def main() -> None:
                         wandb_run_id=logger.wandb_run_id,
                     )
                     print(f"  Saved best model (val_loss={val_loss:.4f})")
+
+                    # Save delta checkpoint (adapter + head weights only)
+                    if args.save_delta and transfer_config is not None:
+                        save_delta_checkpoint(
+                            path=output_dir / "best_model.delta.pth",
+                            model=model_module,
+                            config=transfer_config,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            epoch=epoch,
+                            val_loss=val_loss,
+                            best_val_loss=best_val_loss,
+                            track_names=modality_track_names,
+                            modality=args.modalities,
+                            resolutions=modality_resolutions,
+                        )
+                        print(f"  Saved delta checkpoint (adapter + head weights)")
 
                 if epoch % args.save_every == 0:
                     save_checkpoint(

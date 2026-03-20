@@ -26,7 +26,7 @@ Example:
     model = prepare_for_transfer(model, config)
 """
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +56,9 @@ class TransferConfig:
             Options:
             - 'full': Train all weights (lower LR recommended). Cannot combine.
             - 'linear': Freeze trunk, train only heads (linear probing)
+            - 'encoder-only': Freeze trunk, train heads on raw CNN encoder
+              output at 128bp. Cannot combine. Use with ``encoder_only=True``
+              in head configs and ``model.forward(encoder_only=True)``.
             - 'lora': Apply LoRA adapters to attention
             - 'locon': Apply Locon adapters to conv layers
             - 'ia3': Apply IA3 scaling adapters
@@ -294,13 +297,38 @@ def prepare_for_transfer(
         if isinstance(track_means, (str, Path)):
             track_means = torch.load(track_means, weights_only=True)
 
+        # Determine encoder_only flag: infer from mode, validate consistency
+        is_encoder_only_mode = (
+            config.mode == 'encoder-only'
+            or (isinstance(config.mode, list) and 'encoder-only' in config.mode)
+        )
+        head_encoder_only = head_config.get('encoder_only', None)
+        if is_encoder_only_mode:
+            if head_encoder_only is not None and not head_encoder_only:
+                raise ValueError(
+                    f"Head '{head_name}' sets encoder_only=False, but "
+                    f"mode is 'encoder-only'. All heads must use "
+                    f"encoder_only=True in encoder-only mode."
+                )
+            head_encoder_only = True
+        else:
+            if head_encoder_only is None:
+                head_encoder_only = False
+
+        # Let create_finetuning_head pick the default resolution when
+        # the caller didn't specify one (encoder_only defaults to 128bp).
+        resolutions = head_config.get('resolutions')
+        if resolutions is None and not head_encoder_only:
+            resolutions = [1, 128]
+
         head = create_finetuning_head(
             assay_type=head_config['modality'],
             n_tracks=head_config['num_tracks'],
-            resolutions=head_config.get('resolutions', [1, 128]),
+            resolutions=resolutions,
             num_organisms=head_config.get('num_organisms', 1),
             track_means=track_means,
             init_scheme=head_config.get('init_scheme', 'truncated_normal'),
+            encoder_only=head_encoder_only,
         )
         add_head(model, head_name, head, replace=True)
     
@@ -308,7 +336,7 @@ def prepare_for_transfer(
     modes = config.mode if isinstance(config.mode, list) else [config.mode]
     
     # Validate modes
-    valid_modes = {'full', 'linear', 'lora', 'locon', 'ia3', 'houlsby'}
+    valid_modes = {'full', 'linear', 'encoder-only', 'lora', 'locon', 'ia3', 'houlsby'}
     for m in modes:
         if m not in valid_modes:
             raise ValueError(
@@ -320,7 +348,13 @@ def prepare_for_transfer(
             "'full' mode cannot be combined with other modes. "
             f"Got: {modes}"
         )
-    
+
+    if 'encoder-only' in modes and len(modes) > 1:
+        raise ValueError(
+            "'encoder-only' mode cannot be combined with other modes. "
+            f"Got: {modes}"
+        )
+
     if 'full' in modes:
         # Train everything - no freezing
         return model
@@ -429,6 +463,63 @@ def count_trainable_params(model: nn.Module) -> dict[str, int]:
     }
 
 
+def transfer_config_to_dict(config: TransferConfig) -> dict[str, Any]:
+    """Serialize TransferConfig to a JSON-compatible dict.
+
+    Non-serializable values in ``new_heads`` (e.g. tensors, Path objects)
+    are dropped so the result is safe for ``json.dumps`` and safetensors
+    metadata.
+
+    Args:
+        config: TransferConfig instance.
+
+    Returns:
+        Dict representation suitable for JSON serialization and checkpoints.
+
+    Example:
+        >>> config = TransferConfig(mode='lora', lora_rank=16)
+        >>> data = transfer_config_to_dict(config)
+        >>> data['lora_rank']
+        16
+    """
+    import torch
+
+    data = asdict(config)
+
+    # Sanitize new_heads: drop values that are not JSON-serializable
+    # (e.g. track_means tensors, Path objects)
+    for head_config in data.get("new_heads", {}).values():
+        for key in list(head_config.keys()):
+            val = head_config[key]
+            if isinstance(val, (torch.Tensor, Path)):
+                del head_config[key]
+
+    return data
+
+
+def transfer_config_from_dict(data: dict[str, Any]) -> TransferConfig:
+    """Reconstruct TransferConfig from a dict.
+
+    Filters to known fields for forward compatibility (ignores unknown keys
+    from future versions).
+
+    Args:
+        data: Dict from checkpoint or config file.
+
+    Returns:
+        TransferConfig instance.
+
+    Example:
+        >>> data = {'mode': 'lora', 'lora_rank': 16, 'future_field': 'ignored'}
+        >>> config = transfer_config_from_dict(data)
+        >>> config.mode
+        'lora'
+    """
+    known_fields = {f.name for f in fields(TransferConfig)}
+    filtered = {k: v for k, v in data.items() if k in known_fields}
+    return TransferConfig(**filtered)
+
+
 __all__ = [
     'TransferConfig',
     'load_trunk',
@@ -436,4 +527,6 @@ __all__ = [
     'remove_all_heads',
     'prepare_for_transfer',
     'count_trainable_params',
+    'transfer_config_to_dict',
+    'transfer_config_from_dict',
 ]
