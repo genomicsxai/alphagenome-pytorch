@@ -9,10 +9,10 @@ from alphagenome_pytorch.extensions.finetuning.training import (
     ModalityConfig, collate_genomic, MODALITY_CONFIGS,
     create_lr_scheduler, compute_finetuning_loss,
     train_epoch, validate,
-    ProfilingStats, train_epoch_ddp, validate_ddp,
-    train_epoch_multihead, validate_multihead,
+    ProfilingStats,
 )
 from alphagenome_pytorch.extensions.finetuning.transfer import TransferConfig
+from alphagenome_pytorch.extensions.finetuning.trainer import Trainer, TrainerConfig
 
 # Distributed utilities
 from alphagenome_pytorch.extensions.finetuning.distributed import (
@@ -86,19 +86,15 @@ __all__ = [
     "ModalityConfig",
     "MODALITY_CONFIGS",
     "TransferConfig",
+    "Trainer",
+    "TrainerConfig",
     "collate_genomic",
     "create_lr_scheduler",
     "compute_finetuning_loss",
     "train_epoch",
     "validate",
     "save_checkpoint",
-    # Enhanced training with DDP
     "ProfilingStats",
-    "train_epoch_ddp",
-    "validate_ddp",
-    # Multi-head training
-    "train_epoch_multihead",
-    "validate_multihead",
     # Distributed utilities
     "setup_distributed",
     "cleanup_distributed",
