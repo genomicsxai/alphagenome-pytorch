@@ -204,6 +204,18 @@ class GenomeSequenceProvider:
 
         return result
 
+    def close(self):
+        """Close the FASTA file handle."""
+        if self._fasta is not None:
+            self._fasta.close()
+            self._fasta = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
     def _fetch_from_fasta(self, chrom: str, start: int, end: int) -> np.ndarray:
         """Fetch and encode sequence directly from FASTA."""
         # Lazy-load pyfaidx.Fasta for non-cached access
@@ -390,10 +402,7 @@ def predict_full_chromosome(
         head_preds = preds[head][config.resolution]
         head_preds = head_preds[:, :, track_indices].cpu().numpy()
 
-        # Free GPU memory from unused heads
         del preds, batch_seq, batch_org
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
 
         # Place kept regions into output
         for i, (window_start, window_end, keep_start, keep_end) in enumerate(batch_tiles):

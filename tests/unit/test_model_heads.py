@@ -3,17 +3,9 @@
 import pytest
 import torch
 
-from alphagenome_pytorch import AlphaGenome
-
-
 @pytest.mark.unit
 class TestHeadsParameter:
     """Tests for the heads parameter in AlphaGenome.forward()."""
-
-    @pytest.fixture
-    def model(self):
-        """Create a minimal model for testing."""
-        return AlphaGenome()
 
     def test_unknown_head_raises_error(self, model):
         """Specifying unknown head names should raise ValueError."""

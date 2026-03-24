@@ -520,6 +520,7 @@ class AlphaGenome(nn.Module):
         self,
         dna_sequence,
         organism_index,
+        *,
         splice_site_positions=None,
         return_embeddings=False,
         return_scaled_predictions=False,
@@ -628,11 +629,19 @@ class AlphaGenome(nn.Module):
                 k in head_set for k in ('splice_sites_classification', 'splice_sites_usage', 'splice_sites_junction')
             )
             if need_1bp and need_splice:
-                if self.splice_sites_classification_head is not None:
-                    if head_set is None or 'splice_sites_classification' in head_set:
-                        outputs['splice_sites_classification'] = self.splice_sites_classification_head(
-                            embeddings_1bp, organism_index, channels_last=channels_last
-                        )
+                # Also compute classification when junction needs it for position generation
+                need_classification = (
+                    head_set is None
+                    or 'splice_sites_classification' in head_set
+                    or (
+                        'splice_sites_junction' in head_set
+                        and splice_site_positions is None
+                    )
+                )
+                if self.splice_sites_classification_head is not None and need_classification:
+                    outputs['splice_sites_classification'] = self.splice_sites_classification_head(
+                        embeddings_1bp, organism_index, channels_last=channels_last
+                    )
                 if self.splice_sites_usage_head is not None:
                     if head_set is None or 'splice_sites_usage' in head_set:
                         outputs['splice_sites_usage'] = self.splice_sites_usage_head(
