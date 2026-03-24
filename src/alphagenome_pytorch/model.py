@@ -630,6 +630,7 @@ class AlphaGenome(nn.Module):
             )
             if need_1bp and need_splice:
                 # Also compute classification when junction needs it for position generation
+                classification_output = None
                 need_classification = (
                     head_set is None
                     or 'splice_sites_classification' in head_set
@@ -639,9 +640,11 @@ class AlphaGenome(nn.Module):
                     )
                 )
                 if self.splice_sites_classification_head is not None and need_classification:
-                    outputs['splice_sites_classification'] = self.splice_sites_classification_head(
+                    classification_output = self.splice_sites_classification_head(
                         embeddings_1bp, organism_index, channels_last=channels_last
                     )
+                    if head_set is None or 'splice_sites_classification' in head_set:
+                        outputs['splice_sites_classification'] = classification_output
                 if self.splice_sites_usage_head is not None:
                     if head_set is None or 'splice_sites_usage' in head_set:
                         outputs['splice_sites_usage'] = self.splice_sites_usage_head(
@@ -654,8 +657,13 @@ class AlphaGenome(nn.Module):
                         if splice_site_positions is not None:
                             top_k_positions = splice_site_positions
                         else:
+                            if classification_output is None:
+                                raise ValueError(
+                                    "splice_sites_junction requires either splice_site_positions "
+                                    "or an available splice_sites_classification head"
+                                )
                             # probs: (B, S, 5) NLC - already correct format for generate_splice_site_positions
-                            splice_site_probs = outputs['splice_sites_classification']['probs']
+                            splice_site_probs = classification_output['probs']
 
                             # If NCL (channels_last=False), transpose back to NLC for generate_splice_site_positions
                             if not channels_last:

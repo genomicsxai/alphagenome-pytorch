@@ -86,6 +86,11 @@ CLI Options
    * - ``--device``
      - ``cuda``
      - PyTorch device
+   * - ``--dtype-policy``
+     - ``full_float32``
+     - Dtype policy for model inference. Use ``full_float32`` for maximum
+       compatibility or ``mixed_precision`` for lower GPU memory usage on
+       supported hardware
    * - ``--quiet``
      - *off*
      - Suppress progress bars

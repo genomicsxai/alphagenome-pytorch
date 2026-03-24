@@ -1,7 +1,10 @@
 """Unit tests for model heads parameter validation."""
 
+import types
+
 import pytest
 import torch
+
 
 @pytest.mark.unit
 class TestHeadsParameter:
@@ -68,3 +71,41 @@ class TestHeadsParameter:
         assert "pair_activations" in result
         # Other heads should NOT be in the result
         assert "atac" not in result
+
+    def test_splice_junction_only_does_not_return_classification(self, model):
+        """Junction-only requests may compute classification internally, but should not return it."""
+
+        class _DummySpliceHead(torch.nn.Module):
+            def __init__(self, name, seq_len):
+                super().__init__()
+                self.name = name
+                self.seq_len = seq_len
+
+            def forward(self, *args, **kwargs):
+                if self.name == "classification":
+                    return {"probs": torch.zeros(1, self.seq_len, 5)}
+                return {"pred_counts": torch.zeros(1, 4, 512)}
+
+        seq_len = 1024
+        dna = torch.randn(1, seq_len, 4)
+        organism = torch.tensor([0])
+
+        model._compute_embeddings_ncl = types.MethodType(
+            lambda self, dna_sequence, organism_index, resolutions: (
+                torch.zeros(1, 1536, seq_len),
+                torch.zeros(1, 3072, seq_len // 128),
+                torch.zeros(1, 1, 1, 128),
+                True,
+            ),
+            model,
+        )
+        model.splice_sites_classification_head = _DummySpliceHead("classification", seq_len)
+        model.splice_sites_usage_head = None
+        model.splice_sites_junction_head = _DummySpliceHead("junction", seq_len)
+        model.contact_maps_head = None
+        model.heads = torch.nn.ModuleDict()
+
+        result = model(dna, organism, heads=("splice_sites_junction",))
+
+        assert "splice_sites_junction" in result
+        assert "splice_sites_classification" not in result
