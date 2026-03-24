@@ -624,9 +624,9 @@ def save_delta_checkpoint(
         path: Path to save checkpoint (recommended: use .delta.pth extension).
         model: Model with adapters and new heads (NOT merged).
         config: TransferConfig used to prepare the model.
-        base_model_hash: Optional pre-computed hash. If None, will be computed
-            from model structure (which includes adapters, so compute this
-            from the base model before applying adapters for best results).
+        base_model_hash: Optional pre-computed hash identifying the base model.
+            If None, will be computed from the trunk-only state dict (excluding
+            adapters and new heads, with normalized key paths).
         optimizer: Optional optimizer to save state for training resume.
         scheduler: Optional LR scheduler to save state for training resume.
         **metadata: Additional metadata (epoch, val_loss, track_names, etc.)
@@ -806,69 +806,17 @@ def load_delta_checkpoint(
     if not skip_prepare:
         model = prepare_for_transfer(model, config)
 
-    # Load adapter weights
+    # Load adapter, head, and norm weights in one shot
     adapter_state_dict = checkpoint.get("adapter_state_dict", {})
-    if adapter_state_dict:
-        missing_adapter = []
-        for key, value in adapter_state_dict.items():
-            # Navigate to parent module and set parameter
-            parts = key.rsplit(".", 1)
-            if len(parts) == 2:
-                parent_name, param_name = parts
-                try:
-                    parent = model.get_submodule(parent_name)
-                    if hasattr(parent, param_name):
-                        getattr(parent, param_name).data.copy_(value)
-                    else:
-                        missing_adapter.append(key)
-                except AttributeError:
-                    missing_adapter.append(key)
-            else:
-                missing_adapter.append(key)
-
-        if missing_adapter:
-            msg = f"Missing adapter parameters: {missing_adapter[:5]}..."
-            if strict:
-                raise RuntimeError(msg + " Set strict=False to ignore.")
-            else:
-                print(f"Warning: {msg}")
-
-    # Load head weights
     head_state_dict = checkpoint.get("head_state_dict", {})
-    if head_state_dict:
-        current_state = model.state_dict()
-        missing_head = []
-        for key, value in head_state_dict.items():
-            if key in current_state:
-                current_state[key] = value
-            else:
-                missing_head.append(key)
-
-        # Load back
-        model.load_state_dict(current_state, strict=False)
-
-        if missing_head:
-            msg = f"Missing head parameters: {missing_head[:5]}..."
-            if strict:
-                raise RuntimeError(msg + " Set strict=False to ignore.")
-            else:
-                print(f"Warning: {msg}")
-
-    # Load norm layer weights (saved when unfreeze_norm=True)
     norm_state_dict = checkpoint.get("norm_state_dict", {})
-    if norm_state_dict:
-        current_state = model.state_dict()
-        missing_norm = []
-        for key, value in norm_state_dict.items():
-            if key in current_state:
-                current_state[key] = value
-            else:
-                missing_norm.append(key)
 
-        model.load_state_dict(current_state, strict=False)
-
-        if missing_norm:
-            msg = f"Missing norm parameters: {missing_norm[:5]}..."
+    delta_state = {**adapter_state_dict, **head_state_dict, **norm_state_dict}
+    if delta_state:
+        result = model.load_state_dict(delta_state, strict=False)
+        # unexpected_keys = delta keys not found in the model
+        if result.unexpected_keys:
+            msg = f"Delta keys not found in model: {result.unexpected_keys[:5]}..."
             if strict:
                 raise RuntimeError(msg + " Set strict=False to ignore.")
             else:
@@ -927,7 +875,7 @@ def export_model_weights(
             )
         if not path.suffix:
             path = path.with_suffix(".safetensors")
-        save_file(state_dict, path)
+        save_file({k: v.cpu() for k, v in state_dict.items()}, path)
     elif format == "pth":
         if not path.suffix:
             path = path.with_suffix(".pth")
@@ -991,7 +939,7 @@ def export_delta_weights(
             path = path.with_suffix(".safetensors")
         # safetensors metadata must be str -> str
         metadata = {"transfer_config": json.dumps(config_dict)}
-        save_file(weights, path, metadata=metadata)
+        save_file({k: v.cpu() for k, v in weights.items()}, path, metadata=metadata)
     elif format == "pth":
         if not path.suffix:
             path = path.with_suffix(".pth")
