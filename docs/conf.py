@@ -13,7 +13,10 @@ sys.path.insert(0, os.path.abspath('../src'))
 project = 'AlphaGenome PyTorch'
 copyright = '2025, Kundaje Lab'
 author = 'Kundaje Lab'
-release = '0.2.3'
+
+# Get version dynamically from the package
+from alphagenome_pytorch import __version__
+release = __version__
 
 # -- General configuration ---------------------------------------------------
 extensions = [
