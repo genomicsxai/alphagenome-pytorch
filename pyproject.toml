@@ -55,6 +55,12 @@ scoring = [
     "pyranges",
     "alphagenome",
 ]
+serving = [
+    "grpcio",
+    "pandas",
+    "pyfaidx",
+    "alphagenome",
+]
 docs = [
     "sphinx>=7.0.0",
     "sphinx-book-theme",
@@ -64,6 +70,9 @@ docs = [
 dev = [
     "alphagenome-pytorch[test,jax,scoring,docs]",
 ]
+
+[project.scripts]
+alphagenome-local-serve = "alphagenome_pytorch.extensions.serving.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
