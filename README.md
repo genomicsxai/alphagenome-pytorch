@@ -1,5 +1,9 @@
 # AlphaGenome PyTorch
 
+[![PyPI](https://img.shields.io/pypi/v/alphagenome-pytorch)](https://pypi.org/project/alphagenome-pytorch/)
+[![Documentation](https://readthedocs.org/projects/alphagenome-pytorch/badge/?version=latest)](https://alphagenome-pytorch.readthedocs.io)
+[![Weights](https://img.shields.io/badge/%F0%9F%A4%97-Weights-yellow)](https://huggingface.co/gtca/alphagenome_pytorch)
+
 A PyTorch port of [AlphaGenome](https://www.nature.com/articles/s41586-025-10014-0), the DNA sequence model from Google DeepMind that predicts hundreds of genomic tracks at single base-pair resolution from sequences up to 1M bp.
 
 We strive to make it an accessible, readable, and hackable implementation — for integrating into existing PyTorch pipelines, fine-tuning on custom datasets, and building on top of.
@@ -62,7 +66,7 @@ Contact maps are returned as a single tensor (no resolution dict):
 outputs['contact_maps']      # (1, 64, 64, 28)   3D chromatin contacts
 ```
 
-Splice heads return dicts of tensors (logits, probs, etc.):
+Splice heads return dicts of tensors:
 
 ```python
 outputs['splice_sites']['probs']  # (1, 131072, 5)  splice site classes
