@@ -1093,6 +1093,12 @@ class NamedOutputs:
 
         result = cls(outputs, named_heads)
         if not include_padding:
+            if catalog is None:
+                raise ValueError(
+                    "include_padding=False (the default) requires a metadata catalog "
+                    "to distinguish real tracks from padding. Either pass a catalog "
+                    "or set include_padding=True."
+                )
             result = result.strip_padding()
         return result
 

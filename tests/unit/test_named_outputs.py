@@ -109,12 +109,12 @@ def test_named_outputs_without_catalog_uses_placeholders():
 
 
 @pytest.mark.unit
-def test_placeholder_tracks_are_stripped_by_default():
-    """Placeholder tracks from missing catalog are stripped when include_padding=False."""
+def test_no_catalog_without_include_padding_raises():
+    """Without a catalog, include_padding=False (default) raises ValueError."""
     outputs = {"atac": {128: torch.randn(1, 4, 2)}}
-    named = NamedOutputs.from_raw(outputs, organism=0, catalog=None)
 
-    assert named.atac[128].num_tracks == 0
+    with pytest.raises(ValueError, match="requires a metadata catalog"):
+        NamedOutputs.from_raw(outputs, organism=0, catalog=None)
 
 
 @pytest.mark.unit
@@ -238,7 +238,7 @@ def test_track_metadata_extras_contain_non_core_fields():
 def test_named_outputs_len():
     """NamedOutputs supports len()."""
     outputs = {"atac": {128: torch.randn(1, 4, 2)}, "dnase": {128: torch.randn(1, 4, 3)}}
-    named = NamedOutputs.from_raw(outputs, organism=0, catalog=None)
+    named = NamedOutputs.from_raw(outputs, organism=0, catalog=None, include_padding=True)
     assert len(named) == 2
 
 
@@ -246,7 +246,7 @@ def test_named_outputs_len():
 def test_named_outputs_dict_interface():
     """NamedOutputs supports dict-like access."""
     outputs = {"atac": {128: torch.randn(1, 4, 2)}}
-    named = NamedOutputs.from_raw(outputs, organism=0, catalog=None)
+    named = NamedOutputs.from_raw(outputs, organism=0, catalog=None, include_padding=True)
 
     assert "atac" in named
     assert list(named.keys()) == ["atac"]
