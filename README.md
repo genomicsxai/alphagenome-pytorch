@@ -27,6 +27,8 @@ pip install alphagenome-pytorch[finetuning]  # adds pyBigWig, pyfaidx
 ## Quick Start
 
 ```python
+import torch
+import numpy as np
 from alphagenome_pytorch import AlphaGenome
 
 # Load pretrained model
@@ -35,17 +37,57 @@ model = AlphaGenome.from_pretrained('alphagenome.pt', device='cuda')
 # Create one-hot encoded DNA sequence in NLC format (batch=1, length=131072, channels=4)
 # Channels: A=0, C=1, G=2, T=3
 sequence = np.random.randint(0, 4, size=(1, 131072))
-dna_onehot = torch.tensor(np.eye(4)[sequence], dtype=torch.float32)
+dna_onehot = torch.tensor(np.eye(4)[sequence], dtype=torch.float32).cuda()
 
 # Inference (handles dtype casting, returns float32 outputs)
 outputs = model.predict(dna_onehot, organism_index=0)  # organism: 0=human, 1=mouse
-
-# outputs['atac'][1]   -> (B, 131072, 256) ATAC at 1bp
-# outputs['atac'][128] -> (B, 1024, 256) ATAC at 128bp
-# outputs['contact_maps'] -> (B, 28, 64, 64) 3D contact
 ```
 
 The weights for this port are [available on Hugging Face](https://huggingface.co/gtca/alphagenome_pytorch).
+
+### Output structure
+Each genomic-track head returns a dict mapping resolution → tensor:
+
+```python
+outputs['atac'][1]           # (1, 131072, 256)   ATAC-seq  at 1 bp
+outputs['atac'][128]         # (1, 1024,   256)   ATAC-seq  at 128 bp
+outputs['dnase'][1]          # (1, 131072, 384)   DNase     at 1 bp
+outputs['cage'][128]         # (1, 1024,   640)   CAGE      at 128 bp
+outputs['chip_histone'][128] # (1, 1024,   1152)  ChIP-hist at 128 bp only
+```
+
+Contact maps are returned as a single tensor (no resolution dict):
+
+```python
+outputs['contact_maps']      # (1, 64, 64, 28)   3D chromatin contacts
+```
+
+Splice heads return dicts of tensors (logits, probs, etc.):
+
+```python
+outputs['splice_sites']['probs']  # (1, 131072, 5)  splice site classes
+```
+
+### Padding
+
+Track dimensions are padded (e.g. ATAC has 167 real human
+tracks but the tensor has 256 channels).  Real tracks come first; the rest
+are zeros.  Use `named_outputs=True` to auto-strip padding:
+
+```python
+from alphagenome_pytorch.named_outputs import NamedOutputs, TrackMetadataCatalog
+catalog = TrackMetadataCatalog.load_builtin(organism=0)
+model.set_track_metadata_catalog(catalog)
+
+named = model.predict(dna_onehot, organism_index=0, named_outputs=True)
+named.atac[1].shape                  # (1, 131072, 167)  — padding removed
+named.atac[1].tracks[-1].track_name  # 'UBERON:0015143 ATAC-seq'
+
+# Filter by metadata
+named.rna_seq[128].select(strand='+')
+named.chip_tf[128].select(transcription_factor='CTCF')
+named.atac[1].select(biosample_type='tissue', ontology_curie='UBERON:0015143')
+```
 
 ## Extracting Embeddings
 
