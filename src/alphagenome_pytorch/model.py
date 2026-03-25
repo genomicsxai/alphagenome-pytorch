@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 from pathlib import Path
 import warnings
 
@@ -452,6 +452,72 @@ class AlphaGenome(nn.Module):
             include_padding=include_padding,
         )
 
+    @classmethod
+    def from_delta(
+        cls,
+        delta_path: Union[str, Path],
+        base_path: Union[str, Path],
+        dtype_policy: Optional[DtypePolicy] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        **kwargs,
+    ) -> "AlphaGenome":
+        """Load a finetuned AlphaGenome model from delta weights and base weights.
+
+        This is the simplest way to load a finetuned model. It reconstructs the
+        full model from a small delta weights file (adapters + heads) and the
+        base pretrained weights.
+
+        Args:
+            delta_path: Path to the delta weights file (.safetensors or .pth)
+                created by ``export_delta_weights()``.
+            base_path: Path to the base pretrained weights file (.pth or
+                .safetensors) created by ``convert_weights.py``.
+            dtype_policy: DtypePolicy for precision control. Defaults to
+                DtypePolicy.full_float32().
+            device: Device to load the model onto ('cuda', 'cpu', etc.).
+                If None, loads to CPU.
+            **kwargs: Additional arguments passed to AlphaGenome constructor
+                (e.g., num_organisms, gradient_checkpointing).
+
+        Returns:
+            AlphaGenome model with base weights, adapters, and finetuned heads.
+
+        Example:
+            >>> model = AlphaGenome.from_delta(
+            ...     'colleague_lora.safetensors',
+            ...     'alphagenome_pretrained.pth',
+            ...     device='cuda',
+            ... )
+        """
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            load_delta_config,
+            load_delta_weights,
+        )
+        from alphagenome_pytorch.extensions.finetuning.transfer import (
+            load_trunk,
+            prepare_for_transfer,
+        )
+
+        if dtype_policy is None:
+            dtype_policy = DtypePolicy.default()
+
+        # 1. Create base model and load pretrained trunk
+        model = cls(dtype_policy=dtype_policy, **kwargs)
+        model = load_trunk(model, base_path, exclude_heads=True)
+
+        # 2. Read config and set up adapters/heads
+        config = load_delta_config(delta_path)
+        model = prepare_for_transfer(model, config)
+
+        # 3. Load delta weights
+        load_delta_weights(model, delta_path)
+
+        # 4. Move to target device
+        if device:
+            model.to(device)
+
+        return model
+
     def _compute_embeddings_ncl(self, dna_sequence, organism_index, resolutions=None):
         """Internal method to compute embeddings in NCL format.
 
@@ -574,10 +640,12 @@ class AlphaGenome(nn.Module):
         self,
         dna_sequence,
         organism_index,
+        *,
         splice_site_positions=None,
         return_embeddings=False,
         return_scaled_predictions=False,
         resolutions=None,
+        heads: Optional[Tuple[str, ...]] = None,
         channels_last=True,
         embeddings_only=False,
         encoder_only=False,
@@ -594,6 +662,9 @@ class AlphaGenome(nn.Module):
                                        If False, return experimental space (for inference).
             resolutions: Tuple of resolutions to compute, e.g. (1, 128) or (128,).
                          If None, computes all resolutions.
+            heads: Tuple of head names to compute, e.g. ('atac',) or ('atac', 'dnase').
+                   If None, computes all heads. Use this to skip expensive unused heads
+                   during inference.
             channels_last: Format for embeddings and head outputs.
                 - True (default): NLC format (B, S, C) - user-friendly, matches JAX
                 - False: NCL format (B, C, S) - for training efficiency (0 transposes)
@@ -610,12 +681,39 @@ class AlphaGenome(nn.Module):
             resolution (1 or 128) to prediction tensors.
             If return_embeddings is True, also contains 'embeddings_1bp' and 'embeddings_128bp'.
             If encoder_only is True, returns ``{"encoder_output": tensor}`` only.
+
+        Raises:
+            ValueError: If unknown head names are specified in ``heads``.
         """
         if encoder_only:
             # Return raw CNN encoder output before organism embedding and transformer.
             trunk, _intermediates = self.encoder(dna_sequence)
             outputs = {"encoder_output": trunk}
             return self._cast_outputs(outputs)
+
+        # Validate heads parameter
+        if heads is not None:
+            # Build set of all valid head names
+            valid_heads = set(self.heads.keys())
+            if self.contact_maps_head is not None:
+                valid_heads.add('contact_maps')
+            if self.splice_sites_classification_head is not None:
+                valid_heads.add('splice_sites')
+            if self.splice_sites_usage_head is not None:
+                valid_heads.add('splice_site_usage')
+            if self.splice_sites_junction_head is not None:
+                valid_heads.add('splice_junctions')
+
+            # Check for unknown heads
+            unknown_heads = set(heads) - valid_heads
+            if unknown_heads:
+                raise ValueError(
+                    f"Unknown head names: {sorted(unknown_heads)}. "
+                    f"Available heads: {sorted(valid_heads)}"
+                )
+            head_set = set(heads)
+        else:
+            head_set = None
 
         # Compute embeddings (NCL format internally)
         embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = \
@@ -631,6 +729,8 @@ class AlphaGenome(nn.Module):
 
         if not embeddings_only:
             for name, head in self.heads.items():
+                if head_set is not None and name not in head_set:
+                    continue
                 outputs[name] = head(
                     embeddings_dict, organism_index,
                     return_scaled=return_scaled_predictions,
@@ -639,47 +739,70 @@ class AlphaGenome(nn.Module):
 
             # Contact Maps
             if self.contact_maps_head is not None:
-                outputs['contact_maps'] = self.contact_maps_head(
-                    embeddings_pair, organism_index, channels_last=channels_last
-                )
+                if head_set is None or 'contact_maps' in head_set:
+                    outputs['contact_maps'] = self.contact_maps_head(
+                        embeddings_pair, organism_index, channels_last=channels_last
+                    )
 
             # Splice predictions (require 1bp embeddings)
-            if need_1bp:
-                if self.splice_sites_classification_head is not None:
-                    outputs['splice_sites'] = self.splice_sites_classification_head(
+            need_splice = head_set is None or any(
+                k in head_set for k in ('splice_sites', 'splice_site_usage', 'splice_junctions')
+            )
+            if need_1bp and need_splice:
+                # Also compute classification when junction needs it for position generation
+                classification_output = None
+                need_classification = (
+                    head_set is None
+                    or 'splice_sites' in head_set
+                    or (
+                        'splice_junctions' in head_set
+                        and splice_site_positions is None
+                    )
+                )
+                if self.splice_sites_classification_head is not None and need_classification:
+                    classification_output = self.splice_sites_classification_head(
                         embeddings_1bp, organism_index, channels_last=channels_last
                     )
+                    if head_set is None or 'splice_sites' in head_set:
+                        outputs['splice_sites'] = classification_output
                 if self.splice_sites_usage_head is not None:
-                    outputs['splice_site_usage'] = self.splice_sites_usage_head(
-                        embeddings_1bp, organism_index, channels_last=channels_last
-                    )
+                    if head_set is None or 'splice_site_usage' in head_set:
+                        outputs['splice_site_usage'] = self.splice_sites_usage_head(
+                            embeddings_1bp, organism_index, channels_last=channels_last
+                        )
 
                 if self.splice_sites_junction_head is not None:
-                    # Use provided positions if given, otherwise generate from classification
-                    if splice_site_positions is not None:
-                        top_k_positions = splice_site_positions
-                    else:
-                        # probs: (B, S, 5) NLC - already correct format for generate_splice_site_positions
-                        splice_site_probs = outputs['splice_sites']['probs']
+                    if head_set is None or 'splice_junctions' in head_set:
+                        # Use provided positions if given, otherwise generate from classification
+                        if splice_site_positions is not None:
+                            top_k_positions = splice_site_positions
+                        else:
+                            if classification_output is None:
+                                raise ValueError(
+                                    "splice_junctions requires either splice_site_positions "
+                                    "or an available splice_sites classification head"
+                                )
+                            # probs: (B, S, 5) NLC - already correct format for generate_splice_site_positions
+                            splice_site_probs = classification_output['probs']
 
-                        # If NCL (channels_last=False), transpose back to NLC for generate_splice_site_positions
-                        if not channels_last:
-                            splice_site_probs = splice_site_probs.transpose(1, 2)
+                            # If NCL (channels_last=False), transpose back to NLC for generate_splice_site_positions
+                            if not channels_last:
+                                splice_site_probs = splice_site_probs.transpose(1, 2)
 
-                        top_k_positions = generate_splice_site_positions(
-                            ref=splice_site_probs,
-                            alt=None,
-                            true_splice_sites=None,
-                            k=512,
-                            pad_to_length=512,
-                            threshold=0.1,
+                            top_k_positions = generate_splice_site_positions(
+                                ref=splice_site_probs,
+                                alt=None,
+                                true_splice_sites=None,
+                                k=512,
+                                pad_to_length=512,
+                                threshold=0.1,
+                            )
+                        outputs['splice_junctions'] = self.splice_sites_junction_head(
+                            embeddings_1bp,
+                            organism_index,
+                            channels_last=channels_last,
+                            splice_site_positions=top_k_positions,
                         )
-                    outputs['splice_junctions'] = self.splice_sites_junction_head(
-                        embeddings_1bp,
-                        organism_index,
-                        channels_last=channels_last,
-                        splice_site_positions=top_k_positions,
-                    )
 
         if return_embeddings or embeddings_only:
             if channels_last:

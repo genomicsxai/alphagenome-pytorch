@@ -14,8 +14,8 @@ from alphagenome_pytorch.model import AlphaGenome
 from alphagenome_pytorch.config import DtypePolicy
 
 
-def _make_small_model():
-    """Create a small AlphaGenome model for fast testing."""
+def _make_model():
+    """Create an AlphaGenome model for testing."""
     model = AlphaGenome(
         num_organisms=2,
         dtype_policy=DtypePolicy.full_float32(),
@@ -42,7 +42,7 @@ class TestModelDeterminism:
     def model(self):
         """Shared model instance for determinism tests."""
         torch.manual_seed(0)
-        model = _make_small_model()
+        model = _make_model()
         yield model
         del model
         gc.collect()
@@ -79,11 +79,11 @@ class TestModelDeterminism:
         """Two models initialized with the same seed should produce identical outputs."""
         # Model 1
         torch.manual_seed(123)
-        model1 = _make_small_model()
+        model1 = _make_model()
 
         # Model 2 (same seed)
         torch.manual_seed(123)
-        model2 = _make_small_model()
+        model2 = _make_model()
 
         x, org = _make_input(seed=99)
 
@@ -108,10 +108,10 @@ class TestModelDeterminism:
     def test_different_seed_different_output(self):
         """Different weight seeds should produce different outputs (sanity check)."""
         torch.manual_seed(1)
-        model1 = _make_small_model()
+        model1 = _make_model()
 
         torch.manual_seed(2)
-        model2 = _make_small_model()
+        model2 = _make_model()
 
         x, org = _make_input(seed=42)
 

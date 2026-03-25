@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = [
     "torch>=2.0.0",
     "numpy",
+    "safetensors"
 ]
 
 [project.optional-dependencies]
@@ -26,7 +27,6 @@ test = [
     "aiohttp",
     "requests",
     "pybigwig",
-    "pysam",
     "pyfaidx",
     "tqdm",
     "logomaker",
@@ -36,6 +36,11 @@ jax = [
     "jaxlib",
     "dm-haiku",
     "orbax-checkpoint",
+]
+inference = [
+    "pybigwig",
+    "pyfaidx",
+    "tqdm",
 ]
 finetuning = [
     "pybigwig",
@@ -49,7 +54,6 @@ scoring = [
     "tqdm",
     "pyranges",
     "alphagenome",
-    "safetensors",
 ]
 docs = [
     "sphinx>=7.0.0",
