@@ -39,9 +39,9 @@ HEAD_CONFIGS = {
     'chip_tf': {'num_tracks': 1664},
     'chip_histone': {'num_tracks': 1152},
     'contact_maps': {'num_tracks': 28},
-    'splice_sites_classification': {'num_tracks': 5},
-    'splice_sites_usage': {'num_tracks': 734},
-    'splice_sites_junction': {'num_tracks': 367},
+    'splice_sites': {'num_tracks': 5},
+    'splice_site_usage': {'num_tracks': 734},
+    'splice_junctions': {'num_tracks': 367},
 }
 
 # Map JAX/Original metadata columns to PyTorch TrackMetadata fields
@@ -74,9 +74,9 @@ def get_metadata_for_head(metadata_obj, head_name, num_tracks):
         'chip_tf': 'CHIP_TF',
         'chip_histone': 'CHIP_HISTONE',
         'contact_maps': 'CONTACT_MAPS',
-        'splice_sites_classification': 'SPLICE_SITES',
-        'splice_sites_usage': 'SPLICE_SITE_USAGE',
-        'splice_sites_junction': 'SPLICE_JUNCTIONS',
+        'splice_sites': 'SPLICE_SITES',
+        'splice_site_usage': 'SPLICE_SITE_USAGE',
+        'splice_junctions': 'SPLICE_JUNCTIONS',
     }
 
     output_type_enum = getattr(dna_output.OutputType, output_type_map[head_name])
@@ -105,7 +105,7 @@ def get_metadata_for_head(metadata_obj, head_name, num_tracks):
     if len(df) < num_tracks:
         print(f"  {head_name}: Padding metadata from {len(df)} to {num_tracks}")
         padding = pd.DataFrame({
-            'track_name': [f'{head_name}_{i}' for i in range(len(df), num_tracks)],
+            'track_name': ['Padding'] * (num_tracks - len(df)),
             'strand': ['.'] * (num_tracks - len(df))
         })
         df = pd.concat([df, padding], ignore_index=True)
@@ -138,11 +138,7 @@ def extract_metadata_for_organism(org_name: str, output_dir: Path) -> pd.DataFra
         # Add identifying columns
         df['organism'] = org_index
 
-        # Map head_name to PyTorch output_type string value
-        if head_name == 'contact_maps':
-            df['output_type'] = 'pair_activations'
-        else:
-            df['output_type'] = head_name
+        df['output_type'] = head_name
 
         print(f"  {head_name}: {len(df)} tracks")
         all_dfs.append(df)

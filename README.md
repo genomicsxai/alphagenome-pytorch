@@ -104,11 +104,11 @@ See a compiled [ARCHITECTURE_COMPARISON.md](ARCHITECTURE_COMPARISON.md) for some
 | dnase | 305 | 384 | 1bp, 128bp | DNase-seq |
 | procap | 12 | 128 | 1bp, 128bp | Transcription initiation |
 | cage | 546 | 640 | 1bp, 128bp | 5' cap RNA |
-| rnaseq | 667 | 768 | 1bp, 128bp | RNA expression |
+| rna_seq | 667 | 768 | 1bp, 128bp | RNA expression |
 | chip_tf | 1617 | 1664 | 128bp | TF binding |
 | chip_histone | 1116 | 1152 | 128bp | Histone modifications |
 | contact_maps | 28 | 28 | 64×64 | 3D chromatin contacts |
-| splice_sites | 4 | 4 | 1bp | Splice site classification (D+, A+, D−, A−) |
+| splice_sites | 5 | 5 | 1bp | Splice site classification (D+, A+, D−, A−, none) |
 | splice_junctions | 734 | 734 | pairwise | Junction read counts (367 tissues × 2 strands) |
 | splice_site_usage | 734 | 734 | 1bp | Fraction of transcripts using splice site |
 

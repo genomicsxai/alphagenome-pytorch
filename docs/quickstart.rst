@@ -144,7 +144,7 @@ Each output type has predictions at one or more resolutions (1bp and/or 128bp):
    # Available output types
    print(outputs.keys())
    # dict_keys(['atac', 'dnase', 'procap', 'cage', 'rna_seq',
-   #            'chip_tf', 'chip_histone', 'pair_activations'])
+   #            'chip_tf', 'chip_histone', 'contact_maps'])
 
    # Each output has predictions at different resolutions
    atac_1bp = outputs['atac'][1]      # 1bp resolution
@@ -236,7 +236,7 @@ keep them (useful for training with loss masking).
      - 1116
      - 183
      - 1152
-   * - ``pair_activations``
+   * - ``contact_maps``
      - 128bp
      - 28
      - 8

@@ -98,13 +98,23 @@ def test_named_outputs_where_with_collection():
 
 @pytest.mark.unit
 def test_named_outputs_without_catalog_uses_placeholders():
-    """Without a catalog, placeholder track names are generated."""
+    """Without a catalog, placeholder tracks are generated and recognized as padding."""
+    outputs = {"atac": {128: torch.randn(1, 4, 2)}}
+    named = NamedOutputs.from_raw(outputs, organism=0, catalog=None, include_padding=True)
+
+    tracks = named.atac[128].tracks
+    assert tracks[0].track_name == "Padding"
+    assert tracks[1].track_name == "Padding"
+    assert all(t.is_padding for t in tracks)
+
+
+@pytest.mark.unit
+def test_placeholder_tracks_are_stripped_by_default():
+    """Placeholder tracks from missing catalog are stripped when include_padding=False."""
     outputs = {"atac": {128: torch.randn(1, 4, 2)}}
     named = NamedOutputs.from_raw(outputs, organism=0, catalog=None)
 
-    tracks = named.atac[128].tracks
-    assert tracks[0].track_name == "track_0"
-    assert tracks[1].track_name == "track_1"
+    assert named.atac[128].num_tracks == 0
 
 
 @pytest.mark.unit
@@ -117,9 +127,71 @@ def test_named_outputs_strict_metadata_requires_catalog_entries():
         NamedOutputs.from_raw(outputs, organism=0, catalog=catalog, strict_metadata=True)
 
 
+_EXPECTED_OUTPUTS = {
+    "atac", "dnase", "procap", "cage", "rna_seq",
+    "chip_tf", "chip_histone", "contact_maps",
+    "splice_sites", "splice_site_usage", "splice_junctions",
+}
+
+_OLD_OUTPUT_NAMES = {
+    "pair_activations", "splice_sites_classification",
+    "splice_sites_usage", "splice_sites_junction",
+}
+
+
 @pytest.mark.unit
-def test_catalog_from_csv_normalizes_output_alias(tmp_path):
-    """Output name aliases (contact_maps -> pair_activations) are normalized."""
+def test_load_builtin_human():
+    """load_builtin('human') loads only human metadata."""
+    catalog = TrackMetadataCatalog.load_builtin("human")
+    assert 0 in catalog.organisms
+    assert 1 not in catalog.organisms
+
+    outputs = set(catalog.outputs(organism=0))
+    assert outputs == _EXPECTED_OUTPUTS, f"Unexpected outputs: {outputs ^ _EXPECTED_OUTPUTS}"
+    assert not outputs & _OLD_OUTPUT_NAMES, f"Old output names present: {outputs & _OLD_OUTPUT_NAMES}"
+
+
+@pytest.mark.unit
+def test_load_builtin_mouse():
+    """load_builtin('mouse') loads only mouse metadata."""
+    catalog = TrackMetadataCatalog.load_builtin("mouse")
+    assert 1 in catalog.organisms
+    assert 0 not in catalog.organisms
+
+    outputs = set(catalog.outputs(organism=1))
+    assert outputs == _EXPECTED_OUTPUTS, f"Unexpected outputs: {outputs ^ _EXPECTED_OUTPUTS}"
+    assert not outputs & _OLD_OUTPUT_NAMES, f"Old output names present: {outputs & _OLD_OUTPUT_NAMES}"
+
+
+@pytest.mark.unit
+def test_load_builtin_default_loads_both():
+    """load_builtin() with no argument loads both human and mouse."""
+    catalog = TrackMetadataCatalog.load_builtin()
+    assert 0 in catalog.organisms
+    assert 1 in catalog.organisms
+
+    for org in (0, 1):
+        outputs = set(catalog.outputs(organism=org))
+        assert outputs == _EXPECTED_OUTPUTS, f"Organism {org}: unexpected outputs: {outputs ^ _EXPECTED_OUTPUTS}"
+
+
+@pytest.mark.unit
+def test_load_builtin_padding_tracks_are_named_correctly():
+    """Padding tracks in built-in metadata use 'Padding' as track_name."""
+    catalog = TrackMetadataCatalog.load_builtin()
+    for org in catalog.organisms:
+        for output_name in catalog.outputs(organism=org):
+            for track in catalog.get_tracks(output_name, organism=org):
+                if track.is_padding:
+                    assert track.track_name.lower() == "padding", (
+                        f"Padding track in {output_name} org={org} has "
+                        f"track_name='{track.track_name}', expected 'Padding' (case-insensitive)"
+                    )
+
+
+@pytest.mark.unit
+def test_catalog_from_csv_loads_contact_maps(tmp_path):
+    """Contact maps output name is loaded correctly from CSV."""
     csv_path = tmp_path / "tracks.csv"
     csv_path.write_text(
         "organism,output_type,track_name\n"
@@ -129,10 +201,10 @@ def test_catalog_from_csv_normalizes_output_alias(tmp_path):
     )
 
     catalog = TrackMetadataCatalog.from_file(csv_path)
-    tracks = catalog.get_tracks("pair_activations", organism=0, num_tracks=2, strict=True)
+    tracks = catalog.get_tracks("contact_maps", organism=0, num_tracks=2, strict=True)
 
     assert len(tracks) == 2
-    assert tracks[0].output_name == "pair_activations"
+    assert tracks[0].output_name == "contact_maps"
     assert tracks[1].track_name == "cm_1"
 
 
@@ -636,6 +708,28 @@ def test_from_raw_include_padding_true_keeps_all_tracks():
 
     assert named.atac[128].num_tracks == 5
     assert sum(t.is_padding for t in named.atac[128].tracks) == 2
+
+
+@pytest.mark.unit
+def test_catalog_padding_when_fewer_tracks_than_tensor():
+    """When catalog has fewer tracks than tensor, padding tracks are added and strippable."""
+    rows = [
+        {"organism": "human", "output_type": "atac", "track_name": "liver"},
+        {"organism": "human", "output_type": "atac", "track_name": "brain"},
+    ]
+    catalog = TrackMetadataCatalog.from_rows(rows)
+
+    # Tensor has 5 tracks but catalog only has 2
+    outputs = {"atac": {128: torch.randn(1, 8, 5)}}
+    named = NamedOutputs.from_raw(outputs, organism=0, catalog=catalog, include_padding=True)
+
+    assert named.atac[128].num_tracks == 5
+    assert sum(t.is_padding for t in named.atac[128].tracks) == 3
+
+    # Stripping removes the 3 padded tracks
+    stripped = named.atac[128].strip_padding()
+    assert stripped.num_tracks == 2
+    assert [t.track_name for t in stripped.tracks] == ["liver", "brain"]
 
 
 @pytest.mark.unit

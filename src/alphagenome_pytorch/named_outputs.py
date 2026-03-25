@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import dataclasses
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -22,17 +23,8 @@ _ORGANISM_ALIASES = {
     "mus_musculus": 1,
 }
 
-_OUTPUT_ALIASES = {
-    "contact_maps": "pair_activations",
-    "splice_sites": "splice_sites_classification",
-    "splice_site_usage": "splice_sites_usage",
-    "splice_junctions": "splice_sites_junction",
-}
-
-
 def _normalize_output_name(output_name: str) -> str:
-    key = output_name.strip().lower()
-    return _OUTPUT_ALIASES.get(key, key)
+    return output_name.strip().lower()
 
 
 def _resolve_organism_index(value: int | str | torch.Tensor | None, default: int = 0) -> int:
@@ -59,13 +51,16 @@ def _resolve_organism_index(value: int | str | torch.Tensor | None, default: int
     return default
 
 
-def _clean_optional(value: Any) -> str | None:
+def _clean_optional(value: Any) -> Any:
     if value is None:
         return None
-    text = str(value).strip()
-    if not text or text.lower() in {"nan", "none", "null"}:
+    if isinstance(value, str):
+        value = value.strip()
+        if not value or value.lower() in {"nan", "none", "null"}:
+            return None
+    elif isinstance(value, float) and math.isnan(value):
         return None
-    return text
+    return value
 
 
 def _placeholder_tracks(
@@ -79,7 +74,7 @@ def _placeholder_tracks(
             track_index=start_index + i,
             output_name=output_name,
             organism=organism,
-            track_name=f"track_{start_index + i}",
+            track_name="Padding",
         )
         for i in range(count)
     )
@@ -114,7 +109,7 @@ class TrackMetadata:
     extras: dict[str, Any] = field(default_factory=dict)
 
     # Core attribute names that should not be looked up in extras
-    _CORE_FIELDS: frozenset[str] = frozenset({
+    _CORE_FIELDS = frozenset({
         "track_index", "output_name", "organism", "track_name", "extras"
     })
 
@@ -352,13 +347,6 @@ class TrackMetadataCatalog:
 
         tracks = self._tracks_by_organism.get(organism_idx, {}).get(canonical_name)
 
-        # Fallback to the first organism with metadata for this output.
-        if tracks is None and not strict:
-            for per_output in self._tracks_by_organism.values():
-                if canonical_name in per_output:
-                    tracks = per_output[canonical_name]
-                    break
-
         if tracks is None:
             if strict:
                 raise KeyError(
@@ -474,20 +462,31 @@ class TrackMetadataCatalog:
         )
 
     @classmethod
-    def load_builtin(cls, organism: str | int = "human") -> "TrackMetadataCatalog":
+    def load_builtin(cls, organism: str | int | None = None) -> "TrackMetadataCatalog":
         """Load built-in metadata extracted from AlphaGenome.
 
         Args:
-            organism: "human" (or 0) or "mouse" (or 1).
+            organism: "human" (or 0), "mouse" (or 1), or None to load both.
 
         Returns:
-            A TrackMetadataCatalog with metadata for the specified organism.
+            A TrackMetadataCatalog with metadata for the specified organism(s).
 
         Raises:
             FileNotFoundError: If the built-in metadata file is not found.
                 Run `python scripts/extract_track_metadata.py` to generate it.
         """
-        org_idx = _resolve_organism_index(organism)
+        if organism is None:
+            catalog = cls()
+            for org_idx in (0, 1):
+                single = cls._load_builtin_organism(org_idx)
+                catalog._tracks_by_organism.update(single._tracks_by_organism)
+            return catalog
+
+        return cls._load_builtin_organism(_resolve_organism_index(organism))
+
+    @classmethod
+    def _load_builtin_organism(cls, org_idx: int) -> "TrackMetadataCatalog":
+        """Load built-in metadata for a single organism."""
         org_name = "human" if org_idx == 0 else "mouse"
 
         # Try package data first
@@ -1045,9 +1044,11 @@ class NamedOutputs:
         organism_idx = _resolve_organism_index(organism, default=0)
         named_heads: dict[str, NamedOutputHead] = {}
 
-        for output_name, output_value in outputs.items():
+        for raw_name, output_value in outputs.items():
             if not isinstance(output_value, Mapping):
                 continue
+
+            output_name = _normalize_output_name(raw_name)
 
             resolution_tensors = {
                 res: tensor
@@ -1067,7 +1068,7 @@ class NamedOutputs:
 
                 if catalog is None:
                     tracks = _placeholder_tracks(
-                        _normalize_output_name(output_name),
+                        output_name,
                         organism_idx,
                         num_tracks,
                     )
@@ -1082,7 +1083,7 @@ class NamedOutputs:
                 by_resolution[resolution] = NamedTrackTensor(
                     tensor=tensor,
                     tracks=tracks,
-                    output_name=_normalize_output_name(output_name),
+                    output_name=output_name,
                     resolution=resolution,
                     track_axis=track_axis,
                 )

@@ -83,7 +83,7 @@ Output types and track counts
      - 1116
      - 183
      - 1152
-   * - ``pair_activations``
+   * - ``contact_maps``
      - 128bp
      - 28
      - 8
@@ -165,7 +165,7 @@ By metadata field
    h3k27ac = out.chip_histone[128].select(histone_mark='H3K27ac')
 
    # By tissue
-   aorta = out.splice_sites_junction[1].select(gtex_tissue='Artery_Aorta')
+   aorta = out.splice_junctions[1].select(gtex_tissue='Artery_Aorta')
 
    # By ontology
    hepg2_rna = out.rna_seq[1].select(ontology_curie='EFO:0001187')

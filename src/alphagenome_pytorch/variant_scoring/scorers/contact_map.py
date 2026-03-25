@@ -50,7 +50,7 @@ class ContactMapScorer(BaseVariantScorer):
         >>> scorer.is_signed
         False
         >>> scorer.requested_output
-        <OutputType.CONTACT_MAPS: 'pair_activations'>
+        <OutputType.CONTACT_MAPS: 'contact_maps'>
     """
 
     @property

@@ -637,20 +637,20 @@ class AlphaGenome(nn.Module):
                     channels_last=channels_last,
                 )
 
-            # Contact Maps (pair activations format)
+            # Contact Maps
             if self.contact_maps_head is not None:
-                outputs['pair_activations'] = self.contact_maps_head(
+                outputs['contact_maps'] = self.contact_maps_head(
                     embeddings_pair, organism_index, channels_last=channels_last
                 )
 
             # Splice predictions (require 1bp embeddings)
             if need_1bp:
                 if self.splice_sites_classification_head is not None:
-                    outputs['splice_sites_classification'] = self.splice_sites_classification_head(
+                    outputs['splice_sites'] = self.splice_sites_classification_head(
                         embeddings_1bp, organism_index, channels_last=channels_last
                     )
                 if self.splice_sites_usage_head is not None:
-                    outputs['splice_sites_usage'] = self.splice_sites_usage_head(
+                    outputs['splice_site_usage'] = self.splice_sites_usage_head(
                         embeddings_1bp, organism_index, channels_last=channels_last
                     )
 
@@ -660,7 +660,7 @@ class AlphaGenome(nn.Module):
                         top_k_positions = splice_site_positions
                     else:
                         # probs: (B, S, 5) NLC - already correct format for generate_splice_site_positions
-                        splice_site_probs = outputs['splice_sites_classification']['probs']
+                        splice_site_probs = outputs['splice_sites']['probs']
 
                         # If NCL (channels_last=False), transpose back to NLC for generate_splice_site_positions
                         if not channels_last:
@@ -674,7 +674,7 @@ class AlphaGenome(nn.Module):
                             pad_to_length=512,
                             threshold=0.1,
                         )
-                    outputs['splice_sites_junction'] = self.splice_sites_junction_head(
+                    outputs['splice_junctions'] = self.splice_sites_junction_head(
                         embeddings_1bp,
                         organism_index,
                         channels_last=channels_last,

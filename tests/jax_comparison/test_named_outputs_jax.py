@@ -29,10 +29,10 @@ _OUTPUT_TYPE_MAP = {
     "RNA_SEQ": "rna_seq",
     "CHIP_TF": "chip_tf",
     "CHIP_HISTONE": "chip_histone",
-    "CONTACT_MAPS": "pair_activations",
-    "SPLICE_SITES": "splice_sites_classification",
-    "SPLICE_SITE_USAGE": "splice_sites_usage",
-    "SPLICE_JUNCTIONS": "splice_sites_junction",
+    "CONTACT_MAPS": "contact_maps",
+    "SPLICE_SITES": "splice_sites",
+    "SPLICE_SITE_USAGE": "splice_site_usage",
+    "SPLICE_JUNCTIONS": "splice_junctions",
 }
 
 # JAX DataFrame column → PyTorch TrackMetadata field or extras key
