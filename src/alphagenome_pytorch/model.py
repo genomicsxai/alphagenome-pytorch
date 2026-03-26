@@ -114,7 +114,9 @@ class TransformerTower(nn.Module):
     def _forward_block(self, block, x, pair_x, compute_dtype):
         if block['pair_update'] is not None:
             pair_x = block['pair_update'](x, pair_x, compute_dtype=compute_dtype)
-        mha_bias = block['attn_bias'](pair_x)
+        # Bias is computed on pooled tokens, makes sure dim aligns with inputs
+        pad_left = (pair_x.shape[1] * 16 -x.shape[1])//2
+        mha_bias = block['attn_bias'](pair_x)[..., pad_left:pad_left+x.shape[1], pad_left:pad_left+x.shape[1]]
         x = x + block['mha'](x, mha_bias, compute_dtype=compute_dtype)
         x = x + block['mlp'](x)
         return x, pair_x
