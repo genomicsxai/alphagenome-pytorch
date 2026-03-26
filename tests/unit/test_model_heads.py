@@ -62,13 +62,13 @@ class TestHeadsParameter:
         assert "chip_tf" in result
         assert "chip_histone" in result
 
-    def test_pair_activations_head(self, model):
-        """pair_activations should be a valid head name."""
+    def test_contact_maps_head(self, model):
+        """contact_maps should be a valid head name."""
         dna = torch.randn(1, 131072, 4)
         organism = torch.tensor([0])
 
-        result = model(dna, organism, heads=("pair_activations",), resolutions=(128,))
-        assert "pair_activations" in result
+        result = model(dna, organism, heads=("contact_maps",), resolutions=(128,))
+        assert "contact_maps" in result
         # Other heads should NOT be in the result
         assert "atac" not in result
 
@@ -105,7 +105,7 @@ class TestHeadsParameter:
         model.contact_maps_head = None
         model.heads = torch.nn.ModuleDict()
 
-        result = model(dna, organism, heads=("splice_sites_junction",))
+        result = model(dna, organism, heads=("splice_junctions",))
 
-        assert "splice_sites_junction" in result
-        assert "splice_sites_classification" not in result
+        assert "splice_junctions" in result
+        assert "splice_sites" not in result

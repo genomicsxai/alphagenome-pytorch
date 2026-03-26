@@ -221,7 +221,7 @@ def cached_junction_with_shared_positions(
         jax_out = cached_jax_predictions[org_name]
 
         # Use the actual positions JAX used (from its junction output)
-        jax_positions = jax_out["splice_sites_junction"]["splice_site_positions"]
+        jax_positions = jax_out["splice_junctions"]["splice_site_positions"]
         positions_tensor = torch.tensor(jax_positions, dtype=torch.long, device=device)
 
         # Re-run PyTorch with JAX's actual positions
