@@ -14,12 +14,12 @@ project = 'AlphaGenome PyTorch'
 copyright = '2026, Kundaje Lab'
 author = 'Kundaje Lab'
 
-# Get version without importing the package (avoids torch dependency at build time)
+# Get version from installed package metadata (avoids importing torch)
+from importlib.metadata import version as get_version, PackageNotFoundError
 try:
-    from alphagenome_pytorch._version import __version__
-except ImportError:
-    __version__ = "0.0.0.dev0"
-release = __version__
+    release = get_version("alphagenome-pytorch")
+except PackageNotFoundError:
+    release = "0.0.0.dev0"
 
 # -- General configuration ---------------------------------------------------
 extensions = [
