@@ -276,12 +276,6 @@ def find_matching_api_scorer(pt_scorer, api_scores: list) -> 'anndata.AnnData | 
             pt_output = pt_scorer.requested_output.value.lower()
             api_output = api_scorer.requested_output.name.lower()
 
-            # Map PyTorch output names to JAX/API names
-            if pt_output == 'splice_sites_classification':
-                pt_output = 'splice_sites'
-            if api_output == 'splice_site_usage':
-                api_output = 'splice_sites_usage'
-
             if pt_output != api_output:
                 continue
             return adata

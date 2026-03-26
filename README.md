@@ -1,5 +1,9 @@
 # AlphaGenome PyTorch
 
+[![PyPI](https://img.shields.io/pypi/v/alphagenome-pytorch)](https://pypi.org/project/alphagenome-pytorch/)
+[![Documentation](https://readthedocs.org/projects/alphagenome-pytorch/badge/?version=latest)](https://alphagenome-pytorch.readthedocs.io)
+[![Weights](https://img.shields.io/badge/%F0%9F%A4%97-Weights-yellow)](https://huggingface.co/gtca/alphagenome_pytorch)
+
 A PyTorch port of [AlphaGenome](https://www.nature.com/articles/s41586-025-10014-0), the DNA sequence model from Google DeepMind that predicts hundreds of genomic tracks at single base-pair resolution from sequences up to 1M bp.
 
 We strive to make it an accessible, readable, and hackable implementation — for integrating into existing PyTorch pipelines, fine-tuning on custom datasets, and building on top of.
@@ -27,6 +31,8 @@ pip install alphagenome-pytorch[finetuning]  # adds pyBigWig, pyfaidx
 ## Quick Start
 
 ```python
+import torch
+import numpy as np
 from alphagenome_pytorch import AlphaGenome
 
 # Load pretrained model
@@ -35,17 +41,57 @@ model = AlphaGenome.from_pretrained('alphagenome.pt', device='cuda')
 # Create one-hot encoded DNA sequence in NLC format (batch=1, length=131072, channels=4)
 # Channels: A=0, C=1, G=2, T=3
 sequence = np.random.randint(0, 4, size=(1, 131072))
-dna_onehot = torch.tensor(np.eye(4)[sequence], dtype=torch.float32)
+dna_onehot = torch.tensor(np.eye(4)[sequence], dtype=torch.float32).cuda()
 
 # Inference (handles dtype casting, returns float32 outputs)
 outputs = model.predict(dna_onehot, organism_index=0)  # organism: 0=human, 1=mouse
-
-# outputs['atac'][1]   -> (B, 131072, 256) ATAC at 1bp
-# outputs['atac'][128] -> (B, 1024, 256) ATAC at 128bp
-# outputs['contact_maps'] -> (B, 28, 64, 64) 3D contact
 ```
 
 The weights for this port are [available on Hugging Face](https://huggingface.co/gtca/alphagenome_pytorch).
+
+### Output structure
+Each genomic-track head returns a dict mapping resolution → tensor:
+
+```python
+outputs['atac'][1]           # (1, 131072, 256)   ATAC-seq  at 1 bp
+outputs['atac'][128]         # (1, 1024,   256)   ATAC-seq  at 128 bp
+outputs['dnase'][1]          # (1, 131072, 384)   DNase     at 1 bp
+outputs['cage'][128]         # (1, 1024,   640)   CAGE      at 128 bp
+outputs['chip_histone'][128] # (1, 1024,   1152)  ChIP-hist at 128 bp only
+```
+
+Contact maps are returned as a single tensor (no resolution dict):
+
+```python
+outputs['contact_maps']      # (1, 64, 64, 28)   3D chromatin contacts
+```
+
+Splice heads return dicts of tensors:
+
+```python
+outputs['splice_sites']['probs']  # (1, 131072, 5)  splice site classes
+```
+
+### Padding
+
+Track dimensions are padded (e.g. ATAC has 167 real human
+tracks but the tensor has 256 channels).  Real tracks come first; the rest
+are zeros.  Use `named_outputs=True` to auto-strip padding:
+
+```python
+from alphagenome_pytorch.named_outputs import NamedOutputs, TrackMetadataCatalog
+catalog = TrackMetadataCatalog.load_builtin(organism=0)
+model.set_track_metadata_catalog(catalog)
+
+named = model.predict(dna_onehot, organism_index=0, named_outputs=True)
+named.atac[1].shape                  # (1, 131072, 167)  — padding removed
+named.atac[1].tracks[-1].track_name  # 'UBERON:0015143 ATAC-seq'
+
+# Filter by metadata
+named.rna_seq[128].select(strand='+')
+named.chip_tf[128].select(transcription_factor='CTCF')
+named.atac[1].select(biosample_type='tissue', ontology_curie='UBERON:0015143')
+```
 
 ## Extracting Embeddings
 
@@ -98,19 +144,21 @@ See a compiled [ARCHITECTURE_COMPARISON.md](ARCHITECTURE_COMPARISON.md) for some
 
 ## Model Outputs
 
-| Head | Tracks | Resolutions | Description |
-|------|--------|-------------|-------------|
-| atac | 256 | 1bp, 128bp | Chromatin accessibility |
-| dnase | 384 | 1bp, 128bp | DNase-seq |
-| procap | 128 | 1bp, 128bp | Transcription initiation |
-| cage | 640 | 1bp, 128bp | 5' cap RNA |
-| rnaseq | 768 | 1bp, 128bp | RNA expression |
-| chip_tf | 1664 | 128bp | TF binding |
-| chip_histone | 1152 | 128bp | Histone modifications |
-| contact_maps | 28 | 64×64 | 3D chromatin contacts |
-| splice_sites | 4 | 1bp | Splice site classification (D+, A+, D−, A−) |
-| splice_junctions | 734 | pairwise | Junction read counts (367 tissues × 2 strands) |
-| splice_site_usage | 734 | 1bp | Fraction of transcripts using splice site |
+| Head | Tracks (human) | Dimension (padded) | Resolutions | Description |
+|------|--------|-----------|-------------|-------------|
+| atac | 167 | 256 | 1bp, 128bp | Chromatin accessibility |
+| dnase | 305 | 384 | 1bp, 128bp | DNase-seq |
+| procap | 12 | 128 | 1bp, 128bp | Transcription initiation |
+| cage | 546 | 640 | 1bp, 128bp | 5' cap RNA |
+| rna_seq | 667 | 768 | 1bp, 128bp | RNA expression |
+| chip_tf | 1617 | 1664 | 128bp | TF binding |
+| chip_histone | 1116 | 1152 | 128bp | Histone modifications |
+| contact_maps | 28 | 28 | 64×64 | 3D chromatin contacts |
+| splice_sites | 5 | 5 | 1bp | Splice site classification (D+, A+, D−, A−, none) |
+| splice_junctions | 734 | 734 | pairwise | Junction read counts (367 tissues × 2 strands) |
+| splice_site_usage | 734 | 734 | 1bp | Fraction of transcripts using splice site |
+
+Tracks column shows the number of real human tracks (without padding). Dimension is the raw output tensor size — padding fills the gap. When using `named_outputs=True`, padding is stripped by default. See [named outputs guide](docs/named_outputs.rst) for details.
 
 See more information about model outputs [in the official AlphaGenome documentation](https://www.alphagenomedocs.com/exploring_model_metadata.html).
 

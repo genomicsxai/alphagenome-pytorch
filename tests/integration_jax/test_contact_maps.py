@@ -17,7 +17,7 @@ class TestContactMaps:
     """Contact Maps head comparison tests."""
 
     HEAD_NAME = "contact_maps"
-    PYTORCH_KEY = "pair_activations"  # PyTorch uses this key
+    PYTORCH_KEY = "contact_maps"
     NUM_TRACKS = 28
 
     @pytest.mark.parametrize("organism", ["human", "mouse"])
