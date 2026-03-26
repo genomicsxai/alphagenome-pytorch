@@ -8,7 +8,7 @@ ontology) rather than raw channel indices.
 
 .. contents:: On this page
    :local:
-   :depth: 2
+   :depth: 1
 
 Setup
 -----
