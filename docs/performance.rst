@@ -1,5 +1,5 @@
-Performance
-===========
+Performance Tips
+================
 
 This page covers techniques for making AlphaGenome inference and training faster
 and more memory-efficient.

@@ -33,6 +33,10 @@ Alternatively, you can use the standard PyTorch ``.load_state_dict()``:
    # Load weights and buffers
    model.load_state_dict(state_dict, strict=False)
 
+
+The weights for the all-folds model as well as for each fold are `available on Hugging Face <https://huggingface.co/gtca/alphagenome_pytorch>`_. They were generated from the `JAX checkpoints <https://www.kaggle.com/models/google/alphagenome>`_ using `this scripts <https://github.com/kundajelab/alphagenome-pytorch/blob/main/scripts/convert_weights.py>`_.
+
+
 Preparing Input
 ---------------
 
@@ -41,7 +45,7 @@ where the 4 channels represent A, C, G, T nucleotides in that order.
 
 .. code-block:: python
 
-   from alphagenome_pytorch.extensions.finetuning import (
+   from alphagenome_pytorch.utils.sequence import (
        sequence_to_onehot,
        onehot_to_sequence,
    )
@@ -62,7 +66,7 @@ In real-world scenarios you would likely be loading regions from a reference gen
 
    import torch
    from pyfaidx import Fasta
-   from alphagenome_pytorch.extensions.finetuning import sequence_to_onehot
+   from alphagenome_pytorch.utils.sequence import sequence_to_onehot
 
    # Extract a 1MB region
    with Fasta('hg38.fa') as genome:
