@@ -7,6 +7,7 @@ the AlphaGenome PyTorch model.
 from __future__ import annotations
 
 import gc
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -316,6 +317,7 @@ class VariantScoringModel:
         Returns:
             Dictionary of model outputs
         """
+        print("PREDICT START")
         organism_index = self._resolve_organism_index(organism)
         
         if isinstance(sequence, str):
@@ -365,6 +367,12 @@ class VariantScoringModel:
         Returns:
             Tuple of (ref_outputs, alt_outputs) dictionaries.
         """
+        print("PREDICT VARIANT START")
+        offload_between_passes = (
+            self.device.type == "cuda"
+            and os.getenv("ALPHAGENOME_VARIANT_OFFLOAD_BETWEEN_PASSES", "1") != "0"
+        )
+
         # Handle indels: for deletions, extend extraction to compensate for
         # sequence shrinkage. For insertions, the alt is longer and gets
         # truncated. Both ref and alt are truncated to the original interval
@@ -389,18 +397,27 @@ class VariantScoringModel:
             base_seq, variant, extraction_interval
         )[:interval_length]
 
-        # First pass: Get standard predictions with embeddings if needed
-        return_embeddings = unified_splicing
-        ref_outputs = self.predict(ref_seq, organism, return_embeddings=return_embeddings)
-        alt_outputs = self.predict(alt_seq, organism, return_embeddings=return_embeddings)
-
         if unified_splicing:
-            # Calculate unified splice site positions (max of Ref and Alt)
+            print("PREDICT VARIANT PASS #1")
+            # Pass 1: get only splice classification to build unified positions.
             from ..utils.splicing import generate_splice_site_positions
             
-            ref_probs = ref_outputs['splice_sites_classification']['probs']
-            alt_probs = alt_outputs['splice_sites_classification']['probs']
-            
+            ref_cls = self.predict(
+                ref_seq,
+                organism,
+                heads=['splice_sites_classification'],
+                return_embeddings=False,
+            )
+            alt_cls = self.predict(
+                alt_seq,
+                organism,
+                heads=['splice_sites_classification'],
+                return_embeddings=False,
+            )
+
+            ref_probs = ref_cls['splice_sites_classification']['probs']
+            alt_probs = alt_cls['splice_sites_classification']['probs']
+
             # Use max(Ref, Alt) to determine sites
             unified_positions = generate_splice_site_positions(
                 ref=ref_probs,
@@ -410,46 +427,38 @@ class VariantScoringModel:
                 pad_to_length=512,
                 threshold=0.1,
             )
-            
-            # Second pass: Re-run just the splice junction head with unified positions
-            organism_index = self._resolve_organism_index(organism)
-            
-            def _run_head_with_positions(outputs, pos):
-                # Ensure we have the embeddings
-                if 'embeddings_1bp' not in outputs:
-                     raise ValueError("Embeddings missing from first pass")
-
-                emb = outputs['embeddings_1bp']
-                batch_size = emb.shape[0]
-                org_idx = torch.full((batch_size,), organism_index, dtype=torch.long, device=self.device)
-
-                # Run just the junction head
-                # Note: The head expects embeddings_1bp in NCL format (B, C, S)
-                # but predict() returns them in NLC format (B, S, C) when channels_last=True
-                # Transpose to NCL format for the head
-                emb_ncl = emb.transpose(1, 2)
-                junction_out = self.model.splice_sites_junction_head(
-                    emb_ncl,
-                    org_idx,
-                    splice_site_positions=pos
-                )
-                
-                # Update outputs
-                outputs['splice_sites_junction'] = junction_out
-                return outputs
-
-            ref_outputs = _run_head_with_positions(ref_outputs, unified_positions)
-            alt_outputs = _run_head_with_positions(alt_outputs, unified_positions)
-            
-            # Remove embeddings to save memory / cleanup
-            for out in [ref_outputs, alt_outputs]:
-                out.pop('embeddings_1bp', None)
-                out.pop('embeddings_128bp', None)
+            # Pass 2: run full predictions once with fixed unified positions.
+            print("PREDICT VARIANT PASS #2 ref_outputs")
+            ref_outputs = self.predict(
+                ref_seq,
+                organism,
+                splice_site_positions=unified_positions,
+                return_embeddings=False,
+            )
+            if offload_between_passes:
+                ref_outputs = self._outputs_to_cpu(ref_outputs)
+                gc.collect()
+                torch.cuda.empty_cache()
+            print("PREDICT VARIANT PASS #2 alt_outputs")
+            alt_outputs = self.predict(
+                alt_seq,
+                organism,
+                splice_site_positions=unified_positions,
+                return_embeddings=False,
+            )
+        else:
+            print("PREDICT VARIANT PASS #1")
+            ref_outputs = self.predict(ref_seq, organism, return_embeddings=False)
+            if offload_between_passes:
+                ref_outputs = self._outputs_to_cpu(ref_outputs)
+                gc.collect()
+                torch.cuda.empty_cache()
+            alt_outputs = self.predict(alt_seq, organism, return_embeddings=False)
 
         # Move ref to CPU before alt prediction to free GPU memory
         # logic for to_cpu handled at end or between
         
-        if to_cpu:
+        if to_cpu or offload_between_passes:
             ref_outputs = self._outputs_to_cpu(ref_outputs)
             alt_outputs = self._outputs_to_cpu(alt_outputs)
             gc.collect()
@@ -491,6 +500,7 @@ class VariantScoringModel:
         Returns:
             List of VariantScore objects
         """
+        print("SCORE VARIANT START")
         organism_index = self._resolve_organism_index(organism)
 
         # Check if we need unified splicing pass
@@ -501,7 +511,11 @@ class VariantScoringModel:
 
         # Get predictions
         ref_outputs, alt_outputs = self.predict_variant(
-            interval, variant, organism, unified_splicing=unified_splicing
+            interval,
+            variant,
+            organism,
+            to_cpu=to_cpu,
+            unified_splicing=unified_splicing,
         )
 
         # Use instance gene annotation if not provided
@@ -565,6 +579,7 @@ class VariantScoringModel:
         Returns:
             Nested list: outer list is per variant, inner list is per scorer
         """
+        print("SCORE VARIANTS START")
         # Handle single interval for all variants
         if isinstance(intervals, Interval):
             intervals = [intervals] * len(variants)
@@ -649,6 +664,7 @@ class VariantScoringModel:
             ...     window_size=21,
             ... )
         """
+        print("SCORE ISM VARIANTS START")
         # Get reference sequence
         ref_seq = self.get_sequence(interval)
 
@@ -703,6 +719,7 @@ class VariantScoringModel:
         Returns:
             pd.DataFrame
         """
+        print("TIDY SCORE START")
         # Resolve organism for metadata
         # (This handles the case where user might want to tidy mouse scores using mouse metadata)
         idx = self._resolve_organism_index(organism)
@@ -747,6 +764,7 @@ class VariantScoringModel:
             >>> variants = [...]  # Same order as ism_scores
             >>> matrix = scorer.ism_matrix(flat_scores, variants, interval)
         """
+        print("ISM MATRIX START")
         import numpy as np
 
         scores = np.zeros((interval.width, len(vocabulary)), dtype=np.float32)
