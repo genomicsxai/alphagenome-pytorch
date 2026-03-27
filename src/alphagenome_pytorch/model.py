@@ -8,6 +8,7 @@ from torch.utils.checkpoint import checkpoint
 
 from . import layers, convolutions, attention, embeddings, heads
 from .config import DtypePolicy
+from .named_outputs import NamedOutputs, TrackMetadataCatalog
 from alphagenome_pytorch.utils.splicing import generate_splice_site_positions
 
 class SequenceEncoder(nn.Module):
@@ -303,6 +304,8 @@ class AlphaGenome(nn.Module):
             num_tracks_per_organism=splice_junction_tracks_per_organism,
         )
 
+        self._track_metadata_catalog: TrackMetadataCatalog | None = None
+
         # Convert model parameters to params_dtype
         # JAX keeps params in float32 even when computing in bfloat16
         if self.dtype_policy.params_dtype != torch.float32:
@@ -399,6 +402,57 @@ class AlphaGenome(nn.Module):
                 )
 
         return model
+
+    def set_track_metadata_catalog(self, catalog: TrackMetadataCatalog) -> None:
+        """Attach a metadata catalog used by named output views."""
+        self._track_metadata_catalog = catalog
+
+    def load_track_metadata(
+        self,
+        metadata_path: str | Path,
+        *,
+        default_organism: int = 0,
+        default_output_name: str | None = None,
+    ) -> TrackMetadataCatalog:
+        """Load track metadata (parquet/csv/tsv) and attach it to the model."""
+        catalog = TrackMetadataCatalog.from_file(
+            metadata_path,
+            default_organism=default_organism,
+            default_output_name=default_output_name,
+        )
+        self._track_metadata_catalog = catalog
+        return catalog
+
+    def named_outputs(
+        self,
+        outputs: dict,
+        *,
+        organism: int | str | torch.Tensor | None = None,
+        strict_metadata: bool = False,
+        metadata_catalog: TrackMetadataCatalog | None = None,
+        channels_last: bool = True,
+        include_padding: bool = False,
+    ) -> NamedOutputs:
+        """Wrap raw model outputs with metadata-aware named views.
+
+        Args:
+            outputs: Raw model output dict.
+            organism: Organism index or name.
+            strict_metadata: If True, raise on missing/mismatched metadata.
+            metadata_catalog: Override the model's attached catalog.
+            channels_last: If True, track axis is last dimension.
+            include_padding: If True, keep padding tracks. If False
+                (default), padding tracks are stripped.
+        """
+        catalog = metadata_catalog if metadata_catalog is not None else self._track_metadata_catalog
+        return NamedOutputs.from_raw(
+            outputs,
+            organism=organism,
+            catalog=catalog,
+            strict_metadata=strict_metadata,
+            channels_last=channels_last,
+            include_padding=include_padding,
+        )
 
     @classmethod
     def from_delta(
@@ -644,13 +698,13 @@ class AlphaGenome(nn.Module):
             # Build set of all valid head names
             valid_heads = set(self.heads.keys())
             if self.contact_maps_head is not None:
-                valid_heads.add('pair_activations')
+                valid_heads.add('contact_maps')
             if self.splice_sites_classification_head is not None:
-                valid_heads.add('splice_sites_classification')
+                valid_heads.add('splice_sites')
             if self.splice_sites_usage_head is not None:
-                valid_heads.add('splice_sites_usage')
+                valid_heads.add('splice_site_usage')
             if self.splice_sites_junction_head is not None:
-                valid_heads.add('splice_sites_junction')
+                valid_heads.add('splice_junctions')
 
             # Check for unknown heads
             unknown_heads = set(heads) - valid_heads
@@ -685,25 +739,25 @@ class AlphaGenome(nn.Module):
                     channels_last=channels_last,
                 )
 
-            # Contact Maps (pair activations format)
+            # Contact Maps
             if self.contact_maps_head is not None:
-                if head_set is None or 'pair_activations' in head_set:
-                    outputs['pair_activations'] = self.contact_maps_head(
+                if head_set is None or 'contact_maps' in head_set:
+                    outputs['contact_maps'] = self.contact_maps_head(
                         embeddings_pair, organism_index, channels_last=channels_last
                     )
 
             # Splice predictions (require 1bp embeddings)
             need_splice = head_set is None or any(
-                k in head_set for k in ('splice_sites_classification', 'splice_sites_usage', 'splice_sites_junction')
+                k in head_set for k in ('splice_sites', 'splice_site_usage', 'splice_junctions')
             )
             if need_1bp and need_splice:
                 # Also compute classification when junction needs it for position generation
                 classification_output = None
                 need_classification = (
                     head_set is None
-                    or 'splice_sites_classification' in head_set
+                    or 'splice_sites' in head_set
                     or (
-                        'splice_sites_junction' in head_set
+                        'splice_junctions' in head_set
                         and splice_site_positions is None
                     )
                 )
@@ -711,24 +765,24 @@ class AlphaGenome(nn.Module):
                     classification_output = self.splice_sites_classification_head(
                         embeddings_1bp, organism_index, channels_last=channels_last
                     )
-                    if head_set is None or 'splice_sites_classification' in head_set:
-                        outputs['splice_sites_classification'] = classification_output
+                    if head_set is None or 'splice_sites' in head_set:
+                        outputs['splice_sites'] = classification_output
                 if self.splice_sites_usage_head is not None:
-                    if head_set is None or 'splice_sites_usage' in head_set:
-                        outputs['splice_sites_usage'] = self.splice_sites_usage_head(
+                    if head_set is None or 'splice_site_usage' in head_set:
+                        outputs['splice_site_usage'] = self.splice_sites_usage_head(
                             embeddings_1bp, organism_index, channels_last=channels_last
                         )
 
                 if self.splice_sites_junction_head is not None:
-                    if head_set is None or 'splice_sites_junction' in head_set:
+                    if head_set is None or 'splice_junctions' in head_set:
                         # Use provided positions if given, otherwise generate from classification
                         if splice_site_positions is not None:
                             top_k_positions = splice_site_positions
                         else:
                             if classification_output is None:
                                 raise ValueError(
-                                    "splice_sites_junction requires either splice_site_positions "
-                                    "or an available splice_sites_classification head"
+                                    "splice_junctions requires either splice_site_positions "
+                                    "or an available splice_sites classification head"
                                 )
                             # probs: (B, S, 5) NLC - already correct format for generate_splice_site_positions
                             splice_site_probs = classification_output['probs']
@@ -745,7 +799,7 @@ class AlphaGenome(nn.Module):
                                 pad_to_length=512,
                                 threshold=0.1,
                             )
-                        outputs['splice_sites_junction'] = self.splice_sites_junction_head(
+                        outputs['splice_junctions'] = self.splice_sites_junction_head(
                             embeddings_1bp,
                             organism_index,
                             channels_last=channels_last,
@@ -799,8 +853,11 @@ class AlphaGenome(nn.Module):
         self,
         dna_sequence: torch.Tensor,
         organism_index: Union[torch.Tensor, int],
+        named_outputs: bool = False,
+        strict_metadata: bool = False,
+        include_padding: bool = False,
         **kwargs,
-    ) -> dict:
+    ) -> dict | NamedOutputs:
         """Inference-mode forward pass with automatic dtype handling.
 
         Wraps forward() with:
@@ -816,11 +873,20 @@ class AlphaGenome(nn.Module):
             dna_sequence: One-hot encoded DNA sequence (B, S, 4). Can be any
                 float dtype — autocast handles weight/input casting.
             organism_index: Organism index per batch (B,). 0=human, 1=mouse.
+            named_outputs: If True, return a ``NamedOutputs`` wrapper instead
+                of a raw dict.
+            strict_metadata: If True, raise when metadata is missing or
+                mismatched for named outputs. If False, fallback placeholders
+                are used.
+            include_padding: If True, keep padding tracks in named outputs.
+                If False (default), padding tracks are stripped. Only applies
+                when ``named_outputs=True``.
             **kwargs: Additional arguments passed to forward()
                 (e.g., return_embeddings, resolutions).
 
         Returns:
-            Dict of predictions with all floating-point tensors in float32.
+            Dict of predictions with all floating-point tensors in float32, or
+            ``NamedOutputs`` when ``named_outputs=True``.
         """
         device_type = "cuda" if dna_sequence.is_cuda else "cpu"
         use_amp = self.dtype_policy.compute_dtype != torch.float32
@@ -839,4 +905,13 @@ class AlphaGenome(nn.Module):
         with torch.autocast(device_type=device_type, dtype=self.dtype_policy.compute_dtype, enabled=use_amp):
             outputs = self.forward(dna_sequence, organism_index, **kwargs)
 
-        return self._upcast_outputs(outputs)
+        upcast_outputs = self._upcast_outputs(outputs)
+        if named_outputs:
+            return self.named_outputs(
+                upcast_outputs,
+                organism=organism_index,
+                strict_metadata=strict_metadata,
+                channels_last=kwargs.get("channels_last", True),
+                include_padding=include_padding,
+            )
+        return upcast_outputs

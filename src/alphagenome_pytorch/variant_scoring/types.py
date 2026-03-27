@@ -25,10 +25,10 @@ class OutputType(enum.Enum):
     RNA_SEQ = 'rna_seq'
     CHIP_HISTONE = 'chip_histone'
     CHIP_TF = 'chip_tf'
-    SPLICE_SITES = 'splice_sites_classification'
-    SPLICE_SITE_USAGE = 'splice_sites_usage'
-    SPLICE_JUNCTIONS = 'splice_sites_junction'
-    CONTACT_MAPS = 'pair_activations'
+    SPLICE_SITES = 'splice_sites'
+    SPLICE_SITE_USAGE = 'splice_site_usage'
+    SPLICE_JUNCTIONS = 'splice_junctions'
+    CONTACT_MAPS = 'contact_maps'
 
 import enum
 

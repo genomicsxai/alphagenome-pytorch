@@ -136,20 +136,20 @@ def compute_combined_loss(outputs: Dict, include_splice: bool = False) -> torch.
                     loss = loss + torch.nanmean(pred)
 
     # Contact maps
-    if "pair_activations" in outputs:
-        loss = loss + outputs["pair_activations"].mean()
+    if "contact_maps" in outputs:
+        loss = loss + outputs["contact_maps"].mean()
 
     # Splice heads - excluded by default to match JAX parity testing
     # JAX side comments these out due to known forward pass differences
     # See tests/integration/conftest.py lines 214-227
     if include_splice:
-        if "splice_sites_classification" in outputs:
-            loss = loss + outputs["splice_sites_classification"]["logits"].mean()
-        if "splice_sites_usage" in outputs:
-            loss = loss + outputs["splice_sites_usage"]["logits"].mean()
+        if "splice_sites" in outputs:
+            loss = loss + outputs["splice_sites"]["logits"].mean()
+        if "splice_site_usage" in outputs:
+            loss = loss + outputs["splice_site_usage"]["logits"].mean()
         # Skip junction - too memory intensive for gradient testing
-        # if "splice_sites_junction" in outputs:
-        #     loss = loss + outputs["splice_sites_junction"]["pred_counts"].mean()
+        # if "splice_junctions" in outputs:
+        #     loss = loss + outputs["splice_junctions"]["pred_counts"].mean()
 
     return loss
 
@@ -189,19 +189,19 @@ def compute_per_head_losses(outputs: Dict) -> Dict[str, torch.Tensor]:
             losses[head_name] = head_loss
 
     # Contact maps
-    if "pair_activations" in outputs:
-        losses["contact_maps"] = outputs["pair_activations"].mean()
+    if "contact_maps" in outputs:
+        losses["contact_maps"] = outputs["contact_maps"].mean()
 
     # Splice heads (reported separately for debugging)
-    if "splice_sites_classification" in outputs:
-        losses["splice_sites_classification"] = (
-            outputs["splice_sites_classification"]["logits"].mean()
+    if "splice_sites" in outputs:
+        losses["splice_sites"] = (
+            outputs["splice_sites"]["logits"].mean()
         )
-    if "splice_sites_usage" in outputs:
-        losses["splice_sites_usage"] = outputs["splice_sites_usage"]["logits"].mean()
-    if "splice_sites_junction" in outputs:
-        losses["splice_sites_junction"] = (
-            outputs["splice_sites_junction"]["pred_counts"].mean()
+    if "splice_site_usage" in outputs:
+        losses["splice_site_usage"] = outputs["splice_site_usage"]["logits"].mean()
+    if "splice_junctions" in outputs:
+        losses["splice_junctions"] = (
+            outputs["splice_junctions"]["pred_counts"].mean()
         )
 
     return losses
@@ -226,17 +226,17 @@ def compute_head_loss(outputs: Dict, head_name: str) -> torch.Tensor:
             loss = loss + torch.nanmean(pred)
         return loss
 
-    elif head_name == "pair_activations":
-        return outputs["pair_activations"].mean()
+    elif head_name == "contact_maps":
+        return outputs["contact_maps"].mean()
 
-    elif head_name == "splice_sites_classification":
-        return outputs["splice_sites_classification"]["logits"].mean()
+    elif head_name == "splice_sites":
+        return outputs["splice_sites"]["logits"].mean()
 
-    elif head_name == "splice_sites_usage":
-        return outputs["splice_sites_usage"]["logits"].mean()
+    elif head_name == "splice_site_usage":
+        return outputs["splice_site_usage"]["logits"].mean()
 
-    elif head_name == "splice_sites_junction":
-        return outputs["splice_sites_junction"]["pred_counts"].mean()
+    elif head_name == "splice_junctions":
+        return outputs["splice_junctions"]["pred_counts"].mean()
 
     else:
         raise ValueError(f"Unknown head name: {head_name}")

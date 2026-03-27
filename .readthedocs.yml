@@ -9,6 +9,11 @@ build:
   os: ubuntu-24.04
   tools:
     python: "3.13"
+  jobs:
+    # Install the package without dependencies so hatch-vcs writes _version.py
+    # and importlib.metadata can resolve the version (avoids installing torch).
+    post_install:
+      - pip install --no-deps .
 
 # Build documentation in the "docs/" directory with Sphinx
 sphinx:

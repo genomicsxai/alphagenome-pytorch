@@ -11,12 +11,15 @@ sys.path.insert(0, os.path.abspath('../src'))
 
 # -- Project information -----------------------------------------------------
 project = 'AlphaGenome PyTorch'
-copyright = '2025, Kundaje Lab'
+copyright = '2026, Kundaje Lab'
 author = 'Kundaje Lab'
 
-# Get version dynamically from the package
-from alphagenome_pytorch import __version__
-release = __version__
+# Get version from installed package metadata (avoids importing torch)
+from importlib.metadata import version as get_version, PackageNotFoundError
+try:
+    release = get_version("alphagenome-pytorch")
+except PackageNotFoundError:
+    release = "0.0.0.dev0"
 
 # -- General configuration ---------------------------------------------------
 extensions = [
@@ -58,6 +61,9 @@ intersphinx_mapping = {
     'torch': ('https://pytorch.org/docs/stable', None),
     'numpy': ('https://numpy.org/doc/stable', None),
 }
+
+# Mock heavy imports so docs build without torch installed
+autodoc_mock_imports = ['torch']
 
 # Autodoc settings
 autodoc_default_options = {
