@@ -121,28 +121,28 @@ class TestSequenceLengthForward:
             resolutions=resolutions,
         )
 
-        assert outputs["pair_activations"].shape == (
+        assert outputs["contact_maps"].shape == (
             1,
             expected_pair_tokens,
             expected_pair_tokens,
             28,
-        ), f"{case}: unexpected pair_activations shape"
+        ), f"{case}: unexpected contact_maps shape"
 
         if expect_1bp_embeddings:
-            classification = outputs["splice_sites_classification"]
+            classification = outputs["splice_sites"]
             assert classification["logits"].shape == (1, sequence_length, 5), case
             assert classification["probs"].shape == (1, sequence_length, 5), case
 
-            usage = outputs["splice_sites_usage"]
+            usage = outputs["splice_site_usage"]
             assert usage["logits"].shape == (1, sequence_length, 734), case
             assert usage["predictions"].shape == (1, sequence_length, 734), case
             assert usage["track_mask"].shape == (1, 1, 734), case
 
-            junction = outputs["splice_sites_junction"]
+            junction = outputs["splice_junctions"]
             assert junction["pred_counts"].shape == (1, 512, 512, 734), case
             assert junction["splice_site_positions"].shape == (1, 4, 512), case
             assert junction["splice_junction_mask"].shape == (1, 512, 512, 734), case
         else:
-            assert "splice_sites_classification" not in outputs, case
-            assert "splice_sites_usage" not in outputs, case
-            assert "splice_sites_junction" not in outputs, case
+            assert "splice_sites" not in outputs, case
+            assert "splice_site_usage" not in outputs, case
+            assert "splice_junctions" not in outputs, case
