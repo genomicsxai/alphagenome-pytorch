@@ -1,5 +1,6 @@
 from typing import Optional, Tuple, Union
 from pathlib import Path
+import os
 import warnings
 
 import torch
@@ -9,6 +10,25 @@ from torch.utils.checkpoint import checkpoint
 from . import layers, convolutions, attention, embeddings, heads
 from .config import DtypePolicy
 from alphagenome_pytorch.utils.splicing import generate_splice_site_positions
+
+def _debug_memory(tag: str, x: torch.Tensor | None = None):
+    """Optional CUDA memory/debug logger controlled by env var.
+
+    Enable with: ALPHAGENOME_DEBUG_MEMORY=1
+    """
+    if os.getenv("ALPHAGENOME_DEBUG_MEMORY", "0") == "0":
+        return
+    if not torch.cuda.is_available():
+        return
+    alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+    reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+    max_alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    shape_str = f", shape={tuple(x.shape)}" if x is not None else ""
+    print(
+        f"[model.py][memory] {tag}{shape_str} | "
+        f"alloc={alloc:.2f} GiB reserved={reserved:.2f} GiB max={max_alloc:.2f} GiB"
+    )
+
 
 class SequenceEncoder(nn.Module):
     """Encodes DNA sequence to trunk representation. Outputs NCL format (B, C, S)."""
@@ -31,11 +51,14 @@ class SequenceEncoder(nn.Module):
     def forward(self, x):
         # x input: (B, S, 4) from user - NLC format
         x = x.transpose(1, 2)  # → (B, 4, S) NCL format
+        # _debug_memory("encoder.input_ncl", x)
 
         intermediates = {}
         x = self.dna_embedder(x)
+        # _debug_memory("encoder.after_dna_embedder", x)
         intermediates['bin_size_1'] = x
         x = self.pool(x)
+        # _debug_memory("encoder.after_pool_bin1", x)
 
         for i, block in enumerate(self.down_blocks):
             if self.gradient_checkpointing and torch.is_grad_enabled():
@@ -43,8 +66,10 @@ class SequenceEncoder(nn.Module):
             else:
                 x = block(x)
             bin_size = self.bin_sizes[i]
+            # _debug_memory(f"encoder.after_down_block_bin{bin_size}", x)
             intermediates[f'bin_size_{bin_size}'] = x
             x = self.pool(x)
+            # _debug_memory(f"encoder.after_pool_bin{bin_size}", x)
 
         # x: (B, 1536, 1024), intermediates: all NCL
         return x, intermediates
@@ -77,13 +102,16 @@ class SequenceDecoder(nn.Module):
 
     def forward(self, x, intermediates):
         # x: (B, C, S) - NCL format
+        # _debug_memory("decoder.input", x)
         for i, bin_size in enumerate(self.bin_sizes):
             block = self.up_blocks[i]
             skip = intermediates.pop(f'bin_size_{bin_size}')
+            # _debug_memory(f"decoder.skip_bin{bin_size}", skip)
             if self.gradient_checkpointing and torch.is_grad_enabled():
                 x = checkpoint(block, x, skip, use_reentrant=False)
             else:
                 x = block(x, skip)
+                # _debug_memory(f"decoder.after_up_block_bin{bin_size}", x)
             del skip
         return x  # (B, 768, S) - NCL format
 
@@ -661,9 +689,30 @@ class AlphaGenome(nn.Module):
         else:
             head_set = None
 
+        # If caller selected specific heads but did not set resolutions, infer the
+        # minimal required resolutions to avoid unnecessary 1bp decoder/embeddings.
+        effective_resolutions = resolutions
+        if resolutions is None and head_set is not None:
+            need_1bp_for_splice = any(
+                k in head_set for k in (
+                    'splice_sites_classification',
+                    'splice_sites_usage',
+                    'splice_sites_junction',
+                )
+            )
+            need_1bp_for_tracks = any(
+                name in self.heads
+                and 1 in getattr(self.heads[name], 'resolutions', [])
+                for name in head_set
+            )
+            if need_1bp_for_splice or need_1bp_for_tracks:
+                effective_resolutions = (1, 128)
+            else:
+                effective_resolutions = (128,)
+
         # Compute embeddings (NCL format internally)
         embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = \
-            self._compute_embeddings_ncl(dna_sequence, organism_index, resolutions)
+            self._compute_embeddings_ncl(dna_sequence, organism_index, effective_resolutions)
 
         if need_1bp:
             embeddings_dict = {1: embeddings_1bp, 128: embeddings_128bp}
@@ -671,7 +720,13 @@ class AlphaGenome(nn.Module):
             embeddings_dict = {128: embeddings_128bp}
 
         # ===== HEADS =====
+        _debug_memory("model.forward - post embeddings")
         outputs = {}
+
+        self.encoder.cpu()
+        self.tower.cpu()
+        self.decoder.cpu()
+        _debug_memory("model.forward - post offload model")
 
         if not embeddings_only:
             for name, head in self.heads.items():
@@ -682,7 +737,7 @@ class AlphaGenome(nn.Module):
                     return_scaled=return_scaled_predictions,
                     channels_last=channels_last,
                 )
-
+            _debug_memory("model.forward - post heads call")
             # Contact Maps (pair activations format)
             if self.contact_maps_head is not None:
                 if head_set is None or 'pair_activations' in head_set:
@@ -711,12 +766,13 @@ class AlphaGenome(nn.Module):
                     )
                     if head_set is None or 'splice_sites_classification' in head_set:
                         outputs['splice_sites_classification'] = classification_output
+                _debug_memory("model.forward - post splice_sites_classification_head")
                 if self.splice_sites_usage_head is not None:
                     if head_set is None or 'splice_sites_usage' in head_set:
                         outputs['splice_sites_usage'] = self.splice_sites_usage_head(
                             embeddings_1bp, organism_index, channels_last=channels_last
                         )
-
+                _debug_memory("model.forward - post splice_sites_usage_head")
                 if self.splice_sites_junction_head is not None:
                     if head_set is None or 'splice_sites_junction' in head_set:
                         # Use provided positions if given, otherwise generate from classification
@@ -749,7 +805,10 @@ class AlphaGenome(nn.Module):
                             channels_last=channels_last,
                             splice_site_positions=top_k_positions,
                         )
-
+                    _debug_memory("model.forward - post splice_sites_junction")
+        self.encoder.to(dna_sequence.device)
+        self.decoder.to(dna_sequence.device)
+        self.tower.to(dna_sequence.device)
         if return_embeddings or embeddings_only:
             if channels_last:
                 if need_1bp:

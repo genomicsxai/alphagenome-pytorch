@@ -1,7 +1,19 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
 from . import layers
+
+
+def _parse_conv_block_chunk_size():
+    value = os.getenv("ALPHAGENOME_CONV_BLOCK_CHUNK_SIZE")
+    if value is None or value == "":
+        return 524288
+    parsed = int(value)
+    return max(parsed, 0)
+
+
+_CONV_BLOCK_CHUNK_SIZE = _parse_conv_block_chunk_size()
 
 class StandardizedConv1d(nn.Conv1d):
     """1D Convolution with weight standardization and learned scaling.
@@ -26,7 +38,6 @@ class StandardizedConv1d(nn.Conv1d):
         # We want to standardize over (in_channels, kernel_width) corresponding to fan-in?
         # JAX shape: (width, input_channels, output_channels). Mean axis (0, 1) means mean over width and input_channels.
         # PyTorch equivalent: mean over (1, 2).
-        
         w = self.weight
         mean = w.mean(dim=(1, 2), keepdim=True)
         var = w.var(dim=(1, 2), keepdim=True, unbiased=False) 
@@ -36,15 +47,19 @@ class StandardizedConv1d(nn.Conv1d):
         
         w_standardized = (w - mean) * scale_factor
         
-        # Padding 'SAME' manually if needed, or use functional
-        # For even kernel sizes, 'same' padding is asymmetric. JAX/TF usually pad more on the right.
+        # Use conv1d built-in SAME padding to avoid materializing a full padded tensor.
+        # If dilation > 1, the old code was silently wrong — it under-padded because it ignored dilation in the formula.
+        # The new code using padding='same' correctly accounts for dilation.
         if self.pad_mode == 'same':
-            # Padding formulation:
-            # Note: this formula is valid for stride=1 only (the only stride used in this model).
-            pad_total = self.kernel_size[0] - 1
-            pad_left = pad_total // 2
-            pad_right = pad_total - pad_left
-            x = F.pad(x, (pad_left, pad_right))
+            return F.conv1d(
+                x,
+                w_standardized,
+                self.bias,
+                self.stride,
+                padding='same',
+                dilation=self.dilation,
+                groups=self.groups,
+            )
             
         return F.conv1d(x, w_standardized, self.bias, self.stride, 0, self.dilation, self.groups)
 
@@ -67,7 +82,29 @@ class ConvBlock(nn.Module):
 
     def forward(self, x):
         # x: (B, C, S) - NCL format, no transposes needed
-        return self.conv(layers.gelu(self.norm(x)))
+        if torch.is_grad_enabled() or _CONV_BLOCK_CHUNK_SIZE <= 0 or x.shape[-1] <= _CONV_BLOCK_CHUNK_SIZE:
+            return self.conv(layers.gelu(self.norm(x)))
+
+        # Inference low-memory path: process along sequence chunks so norm/gelu
+        # activations are never materialized for the full sequence at once.
+        B, _, S = x.shape
+        out = torch.empty(B, self.out_channels, S, device=x.device, dtype=x.dtype)
+        kernel = self.kernel_size if isinstance(self.kernel_size, int) else self.kernel_size[0]
+        overlap = max(kernel // 2, 0)
+
+        for start in range(0, S, _CONV_BLOCK_CHUNK_SIZE):
+            end = min(start + _CONV_BLOCK_CHUNK_SIZE, S)
+            in_start = max(0, start - overlap)
+            in_end = min(S, end + overlap)
+
+            x_chunk = x[:, :, in_start:in_end]
+            y_chunk = self.conv(layers.gelu(self.norm(x_chunk)))
+
+            trim_left = start - in_start
+            trim_right = trim_left + (end - start)
+            out[:, :, start:end] = y_chunk[:, :, trim_left:trim_right]
+
+        return out
 
 class DnaEmbedder(nn.Module):
     """Embeds one-hot DNA to feature space. Expects NCL format (B, 4, S)."""
@@ -82,7 +119,10 @@ class DnaEmbedder(nn.Module):
     def forward(self, x):
         # x: (B, 4, S) - NCL format, no transposes needed
         out = self.conv1(x)
-        return out + self.block(out)
+        if torch.is_grad_enabled():
+            return out + self.block(out)
+        out.add_(self.block(out))
+        return out
 
 class DownResBlock(nn.Module):
     """Downsampling residual block. Expects NCL format (B, C, S)."""
@@ -98,9 +138,17 @@ class DownResBlock(nn.Module):
         out = self.block1(x)
 
         # Residual connection with channel padding
-        # F.pad pads from last dim backwards: (left_S, right_S, left_C, right_C)
-        # We want to pad channels (dim 1), so: (0, 0, 0, 128)
-        x_padded = F.pad(x, (0, 0, 0, 128))
+        # Instead of materializing x_padded, add x into the leading channels.
+        if torch.is_grad_enabled():
+            # F.pad pads from last dim backwards: (left_S, right_S, left_C, right_C)
+            # We want to pad channels (dim 1), so: (0, 0, 0, 128)
+            x_padded = F.pad(x, (0, 0, 0, 128))
+            out = out + x_padded
+            return out + self.block2(out)
+        else:
+            out[:, :x.shape[1], :].add_(x)
+            out.add_(self.block2(out))
+            return out
 
         out = out + x_padded
         return out + self.block2(out)
@@ -119,17 +167,25 @@ class UpResBlock(nn.Module):
         # x: (B, C, S) - NCL format
         # unet_skip: (B, C_skip, S*2) - skip has 2x sequence length
 
-        # 1. First block + slice channels to match skip
-        # Channels are dim 1 in NCL: x[:, :skip_channels, :]
-        out = self.conv_in(x) + x[:, :unet_skip.shape[1], :]
+        if torch.is_grad_enabled():
+            # 1. First block + slice channels to match skip
+            # Channels are dim 1 in NCL: x[:, :skip_channels, :]
+            out = self.conv_in(x) + x[:, :unet_skip.shape[1], :]
+            # 2. Upsample sequence (dim 2 in NCL)
+            out = torch.repeat_interleave(out, repeats=2, dim=2)
 
-        # 2. Upsample sequence (dim 2 in NCL)
-        out = torch.repeat_interleave(out, repeats=2, dim=2)
+            out = out * self.residual_scale
 
-        out = out * self.residual_scale
+            # 3. Add skip connection
+            out = out + self.pointwise(unet_skip)
 
-        # 3. Add skip connection
-        out = out + self.pointwise(unet_skip)
-
-        # 4. Final block
-        return out + self.conv_out(out)
+            # 4. Final block
+            return out + self.conv_out(out)
+        else:
+            out = self.conv_in(x)
+            out.add_(x[:, :unet_skip.shape[1], :])
+            out = torch.repeat_interleave(out, repeats=2, dim=2)
+            out.mul_(self.residual_scale)
+            out.add_(self.pointwise(unet_skip))
+            out.add_(self.conv_out(out))
+            return out

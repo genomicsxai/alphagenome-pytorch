@@ -1,10 +1,81 @@
 import math
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from . import layers
 
 _MAX_RELATIVE_DISTANCE = 8192
+
+
+def _parse_optional_chunk_size():
+    value = os.getenv("ALPHAGENOME_MHA_QUERY_CHUNK_SIZE")
+    if value is None or value == "":
+        return 0  # chunking not necessary in fact
+    parsed = int(value)
+    return parsed if parsed > 0 else None
+
+
+def _streaming_softmax_attention_with_softcap(
+    q_t,
+    k_t,
+    v_t,
+    attention_bias,
+    logits_soft_cap,
+    scale,
+    query_chunk_size,
+    key_chunk_size,
+    compute_dtype,
+):
+    """Memory-efficient attention with exact softmax over key chunks.
+
+    Uses numerically-stable online softmax accumulation so results match dense
+    attention math while avoiding full (S x S) logits materialization.
+    """
+    B, H, S, _ = q_t.shape
+    v_dim = v_t.shape[-1]
+    q_chunk = query_chunk_size or S
+    k_chunk = key_chunk_size or S
+
+    outputs = []
+    for i, q_start in enumerate(range(0, S, q_chunk)):
+        q_end = min(q_start + q_chunk, S)
+        q_slice = q_t[:, :, q_start:q_end, :]
+        q_len = q_end - q_start
+
+        running_max = torch.full(
+            (B, H, q_len, 1), -float("inf"), device=q_t.device, dtype=torch.float32
+        )
+        running_l = torch.zeros((B, H, q_len, 1), device=q_t.device, dtype=torch.float32)
+        running_out = torch.zeros((B, H, q_len, v_dim), device=q_t.device, dtype=torch.float32)
+
+        for j, k_start in enumerate(range(0, S, k_chunk)):
+            k_end = min(k_start + k_chunk, S)
+            k_slice = k_t[:, :, k_start:k_end, :]
+            v_slice = v_t[:, :, k_start:k_end, :]
+
+            scores = torch.matmul(q_slice, k_slice.transpose(-2, -1)).float() * scale
+            if attention_bias is not None:
+                scores = scores + attention_bias[:, :, q_start:q_end, k_start:k_end].float()
+
+            scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
+
+            block_max = scores.amax(dim=-1, keepdim=True)
+            next_max = torch.maximum(running_max, block_max)
+
+            exp_scores = torch.exp(scores - next_max)
+            exp_running = torch.exp(running_max - next_max)
+
+            running_l = running_l * exp_running + exp_scores.sum(dim=-1, keepdim=True)
+            running_out = (
+                running_out * exp_running
+                + torch.matmul(exp_scores, v_slice.float())
+            )
+            running_max = next_max
+
+        outputs.append((running_out / running_l.clamp_min(1e-9)).to(compute_dtype))
+
+    return torch.cat(outputs, dim=2)
 
 
 def _apply_rope_inplace(x, cos_theta, sin_theta):
@@ -146,6 +217,8 @@ class MHABlock(nn.Module):
     """
     def __init__(self, d_model):
         super().__init__()
+        self.query_chunk_size = _parse_optional_chunk_size()
+        self.key_chunk_size = _parse_optional_chunk_size()
         self.norm = layers.RMSBatchNorm(d_model, channels_last=True)
         self.q_proj = nn.Linear(d_model, 8 * 128, bias=False)
         self.norm_q = layers.LayerNorm(128)
@@ -176,23 +249,37 @@ class MHABlock(nn.Module):
         q_t = q.permute(0, 2, 1, 3)  # (B, 8, S, C)
         k_t = k.permute(0, 2, 1, 3)  # (B, 1, S, C)
 
-        # Attention logits: bf16 matmul then cast to f32 (matches JAX BF16_BF16_F32)
-        # JAX uses precision=BF16_BF16_F32: bf16 inputs, f32 accumulation, f32 output
-        att = torch.matmul(q_t, k_t.transpose(-2, -1)).float()  # (B, 8, S, S)
-        att = att / math.sqrt(128.0)
-
-        if attention_bias is not None:
-            att = att + attention_bias.float()
-
         logits_soft_cap = 5.0
-        att = torch.tanh(att / logits_soft_cap) * logits_soft_cap
-
-        attn_weights = F.softmax(att, dim=-1)
-
-        # Value projection: bf16 matmul then cast back to compute dtype
         v_t = v.permute(0, 2, 1, 3)
-        y = torch.matmul(attn_weights.to(compute_dtype), v_t).float()  # (B, 8, S, 192)
-        y = y.to(compute_dtype)
+        scale = 1.0 / math.sqrt(128.0)
+
+        if self.query_chunk_size is not None or self.key_chunk_size is not None:
+            y = _streaming_softmax_attention_with_softcap(
+                q_t=q_t,
+                k_t=k_t,
+                v_t=v_t,
+                attention_bias=attention_bias,
+                logits_soft_cap=logits_soft_cap,
+                scale=scale,
+                query_chunk_size=self.query_chunk_size,
+                key_chunk_size=self.key_chunk_size,
+                compute_dtype=compute_dtype,
+            )
+        else:
+            # Attention logits: bf16 matmul then cast to f32 (matches JAX BF16_BF16_F32)
+            # JAX uses precision=BF16_BF16_F32: bf16 inputs, f32 accumulation, f32 output
+            att = torch.matmul(q_t, k_t.transpose(-2, -1)).float()  # (B, 8, S, S)
+            att = att * scale
+
+            if attention_bias is not None:
+                att = att + attention_bias.float()
+
+            att = torch.tanh(att / logits_soft_cap) * logits_soft_cap
+            attn_weights = F.softmax(att, dim=-1)
+
+            # Value projection: bf16 matmul then cast back to compute dtype
+            y = torch.matmul(attn_weights.to(compute_dtype), v_t).float()  # (B, 8, S, 192)
+            y = y.to(compute_dtype)
         y = y.permute(0, 2, 1, 3).reshape(B, S, -1)
 
         y = self.linear_embedding(y)

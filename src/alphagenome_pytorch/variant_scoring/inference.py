@@ -317,7 +317,6 @@ class VariantScoringModel:
         Returns:
             Dictionary of model outputs
         """
-        print("PREDICT START")
         organism_index = self._resolve_organism_index(organism)
         
         if isinstance(sequence, str):
@@ -367,7 +366,6 @@ class VariantScoringModel:
         Returns:
             Tuple of (ref_outputs, alt_outputs) dictionaries.
         """
-        print("PREDICT VARIANT START")
         offload_between_passes = (
             self.device.type == "cuda"
             and os.getenv("ALPHAGENOME_VARIANT_OFFLOAD_BETWEEN_PASSES", "1") != "0"
@@ -398,7 +396,6 @@ class VariantScoringModel:
         )[:interval_length]
 
         if unified_splicing:
-            print("PREDICT VARIANT PASS #1")
             # Pass 1: get only splice classification to build unified positions.
             from ..utils.splicing import generate_splice_site_positions
             
@@ -428,7 +425,6 @@ class VariantScoringModel:
                 threshold=0.1,
             )
             # Pass 2: run full predictions once with fixed unified positions.
-            print("PREDICT VARIANT PASS #2 ref_outputs")
             ref_outputs = self.predict(
                 ref_seq,
                 organism,
@@ -439,7 +435,6 @@ class VariantScoringModel:
                 ref_outputs = self._outputs_to_cpu(ref_outputs)
                 gc.collect()
                 torch.cuda.empty_cache()
-            print("PREDICT VARIANT PASS #2 alt_outputs")
             alt_outputs = self.predict(
                 alt_seq,
                 organism,
@@ -447,7 +442,6 @@ class VariantScoringModel:
                 return_embeddings=False,
             )
         else:
-            print("PREDICT VARIANT PASS #1")
             ref_outputs = self.predict(ref_seq, organism, return_embeddings=False)
             if offload_between_passes:
                 ref_outputs = self._outputs_to_cpu(ref_outputs)
@@ -500,7 +494,6 @@ class VariantScoringModel:
         Returns:
             List of VariantScore objects
         """
-        print("SCORE VARIANT START")
         organism_index = self._resolve_organism_index(organism)
 
         # Check if we need unified splicing pass
@@ -579,7 +572,6 @@ class VariantScoringModel:
         Returns:
             Nested list: outer list is per variant, inner list is per scorer
         """
-        print("SCORE VARIANTS START")
         # Handle single interval for all variants
         if isinstance(intervals, Interval):
             intervals = [intervals] * len(variants)
@@ -664,7 +656,6 @@ class VariantScoringModel:
             ...     window_size=21,
             ... )
         """
-        print("SCORE ISM VARIANTS START")
         # Get reference sequence
         ref_seq = self.get_sequence(interval)
 
@@ -719,7 +710,6 @@ class VariantScoringModel:
         Returns:
             pd.DataFrame
         """
-        print("TIDY SCORE START")
         # Resolve organism for metadata
         # (This handles the case where user might want to tidy mouse scores using mouse metadata)
         idx = self._resolve_organism_index(organism)
@@ -764,7 +754,6 @@ class VariantScoringModel:
             >>> variants = [...]  # Same order as ism_scores
             >>> matrix = scorer.ism_matrix(flat_scores, variants, interval)
         """
-        print("ISM MATRIX START")
         import numpy as np
 
         scores = np.zeros((interval.width, len(vocabulary)), dtype=np.float32)
