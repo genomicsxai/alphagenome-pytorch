@@ -386,17 +386,25 @@ class VariantScoringModel:
             base_seq, variant, extraction_interval
         )[:interval_length]
 
-        # First pass: Get standard predictions with embeddings if needed
-        return_embeddings = unified_splicing
-        ref_outputs = self.predict(ref_seq, organism, return_embeddings=return_embeddings)
-        alt_outputs = self.predict(alt_seq, organism, return_embeddings=return_embeddings)
-
         if unified_splicing:
-            # Calculate unified splice site positions (max of Ref and Alt)
+            # Pass 1: get only splice classification to build unified positions.
             from ..utils.splicing import generate_splice_site_positions
             
-            ref_probs = ref_outputs['splice_sites']['probs']
-            alt_probs = alt_outputs['splice_sites']['probs']
+            ref_cls = self.predict(
+                ref_seq,
+                organism,
+                heads=['splice_sites'],
+                return_embeddings=False,
+            )
+            alt_cls = self.predict(
+                alt_seq,
+                organism,
+                heads=['splice_sites'],
+                return_embeddings=False,
+            )
+
+            ref_probs = ref_cls['splice_sites']['probs']
+            alt_probs = alt_cls['splice_sites']['probs']
             
             # Use max(Ref, Alt) to determine sites
             unified_positions = generate_splice_site_positions(
@@ -407,47 +415,35 @@ class VariantScoringModel:
                 pad_to_length=512,
                 threshold=0.1,
             )
-            
-            # Second pass: Re-run just the splice junction head with unified positions
-            organism_index = self._resolve_organism_index(organism)
-            
-            def _run_head_with_positions(outputs, pos):
-                # Ensure we have the embeddings
-                if 'embeddings_1bp' not in outputs:
-                     raise ValueError("Embeddings missing from first pass")
 
-                emb = outputs['embeddings_1bp']
-                batch_size = emb.shape[0]
-                org_idx = torch.full((batch_size,), organism_index, dtype=torch.long, device=self.device)
-
-                # Run just the junction head
-                # Note: The head expects embeddings_1bp in NCL format (B, C, S)
-                # but predict() returns them in NLC format (B, S, C) when channels_last=True
-                # Transpose to NCL format for the head
-                emb_ncl = emb.transpose(1, 2)
-                junction_out = self.model.splice_sites_junction_head(
-                    emb_ncl,
-                    org_idx,
-                    splice_site_positions=pos
-                )
-                
-                # Update outputs
-                outputs['splice_junctions'] = junction_out
-                return outputs
-
-            ref_outputs = _run_head_with_positions(ref_outputs, unified_positions)
-            alt_outputs = _run_head_with_positions(alt_outputs, unified_positions)
-            
-            # Remove embeddings to save memory / cleanup
-            for out in [ref_outputs, alt_outputs]:
-                out.pop('embeddings_1bp', None)
-                out.pop('embeddings_128bp', None)
+            # Pass 2: run full predictions once with fixed unified positions.
+            ref_outputs = self.predict(
+                ref_seq,
+                organism,
+                splice_site_positions=unified_positions,
+                return_embeddings=False,
+            )
+            if to_cpu:
+                ref_outputs = self._outputs_to_cpu(ref_outputs)
+                gc.collect()
+                torch.cuda.empty_cache()
+            alt_outputs = self.predict(
+                alt_seq,
+                organism,
+                splice_site_positions=unified_positions,
+                return_embeddings=False,
+            )
+        else:
+            ref_outputs = self.predict(ref_seq, organism, return_embeddings=False)
+            if to_cpu:
+                ref_outputs = self._outputs_to_cpu(ref_outputs)
+                gc.collect()
+                torch.cuda.empty_cache()
+            alt_outputs = self.predict(alt_seq, organism, return_embeddings=False)
 
         # Move ref to CPU before alt prediction to free GPU memory
-        # logic for to_cpu handled at end or between
         
         if to_cpu:
-            ref_outputs = self._outputs_to_cpu(ref_outputs)
             alt_outputs = self._outputs_to_cpu(alt_outputs)
             gc.collect()
             torch.cuda.empty_cache()
@@ -498,7 +494,11 @@ class VariantScoringModel:
 
         # Get predictions
         ref_outputs, alt_outputs = self.predict_variant(
-            interval, variant, organism, unified_splicing=unified_splicing
+            interval,
+            variant,
+            organism,
+            to_cpu=to_cpu,
+            unified_splicing=unified_splicing,
         )
 
         # Use instance gene annotation if not provided

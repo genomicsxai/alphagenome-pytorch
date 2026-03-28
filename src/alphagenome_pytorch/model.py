@@ -1,5 +1,6 @@
 from typing import Optional, Tuple, Union
 from pathlib import Path
+import os
 import warnings
 
 import torch
@@ -10,6 +11,25 @@ from . import layers, convolutions, attention, embeddings, heads
 from .config import DtypePolicy
 from .named_outputs import NamedOutputs, TrackMetadataCatalog
 from alphagenome_pytorch.utils.splicing import generate_splice_site_positions
+
+def _debug_memory(tag: str, x: torch.Tensor | None = None):
+    """Optional CUDA memory/debug logger controlled by env var.
+
+    Enable with: ALPHAGENOME_DEBUG_MEMORY=1
+    """
+    if os.getenv("ALPHAGENOME_DEBUG_MEMORY", "0") == "0":
+        return
+    if not torch.cuda.is_available():
+        return
+    alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+    reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+    max_alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    shape_str = f", shape={tuple(x.shape)}" if x is not None else ""
+    print(
+        f"[model.py][memory] {tag}{shape_str} | "
+        f"alloc={alloc:.2f} GiB reserved={reserved:.2f} GiB max={max_alloc:.2f} GiB"
+    )
+
 
 class SequenceEncoder(nn.Module):
     """Encodes DNA sequence to trunk representation. Outputs NCL format (B, C, S)."""
@@ -715,9 +735,30 @@ class AlphaGenome(nn.Module):
         else:
             head_set = None
 
+        # If caller selected specific heads but did not set resolutions, infer the
+        # minimal required resolutions to avoid unnecessary 1bp decoder/embeddings.
+        effective_resolutions = resolutions
+        if resolutions is None and head_set is not None:
+            need_1bp_for_splice = any(
+                k in head_set for k in (
+                    'splice_sites',
+                    'splice_site_usage',
+                    'splice_site_junction',
+                )
+            )
+            need_1bp_for_tracks = any(
+                name in self.heads
+                and 1 in getattr(self.heads[name], 'resolutions', [])
+                for name in head_set
+            )
+            if need_1bp_for_splice or need_1bp_for_tracks:
+                effective_resolutions = (1, 128)
+            else:
+                effective_resolutions = (128,)
+
         # Compute embeddings (NCL format internally)
         embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = \
-            self._compute_embeddings_ncl(dna_sequence, organism_index, resolutions)
+            self._compute_embeddings_ncl(dna_sequence, organism_index, effective_resolutions)
 
         if need_1bp:
             embeddings_dict = {1: embeddings_1bp, 128: embeddings_128bp}
@@ -726,6 +767,10 @@ class AlphaGenome(nn.Module):
 
         # ===== HEADS =====
         outputs = {}
+
+        # self.encoder.cpu()
+        # self.tower.cpu()
+        # self.decoder.cpu()
 
         if not embeddings_only:
             for name, head in self.heads.items():
@@ -804,6 +849,9 @@ class AlphaGenome(nn.Module):
                             splice_site_positions=top_k_positions,
                         )
 
+        # self.encoder.to(dna_sequence.device)
+        # self.decoder.to(dna_sequence.device)
+        # self.tower.to(dna_sequence.device)
         if return_embeddings or embeddings_only:
             if channels_last:
                 if need_1bp:
