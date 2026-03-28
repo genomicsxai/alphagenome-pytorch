@@ -566,13 +566,15 @@ class SpliceSitesUsageHead(nn.Module):
             mask = self.track_mask[organism_index][:, :, None]
             chunk_dim = 2  # chunk over S
 
-        chunks = []
-        for start in range(0, logits.size(chunk_dim), _HEAD_CONV_CHUNK_SIZE):
-            end = start + _HEAD_CONV_CHUNK_SIZE
-            chunk = logits.narrow(chunk_dim, start, min(_HEAD_CONV_CHUNK_SIZE, logits.size(chunk_dim) - start))
-            chunks.append(torch.sigmoid(chunk).cpu())
-        predictions = torch.cat(chunks, dim=chunk_dim)
-        # predictions = torch.sigmoid(logits)
+        if torch.is_grad_enabled() or _HEAD_CONV_CHUNK_SIZE <= 0 or logits.size(chunk_dim) <= _HEAD_CONV_CHUNK_SIZE:
+            predictions = torch.sigmoid(logits).cpu()
+        else:
+            chunks = []
+            for start in range(0, logits.size(chunk_dim), _HEAD_CONV_CHUNK_SIZE):
+                end = start + _HEAD_CONV_CHUNK_SIZE
+                chunk = logits.narrow(chunk_dim, start, min(_HEAD_CONV_CHUNK_SIZE, logits.size(chunk_dim) - start))
+                chunks.append(torch.sigmoid(chunk).cpu())
+            predictions = torch.cat(chunks, dim=chunk_dim)
 
         return {
             "logits": logits.cpu(),

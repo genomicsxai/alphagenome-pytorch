@@ -1,19 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os
 from . import layers
-
-
-def _parse_conv_block_chunk_size():
-    value = os.getenv("ALPHAGENOME_CONV_BLOCK_CHUNK_SIZE")
-    if value is None or value == "":
-        return 524288
-    parsed = int(value)
-    return max(parsed, 0)
-
-
-_CONV_BLOCK_CHUNK_SIZE = _parse_conv_block_chunk_size()
 
 class StandardizedConv1d(nn.Conv1d):
     """1D Convolution with weight standardization and learned scaling.
@@ -38,6 +26,7 @@ class StandardizedConv1d(nn.Conv1d):
         # We want to standardize over (in_channels, kernel_width) corresponding to fan-in?
         # JAX shape: (width, input_channels, output_channels). Mean axis (0, 1) means mean over width and input_channels.
         # PyTorch equivalent: mean over (1, 2).
+
         w = self.weight
         mean = w.mean(dim=(1, 2), keepdim=True)
         var = w.var(dim=(1, 2), keepdim=True, unbiased=False) 
@@ -82,29 +71,7 @@ class ConvBlock(nn.Module):
 
     def forward(self, x):
         # x: (B, C, S) - NCL format, no transposes needed
-        if torch.is_grad_enabled() or _CONV_BLOCK_CHUNK_SIZE <= 0 or x.shape[-1] <= _CONV_BLOCK_CHUNK_SIZE:
-            return self.conv(layers.gelu(self.norm(x)))
-
-        # Inference low-memory path: process along sequence chunks so norm/gelu
-        # activations are never materialized for the full sequence at once.
-        B, _, S = x.shape
-        out = torch.empty(B, self.out_channels, S, device=x.device, dtype=x.dtype)
-        kernel = self.kernel_size if isinstance(self.kernel_size, int) else self.kernel_size[0]
-        overlap = max(kernel // 2, 0)
-
-        for start in range(0, S, _CONV_BLOCK_CHUNK_SIZE):
-            end = min(start + _CONV_BLOCK_CHUNK_SIZE, S)
-            in_start = max(0, start - overlap)
-            in_end = min(S, end + overlap)
-
-            x_chunk = x[:, :, in_start:in_end]
-            y_chunk = self.conv(layers.gelu(self.norm(x_chunk)))
-
-            trim_left = start - in_start
-            trim_right = trim_left + (end - start)
-            out[:, :, start:end] = y_chunk[:, :, trim_left:trim_right]
-
-        return out
+        return self.conv(layers.gelu(self.norm(x)))
 
 class DnaEmbedder(nn.Module):
     """Embeds one-hot DNA to feature space. Expects NCL format (B, 4, S)."""
@@ -119,10 +86,7 @@ class DnaEmbedder(nn.Module):
     def forward(self, x):
         # x: (B, 4, S) - NCL format, no transposes needed
         out = self.conv1(x)
-        if torch.is_grad_enabled():
-            return out + self.block(out)
-        out.add_(self.block(out))
-        return out
+        return out + self.block(out)
 
 class DownResBlock(nn.Module):
     """Downsampling residual block. Expects NCL format (B, C, S)."""

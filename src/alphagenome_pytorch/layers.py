@@ -7,7 +7,7 @@ import os
 def _parse_gelu_chunk_size():
     value = os.getenv("ALPHAGENOME_GELU_CHUNK_SIZE")
     if value is None or value == "":
-        return 65536  # max value tested with 1MB and 24GB RTX card
+        return 262148  #262144 + 4
     parsed = int(value)
     return max(parsed, 0)
 
@@ -36,6 +36,7 @@ def gelu(x):
         x_chunk = x[..., start:end]
         x_chunk.mul_(torch.sigmoid(coef * x_chunk))
     return x
+
 
 class Pool1d(nn.Module):
     """1D pooling with SAME padding. Expects NCL input (B, C, S).

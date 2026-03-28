@@ -7,7 +7,6 @@ the AlphaGenome PyTorch model.
 from __future__ import annotations
 
 import gc
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -366,11 +365,6 @@ class VariantScoringModel:
         Returns:
             Tuple of (ref_outputs, alt_outputs) dictionaries.
         """
-        offload_between_passes = (
-            self.device.type == "cuda"
-            and os.getenv("ALPHAGENOME_VARIANT_OFFLOAD_BETWEEN_PASSES", "1") != "0"
-        )
-
         # Handle indels: for deletions, extend extraction to compensate for
         # sequence shrinkage. For insertions, the alt is longer and gets
         # truncated. Both ref and alt are truncated to the original interval
@@ -431,7 +425,7 @@ class VariantScoringModel:
                 splice_site_positions=unified_positions,
                 return_embeddings=False,
             )
-            if offload_between_passes:
+            if to_cpu:
                 ref_outputs = self._outputs_to_cpu(ref_outputs)
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -443,17 +437,15 @@ class VariantScoringModel:
             )
         else:
             ref_outputs = self.predict(ref_seq, organism, return_embeddings=False)
-            if offload_between_passes:
+            if to_cpu:
                 ref_outputs = self._outputs_to_cpu(ref_outputs)
                 gc.collect()
                 torch.cuda.empty_cache()
             alt_outputs = self.predict(alt_seq, organism, return_embeddings=False)
 
         # Move ref to CPU before alt prediction to free GPU memory
-        # logic for to_cpu handled at end or between
         
-        if to_cpu or offload_between_passes:
-            ref_outputs = self._outputs_to_cpu(ref_outputs)
+        if to_cpu:
             alt_outputs = self._outputs_to_cpu(alt_outputs)
             gc.collect()
             torch.cuda.empty_cache()

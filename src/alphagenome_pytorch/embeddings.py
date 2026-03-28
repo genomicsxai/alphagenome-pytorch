@@ -1,29 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os
 from . import layers
-
-def _parse_embedder_chunk_size():
-    value = os.getenv("ALPHAGENOME_EMBEDDER_ACT_CHUNK_SIZE")
-    if value is None or value == "":
-        return 524288
-    parsed = int(value)
-    return max(parsed, 0)
-
-
-def _gelu_inplace_chunked_ncl(x, chunk_size):
-    """In-place GELU approximation on NCL tensor with optional sequence chunking."""
-    coef = 1.702
-    if chunk_size <= 0 or chunk_size >= x.shape[2]:
-        x.mul_(torch.sigmoid(x * coef))
-        return x
-
-    for start in range(0, x.shape[2], chunk_size):
-        end = min(start + chunk_size, x.shape[2])
-        chunk = x[:, :, start:end]
-        chunk.mul_(torch.sigmoid(chunk * coef))
-    return x
 
 
 class OutputEmbedder(nn.Module):
@@ -53,7 +31,6 @@ class OutputEmbedder(nn.Module):
 
         self.organism_embed = nn.Embedding(num_organisms, out_channels)
         self.norm = layers.RMSBatchNorm(channels=out_channels)
-        self.inference_act_chunk_size = _parse_embedder_chunk_size()
 
     def forward(self, x, organism_index, skip_x=None, channels_last=False):
         # x: (B, C, S) - NCL format
@@ -97,11 +74,9 @@ class OutputEmbedder(nn.Module):
         emb = self.organism_embed(organism_index).unsqueeze(2)
         if torch.is_grad_enabled():
             out = out + emb
-            out = layers.gelu(out)
         else:
             out.add_(emb)
-            _gelu_inplace_chunked_ncl(out, self.inference_act_chunk_size)
-
+        out = layers.gelu(out)
         if channels_last:
             # (B, C, S) -> (B, S, C)
             out = out.transpose(1, 2)
