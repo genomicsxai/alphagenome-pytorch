@@ -19,7 +19,7 @@ class TestSpliceSitesClassification:
 
     NUM_CLASSES = 5
     JAX_OUTPUT_NAME = "splice_sites_classification"
-    PT_OUTPUT_NAME = "splice_sites_classification"
+    PT_OUTPUT_NAME = "splice_sites"
 
     @pytest.mark.parametrize("organism", ["human", "mouse"])
     def test_classification_comparison(
@@ -84,7 +84,7 @@ class TestSpliceSitesUsage:
 
     NUM_TRACKS = 734
     JAX_OUTPUT_NAME = "splice_sites_usage"
-    PT_OUTPUT_NAME = "splice_sites_usage"
+    PT_OUTPUT_NAME = "splice_site_usage"
 
     @pytest.mark.parametrize("organism", ["human", "mouse"])
     def test_usage_comparison(
@@ -134,7 +134,7 @@ class TestSpliceSitesJunction:
 
     NUM_TRACKS = 734
     JAX_OUTPUT_NAME = "splice_sites_junction"
-    PT_OUTPUT_NAME = "splice_sites_junction"
+    PT_OUTPUT_NAME = "splice_junctions"
 
     @pytest.mark.parametrize("organism", ["human", "mouse"])
     def test_junction_comparison(

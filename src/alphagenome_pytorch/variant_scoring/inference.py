@@ -258,10 +258,7 @@ class VariantScoringModel:
                 continue # Skip unknown organisms in file
                 
             try:
-                if output_type_str == 'contact_maps':
-                    output_type = OutputType.CONTACT_MAPS
-                else:
-                    output_type = OutputType(output_type_str)
+                output_type = OutputType(output_type_str)
             except ValueError:
                 continue
 
@@ -396,19 +393,19 @@ class VariantScoringModel:
             ref_cls = self.predict(
                 ref_seq,
                 organism,
-                heads=['splice_sites_classification'],
+                heads=['splice_sites'],
                 return_embeddings=False,
             )
             alt_cls = self.predict(
                 alt_seq,
                 organism,
-                heads=['splice_sites_classification'],
+                heads=['splice_sites'],
                 return_embeddings=False,
             )
 
-            ref_probs = ref_cls['splice_sites_classification']['probs']
-            alt_probs = alt_cls['splice_sites_classification']['probs']
-
+            ref_probs = ref_cls['splice_sites']['probs']
+            alt_probs = alt_cls['splice_sites']['probs']
+            
             # Use max(Ref, Alt) to determine sites
             unified_positions = generate_splice_site_positions(
                 ref=ref_probs,
@@ -418,6 +415,7 @@ class VariantScoringModel:
                 pad_to_length=512,
                 threshold=0.1,
             )
+
             # Pass 2: run full predictions once with fixed unified positions.
             ref_outputs = self.predict(
                 ref_seq,
