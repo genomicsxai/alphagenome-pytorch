@@ -322,8 +322,6 @@ def setup_preemption_handler(
     """
     handler = PreemptionHandler(save_fn=save_fn, rank=rank, world_size=world_size)
     handler.register()
-    # Also handle SIGTERM (sent by SLURM on wall-time timeout before SIGKILL)
-    signal.signal(signal.SIGTERM, handler._handler)
     return handler
 
 
