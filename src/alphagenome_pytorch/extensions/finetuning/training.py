@@ -1129,6 +1129,9 @@ def train_epoch_multihead(
     profile_batches: int = 0,
     log_fn: Any | None = None,
     encoder_only: bool = False,
+    save_every_steps: int | None = None,
+    save_fn: Any | None = None,
+    global_step_offset: int = 0,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with multiple modality heads.
 
@@ -1197,6 +1200,7 @@ def train_epoch_multihead(
     t_batch_start = time.perf_counter()
     running_loss = 0.0
     accumulated_batches = 0
+    opt_step = 0
 
     for batch_idx, (sequences, modality_targets) in enumerate(pbar):
         is_profiling = do_profile and batch_idx < profile_batches
@@ -1355,10 +1359,16 @@ def train_epoch_multihead(
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
+            opt_step += 1
 
             if is_profiling:
                 _cuda_sync(device)
                 profile_stats.add("6_optimizer", time.perf_counter() - t0)
+
+            if save_every_steps is not None and save_fn is not None:
+                global_step = global_step_offset + opt_step
+                if global_step % save_every_steps == 0:
+                    save_fn()
 
         raw_loss = loss.item()
         total_loss_accum += raw_loss
@@ -1649,6 +1659,9 @@ def train_epoch_sequence_parallel(
     profile_batches: int = 0,
     log_fn: Any | None = None,
     encoder_only: bool = False,
+    save_every_steps: int | None = None,
+    save_fn: Any | None = None,
+    global_step_offset: int = 0,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with sequence parallelism.
 
@@ -1716,6 +1729,7 @@ def train_epoch_sequence_parallel(
     n_batches = 0
     running_loss = 0.0
     accumulated_batches = 0
+    opt_step = 0
 
     if is_main_process(rank):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch} [SP]")
@@ -1880,6 +1894,12 @@ def train_epoch_sequence_parallel(
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
+            opt_step += 1
+
+            if save_every_steps is not None and save_fn is not None:
+                global_step = global_step_offset + opt_step
+                if global_step % save_every_steps == 0:
+                    save_fn()
 
         # ===== LOGGING =====
         raw_loss = loss.item()

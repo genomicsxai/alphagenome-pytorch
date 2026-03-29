@@ -60,6 +60,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -328,6 +329,7 @@ def parse_args() -> argparse.Namespace:
     out.add_argument("--output-dir", type=str, default=DEFAULTS["output_dir"])
     out.add_argument("--run-name", type=str, default=None)
     out.add_argument("--save-every", type=int, default=DEFAULTS["save_every"])
+    out.add_argument("--save-every-steps", type=int, default=None, help="Save preemption checkpoint every N optimizer steps (None = disabled)")
     out.add_argument("--no-save-checkpoints", action="store_true", help="Skip saving model checkpoints (keeps logs/config)")
 
     # Resume arguments
@@ -1107,6 +1109,8 @@ def main() -> None:
                 torch.cuda.empty_cache()
 
             # Training
+            steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
+            global_step_offset = (epoch - 1) * steps_per_epoch
             if args.sequence_parallel and sequence_parallel is not None:
                 # Sequence parallel training (distributes sequence across GPUs)
                 train_loss, per_modality_train_loss = train_epoch_sequence_parallel(
@@ -1135,6 +1139,9 @@ def main() -> None:
                     profile_batches=args.profile_batches if epoch == start_epoch else 0,
                     log_fn=logger.log_step if is_main_process(rank) else None,
                     encoder_only=encoder_only,
+                    save_every_steps=args.save_every_steps,
+                    save_fn=_save_preempt if not args.no_save_checkpoints else None,
+                    global_step_offset=global_step_offset,
                 )
             else:
                 # Standard multimodal training (uses multihead functions)
@@ -1163,6 +1170,9 @@ def main() -> None:
                     profile_batches=args.profile_batches if epoch == start_epoch else 0,
                     log_fn=logger.log_step if is_main_process(rank) else None,
                     encoder_only=encoder_only,
+                    save_every_steps=args.save_every_steps,
+                    save_fn=_save_preempt if not args.no_save_checkpoints else None,
+                    global_step_offset=global_step_offset,
                 )
 
             if handler.preempted:
