@@ -743,7 +743,7 @@ class AlphaGenome(nn.Module):
                 k in head_set for k in (
                     'splice_sites',
                     'splice_site_usage',
-                    'splice_site_junction',
+                    'splice_junctions',
                 )
             )
             need_1bp_for_tracks = any(

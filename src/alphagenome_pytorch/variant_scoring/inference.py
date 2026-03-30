@@ -480,9 +480,7 @@ class VariantScoringModel:
 
         # Score with each scorer
         scores = []
-        print(scorers)
         for scorer in scorers:
-            print(scorer)
             score_result = scorer.score(
                 ref_outputs=ref_outputs,
                 alt_outputs=alt_outputs,
