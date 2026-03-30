@@ -768,10 +768,6 @@ class AlphaGenome(nn.Module):
         # ===== HEADS =====
         outputs = {}
 
-        # self.encoder.cpu()
-        # self.tower.cpu()
-        # self.decoder.cpu()
-
         if not embeddings_only:
             for name, head in self.heads.items():
                 if head_set is not None and name not in head_set:
@@ -846,12 +842,9 @@ class AlphaGenome(nn.Module):
                             embeddings_1bp,
                             organism_index,
                             channels_last=channels_last,
-                            splice_site_positions=top_k_positions,
+                            splice_site_positions=top_k_positions.to(dna_sequence.device),
                         )
 
-        # self.encoder.to(dna_sequence.device)
-        # self.decoder.to(dna_sequence.device)
-        # self.tower.to(dna_sequence.device)
         if return_embeddings or embeddings_only:
             if channels_last:
                 if need_1bp:

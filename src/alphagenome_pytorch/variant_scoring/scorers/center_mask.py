@@ -154,6 +154,7 @@ class CenterMaskScorer(BaseVariantScorer):
         variant: Variant,
         interval: Interval,
         organism_index: int,
+        device: torch.device = torch.device("cpu"),
         **kwargs,
     ) -> VariantScore:
         """Compute variant score using center mask aggregation.
@@ -194,7 +195,8 @@ class CenterMaskScorer(BaseVariantScorer):
             alt_preds = alt_preds.unsqueeze(0)
 
         B, S, T = ref_preds.shape
-
+        ref_preds = ref_preds.to(device)
+        alt_preds = alt_preds.to(device)
         # Create center mask
         mask = create_center_mask(
             variant_position=variant.position,

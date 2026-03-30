@@ -414,7 +414,7 @@ class VariantScoringModel:
                 k=512,
                 pad_to_length=512,
                 threshold=0.1,
-            )
+            ).to(self.device)
 
             # Pass 2: run full predictions once with fixed unified positions.
             ref_outputs = self.predict(
@@ -423,10 +423,6 @@ class VariantScoringModel:
                 splice_site_positions=unified_positions,
                 return_embeddings=False,
             )
-            if to_cpu:
-                ref_outputs = self._outputs_to_cpu(ref_outputs)
-                gc.collect()
-                torch.cuda.empty_cache()
             alt_outputs = self.predict(
                 alt_seq,
                 organism,
@@ -435,44 +431,9 @@ class VariantScoringModel:
             )
         else:
             ref_outputs = self.predict(ref_seq, organism, return_embeddings=False)
-            if to_cpu:
-                ref_outputs = self._outputs_to_cpu(ref_outputs)
-                gc.collect()
-                torch.cuda.empty_cache()
             alt_outputs = self.predict(alt_seq, organism, return_embeddings=False)
 
-        # Move ref to CPU before alt prediction to free GPU memory
-        
-        if to_cpu:
-            alt_outputs = self._outputs_to_cpu(alt_outputs)
-            gc.collect()
-            torch.cuda.empty_cache()
-
         return ref_outputs, alt_outputs
-
-    def _outputs_to_cpu(self, outputs: Any) -> Any:
-        """Recursively move all tensors in outputs to CPU."""
-        if torch.is_tensor(outputs):
-            return outputs.cpu()
-        if isinstance(outputs, dict):
-            return {k: self._outputs_to_cpu(v) for k, v in outputs.items()}
-        if isinstance(outputs, list):
-            return [self._outputs_to_cpu(v) for v in outputs]
-        if isinstance(outputs, tuple):
-            return tuple(self._outputs_to_cpu(v) for v in outputs)
-        return outputs
-
-    def _outputs_to_gpu(self, outputs: Any) -> Any:
-        """Recursively move all tensors in outputs to GPU."""
-        if torch.is_tensor(outputs):
-            return outputs.cuda()
-        if isinstance(outputs, dict):
-            return {k: self._outputs_to_gpu(v) for k, v in outputs.items()}
-        if isinstance(outputs, list):
-            return [self._outputs_to_gpu(v) for v in outputs]
-        if isinstance(outputs, tuple):
-            return tuple(self._outputs_to_gpu(v) for v in outputs)
-        return outputs
 
     def score_variant(
         self,
@@ -519,9 +480,9 @@ class VariantScoringModel:
 
         # Score with each scorer
         scores = []
-        ref_outputs = self._outputs_to_gpu(ref_outputs)
-        alt_outputs = self._outputs_to_gpu(alt_outputs)
+        print(scorers)
         for scorer in scorers:
+            print(scorer)
             score_result = scorer.score(
                 ref_outputs=ref_outputs,
                 alt_outputs=alt_outputs,
@@ -530,6 +491,7 @@ class VariantScoringModel:
                 organism_index=organism_index,
                 gene_annotation=gene_annotation,
                 polya_annotation=self._polya_annotation,
+                device=self.device,
             )
 
             if to_cpu:
@@ -545,6 +507,8 @@ class VariantScoringModel:
                         s.scores = s.scores.to(dtype=torch.float32, device='cpu')
 
             scores.append(score_result)
+            del score_result
+            torch.cuda.empty_cache()
 
         if to_cpu:
             del ref_outputs, alt_outputs

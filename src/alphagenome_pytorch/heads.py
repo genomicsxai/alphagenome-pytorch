@@ -498,7 +498,7 @@ class SpliceSitesClassificationHead(nn.Module):
 
         return {
             "logits": logits.cpu(),
-            "probs": probs,
+            "probs": probs.cpu(),
         }
 
 class SpliceSitesUsageHead(nn.Module):
@@ -578,7 +578,7 @@ class SpliceSitesUsageHead(nn.Module):
 
         return {
             "logits": logits.cpu(),
-            "predictions": predictions,
+            "predictions": predictions.cpu(),
             "track_mask": mask.cpu(),
         }
 
