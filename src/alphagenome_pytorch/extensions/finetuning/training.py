@@ -601,6 +601,11 @@ def train_epoch_ddp(
     profile_batches: int = 0,
     log_fn: Any | None = None,
     encoder_only: bool = False,
+    save_every_steps: int | None = None,
+    save_fn: Any | None = None,
+    global_step_offset: int = 0,
+    skip_batches: int = 0,
+    save_state: dict | None = None,
 ) -> float:
     """Train for one epoch with DDP and profiling support.
 
@@ -672,8 +677,12 @@ def train_epoch_ddp(
     t_batch_start = time.perf_counter()
     running_loss = 0.0
     accumulated_batches = 0
+    opt_step = 0
 
     for batch_idx, (sequences, targets_dict) in enumerate(pbar):
+        if batch_idx < skip_batches:
+            continue
+
         is_profiling = do_profile and batch_idx < profile_batches
 
         # --- Data loading time (time since last batch ended) ---
@@ -827,10 +836,18 @@ def train_epoch_ddp(
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
+            opt_step += 1
 
             if is_profiling:
                 _cuda_sync(device)
                 profile_stats.add("6_optimizer", time.perf_counter() - t0)
+
+            if save_every_steps is not None and save_fn is not None:
+                global_step = global_step_offset + opt_step
+                if global_step % save_every_steps == 0:
+                    if save_state is not None:
+                        save_state["batch_idx"] = batch_idx + 1
+                    save_fn()
 
         # Update totals
         raw_loss = loss.item()
@@ -1128,6 +1145,11 @@ def train_epoch_multihead(
     profile_batches: int = 0,
     log_fn: Any | None = None,
     encoder_only: bool = False,
+    save_every_steps: int | None = None,
+    save_fn: Any | None = None,
+    global_step_offset: int = 0,
+    skip_batches: int = 0,
+    save_state: dict | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with multiple modality heads.
 
@@ -1196,8 +1218,12 @@ def train_epoch_multihead(
     t_batch_start = time.perf_counter()
     running_loss = 0.0
     accumulated_batches = 0
+    opt_step = 0
 
     for batch_idx, (sequences, modality_targets) in enumerate(pbar):
+        if batch_idx < skip_batches:
+            continue
+
         is_profiling = do_profile and batch_idx < profile_batches
 
         if is_profiling and batch_idx > 0:
@@ -1354,10 +1380,18 @@ def train_epoch_multihead(
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
+            opt_step += 1
 
             if is_profiling:
                 _cuda_sync(device)
                 profile_stats.add("6_optimizer", time.perf_counter() - t0)
+
+            if save_every_steps is not None and save_fn is not None:
+                global_step = global_step_offset + opt_step
+                if global_step % save_every_steps == 0:
+                    if save_state is not None:
+                        save_state["batch_idx"] = batch_idx + 1
+                    save_fn()
 
         raw_loss = loss.item()
         total_loss_accum += raw_loss

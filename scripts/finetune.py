@@ -60,6 +60,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -317,6 +318,7 @@ def parse_args() -> argparse.Namespace:
     out.add_argument("--output-dir", type=str, default=DEFAULTS["output_dir"])
     out.add_argument("--run-name", type=str, default=None)
     out.add_argument("--save-every", type=int, default=DEFAULTS["save_every"])
+    out.add_argument("--save-every-steps", type=int, default=None, help="Save preemption checkpoint every N optimizer steps (None = disabled)")
 
     # Resume arguments
     resume = parser.add_argument_group("Resume / Checkpointing")
@@ -993,6 +995,7 @@ def main() -> None:
     start_epoch = 1
     best_val_loss = float("inf")
     wandb_run_id = None
+    skip_batches = 0
 
     if resume_path and resume_path.exists():
         print_rank0(f"Resuming from: {resume_path}", rank)
@@ -1022,6 +1025,7 @@ def main() -> None:
                 device="cpu",
             )
             start_epoch = ckpt["epoch"] + 1
+            skip_batches = ckpt.get("batch_idx", 0)
             best_val_loss = ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf")))
             wandb_run_id = ckpt.get("wandb_run_id")
             print_rank0(f"  Resumed at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}", rank)
@@ -1069,6 +1073,8 @@ def main() -> None:
     }
 
     # Logger (rank 0 only)
+    steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
+    resume_step = (start_epoch - 1) * steps_per_epoch + skip_batches // args.gradient_accumulation_steps
     logger = TrainingLogger(
         output_dir=output_dir,
         rank=rank,
@@ -1078,12 +1084,14 @@ def main() -> None:
         run_name=run_name,
         config=config,
         resume_id=wandb_run_id if resume_path else None,
+        initial_step=resume_step,
     )
 
     use_amp = not args.no_amp
 
     # Preemption handler state
     current_epoch = start_epoch
+    _save_state: dict = {"batch_idx": 0}
 
     def _save_preempt():
         """Save preemption checkpoint."""
@@ -1100,6 +1108,7 @@ def main() -> None:
                 scheduler=scheduler,
                 best_val_loss=best_val_loss,
                 wandb_run_id=logger.wandb_run_id,
+                batch_idx=_save_state["batch_idx"],
             )
             print(f"Preemption checkpoint saved to {output_dir / 'checkpoint_preempt.pth'}")
 
@@ -1135,6 +1144,8 @@ def main() -> None:
                 torch.cuda.empty_cache()
 
             # Training
+            epoch_skip = skip_batches if epoch == start_epoch else 0
+            global_step_offset = (epoch - 1) * steps_per_epoch + epoch_skip // args.gradient_accumulation_steps
             if args.is_multimodal:
                 train_loss, per_modality_train_loss = train_epoch_multihead(
                     model=model,
@@ -1161,6 +1172,11 @@ def main() -> None:
                     profile_batches=args.profile_batches if epoch == start_epoch else 0,
                     log_fn=logger.log_step if is_main_process(rank) else None,
                     encoder_only=encoder_only,
+                    save_every_steps=args.save_every_steps,
+                    save_fn=_save_preempt,
+                    global_step_offset=global_step_offset,
+                    skip_batches=epoch_skip,
+                    save_state=_save_state,
                 )
             else:
                 # Single modality: use the standard train_epoch_ddp
@@ -1189,7 +1205,15 @@ def main() -> None:
                     profile_batches=args.profile_batches if epoch == start_epoch else 0,
                     log_fn=logger.log_step if is_main_process(rank) else None,
                     encoder_only=encoder_only,
+                    save_every_steps=args.save_every_steps,
+                    save_fn=_save_preempt,
+                    global_step_offset=global_step_offset,
+                    skip_batches=epoch_skip,
+                    save_state=_save_state,
                 )
+
+            skip_batches = 0  # Only skip on first resumed epoch
+            _save_state["batch_idx"] = 0
 
             if handler.preempted:
                 print_rank0("Preemption flag set - saving and exiting.", rank)
