@@ -711,7 +711,7 @@ class SpliceSitesJunctionHead(nn.Module):
                 self.rope_params["pos_donor"], organism_index
             )
             pos_acceptor_logits = _apply_rope(
-                embeddings_1bp, pos_donor_idx,
+                embeddings_1bp, pos_acceptor_idx,
                 self.rope_params["pos_acceptor"], organism_index
             )
             pos_counts = F.softplus(torch.einsum(
@@ -724,7 +724,7 @@ class SpliceSitesJunctionHead(nn.Module):
                 self.rope_params["neg_donor"], organism_index
             )
             neg_acceptor_logits = _apply_rope(
-                embeddings_1bp, pos_donor_idx,
+                embeddings_1bp, pos_acceptor_idx,
                 self.rope_params["neg_acceptor"], organism_index
             )
             neg_counts = F.softplus(torch.einsum(
