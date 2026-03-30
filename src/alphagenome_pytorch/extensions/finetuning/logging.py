@@ -49,6 +49,7 @@ class TrainingLogger:
         run_name: str | None = None,
         config: dict | None = None,
         resume_id: str | None = None,
+        initial_step: int = 0,
     ) -> None:
         """Initialize the training logger.
 
@@ -65,7 +66,7 @@ class TrainingLogger:
         self.output_dir = Path(output_dir)
         self.rank = rank
         self.use_wandb = use_wandb and is_main_process(rank)
-        self.step = 0
+        self.step = initial_step
         self.resume_id = resume_id
 
         # Only main process handles logging

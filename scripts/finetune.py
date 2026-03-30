@@ -1045,6 +1045,8 @@ def main() -> None:
     }
 
     # Logger (rank 0 only)
+    steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
+    resume_step = (start_epoch - 1) * steps_per_epoch + skip_batches // args.gradient_accumulation_steps
     logger = TrainingLogger(
         output_dir=output_dir,
         rank=rank,
@@ -1054,6 +1056,7 @@ def main() -> None:
         run_name=run_name,
         config=config,
         resume_id=wandb_run_id if resume_path else None,
+        initial_step=resume_step,
     )
 
     use_amp = not args.no_amp
@@ -1113,7 +1116,6 @@ def main() -> None:
                 torch.cuda.empty_cache()
 
             # Training
-            steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
             epoch_skip = skip_batches if epoch == start_epoch else 0
             global_step_offset = (epoch - 1) * steps_per_epoch + epoch_skip // args.gradient_accumulation_steps
             if args.sequence_parallel and sequence_parallel is not None:
