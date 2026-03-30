@@ -665,37 +665,19 @@ class SpliceSitesJunctionHead(nn.Module):
             neg_donor_idx = splice_site_positions[:, 2, :]
             neg_acceptor_idx = splice_site_positions[:, 3, :]
 
-            # Project only indexed sites instead of full (B, H, S) to reduce memory.
-            w = self.conv.weight[organism_index]  # (B, H, C)
-            b = self.conv.bias[organism_index]    # (B, H)
+            # Project: (B, C, S) → (B, H, S)
+            splice_site_logits = self.conv(embeddings_1bp, organism_index)
 
-            def _project_indexed(embedding, indices):
-                """Project embeddings at indexed positions to hidden dim.
-
-                Args:
-                    embedding: (B, C, S)
-                    indices: (B, P)
-
-                Returns:
-                    (B, P, H)
-                """
-                B, C, S = embedding.shape
+            def _index_embeddings(embedding, indices):
+                """Select embeddings at positions. embedding: (B, H, S), indices: (B, P)"""
+                B, H, S = embedding.shape
                 batch_idx = torch.arange(B, device=embedding.device).unsqueeze(1)
-                # (B, C, S) -> indexed (B, P, C)
-                indexed = embedding[batch_idx, :, indices]
-                projected = torch.einsum(
-                    'bpc,boc->bpo',
-                    indexed.float(),
-                    w.float(),
-                ).to(embedding.dtype)
-                if torch.is_grad_enabled():
-                    projected = projected + b.unsqueeze(1)
-                else:
-                    projected.add_(b.unsqueeze(1))
-                return projected
+                # Index along S dimension: embedding[b, :, indices[b, p]] → (B, P, H)
+                # PyTorch advanced indexing: broadcast indices give leading dims, : gives trailing
+                return embedding[batch_idx, :, indices]  # (B, P, H)
 
             def _apply_rope(embedding, indices, params, organism_index):
-                x = _project_indexed(embedding, indices)  # (B, P, H)
+                x = _index_embeddings(embedding, indices)  # (B, P, H)
                 batch_params = params[organism_index]  # (B, 2, T, H)
                 scale = batch_params[:, [0], :, :]
                 offset = batch_params[:, [1], :, :]
@@ -707,30 +689,28 @@ class SpliceSitesJunctionHead(nn.Module):
                 )
 
             pos_donor_logits = _apply_rope(
-                embeddings_1bp, pos_donor_idx,
+                splice_site_logits, pos_donor_idx,
                 self.rope_params["pos_donor"], organism_index
             )
             pos_acceptor_logits = _apply_rope(
-                embeddings_1bp, pos_acceptor_idx,
+                splice_site_logits, pos_acceptor_idx,
                 self.rope_params["pos_acceptor"], organism_index
             )
-            pos_counts = F.softplus(torch.einsum(
-                "bdth,bath->bdat", pos_donor_logits, pos_acceptor_logits
-            ))
-            del pos_donor_logits, pos_acceptor_logits
-
             neg_donor_logits = _apply_rope(
-                embeddings_1bp, pos_donor_idx,
+                splice_site_logits, neg_donor_idx,
                 self.rope_params["neg_donor"], organism_index
             )
             neg_acceptor_logits = _apply_rope(
-                embeddings_1bp, pos_acceptor_idx,
+                splice_site_logits, neg_acceptor_idx,
                 self.rope_params["neg_acceptor"], organism_index
             )
+
+            pos_counts = F.softplus(torch.einsum(
+                "bdth,bath->bdat", pos_donor_logits, pos_acceptor_logits
+            ))
             neg_counts = F.softplus(torch.einsum(
                 "bdth,bath->bdat", neg_donor_logits, neg_acceptor_logits
             ))
-            del neg_donor_logits, neg_acceptor_logits
 
             pos_mask = torch.einsum("bd,ba->bda", pos_donor_idx >= 0, pos_acceptor_idx >= 0)
             neg_mask = torch.einsum("bd,ba->bda", neg_donor_idx >= 0, neg_acceptor_idx >= 0)
@@ -741,13 +721,8 @@ class SpliceSitesJunctionHead(nn.Module):
             neg_mask = neg_mask[:, :, :, None] * tissue_mask[:, None, None, :]
 
             splice_junction_mask = torch.cat([pos_mask, neg_mask], dim=-1)
-            del pos_mask, neg_mask
             pred_counts = torch.cat([pos_counts, neg_counts], dim=-1)
-            del pos_counts, neg_counts
-            if torch.is_grad_enabled():
-                pred_counts = torch.where(splice_junction_mask, pred_counts, 0.0)
-            else:
-                pred_counts.masked_fill_(~splice_junction_mask, 0.0)
+            pred_counts = torch.where(splice_junction_mask, pred_counts, 0.0)
 
             return pred_counts, splice_junction_mask
 
