@@ -462,6 +462,18 @@ class VariantScoringModel:
             return tuple(self._outputs_to_cpu(v) for v in outputs)
         return outputs
 
+    def _outputs_to_gpu(self, outputs: Any) -> Any:
+        """Recursively move all tensors in outputs to GPU."""
+        if torch.is_tensor(outputs):
+            return outputs.cuda()
+        if isinstance(outputs, dict):
+            return {k: self._outputs_to_gpu(v) for k, v in outputs.items()}
+        if isinstance(outputs, list):
+            return [self._outputs_to_gpu(v) for v in outputs]
+        if isinstance(outputs, tuple):
+            return tuple(self._outputs_to_gpu(v) for v in outputs)
+        return outputs
+
     def score_variant(
         self,
         interval: Interval,
@@ -507,6 +519,8 @@ class VariantScoringModel:
 
         # Score with each scorer
         scores = []
+        ref_outputs = self._outputs_to_gpu(ref_outputs)
+        alt_outputs = self._outputs_to_gpu(alt_outputs)
         for scorer in scorers:
             score_result = scorer.score(
                 ref_outputs=ref_outputs,
