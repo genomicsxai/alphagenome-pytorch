@@ -567,7 +567,7 @@ class SpliceSitesUsageHead(nn.Module):
             chunk_dim = 2  # chunk over S
 
         if torch.is_grad_enabled() or _HEAD_CONV_CHUNK_SIZE <= 0 or logits.size(chunk_dim) <= _HEAD_CONV_CHUNK_SIZE:
-            predictions = torch.sigmoid(logits).cpu()
+            predictions = torch.sigmoid(logits)
         else:
             chunks = []
             for start in range(0, logits.size(chunk_dim), _HEAD_CONV_CHUNK_SIZE):

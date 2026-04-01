@@ -354,8 +354,8 @@ class VariantScoringModel:
             interval: Genomic interval containing the variant.
             variant: Variant to score.
             organism: 'human', 'mouse', or index. Uses default if None.
-            to_cpu: If True, move all output tensors to CPU and clear GPU cache.
-                Recommended for visualization or when processing many variants.
+            to_cpu: No longer moves output tensors explicitly—all head outputs are
+                already returned on CPU. Kept for backward compatibility.
             unified_splicing: If True, performs a second pass to align splice
                 sites between Ref and Alt predictions. Required for SpliceJunctionScorer.
 

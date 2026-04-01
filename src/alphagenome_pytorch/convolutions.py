@@ -114,9 +114,6 @@ class DownResBlock(nn.Module):
             out.add_(self.block2(out))
             return out
 
-        out = out + x_padded
-        return out + self.block2(out)
-
 class UpResBlock(nn.Module):
     """Upsampling residual block with skip connection. Expects NCL format (B, C, S)."""
 
