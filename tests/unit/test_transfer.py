@@ -14,6 +14,7 @@ from alphagenome_pytorch.extensions.finetuning.transfer import (
     prepare_for_transfer,
     count_trainable_params,
 )
+from alphagenome_pytorch import AlphaGenome
 
 
 # Mock model for testing (simpler than full AlphaGenome)
@@ -64,8 +65,8 @@ class TestTransferConfig:
         assert config.lora_targets == ['q_proj', 'v_proj']
         assert config.locon_rank == 4
         assert config.locon_alpha == 1
-        assert config.locon_targets == ['conv_tower']
-        assert config.ia3_targets == ['to_k', 'to_v']
+        assert config.locon_targets == []
+        assert config.ia3_targets == ['k_proj', 'v_proj']
         assert config.ia3_ff_targets == []
         assert config.new_heads == {}
         assert config.remove_heads == []
@@ -307,6 +308,64 @@ class TestTransferEdgeCases:
         # Heads should be trainable
         for head in model.heads.values():
             assert head.weight.requires_grad
+
+    def test_locon_block_targets_can_select_last_encoder_convs(self):
+        """Locon can target the final encoder block via module-name substrings."""
+        from alphagenome_pytorch.extensions.finetuning.adapters import Locon
+
+        model = AlphaGenome()
+        config = TransferConfig(
+            mode='locon',
+            locon_rank=2,
+            locon_targets=['down_blocks.5'],
+            remove_heads=list(model.heads.keys()),
+        )
+
+        model = prepare_for_transfer(model, config)
+
+        assert isinstance(model.encoder.down_blocks[5].block1.conv, Locon)
+        assert isinstance(model.encoder.down_blocks[5].block2.conv, Locon)
+        assert not isinstance(model.encoder.down_blocks[4].block2.conv, Locon)
+        assert not isinstance(model.decoder.up_blocks[0].conv_in.conv, Locon)
+
+    def test_locon_requires_explicit_targets(self):
+        """Locon mode should fail closed when no targets are provided."""
+        model = AlphaGenome()
+        config = TransferConfig(
+            mode='locon',
+            remove_heads=list(model.heads.keys()),
+        )
+
+        with pytest.raises(ValueError, match="requires explicit locon_targets"):
+            prepare_for_transfer(model, config)
+
+    def test_locon_rejects_non_matching_targets(self):
+        """Locon mode should raise when target patterns match no conv modules."""
+        model = AlphaGenome()
+        config = TransferConfig(
+            mode='locon',
+            locon_targets=['definitely_not_a_real_conv'],
+            remove_heads=list(model.heads.keys()),
+        )
+
+        with pytest.raises(ValueError, match="did not match any Conv1d modules"):
+            prepare_for_transfer(model, config)
+
+    def test_locon_encoder_block_forward_no_length_mismatch(self):
+        """Locon on the real encoder block should preserve the output length."""
+        model = AlphaGenome()
+        config = TransferConfig(
+            mode='locon',
+            locon_rank=2,
+            locon_targets=['down_blocks.5'],
+            remove_heads=list(model.heads.keys()),
+        )
+
+        model = prepare_for_transfer(model, config)
+        x = torch.randn(1, 1408, 32)
+        output = model.encoder.down_blocks[5].block1.conv(x)
+
+        assert output.shape == (1, 1536, 32)
 
     def test_full_mode_cannot_combine(self):
         """'full' cannot be combined with other modes."""
