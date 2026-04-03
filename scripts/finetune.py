@@ -729,7 +729,7 @@ def create_model(
     rank: int,
     world_size: int,
     local_rank: int,
-) -> tuple[nn.Module, dict[str, nn.Module], list[torch.nn.Parameter]]:
+) -> tuple[nn.Module, dict[str, nn.Module], list[torch.nn.Parameter], TransferConfig | None]:
     """Create and configure the model based on training mode.
 
     Args:
@@ -743,7 +743,7 @@ def create_model(
         local_rank: Local rank for GPU assignment.
 
     Returns:
-        Tuple of (model, heads_dict, trainable_params).
+        Tuple of (model, heads_dict, trainable_params, transfer_config).
     """
     print_rank0(f"Loading pretrained model from {args.pretrained_weights}", rank)
 
@@ -883,7 +883,7 @@ def create_model(
     n_total = sum(p.numel() for p in model_module.parameters())
     print_rank0(f"Trainable: {n_trainable:,} / {n_total:,} ({100*n_trainable/n_total:.2f}%)", rank)
 
-    return model, heads, trainable_params
+    return model, heads, trainable_params, transfer_config
 
 
 # =============================================================================
@@ -970,7 +970,7 @@ def main() -> None:
     modality_track_means = broadcast_object(modality_track_means, src=0)
 
     # Create model
-    model, heads, trainable_params = create_model(
+    model, heads, trainable_params, transfer_config = create_model(
         args,
         modality_track_names,
         modality_track_means,
