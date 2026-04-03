@@ -25,6 +25,14 @@ if TYPE_CHECKING:
     from alphagenome_pytorch.extensions.finetuning.transfer import TransferConfig
 
 
+def _strip_orig_mod(state_dict: dict[str, Any]) -> dict[str, Any]:
+    """Strip ``_orig_mod.`` prefix from keys added by ``torch.compile``."""
+    prefix = "_orig_mod."
+    if any(k.startswith(prefix) for k in state_dict):
+        return {k.removeprefix(prefix): v for k, v in state_dict.items()}
+    return state_dict
+
+
 def atomic_torch_save(obj: Any, path: Path | str) -> None:
     """Save a PyTorch object atomically.
 
@@ -111,7 +119,7 @@ def save_checkpoint(
     """
     checkpoint = {
         "epoch": epoch,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": _strip_orig_mod(model.state_dict()),
         "optimizer_state_dict": optimizer.state_dict(),
         "val_loss": val_loss,
         "track_names": track_names,
@@ -195,8 +203,13 @@ def load_checkpoint(
     """
     checkpoint = torch.load(path, map_location=device, weights_only=False)
 
-    # Load entire model state (trunk + heads)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    # Load entire model state (trunk + heads), stripping _orig_mod. prefix
+    # from torch.compile'd models if the loading model is not compiled.
+    state_dict = checkpoint["model_state_dict"]
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError:
+        model.load_state_dict(_strip_orig_mod(state_dict))
 
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
@@ -705,12 +718,43 @@ def save_delta_checkpoint(
 def is_delta_checkpoint(path: Path | str) -> bool:
     """Check if a checkpoint file is a delta checkpoint.
 
+    Uses zipfile inspection to peek at keys without fully deserializing,
+    falling back to ``torch.load`` for legacy tar-format checkpoints.
+
     Args:
         path: Path to checkpoint file.
 
     Returns:
         True if the checkpoint is a delta checkpoint, False otherwise.
     """
+    import zipfile
+
+    path = Path(path)
+
+    # Modern PyTorch checkpoints are zip files — peek at entry names
+    # to detect delta format without deserializing tensors.
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as zf:
+            # Delta checkpoints store "delta_checkpoint_version" as a
+            # top-level key, which appears as a data.pkl entry.  We
+            # need to actually unpickle to check, but we can restrict
+            # to the pickle payload (tiny) and skip the large tensor
+            # storage entries.
+            import io
+            import pickle
+
+            for name in zf.namelist():
+                if name.endswith("data.pkl"):
+                    with zf.open(name) as f:
+                        try:
+                            data = pickle.load(io.BytesIO(f.read()))
+                            if isinstance(data, dict):
+                                return "delta_checkpoint_version" in data
+                        except Exception:
+                            break
+            return False
+
+    # Legacy tar-format or unknown — full load as fallback.
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     return "delta_checkpoint_version" in checkpoint
 
@@ -1178,7 +1222,7 @@ def load_finetuned_model(
             f"Unrecognized checkpoint format. Keys: {list(ckpt.keys())[:10]}"
         )
 
-    state_dict = ckpt["model_state_dict"]
+    state_dict = _strip_orig_mod(ckpt["model_state_dict"])
 
     # Determine TransferConfig: external > embedded > None
     effective_config = transfer_config
