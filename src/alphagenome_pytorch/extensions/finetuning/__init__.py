@@ -32,6 +32,7 @@ from alphagenome_pytorch.extensions.finetuning.checkpointing import (
     compute_base_model_hash, DELTA_CHECKPOINT_VERSION,
     export_model_weights, export_delta_weights,
     load_delta_config, load_delta_weights,
+    load_finetuned_model,
 )
 
 # Transfer config serialization
@@ -140,6 +141,8 @@ __all__ = [
     "export_delta_weights",
     "load_delta_config",
     "load_delta_weights",
+    # Inference loading
+    "load_finetuned_model",
     # Data transforms (lazy-loaded)
     "apply_atac_transforms",
     "apply_rnaseq_transforms",

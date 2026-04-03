@@ -122,6 +122,7 @@ from alphagenome_pytorch.extensions.finetuning.transfer import (
     remove_all_heads,
     add_head,
     prepare_for_transfer,
+    transfer_config_to_dict,
 )
 
 
@@ -331,6 +332,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Save delta checkpoints (adapter + head weights only, much smaller). "
              "Delta files saved as best_model.delta.pth",
+    )
+    resume.add_argument(
+        "--export-transfer-config",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Export TransferConfig to JSON file at end of training. "
+             "Useful for loading full checkpoints in predict scripts.",
     )
 
     args = parser.parse_args()
@@ -1100,6 +1109,7 @@ def main() -> None:
                 scheduler=scheduler,
                 best_val_loss=best_val_loss,
                 wandb_run_id=logger.wandb_run_id,
+                transfer_config=transfer_config_to_dict(transfer_config) if transfer_config is not None else None,
             )
             print(f"Preemption checkpoint saved to {output_dir / 'checkpoint_preempt.pth'}")
 
@@ -1283,6 +1293,7 @@ def main() -> None:
                         scheduler=scheduler,
                         best_val_loss=best_val_loss,
                         wandb_run_id=logger.wandb_run_id,
+                        transfer_config=transfer_config_to_dict(transfer_config) if transfer_config is not None else None,
                     )
                     print(f"  Saved best model (val_loss={val_loss:.4f})")
 
@@ -1316,6 +1327,7 @@ def main() -> None:
                         scheduler=scheduler,
                         best_val_loss=best_val_loss,
                         wandb_run_id=logger.wandb_run_id,
+                        transfer_config=transfer_config_to_dict(transfer_config) if transfer_config is not None else None,
                     )
 
             barrier()
@@ -1326,6 +1338,15 @@ def main() -> None:
         logger.finish()
         handler.unregister()
         cleanup_distributed()
+
+    # Export transfer config if requested
+    if args.export_transfer_config and transfer_config is not None and is_main_process(rank):
+        import json
+        config_path = Path(args.export_transfer_config)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, "w") as f:
+            json.dump(transfer_config_to_dict(transfer_config), f, indent=2)
+        print(f"Exported TransferConfig to {config_path}")
 
     print_rank0(f"\nTraining complete! Best val_loss: {best_val_loss:.4f}", rank)
     print_rank0(f"Output: {output_dir}", rank)
