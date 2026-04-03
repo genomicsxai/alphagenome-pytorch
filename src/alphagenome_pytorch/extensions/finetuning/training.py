@@ -804,15 +804,23 @@ def train_epoch_ddp(
             _cuda_sync(device)
             t0 = time.perf_counter()
 
-        scaled_loss.backward()
+        # --- Optimizer step (only every accumulation_steps batches) ---
+        is_accumulation_step = (batch_idx + 1) % accumulation_steps == 0
+        is_last_batch = batch_idx == len(train_loader) - 1
+
+        # Skip DDP gradient sync on intermediate accumulation steps
+        no_sync = (
+            accumulation_steps > 1
+            and not is_accumulation_step
+            and not is_last_batch
+            and hasattr(model, "no_sync")
+        )
+        with model.no_sync() if no_sync else nullcontext():
+            scaled_loss.backward()
 
         if is_profiling:
             _cuda_sync(device)
             profile_stats.add("5_backward", time.perf_counter() - t0)
-
-        # --- Optimizer step (only every accumulation_steps batches) ---
-        is_accumulation_step = (batch_idx + 1) % accumulation_steps == 0
-        is_last_batch = batch_idx == len(train_loader) - 1
 
         if is_accumulation_step or is_last_batch:
             if is_profiling:
@@ -1330,15 +1338,23 @@ def train_epoch_multihead(
             _cuda_sync(device)
             t0 = time.perf_counter()
 
-        scaled_loss.backward()
+        # Optimizer step
+        is_accumulation_step = (batch_idx + 1) % accumulation_steps == 0
+        is_last_batch = batch_idx == len(train_loader) - 1
+
+        # Skip DDP gradient sync on intermediate accumulation steps
+        no_sync = (
+            accumulation_steps > 1
+            and not is_accumulation_step
+            and not is_last_batch
+            and hasattr(model, "no_sync")
+        )
+        with model.no_sync() if no_sync else nullcontext():
+            scaled_loss.backward()
 
         if is_profiling:
             _cuda_sync(device)
             profile_stats.add("5_backward", time.perf_counter() - t0)
-
-        # Optimizer step
-        is_accumulation_step = (batch_idx + 1) % accumulation_steps == 0
-        is_last_batch = batch_idx == len(train_loader) - 1
 
         if is_accumulation_step or is_last_batch:
             if is_profiling:
