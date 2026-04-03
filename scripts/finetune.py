@@ -1281,24 +1281,8 @@ def main() -> None:
             if is_main_process(rank):
                 if is_best:
                     best_val_loss = val_loss
-                    save_checkpoint(
-                        path=output_dir / "best_model.pth",
-                        epoch=epoch,
-                        model=model_module,
-                        optimizer=optimizer,
-                        val_loss=val_loss,
-                        track_names=modality_track_names,
-                        modality=args.modalities,
-                        resolutions=modality_resolutions,
-                        scheduler=scheduler,
-                        best_val_loss=best_val_loss,
-                        wandb_run_id=logger.wandb_run_id,
-                        transfer_config=transfer_config_to_dict(transfer_config) if transfer_config is not None else None,
-                    )
-                    print(f"  Saved best model (val_loss={val_loss:.4f})")
-
-                    # Save delta checkpoint (adapter + head weights only)
                     if args.save_delta and transfer_config is not None:
+                        # Delta-only: skip full checkpoint for best model
                         save_delta_checkpoint(
                             path=output_dir / "best_model.delta.pth",
                             model=model_module,
@@ -1312,7 +1296,23 @@ def main() -> None:
                             modality=args.modalities,
                             resolutions=modality_resolutions,
                         )
-                        print(f"  Saved delta checkpoint (adapter + head weights)")
+                        print(f"  Saved best delta checkpoint (val_loss={val_loss:.4f})")
+                    else:
+                        save_checkpoint(
+                            path=output_dir / "best_model.pth",
+                            epoch=epoch,
+                            model=model_module,
+                            optimizer=optimizer,
+                            val_loss=val_loss,
+                            track_names=modality_track_names,
+                            modality=args.modalities,
+                            resolutions=modality_resolutions,
+                            scheduler=scheduler,
+                            best_val_loss=best_val_loss,
+                            wandb_run_id=logger.wandb_run_id,
+                            transfer_config=transfer_config_to_dict(transfer_config) if transfer_config is not None else None,
+                        )
+                        print(f"  Saved best model (val_loss={val_loss:.4f})")
 
                 if epoch % args.save_every == 0:
                     save_checkpoint(

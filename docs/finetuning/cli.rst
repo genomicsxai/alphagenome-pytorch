@@ -329,7 +329,7 @@ as ``--model`` and the finetuned checkpoint as ``--checkpoint``:
 
 .. code-block:: bash
 
-   # Delta checkpoint (self-describing, recommended)
+   # Delta checkpoint
    python scripts/predict_full_chromosome.py \
        --model pretrained.pth \
        --checkpoint best_model.delta.pth \
@@ -338,7 +338,7 @@ as ``--model`` and the finetuned checkpoint as ``--checkpoint``:
        --head my_atac \
        --chromosomes chr21
 
-   # Full checkpoint (with embedded or external TransferConfig)
+   # Full checkpoint (with embedded TransferConfig)
    python scripts/predict_full_chromosome.py \
        --model pretrained.pth \
        --checkpoint best_model.pth \
@@ -347,7 +347,7 @@ as ``--model`` and the finetuned checkpoint as ``--checkpoint``:
        --head my_atac \
        --chromosomes chr21
 
-   # Full checkpoint from older training run (provide config separately)
+   # Full checkpoint (with external TransferConfig)
    python scripts/predict_full_chromosome.py \
        --model pretrained.pth \
        --checkpoint best_model.pth \
@@ -356,7 +356,8 @@ as ``--model`` and the finetuned checkpoint as ``--checkpoint``:
        --output predictions/ \
        --head my_atac
 
-To export the transfer config from a training run:
+The transfer config is embedded in checkpoints but you can 
+also export it from a training run as a separate file:
 
 .. code-block:: bash
 
