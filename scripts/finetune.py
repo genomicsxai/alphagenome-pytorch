@@ -167,7 +167,7 @@ DEFAULTS = {
 # =============================================================================
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Unified AlphaGenome training script",
@@ -342,10 +342,11 @@ def parse_args() -> argparse.Namespace:
              "Useful for loading full checkpoints in predict scripts.",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    tokens = argv if argv is not None else sys.argv[1:]
     cli_flags = {
         token.split("=", 1)[0]
-        for token in sys.argv[1:]
+        for token in tokens
         if token.startswith("--")
     }
 
@@ -891,9 +892,10 @@ def create_model(
 # =============================================================================
 
 
-def main() -> None:
+def main(args: argparse.Namespace | None = None) -> None:
     """Main training function."""
-    args = parse_args()
+    if args is None:
+        args = parse_args()
 
     # Setup distributed
     rank, world_size, local_rank, device = setup_distributed()
