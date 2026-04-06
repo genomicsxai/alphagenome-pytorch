@@ -53,8 +53,8 @@ class TestFullModelBackward:
     """Test that the full AlphaGenome model supports backward pass."""
 
     @pytest.fixture
-    def small_model(self):
-        """Create a model for testing (no pretrained weights needed)."""
+    def model(self):
+        """Create a model in train mode (no pretrained weights needed)."""
         model = AlphaGenome(num_organisms=2, dtype_policy=DtypePolicy.full_float32())
         model.train()
         return model
@@ -68,7 +68,7 @@ class TestFullModelBackward:
         org_idx = torch.tensor([0])
         return x, org_idx
 
-    def test_full_model_all_params_receive_gradients(self, small_model, small_input):
+    def test_full_model_all_params_receive_gradients(self, model, small_input):
         """CRITICAL: Verify EVERY parameter in the model receives a gradient.
 
         Note: splice_sites_junction_head parameters are excluded because they depend
@@ -77,7 +77,6 @@ class TestFullModelBackward:
         all positions to be invalid (-1), which masks out predictions. These parameters
         are tested separately in TestSpliceHeadGradients.test_splice_junction_head_backward.
         """
-        model = small_model
         x, org_idx = small_input
 
         outputs = model(x, org_idx)
@@ -102,9 +101,8 @@ class TestFullModelBackward:
             + "\n".join(params_without_grad[:20])
         )
 
-    def test_full_model_no_nan_inf(self, small_model, small_input):
+    def test_full_model_no_nan_inf(self, model, small_input):
         """Verify no NaN or Inf in any gradient."""
-        model = small_model
         x, org_idx = small_input
 
         outputs = model(x, org_idx)
@@ -113,9 +111,8 @@ class TestFullModelBackward:
 
         assert_no_nan_inf_gradients(model)
 
-    def test_optimizer_step_works(self, small_model, small_input):
+    def test_optimizer_step_works(self, model, small_input):
         """Verify we can actually take an optimizer step (model is trainable)."""
-        model = small_model
         x, org_idx = small_input
 
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
@@ -137,9 +134,8 @@ class TestFullModelBackward:
 
         assert params_changed > 0, "No parameters were updated by optimizer step"
 
-    def test_input_receives_gradient(self, small_model, small_input):
+    def test_input_receives_gradient(self, model, small_input):
         """Verify gradients flow all the way back to the input."""
-        model = small_model
         x, org_idx = small_input
 
         outputs = model(x, org_idx)

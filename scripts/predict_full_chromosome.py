@@ -142,6 +142,15 @@ def main():
         default="cuda",
         help="PyTorch device (default: cuda)",
     )
+    parser.add_argument(
+        "--dtype-policy",
+        type=str,
+        default="full_float32",
+        choices=["full_float32", "mixed_precision"],
+        help="Dtype policy: full_float32 (default, works everywhere) or "
+             "mixed_precision (bfloat16 compute, ~halves GPU memory, requires Ampere+ GPU)",
+    )
+
     # Output options
     parser.add_argument(
         "--quiet",
@@ -180,16 +189,24 @@ def main():
     # Import here to avoid slow imports when just showing help
     import torch
     from alphagenome_pytorch import AlphaGenome
+    from alphagenome_pytorch.config import DtypePolicy
     from alphagenome_pytorch.extensions.inference import (
         TilingConfig,
         predict_full_chromosomes_to_bigwig,
     )
+
+    # Configure dtype policy
+    if args.dtype_policy == "mixed_precision":
+        dtype_policy = DtypePolicy.mixed_precision()
+    else:
+        dtype_policy = DtypePolicy.full_float32()
 
     # Load model (track means are bundled with weights)
     print(f"Loading model from {model_path}...")
     model = AlphaGenome.from_pretrained(
         model_path,
         device=args.device,
+        dtype_policy=dtype_policy,
     )
     model.eval()
 
