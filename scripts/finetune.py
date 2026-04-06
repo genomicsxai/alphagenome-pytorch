@@ -163,6 +163,25 @@ DEFAULTS = {
 
 
 # =============================================================================
+# Utilities
+# =============================================================================
+
+
+def unwrap_training_model(model: nn.Module) -> nn.Module:
+    """Unwrap the exact wrapper stack used in this training script.
+
+    Wrapping order in finetune.py is deterministic:
+    1. base model
+    2. optional DDP
+    3. optional torch.compile
+    """
+    inner = getattr(model, "_orig_mod", model)
+    if isinstance(inner, DDP):
+        return inner.module
+    return inner
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
@@ -771,37 +790,42 @@ def create_model(
     # encoder-only mode forces 128bp resolution for all heads
     is_encoder_only = args.mode == "encoder-only"
 
-    # Create heads for each modality (after freeze, so they have requires_grad=True)
-    heads: dict[str, nn.Module] = {}
-    for modality, track_names in modality_track_names.items():
-        n_tracks = len(track_names)
-        track_means = modality_track_means.get(modality)
-        resolutions = modality_resolutions[modality]
-
-        head = create_finetuning_head(
-            assay_type=modality,
-            n_tracks=n_tracks,
-            resolutions=resolutions if not is_encoder_only else (128,),
-            num_organisms=1,
-            track_means=track_means,
-            init_scheme=args.head_init_scheme,
-            encoder_only=is_encoder_only,
-        )
-        add_head(model, modality, head)
-        heads[modality] = head
-        head_resolutions = (128,) if is_encoder_only else resolutions
-        print_rank0(f"Created {modality} head with {n_tracks} tracks at resolutions {head_resolutions}", rank)
-
     # Build new_heads dict for TransferConfig (used for delta checkpoints)
     new_heads_config: dict[str, dict] = {}
-    for modality in heads:
+    for modality, track_names in modality_track_names.items():
         head_res = (128,) if is_encoder_only else modality_resolutions[modality]
         new_heads_config[modality] = {
             "modality": modality,
-            "num_tracks": len(modality_track_names[modality]),
+            "num_tracks": len(track_names),
             "resolutions": list(head_res),
             "encoder_only": is_encoder_only,
+            "track_means": modality_track_means.get(modality),
+            "num_organisms": 1,
+            "init_scheme": args.head_init_scheme,
         }
+
+    # Create heads directly except in LoRA mode, where prepare_for_transfer()
+    # constructs the actual trainable heads we want the optimizer to own.
+    heads: dict[str, nn.Module] = {}
+    create_heads_directly = not (args.mode == "lora" and args.lora_rank > 0)
+    if create_heads_directly:
+        for modality, track_names in modality_track_names.items():
+            head = create_finetuning_head(
+                assay_type=modality,
+                n_tracks=len(track_names),
+                resolutions=tuple(new_heads_config[modality]["resolutions"]),
+                num_organisms=1,
+                track_means=modality_track_means.get(modality),
+                init_scheme=args.head_init_scheme,
+                encoder_only=is_encoder_only,
+            )
+            add_head(model, modality, head)
+            heads[modality] = head
+            print_rank0(
+                f"Created {modality} head with {len(track_names)} tracks "
+                f"at resolutions {tuple(new_heads_config[modality]['resolutions'])}",
+                rank,
+            )
 
     # Configure trainable params based on mode
     trainable_params: list[torch.nn.Parameter] = []
@@ -837,7 +861,17 @@ def create_model(
                 new_heads=new_heads_config,
             )
             model = prepare_for_transfer(model, transfer_config)
-            # LoRA adapters + heads (heads already have requires_grad=True)
+            heads = {
+                modality: model.heads[modality]
+                for modality in modality_track_names
+            }
+            for modality, track_names in modality_track_names.items():
+                print_rank0(
+                    f"Created {modality} head with {len(track_names)} tracks "
+                    f"at resolutions {tuple(new_heads_config[modality]['resolutions'])}",
+                    rank,
+                )
+            # LoRA adapters + the freshly registered heads
             trainable_params = get_adapter_params(model)
             for head in heads.values():
                 trainable_params.extend(list(head.parameters()))
@@ -867,8 +901,8 @@ def create_model(
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         print_rank0("Model wrapped with DistributedDataParallel", rank)
 
-    # Get head references from GPU model
-    model_module = model.module if isinstance(model, DDP) else model
+    # Get head references from the underlying model before optional compile.
+    model_module = unwrap_training_model(model)
     heads = {modality: model_module.heads[modality] for modality in heads}
 
     # Optionally compile
@@ -877,6 +911,7 @@ def create_model(
         import torch._inductor.config as inductor_config
         inductor_config.group_fusion = False
         model = torch.compile(model)
+        model_module = unwrap_training_model(model)
 
     # Count parameters
     n_trainable = sum(p.numel() for p in trainable_params)
@@ -980,7 +1015,7 @@ def main() -> None:
         world_size,
         local_rank,
     )
-    model_module = model.module if isinstance(model, DDP) else model
+    model_module = unwrap_training_model(model)
 
     # Optimizer
     optimizer = torch.optim.AdamW(

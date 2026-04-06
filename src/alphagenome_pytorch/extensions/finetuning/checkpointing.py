@@ -718,8 +718,10 @@ def save_delta_checkpoint(
 def is_delta_checkpoint(path: Path | str) -> bool:
     """Check if a checkpoint file is a delta checkpoint.
 
-    Uses zipfile inspection to peek at keys without fully deserializing,
-    falling back to ``torch.load`` for legacy tar-format checkpoints.
+    Uses ``torch.load`` and inspects the top-level keys. This is more robust
+    than trying to unpickle the internal ``data.pkl`` payload directly, which
+    can misclassify valid PyTorch checkpoints that rely on torch-specific
+    storage deserialization.
 
     Args:
         path: Path to checkpoint file.
@@ -727,36 +729,8 @@ def is_delta_checkpoint(path: Path | str) -> bool:
     Returns:
         True if the checkpoint is a delta checkpoint, False otherwise.
     """
-    import zipfile
-
-    path = Path(path)
-
-    # Modern PyTorch checkpoints are zip files — peek at entry names
-    # to detect delta format without deserializing tensors.
-    if zipfile.is_zipfile(path):
-        with zipfile.ZipFile(path) as zf:
-            # Delta checkpoints store "delta_checkpoint_version" as a
-            # top-level key, which appears as a data.pkl entry.  We
-            # need to actually unpickle to check, but we can restrict
-            # to the pickle payload (tiny) and skip the large tensor
-            # storage entries.
-            import io
-            import pickle
-
-            for name in zf.namelist():
-                if name.endswith("data.pkl"):
-                    with zf.open(name) as f:
-                        try:
-                            data = pickle.load(io.BytesIO(f.read()))
-                            if isinstance(data, dict):
-                                return "delta_checkpoint_version" in data
-                        except Exception:
-                            break
-            return False
-
-    # Legacy tar-format or unknown — full load as fallback.
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    return "delta_checkpoint_version" in checkpoint
+    return isinstance(checkpoint, dict) and "delta_checkpoint_version" in checkpoint
 
 
 def load_delta_checkpoint(
