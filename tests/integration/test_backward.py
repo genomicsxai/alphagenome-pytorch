@@ -213,9 +213,9 @@ class TestAllHeadsContributeGradients:
             "rna_seq",
             "chip_tf",
             "chip_histone",
-            "pair_activations",
-            "splice_sites_classification",
-            "splice_sites_usage",
+            "contact_maps",
+            "splice_sites",
+            "splice_site_usage",
             # Note: splice_sites_junction is excluded because its positions come from
             # generate_splice_site_positions with a threshold. With random weights,
             # the classification head may not produce confident predictions, causing

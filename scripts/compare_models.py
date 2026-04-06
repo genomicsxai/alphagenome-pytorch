@@ -188,7 +188,7 @@ def main():
         'rna_seq': dna_output.OutputType.RNA_SEQ,
         'chip_tf': dna_output.OutputType.CHIP_TF,
         'chip_histone': dna_output.OutputType.CHIP_HISTONE,
-        'pair_activations': dna_output.OutputType.CONTACT_MAPS
+        'contact_maps': dna_output.OutputType.CONTACT_MAPS
     }
 
     def compare_arrays(name, p, j):

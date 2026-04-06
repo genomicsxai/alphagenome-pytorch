@@ -151,6 +151,13 @@ def main():
              "mixed_precision (bfloat16 compute, ~halves GPU memory, requires Ampere+ GPU)",
     )
 
+    # Performance options
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Use torch.compile for faster inference (first batch is slower due to compilation)",
+    )
+
     # Output options
     parser.add_argument(
         "--quiet",
@@ -209,6 +216,10 @@ def main():
         dtype_policy=dtype_policy,
     )
     model.eval()
+
+    if args.compile:
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
 
     # Configure tiling
     config = TilingConfig(

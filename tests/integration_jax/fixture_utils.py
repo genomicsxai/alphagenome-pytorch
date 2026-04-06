@@ -104,16 +104,16 @@ def create_jax_loss_fn(jax_model, loss_type: str = 'combined', use_float32: bool
                 cm_out = predictions['contact_maps']
                 if isinstance(cm_out, dict) and 'predictions' in cm_out:
                     loss = loss + cm_out['predictions'].mean()
-            elif 'pair_activations' in predictions:
-                loss = loss + predictions['pair_activations'].mean()
+            elif 'contact_maps' in predictions:
+                loss = loss + predictions['contact_maps'].mean()
 
             # Splice heads
-            if 'splice_sites_classification' in predictions:
-                if 'logits' in predictions['splice_sites_classification']:
-                    loss = loss + predictions['splice_sites_classification']['logits'].mean()
-            if 'splice_sites_usage' in predictions:
-                if 'logits' in predictions['splice_sites_usage']:
-                    loss = loss + predictions['splice_sites_usage']['logits'].mean()
+            if 'splice_sites' in predictions:
+                if 'logits' in predictions['splice_sites']:
+                    loss = loss + predictions['splice_sites']['logits'].mean()
+            if 'splice_site_usage' in predictions:
+                if 'logits' in predictions['splice_site_usage']:
+                    loss = loss + predictions['splice_site_usage']['logits'].mean()
 
             return loss
 
