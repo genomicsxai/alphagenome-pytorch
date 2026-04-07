@@ -292,13 +292,10 @@ def _run_tracks(args: argparse.Namespace) -> int:
 
     lines = header_parts + [""]
 
-    # Tabular format — show more columns for small result sets
-    small_result = len(filtered) <= 10
+    # Tabular format — compact default columns; --columns to override/expand
     display_cols = _pick_display_columns(
         filtered, head_name,
         user_columns=getattr(args, 'columns', None),
-        max_cols=None if small_result else 3,
-        skip_uniform=not small_result,
     )
 
     if display_cols:
@@ -325,80 +322,47 @@ def _run_tracks(args: argparse.Namespace) -> int:
     return 0
 
 
+_DEFAULT_DISPLAY_COLUMNS: tuple[str, ...] = ("biosample_type", "ontology_curie")
+
+# Head-specific column shown in addition to the defaults
+_HEAD_EXTRA_COLUMN: dict[str, str] = {
+    "chip_tf": "transcription_factor",
+    "chip_histone": "histone_mark",
+}
+
+
 def _pick_display_columns(
     tracks: list,
     head_name: str,
     user_columns: str | None = None,
-    max_cols: int | None = 3,
-    skip_uniform: bool = True,
 ) -> list[str]:
     """Pick extra columns to display for this head.
 
-    Args:
-        max_cols: Maximum columns to show. None = all available.
-        skip_uniform: If True, skip columns where all values are the same.
+    Default is a small fixed set (biosample_type, ontology_curie, plus a
+    head-specific column for chip_tf/chip_histone). Pass --columns to
+    override.
     """
     if not tracks:
         return []
 
-    # User-specified columns take priority
+    # User-specified columns take priority. biosample_name is always shown
+    # as the leading column, so drop it from extras to avoid duplicates.
     if user_columns:
-        return [c.strip() for c in user_columns.split(",") if c.strip()]
+        return [
+            c.strip() for c in user_columns.split(",")
+            if c.strip() and c.strip() != "biosample_name"
+        ]
 
-    # Collect all available extras keys
-    all_keys: set[str] = set()
+    cols: list[str] = []
+    if head_name in _HEAD_EXTRA_COLUMN:
+        cols.append(_HEAD_EXTRA_COLUMN[head_name])
+    cols.extend(_DEFAULT_DISPLAY_COLUMNS)
+
+    # Drop columns that aren't present on any track
+    available: set[str] = set()
     for t in tracks:
-        all_keys.update(t.extras.keys())
-
-    # Priority order — head-specific fields first, then general
-    priority: list[str] = []
-    if head_name == "chip_tf":
-        priority.append("transcription_factor")
-    elif head_name == "chip_histone":
-        priority.append("histone_mark")
-    if head_name in ("rna_seq", "cage", "procap"):
-        priority.append("strand")
-
-    priority.extend([
-        "biosample_type",
-        "ontology_curie",
-        "data_source",
-        "strand",
-        "genetically_modified",
-        "endedness",
-    ])
-
-    # Deduplicate while preserving order
-    seen: set[str] = set()
-    deduped = []
-    for col in priority:
-        if col not in seen:
-            seen.add(col)
-            deduped.append(col)
-    priority = deduped
-
-    # Core columns should always be tried first
-    core = ["biosample_type", "ontology_curie"]
-    
-    # Final column list construction
-    result = []
-    for col in priority:
-        if col not in all_keys or col == "biosample_name":
-            continue
-        
-        if skip_uniform and col not in core:
-            # Skip uniform columns unless they are core columns
-            vals = {str(t.get(col, "")) for t in tracks}
-            if len(vals) <= 1:
-                continue
-                
-        result.append(col)
-        if max_cols is not None and len(result) >= max_cols:
-            break
-
-    return result
-
-    return result
+        available.update(t.extras.keys())
+    return [c for c in cols if c in available]
 
 
 def _load_state_dict(path: str) -> tuple[dict, str]:
