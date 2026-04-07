@@ -258,10 +258,7 @@ class VariantScoringModel:
                 continue # Skip unknown organisms in file
                 
             try:
-                if output_type_str == 'contact_maps':
-                    output_type = OutputType.CONTACT_MAPS
-                else:
-                    output_type = OutputType(output_type_str)
+                output_type = OutputType(output_type_str)
             except ValueError:
                 continue
 
@@ -398,8 +395,8 @@ class VariantScoringModel:
             # Calculate unified splice site positions (max of Ref and Alt)
             from ..utils.splicing import generate_splice_site_positions
             
-            ref_probs = ref_outputs['splice_sites_classification']['probs']
-            alt_probs = alt_outputs['splice_sites_classification']['probs']
+            ref_probs = ref_outputs['splice_sites']['probs']
+            alt_probs = alt_outputs['splice_sites']['probs']
             
             # Use max(Ref, Alt) to determine sites
             unified_positions = generate_splice_site_positions(
@@ -435,7 +432,7 @@ class VariantScoringModel:
                 )
                 
                 # Update outputs
-                outputs['splice_sites_junction'] = junction_out
+                outputs['splice_junctions'] = junction_out
                 return outputs
 
             ref_outputs = _run_head_with_positions(ref_outputs, unified_positions)

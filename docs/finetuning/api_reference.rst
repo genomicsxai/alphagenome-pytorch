@@ -40,3 +40,28 @@ Adapters
 .. autoclass:: alphagenome_pytorch.extensions.finetuning.adapters.AdapterHoulsby
    :members:
    :undoc-members:
+
+Checkpointing
+-------------
+
+.. autofunction:: alphagenome_pytorch.extensions.finetuning.checkpointing.save_checkpoint
+
+.. autofunction:: alphagenome_pytorch.extensions.finetuning.checkpointing.load_checkpoint
+
+.. autofunction:: alphagenome_pytorch.extensions.finetuning.checkpointing.save_delta_checkpoint
+
+.. autofunction:: alphagenome_pytorch.extensions.finetuning.checkpointing.load_delta_checkpoint
+
+.. autofunction:: alphagenome_pytorch.extensions.finetuning.checkpointing.export_delta_weights
+
+.. autofunction:: alphagenome_pytorch.extensions.finetuning.checkpointing.load_delta_config
+
+.. autofunction:: alphagenome_pytorch.extensions.finetuning.checkpointing.load_delta_weights
+
+.. autofunction:: alphagenome_pytorch.extensions.finetuning.checkpointing.get_adapter_state_dict
+
+.. autofunction:: alphagenome_pytorch.extensions.finetuning.checkpointing.compute_base_model_hash
+
+.. autofunction:: alphagenome_pytorch.extensions.finetuning.transfer.transfer_config_to_dict
+
+.. autofunction:: alphagenome_pytorch.extensions.finetuning.transfer.transfer_config_from_dict

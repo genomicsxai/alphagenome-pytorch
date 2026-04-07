@@ -315,6 +315,37 @@ class TestTransferEdgeCases:
         with pytest.raises(ValueError, match="cannot be combined"):
             prepare_for_transfer(model, config)
 
+    def test_encoder_only_mode_auto_sets_encoder_only_on_heads(self):
+        """encoder-only mode should auto-set encoder_only=True on new heads."""
+        model = MockAlphaGenome()
+        config = TransferConfig(
+            mode='encoder-only',
+            new_heads={'my_head': {'modality': 'atac', 'num_tracks': 5}},
+        )
+        model = prepare_for_transfer(model, config)
+        # Head should exist and be created with encoder_only=True (128bp only)
+        assert 'my_head' in model.heads
+
+    def test_encoder_only_mode_rejects_encoder_only_false(self):
+        """encoder-only mode should reject heads with explicit encoder_only=False."""
+        model = MockAlphaGenome()
+        config = TransferConfig(
+            mode='encoder-only',
+            new_heads={'bad': {'modality': 'atac', 'num_tracks': 5, 'encoder_only': False}},
+        )
+        with pytest.raises(ValueError, match="encoder_only=False"):
+            prepare_for_transfer(model, config)
+
+    def test_encoder_only_mode_accepts_explicit_true(self):
+        """encoder-only mode should accept heads with explicit encoder_only=True."""
+        model = MockAlphaGenome()
+        config = TransferConfig(
+            mode='encoder-only',
+            new_heads={'ok': {'modality': 'atac', 'num_tracks': 5, 'encoder_only': True}},
+        )
+        model = prepare_for_transfer(model, config)
+        assert 'ok' in model.heads
+
     def test_full_mode_single(self):
         """'full' mode alone trains everything."""
         model = MockAlphaGenome()

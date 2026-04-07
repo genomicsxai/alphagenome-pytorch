@@ -33,6 +33,10 @@ Alternatively, you can use the standard PyTorch ``.load_state_dict()``:
    # Load weights and buffers
    model.load_state_dict(state_dict, strict=False)
 
+
+The weights for the all-folds model as well as for each fold are `available on Hugging Face <https://huggingface.co/gtca/alphagenome_pytorch>`_. They were generated from the `JAX checkpoints <https://www.kaggle.com/models/google/alphagenome>`_ using `this scripts <https://github.com/kundajelab/alphagenome-pytorch/blob/main/scripts/convert_weights.py>`_.
+
+
 Preparing Input
 ---------------
 
@@ -41,7 +45,7 @@ where the 4 channels represent A, C, G, T nucleotides in that order.
 
 .. code-block:: python
 
-   from alphagenome_pytorch.extensions.finetuning import (
+   from alphagenome_pytorch.utils.sequence import (
        sequence_to_onehot,
        onehot_to_sequence,
    )
@@ -62,7 +66,7 @@ In real-world scenarios you would likely be loading regions from a reference gen
 
    import torch
    from pyfaidx import Fasta
-   from alphagenome_pytorch.extensions.finetuning import sequence_to_onehot
+   from alphagenome_pytorch.utils.sequence import sequence_to_onehot
 
    # Extract a 1MB region
    with Fasta('hg38.fa') as genome:
@@ -144,7 +148,7 @@ Each output type has predictions at one or more resolutions (1bp and/or 128bp):
    # Available output types
    print(outputs.keys())
    # dict_keys(['atac', 'dnase', 'procap', 'cage', 'rna_seq',
-   #            'chip_tf', 'chip_histone', 'pair_activations'])
+   #            'chip_tf', 'chip_histone', 'contact_maps'])
 
    # Each output has predictions at different resolutions
    atac_1bp = outputs['atac'][1]      # 1bp resolution
@@ -154,38 +158,100 @@ Each output type has predictions at one or more resolutions (1bp and/or 128bp):
    print(f"ATAC 1bp shape: {atac_1bp.shape}")
    print(f"ATAC 128bp shape: {atac_128bp.shape}")
 
+Named Outputs (Metadata-Aware Filtering)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+You can use named outputs to filter tracks by metadata (ontology, tissue,
+assay, strand, etc.) while keeping tensors and metadata in sync:
+
+.. code-block:: python
+
+   from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
+   catalog = TrackMetadataCatalog.load_builtin()
+   model.set_track_metadata_catalog(catalog)
+
+   out = model.predict(
+       dna_onehot,
+       organism_index=0,  # human
+       named_outputs=True,
+   )
+
+   # Query by ontology directly (no manual mask construction)
+   liver_rna = out.rna_seq[1].select(ontology_curie="UBERON:0002107")
+   liver_tensor = liver_rna.tensor
+   liver_track_names = [track.track_name for track in liver_rna.tracks]
+
+   # Access track metadata fields directly
+   for track in liver_rna.tracks:
+       print(track.biosample_name)        # Direct attribute access
+       print(track.get('assay_title'))    # Safe access with default
+
+   # Filter by multiple criteria, including null checks
+   ctcf_tracks = out.chip_tf[128].select(
+       transcription_factor='CTCF',
+       genetically_modified=None,  # Only unmodified samples
+   )
+
+Padding tracks are stripped by default — for example, ATAC returns 167 real
+human tracks instead of the 256 raw channels. Pass ``include_padding=True`` to
+keep them (useful for training with loss masking).
 
 .. list-table:: Output Types
    :header-rows: 1
-   :widths: 15 15 50
+   :widths: 18 10 12 12 12
 
    * - Output
      - Resolutions
-     - Description
+     - Human tracks
+     - Mouse tracks
+     - Raw (incl. padding)
    * - ``atac``
      - 1bp, 128bp
-     - ATAC-seq chromatin accessibility (256 tracks)
+     - 167
+     - 18
+     - 256
    * - ``dnase``
      - 1bp, 128bp
-     - DNase-seq accessibility (384 tracks)
+     - 305
+     - 67
+     - 384
    * - ``procap``
      - 1bp, 128bp
-     - PRO-cap transcription initiation (128 tracks)
+     - 12
+     - ---
+     - 128
    * - ``cage``
      - 1bp, 128bp
-     - CAGE transcription (640 tracks)
+     - 546
+     - 188
+     - 640
    * - ``rna_seq``
      - 1bp, 128bp
-     - RNA-seq gene expression (768 tracks)
+     - 667
+     - 173
+     - 768
    * - ``chip_tf``
      - 128bp
-     - ChIP-seq transcription factors (1664 tracks)
+     - 1617
+     - 127
+     - 1664
    * - ``chip_histone``
      - 128bp
-     - ChIP-seq histone modifications (1152 tracks)
-   * - ``pair_activations``
+     - 1116
+     - 183
+     - 1152
+   * - ``contact_maps``
      - 128bp
-     - 3D chromatin contact maps (28 tracks)
+     - 28
+     - 8
+     - 28
+
+Track counts show real (non-padding) tracks returned by ``named_outputs=True``.
+The "Raw" column is the full tensor dimension. Both organisms share the same
+raw dimensions — padding fills the gap.
+
+See :doc:`named_outputs` for the full guide — more filtering examples, strand
+handling, variant scoring, and padding details.
 
 GPU Inference
 -------------

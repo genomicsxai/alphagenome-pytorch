@@ -9,7 +9,9 @@ PyTorch implementation of the `AlphaGenome DNA sequence-to-function model <https
 
    installation
    quickstart
+   named_outputs
    full_chromosome_prediction
+   performance
    finetuning/index
    api/index
 

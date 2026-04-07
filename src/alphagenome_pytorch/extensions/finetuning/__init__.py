@@ -27,6 +27,16 @@ from alphagenome_pytorch.extensions.finetuning.logging import TrainingLogger
 from alphagenome_pytorch.extensions.finetuning.checkpointing import (
     save_checkpoint, load_checkpoint, find_latest_checkpoint,
     PreemptionHandler, setup_preemption_handler,
+    save_delta_checkpoint, load_delta_checkpoint, is_delta_checkpoint,
+    get_adapter_state_dict, get_new_head_state_dict,
+    compute_base_model_hash, DELTA_CHECKPOINT_VERSION,
+    export_model_weights, export_delta_weights,
+    load_delta_config, load_delta_weights,
+)
+
+# Transfer config serialization
+from alphagenome_pytorch.extensions.finetuning.transfer import (
+    transfer_config_to_dict, transfer_config_from_dict,
 )
 
 if TYPE_CHECKING:
@@ -115,6 +125,21 @@ __all__ = [
     "load_checkpoint",
     "PreemptionHandler",
     "setup_preemption_handler",
+    # Delta checkpointing
+    "save_delta_checkpoint",
+    "load_delta_checkpoint",
+    "is_delta_checkpoint",
+    "get_adapter_state_dict",
+    "get_new_head_state_dict",
+    "compute_base_model_hash",
+    "DELTA_CHECKPOINT_VERSION",
+    "transfer_config_to_dict",
+    "transfer_config_from_dict",
+    # Export (clean weights for sharing)
+    "export_model_weights",
+    "export_delta_weights",
+    "load_delta_config",
+    "load_delta_weights",
     # Data transforms (lazy-loaded)
     "apply_atac_transforms",
     "apply_rnaseq_transforms",

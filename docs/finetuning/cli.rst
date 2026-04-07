@@ -160,6 +160,30 @@ override YAML values when both are provided.
       # =============================================================================
 
       resume: null                       # Checkpoint path or 'auto' to find latest
+      save_delta: false                  # Save delta checkpoints (adapter + head weights only)
+
+Delta Checkpoints
+-----------------
+
+Use ``--save-delta`` to save lightweight delta checkpoints alongside full checkpoints.
+Delta checkpoints contain only the trained weights (adapters + heads) and are much
+smaller than full checkpoints:
+
+.. code-block:: bash
+
+   python scripts/finetune.py --mode lora --save-delta \
+       --genome hg38.fa \
+       --modality atac --bigwig *.bw \
+       --train-bed train.bed --val-bed val.bed \
+       --pretrained-weights model.pth
+
+This saves both:
+
+- ``best_model.pth`` - Full checkpoint (~1GB)
+- ``best_model.delta.pth`` - Delta checkpoint (~5-10MB for LoRA, ~1MB for linear-probe)
+
+Delta checkpoints work with all modes except ``full`` (which trains all parameters).
+To load a delta checkpoint, see :doc:`python_api`.
 
 Supported Modalities
 --------------------

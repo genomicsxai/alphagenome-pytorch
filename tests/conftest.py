@@ -245,18 +245,15 @@ def pytorch_model(torch_weights_path):
     return model
 
 
-# Lightweight Model Fixture
+# Session-scoped Model Fixture
 
 
 @pytest.fixture(scope="session")
-def small_model():
-    """Create a lightweight AlphaGenome model for unit tests.
+def model():
+    """Create an AlphaGenome model for tests that don't need pretrained weights.
 
-    This creates a minimal model instance (1 organism, float32) without
-    loading any pretrained weights. Useful for testing model behavior,
-    determinism, checkpointing, etc. without requiring weight files.
-
-    Note: Session-scoped so the model is only created once per test session.
+    Session-scoped so the model is only constructed once per test session.
+    Uses 1 organism and float32 for simplicity.
     """
     from alphagenome_pytorch import AlphaGenome
     from alphagenome_pytorch.config import DtypePolicy
