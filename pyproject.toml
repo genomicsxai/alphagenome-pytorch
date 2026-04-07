@@ -14,6 +14,9 @@ dependencies = [
     "safetensors"
 ]
 
+[project.scripts]
+agt = "alphagenome_pytorch.cli:main"
+
 [project.optional-dependencies]
 test = [
     "pytest>=7.0.0",

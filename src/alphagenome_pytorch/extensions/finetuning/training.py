@@ -419,38 +419,39 @@ def validate(
     else:
         amp_context = nullcontext()
 
-    for sequences, targets_dict in tqdm(val_loader, desc="Validation"):
-        sequences = sequences.to(device)
-        targets_dict = {k: v.to(device) for k, v in targets_dict.items() if k in resolutions}
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+    with torch.no_grad():
+        for sequences, targets_dict in tqdm(val_loader, desc="Validation"):
+            sequences = sequences.to(device)
+            targets_dict = {k: v.to(device) for k, v in targets_dict.items() if k in resolutions}
+            organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
 
-        with amp_context:
-            outputs = model(sequences, organism_idx, return_embeddings=True, channels_last=False)
+            with amp_context:
+                outputs = model(sequences, organism_idx, return_embeddings=True, channels_last=False)
 
-            # Only get embeddings for requested resolutions
-            embeddings_dict = {}
-            if 1 in resolutions:
-                emb = outputs.get("embeddings_1bp")
-                if emb is not None:
-                    embeddings_dict[1] = emb
-            if 128 in resolutions:
-                emb = outputs.get("embeddings_128bp")
-                if emb is not None:
-                    embeddings_dict[128] = emb
+                # Only get embeddings for requested resolutions
+                embeddings_dict = {}
+                if 1 in resolutions:
+                    emb = outputs.get("embeddings_1bp")
+                    if emb is not None:
+                        embeddings_dict[1] = emb
+                if 128 in resolutions:
+                    emb = outputs.get("embeddings_128bp")
+                    if emb is not None:
+                        embeddings_dict[128] = emb
 
-            predictions = head(embeddings_dict, organism_idx)
+                predictions = head(embeddings_dict, organism_idx)
 
-            loss, _ = compute_finetuning_loss(
-                predictions=predictions,
-                targets=targets_dict,
-                resolution_weights=resolution_weights,
-                positional_weight=positional_weight,
-                device=device,
-                channels_last=True,
-            )
+                loss, _ = compute_finetuning_loss(
+                    predictions=predictions,
+                    targets=targets_dict,
+                    resolution_weights=resolution_weights,
+                    positional_weight=positional_weight,
+                    device=device,
+                    channels_last=True,
+                )
 
-        total_loss += loss.item()
-        n_batches += 1
+            total_loss += loss.item()
+            n_batches += 1
 
     return total_loss / max(1, n_batches)
 
@@ -804,15 +805,23 @@ def train_epoch_ddp(
             _cuda_sync(device)
             t0 = time.perf_counter()
 
-        scaled_loss.backward()
+        # --- Optimizer step (only every accumulation_steps batches) ---
+        is_accumulation_step = (batch_idx + 1) % accumulation_steps == 0
+        is_last_batch = batch_idx == len(train_loader) - 1
+
+        # Skip DDP gradient sync on intermediate accumulation steps
+        no_sync = (
+            accumulation_steps > 1
+            and not is_accumulation_step
+            and not is_last_batch
+            and hasattr(model, "no_sync")
+        )
+        with model.no_sync() if no_sync else nullcontext():
+            scaled_loss.backward()
 
         if is_profiling:
             _cuda_sync(device)
             profile_stats.add("5_backward", time.perf_counter() - t0)
-
-        # --- Optimizer step (only every accumulation_steps batches) ---
-        is_accumulation_step = (batch_idx + 1) % accumulation_steps == 0
-        is_last_batch = batch_idx == len(train_loader) - 1
 
         if is_accumulation_step or is_last_batch:
             if is_profiling:
@@ -964,91 +973,92 @@ def validate_ddp(
     else:
         pbar = val_loader
 
-    for sequences, targets_dict in pbar:
-        sequences = sequences.to(device)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
-        resolutions = tuple(resolution_weights.keys())
+    with torch.no_grad():
+        for sequences, targets_dict in pbar:
+            sequences = sequences.to(device)
+            organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+            resolutions = tuple(resolution_weights.keys())
 
-        if encoder_only:
-            outputs = model(sequences, organism_idx, encoder_only=True)
-            embeddings_dict = {128: outputs["encoder_output"]}
-        else:
+            if encoder_only:
+                outputs = model(sequences, organism_idx, encoder_only=True)
+                embeddings_dict = {128: outputs["encoder_output"]}
+            else:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
+
+                embeddings_dict = {}
+                for res in resolution_weights:
+                    emb_key = f"embeddings_{res}bp"
+                    if emb_key in outputs:
+                        embeddings_dict[res] = outputs[emb_key]
+
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
-
-            embeddings_dict = {}
-            for res in resolution_weights:
-                emb_key = f"embeddings_{res}bp"
-                if emb_key in outputs:
-                    embeddings_dict[res] = outputs[emb_key]
-
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-            # Get predictions in MODEL space for loss computation
-            head_module = head.module if hasattr(head, "module") else head
-            predictions_scaled = head(
-                embeddings_dict, organism_idx, return_scaled=True, channels_last=True
-            )
-
-            # Get predictions in EXPERIMENTAL space for Pearson R
-            if compute_pearson:
-                predictions_unscaled = head(
-                    embeddings_dict, organism_idx, return_scaled=False, channels_last=True
+                # Get predictions in MODEL space for loss computation
+                head_module = head.module if hasattr(head, "module") else head
+                predictions_scaled = head(
+                    embeddings_dict, organism_idx, return_scaled=True, channels_last=True
                 )
 
-        loss = torch.tensor(0.0, device=device)
+                # Get predictions in EXPERIMENTAL space for Pearson R
+                if compute_pearson:
+                    predictions_unscaled = head(
+                        embeddings_dict, organism_idx, return_scaled=False, channels_last=True
+                    )
 
-        for res, weight in resolution_weights.items():
-            if res not in predictions_scaled or res not in targets_dict:
-                continue
+            loss = torch.tensor(0.0, device=device)
 
-            pred_scaled = predictions_scaled[res]
-            targets = targets_dict[res].to(device)
+            for res, weight in resolution_weights.items():
+                if res not in predictions_scaled or res not in targets_dict:
+                    continue
 
-            # Scale targets from experimental space to model space for loss
-            targets_scaled = head_module.scale(
-                targets, organism_idx, resolution=res, channels_last=True
-            )
-            mask = torch.ones(
-                pred_scaled.shape[0], 1, pred_scaled.shape[-1], dtype=torch.bool, device=device
-            )
+                pred_scaled = predictions_scaled[res]
+                targets = targets_dict[res].to(device)
 
-            # Compute multinomial loss
-            current_seq_len = pred_scaled.shape[-2]
-            multinomial_res = _compute_multinomial_resolution(
-                current_seq_len, num_segments, min_segment_size
-            )
+                # Scale targets from experimental space to model space for loss
+                targets_scaled = head_module.scale(
+                    targets, organism_idx, resolution=res, channels_last=True
+                )
+                mask = torch.ones(
+                    pred_scaled.shape[0], 1, pred_scaled.shape[-1], dtype=torch.bool, device=device
+                )
 
-            loss_dict = multinomial_loss(
-                y_pred=pred_scaled,
-                y_true=targets_scaled,
-                mask=mask,
-                multinomial_resolution=multinomial_res,
-                positional_weight=positional_weight,
-                count_weight=count_weight,
-                channels_last=True,
-            )
+                # Compute multinomial loss
+                current_seq_len = pred_scaled.shape[-2]
+                multinomial_res = _compute_multinomial_resolution(
+                    current_seq_len, num_segments, min_segment_size
+                )
 
-            res_loss = loss_dict["loss"] * weight
-            loss = loss + res_loss
-            loss_by_resolution[f"{res}bp"] += res_loss.item()
-            # Log raw (unweighted) losses for comparability across runs
-            loss_by_resolution[f"{res}bp_count"] += loss_dict["loss_total"].item()
-            loss_by_resolution[f"{res}bp_positional"] += loss_dict["loss_positional"].item()
+                loss_dict = multinomial_loss(
+                    y_pred=pred_scaled,
+                    y_true=targets_scaled,
+                    mask=mask,
+                    multinomial_resolution=multinomial_res,
+                    positional_weight=positional_weight,
+                    count_weight=count_weight,
+                    channels_last=True,
+                )
 
-            # Accumulate for Pearson R (in experimental space)
-            if compute_pearson:
-                pred_unscaled = predictions_unscaled[res]
+                res_loss = loss_dict["loss"] * weight
+                loss = loss + res_loss
+                loss_by_resolution[f"{res}bp"] += res_loss.item()
+                # Log raw (unweighted) losses for comparability across runs
+                loss_by_resolution[f"{res}bp_count"] += loss_dict["loss_total"].item()
+                loss_by_resolution[f"{res}bp_positional"] += loss_dict["loss_positional"].item()
 
-                # Profile Pearson R: compute per-region correlation on-the-fly, store scalars
-                batch_profile_r = profile_pearson_r(pred_unscaled, targets)  # (batch, tracks)
-                accumulated_profile_r[res].append(batch_profile_r.float().cpu())
+                # Accumulate for Pearson R (in experimental space)
+                if compute_pearson:
+                    pred_unscaled = predictions_unscaled[res]
 
-                # Count Pearson R: store total counts per region (tiny memory)
-                accumulated_pred_counts[res].append(pred_unscaled.sum(dim=1).float().cpu())  # (batch, tracks)
-                accumulated_true_counts[res].append(targets.sum(dim=1).float().cpu())
+                    # Profile Pearson R: compute per-region correlation on-the-fly, store scalars
+                    batch_profile_r = profile_pearson_r(pred_unscaled, targets)  # (batch, tracks)
+                    accumulated_profile_r[res].append(batch_profile_r.float().cpu())
 
-        total_loss += loss.item()
-        n_batches += 1
+                    # Count Pearson R: store total counts per region (tiny memory)
+                    accumulated_pred_counts[res].append(pred_unscaled.sum(dim=1).float().cpu())  # (batch, tracks)
+                    accumulated_true_counts[res].append(targets.sum(dim=1).float().cpu())
+
+            total_loss += loss.item()
+            n_batches += 1
 
     # Reduce across all processes
     avg_loss = total_loss / max(1, n_batches)
@@ -1330,15 +1340,23 @@ def train_epoch_multihead(
             _cuda_sync(device)
             t0 = time.perf_counter()
 
-        scaled_loss.backward()
+        # Optimizer step
+        is_accumulation_step = (batch_idx + 1) % accumulation_steps == 0
+        is_last_batch = batch_idx == len(train_loader) - 1
+
+        # Skip DDP gradient sync on intermediate accumulation steps
+        no_sync = (
+            accumulation_steps > 1
+            and not is_accumulation_step
+            and not is_last_batch
+            and hasattr(model, "no_sync")
+        )
+        with model.no_sync() if no_sync else nullcontext():
+            scaled_loss.backward()
 
         if is_profiling:
             _cuda_sync(device)
             profile_stats.add("5_backward", time.perf_counter() - t0)
-
-        # Optimizer step
-        is_accumulation_step = (batch_idx + 1) % accumulation_steps == 0
-        is_last_batch = batch_idx == len(train_loader) - 1
 
         if is_accumulation_step or is_last_batch:
             if is_profiling:
@@ -1484,97 +1502,98 @@ def validate_multihead(
     else:
         pbar = val_loader
 
-    for sequences, modality_targets in pbar:
-        sequences = sequences.to(device)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+    with torch.no_grad():
+        for sequences, modality_targets in pbar:
+            sequences = sequences.to(device)
+            organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
 
-        # Collect all resolutions
-        all_resolutions = set()
-        for modality in heads:
-            all_resolutions.update(resolution_weights.get(modality, {}).keys())
-        resolutions = tuple(all_resolutions)
+            # Collect all resolutions
+            all_resolutions = set()
+            for modality in heads:
+                all_resolutions.update(resolution_weights.get(modality, {}).keys())
+            resolutions = tuple(all_resolutions)
 
-        if encoder_only:
-            outputs = model(sequences, organism_idx, encoder_only=True)
-            embeddings_dict = {128: outputs["encoder_output"]}
-        else:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
+            if encoder_only:
+                outputs = model(sequences, organism_idx, encoder_only=True)
+                embeddings_dict = {128: outputs["encoder_output"]}
+            else:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
-            embeddings_dict = {}
-            for res in resolutions:
-                emb_key = f"embeddings_{res}bp"
-                if emb_key in outputs:
-                    embeddings_dict[res] = outputs[emb_key]
+                embeddings_dict = {}
+                for res in resolutions:
+                    emb_key = f"embeddings_{res}bp"
+                    if emb_key in outputs:
+                        embeddings_dict[res] = outputs[emb_key]
 
-        loss = torch.tensor(0.0, device=device)
+            loss = torch.tensor(0.0, device=device)
 
-        for modality, head in heads.items():
-            if modality not in modality_targets:
-                continue
-
-            modality_weight = modality_weights.get(modality, 1.0)
-            res_weights = resolution_weights.get(modality, {})
-            targets_dict = modality_targets[modality]
-
-            head_module = head.module if hasattr(head, "module") else head
-
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                predictions_scaled = head(
-                    embeddings_dict, organism_idx, return_scaled=True, channels_last=True
-                )
-                if compute_pearson:
-                    predictions_unscaled = head(
-                        embeddings_dict, organism_idx, return_scaled=False, channels_last=True
-                    )
-
-            modality_loss = torch.tensor(0.0, device=device)
-
-            for res, weight in res_weights.items():
-                if res not in predictions_scaled or res not in targets_dict:
+            for modality, head in heads.items():
+                if modality not in modality_targets:
                     continue
 
-                pred_scaled = predictions_scaled[res]
-                targets = targets_dict[res].to(device)
-                targets_scaled = head_module.scale(
-                    targets, organism_idx, resolution=res, channels_last=True
-                )
-                mask = torch.ones(
-                    pred_scaled.shape[0], 1, pred_scaled.shape[-1], dtype=torch.bool, device=device
-                )
+                modality_weight = modality_weights.get(modality, 1.0)
+                res_weights = resolution_weights.get(modality, {})
+                targets_dict = modality_targets[modality]
 
-                current_seq_len = pred_scaled.shape[-2]
-                multinomial_res = _compute_multinomial_resolution(
-                    current_seq_len, num_segments, min_segment_size
-                )
+                head_module = head.module if hasattr(head, "module") else head
 
-                loss_dict = multinomial_loss(
-                    y_pred=pred_scaled,
-                    y_true=targets_scaled,
-                    mask=mask,
-                    multinomial_resolution=multinomial_res,
-                    positional_weight=positional_weight,
-                    count_weight=count_weight,
-                    channels_last=True,
-                )
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    predictions_scaled = head(
+                        embeddings_dict, organism_idx, return_scaled=True, channels_last=True
+                    )
+                    if compute_pearson:
+                        predictions_unscaled = head(
+                            embeddings_dict, organism_idx, return_scaled=False, channels_last=True
+                        )
 
-                res_loss = loss_dict["loss"] * weight
-                modality_loss = modality_loss + res_loss
+                modality_loss = torch.tensor(0.0, device=device)
 
-                # Accumulate for Pearson R
-                if compute_pearson:
-                    pred_unscaled = predictions_unscaled[res]
-                    batch_profile_r = profile_pearson_r(pred_unscaled, targets)
-                    accumulated_profile_r[modality][res].append(batch_profile_r.float().cpu())
-                    accumulated_pred_counts[modality][res].append(pred_unscaled.sum(dim=1).float().cpu())
-                    accumulated_true_counts[modality][res].append(targets.sum(dim=1).float().cpu())
+                for res, weight in res_weights.items():
+                    if res not in predictions_scaled or res not in targets_dict:
+                        continue
 
-            weighted_modality_loss = modality_loss * modality_weight
-            loss = loss + weighted_modality_loss
-            modality_loss_accum[modality] += modality_loss.item()
+                    pred_scaled = predictions_scaled[res]
+                    targets = targets_dict[res].to(device)
+                    targets_scaled = head_module.scale(
+                        targets, organism_idx, resolution=res, channels_last=True
+                    )
+                    mask = torch.ones(
+                        pred_scaled.shape[0], 1, pred_scaled.shape[-1], dtype=torch.bool, device=device
+                    )
 
-        total_loss_accum += loss.item()
-        n_batches += 1
+                    current_seq_len = pred_scaled.shape[-2]
+                    multinomial_res = _compute_multinomial_resolution(
+                        current_seq_len, num_segments, min_segment_size
+                    )
+
+                    loss_dict = multinomial_loss(
+                        y_pred=pred_scaled,
+                        y_true=targets_scaled,
+                        mask=mask,
+                        multinomial_resolution=multinomial_res,
+                        positional_weight=positional_weight,
+                        count_weight=count_weight,
+                        channels_last=True,
+                    )
+
+                    res_loss = loss_dict["loss"] * weight
+                    modality_loss = modality_loss + res_loss
+
+                    # Accumulate for Pearson R
+                    if compute_pearson:
+                        pred_unscaled = predictions_unscaled[res]
+                        batch_profile_r = profile_pearson_r(pred_unscaled, targets)
+                        accumulated_profile_r[modality][res].append(batch_profile_r.float().cpu())
+                        accumulated_pred_counts[modality][res].append(pred_unscaled.sum(dim=1).float().cpu())
+                        accumulated_true_counts[modality][res].append(targets.sum(dim=1).float().cpu())
+
+                weighted_modality_loss = modality_loss * modality_weight
+                loss = loss + weighted_modality_loss
+                modality_loss_accum[modality] += modality_loss.item()
+
+            total_loss_accum += loss.item()
+            n_batches += 1
 
     # Reduce across processes
     avg_loss = total_loss_accum / max(1, n_batches)
