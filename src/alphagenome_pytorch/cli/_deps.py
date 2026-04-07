@@ -15,6 +15,7 @@ _EXTRA_PROBES: dict[str, list[str]] = {
     "inference": ["pyBigWig", "pyfaidx", "tqdm"],
     "finetuning": ["pyBigWig", "pandas", "tqdm", "pyfaidx"],
     "scoring": ["pyfaidx", "pandas", "tqdm"],
+    "serving": ["grpc", "pandas", "pyfaidx", "alphagenome"],
     "jax": ["jax", "orbax.checkpoint"],
 }
 

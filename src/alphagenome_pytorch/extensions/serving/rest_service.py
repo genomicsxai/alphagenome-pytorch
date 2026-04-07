@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import threading
@@ -20,6 +21,29 @@ from alphagenome.models import dna_output
 from .adapter import LocalDnaModelAdapter, _normalize_output_type
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _json_default(value: Any) -> Any:
+    """Fallback encoder for objects ``json.dumps`` can't handle natively.
+
+    Covers the types we know leak through DataFrame ``to_dict`` calls in
+    serializers below: enum members (notably ``dna_output.OutputType`` from
+    ``OutputMetadata.concatenate``), numpy scalars, and numpy arrays. Anything
+    else still raises ``TypeError`` so genuinely unexpected types fail loudly.
+    """
+    if isinstance(value, enum.Enum):
+        return value.name
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (pd.Timestamp,)):
+        return value.isoformat()
+    if value is pd.NaT or (isinstance(value, float) and np.isnan(value)):
+        return None
+    raise TypeError(
+        f'Object of type {type(value).__name__} is not JSON serializable'
+    )
 
 
 def _interval_from_payload(payload: dict[str, Any]) -> genome.Interval:
@@ -151,7 +175,7 @@ class _ServingHandler(BaseHTTPRequestHandler):
         return json.loads(body.decode('utf-8'))
 
     def _write_json(self, payload: dict[str, Any], status: int = 200) -> None:
-        encoded = json.dumps(payload).encode('utf-8')
+        encoded = json.dumps(payload, default=_json_default).encode('utf-8')
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(encoded)))

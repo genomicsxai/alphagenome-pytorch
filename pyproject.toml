@@ -74,15 +74,13 @@ dev = [
     "alphagenome-pytorch[test,jax,scoring,docs]",
 ]
 
-[project.scripts]
-alphagenome-local-serve = "alphagenome_pytorch.extensions.serving.cli:main"
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = ["-v", "--strict-markers"]
+
 markers = [
     "unit: Unit tests (no external dependencies)",
     "integration: Integration tests with full model (PyTorch only, no JAX required)",

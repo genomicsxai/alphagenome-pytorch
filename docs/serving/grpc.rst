@@ -26,7 +26,7 @@ Run the local serving process:
 
    cd /path/to/alphagenome-torch
    source .venv/bin/activate
-   alphagenome-local-serve \
+   agt serve \
      --weights /ABS/PATH/model.pth \
      --fasta /ABS/PATH/hg38.fa \
      --track-metadata /ABS/PATH/track_metadata.parquet \
