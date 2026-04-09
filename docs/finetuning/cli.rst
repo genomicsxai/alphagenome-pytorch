@@ -53,14 +53,19 @@ override YAML values when both are provided.
 
       pretrained_weights: /path/to/model.pth  # Pretrained weights file (required)
 
-      # Training mode: 'linear-probe', 'lora', or 'full'
-      # Python API also supports 'locon', 'ia3', and combined modes (e.g. ['lora', 'locon'])
+      # Training mode: 'linear-probe', 'lora', 'locon', 'lora+locon', or 'full'
+      # Baskerville-style Locon parity uses 'lora+locon'
       mode: lora
 
-      # LoRA configuration (only used when mode='lora')
+      # LoRA configuration (used when mode includes LoRA)
       lora_rank: 8                       # LoRA rank (0 disables LoRA, trains heads only)
       lora_alpha: 16                     # LoRA alpha scaling factor
       lora_targets: "q_proj,v_proj"      # Comma-separated list of target modules
+
+      # Locon configuration (used when mode includes Locon)
+      locon_rank: 4
+      locon_alpha: 1
+      locon_targets: "down_blocks.4,down_blocks.5"  # Required; Locon4 on encoder blocks
 
       # Model precision
       dtype: bfloat16                    # 'bfloat16' or 'float32'
