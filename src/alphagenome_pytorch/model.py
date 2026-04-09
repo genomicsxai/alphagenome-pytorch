@@ -518,6 +518,26 @@ class AlphaGenome(nn.Module):
 
         return model
 
+    @staticmethod
+    def _normalize_organism_index(organism_index, dna_sequence):
+        """Coerce ``organism_index`` to a (B,) long tensor.
+
+        ``organism_index`` may be passed as a Python int for single-organism
+        batches, but downstream code (embedding lookups, named-output metadata
+        selection, head dispatch) expects a per-batch tensor. This helper
+        accepts either an int or a tensor and returns a tensor on
+        ``dna_sequence``'s device. Already-tensor inputs are returned unchanged.
+        """
+        if isinstance(organism_index, int):
+            batch_size = dna_sequence.shape[0]
+            organism_index = torch.full(
+                (batch_size,),
+                organism_index,
+                dtype=torch.long,
+                device=dna_sequence.device,
+            )
+        return organism_index
+
     def _compute_embeddings_ncl(self, dna_sequence, organism_index, resolutions=None):
         """Internal method to compute embeddings in NCL format.
 
@@ -583,7 +603,8 @@ class AlphaGenome(nn.Module):
 
         Args:
             dna_sequence: One-hot encoded DNA sequence (B, S, 4) - NLC input format.
-            organism_index: Organism index per batch (B,). 0=human, 1=mouse.
+            organism_index: Organism index. Either a (B,) long tensor or an int
+                (broadcast to the full batch). 0=human, 1=mouse.
             resolutions: Tuple of resolutions to compute, e.g. (1, 128) or (128,).
                          If None, computes all resolutions. When 1bp is not needed,
                          the expensive decoder is skipped for faster computation.
@@ -615,6 +636,8 @@ class AlphaGenome(nn.Module):
             emb = model.encode(dna_seq, organism_idx, channels_last=False)
             custom_output = my_conv_head(emb['embeddings_128bp'])
         """
+        organism_index = self._normalize_organism_index(organism_index, dna_sequence)
+
         embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = \
             self._compute_embeddings_ncl(dna_sequence, organism_index, resolutions)
 
@@ -889,16 +912,7 @@ class AlphaGenome(nn.Module):
         device_type = "cuda" if dna_sequence.is_cuda else "cpu"
         use_amp = self.dtype_policy.compute_dtype != torch.float32
 
-        # Handle integer organism_index by converting to tensor of shape (B,)
-        # forward() expects a tensor for embedding lookups.
-        if isinstance(organism_index, int):
-            batch_size = dna_sequence.shape[0]
-            organism_index = torch.full(
-                (batch_size,),
-                organism_index,
-                dtype=torch.long,
-                device=dna_sequence.device
-            )
+        organism_index = self._normalize_organism_index(organism_index, dna_sequence)
 
         with torch.autocast(device_type=device_type, dtype=self.dtype_policy.compute_dtype, enabled=use_amp):
             outputs = self.forward(dna_sequence, organism_index, **kwargs)
