@@ -19,9 +19,11 @@ from alphagenome_pytorch.extensions.finetuning.checkpointing import (
     get_new_head_state_dict,
     get_norm_state_dict,
     get_trunk_state_dict,
+    is_delta_checkpoint,
     load_delta_checkpoint,
     load_delta_config,
     load_delta_weights,
+    save_checkpoint,
     save_delta_checkpoint,
     DELTA_CHECKPOINT_VERSION,
 )
@@ -234,6 +236,39 @@ class TestNewHeadStateDict:
 
 class TestDeltaCheckpointSaveLoad:
     """Test save/load delta checkpoint roundtrip."""
+
+    def test_is_delta_checkpoint_recognizes_saved_delta_file(self):
+        """A save_delta_checkpoint output should be detected as delta."""
+        model = nn.Sequential(nn.Linear(64, 64))
+        model.heads = nn.ModuleDict()
+        config = TransferConfig(mode="linear", new_heads={})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.delta.pth"
+            save_delta_checkpoint(path, model, config)
+
+            assert is_delta_checkpoint(path) is True
+
+    def test_is_delta_checkpoint_rejects_full_checkpoint(self):
+        """A normal full checkpoint should not be detected as delta."""
+        model = nn.Sequential(nn.Linear(64, 64))
+        model.heads = nn.ModuleDict()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.full.pth"
+            save_checkpoint(
+                path=path,
+                epoch=1,
+                model=model,
+                optimizer=optimizer,
+                val_loss=0.1,
+                track_names=[],
+                modality="atac",
+                resolutions=(1,),
+            )
+
+            assert is_delta_checkpoint(path) is False
 
     def test_save_requires_adapters_when_expected(self):
         """Should raise if adapters expected but not found."""

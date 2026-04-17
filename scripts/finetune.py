@@ -122,6 +122,7 @@ from alphagenome_pytorch.extensions.finetuning.transfer import (
     remove_all_heads,
     add_head,
     prepare_for_transfer,
+    transfer_config_to_dict,
 )
 
 
@@ -159,6 +160,25 @@ DEFAULTS = {
     # Output
     "output_dir": "finetuning_output",
 }
+
+
+# =============================================================================
+# Utilities
+# =============================================================================
+
+
+def unwrap_training_model(model: nn.Module) -> nn.Module:
+    """Unwrap the exact wrapper stack used in this training script.
+
+    Wrapping order in finetune.py is deterministic:
+    1. base model
+    2. optional DDP
+    3. optional torch.compile
+    """
+    inner = getattr(model, "_orig_mod", model)
+    if isinstance(inner, DDP):
+        return inner.module
+    return inner
 
 
 # =============================================================================
@@ -346,6 +366,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Save delta checkpoints (adapter + head weights only, much smaller). "
              "Delta files saved as best_model.delta.pth",
+    )
+    resume.add_argument(
+        "--export-transfer-config",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Export TransferConfig to JSON file at end of training. "
+             "Useful for loading full checkpoints in predict scripts.",
     )
 
     args = parser.parse_args()
@@ -717,7 +745,7 @@ def create_model(
     rank: int,
     world_size: int,
     local_rank: int,
-) -> tuple[nn.Module, dict[str, nn.Module], list[torch.nn.Parameter]]:
+) -> tuple[nn.Module, dict[str, nn.Module], list[torch.nn.Parameter], TransferConfig | None]:
     """Create and configure the model based on training mode.
 
     Args:
@@ -731,7 +759,7 @@ def create_model(
         local_rank: Local rank for GPU assignment.
 
     Returns:
-        Tuple of (model, heads_dict, trainable_params).
+        Tuple of (model, heads_dict, trainable_params, transfer_config).
     """
     print_rank0(f"Loading pretrained model from {args.pretrained_weights}", rank)
 
@@ -759,37 +787,42 @@ def create_model(
     # encoder-only mode forces 128bp resolution for all heads
     is_encoder_only = args.mode == "encoder-only"
 
-    # Create heads for each modality (after freeze, so they have requires_grad=True)
-    heads: dict[str, nn.Module] = {}
-    for modality, track_names in modality_track_names.items():
-        n_tracks = len(track_names)
-        track_means = modality_track_means.get(modality)
-        resolutions = modality_resolutions[modality]
-
-        head = create_finetuning_head(
-            assay_type=modality,
-            n_tracks=n_tracks,
-            resolutions=resolutions if not is_encoder_only else (128,),
-            num_organisms=1,
-            track_means=track_means,
-            init_scheme=args.head_init_scheme,
-            encoder_only=is_encoder_only,
-        )
-        add_head(model, modality, head)
-        heads[modality] = head
-        head_resolutions = (128,) if is_encoder_only else resolutions
-        print_rank0(f"Created {modality} head with {n_tracks} tracks at resolutions {head_resolutions}", rank)
-
     # Build new_heads dict for TransferConfig (used for delta checkpoints)
     new_heads_config: dict[str, dict] = {}
-    for modality in heads:
+    for modality, track_names in modality_track_names.items():
         head_res = (128,) if is_encoder_only else modality_resolutions[modality]
         new_heads_config[modality] = {
             "modality": modality,
-            "num_tracks": len(modality_track_names[modality]),
+            "num_tracks": len(track_names),
             "resolutions": list(head_res),
             "encoder_only": is_encoder_only,
+            "track_means": modality_track_means.get(modality),
+            "num_organisms": 1,
+            "init_scheme": args.head_init_scheme,
         }
+
+    # Create heads directly except in LoRA mode, where prepare_for_transfer()
+    # constructs the actual trainable heads we want the optimizer to own.
+    heads: dict[str, nn.Module] = {}
+    create_heads_directly = not (args.mode == "lora" and args.lora_rank > 0)
+    if create_heads_directly:
+        for modality, track_names in modality_track_names.items():
+            head = create_finetuning_head(
+                assay_type=modality,
+                n_tracks=len(track_names),
+                resolutions=tuple(new_heads_config[modality]["resolutions"]),
+                num_organisms=1,
+                track_means=modality_track_means.get(modality),
+                init_scheme=args.head_init_scheme,
+                encoder_only=is_encoder_only,
+            )
+            add_head(model, modality, head)
+            heads[modality] = head
+            print_rank0(
+                f"Created {modality} head with {len(track_names)} tracks "
+                f"at resolutions {tuple(new_heads_config[modality]['resolutions'])}",
+                rank,
+            )
 
     # Configure trainable params based on mode
     trainable_params: list[torch.nn.Parameter] = []
@@ -825,7 +858,17 @@ def create_model(
                 new_heads=new_heads_config,
             )
             model = prepare_for_transfer(model, transfer_config)
-            # LoRA adapters + heads (heads already have requires_grad=True)
+            heads = {
+                modality: model.heads[modality]
+                for modality in modality_track_names
+            }
+            for modality, track_names in modality_track_names.items():
+                print_rank0(
+                    f"Created {modality} head with {len(track_names)} tracks "
+                    f"at resolutions {tuple(new_heads_config[modality]['resolutions'])}",
+                    rank,
+                )
+            # LoRA adapters + the freshly registered heads
             trainable_params = get_adapter_params(model)
             for head in heads.values():
                 trainable_params.extend(list(head.parameters()))
@@ -855,8 +898,8 @@ def create_model(
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         print_rank0("Model wrapped with DistributedDataParallel", rank)
 
-    # Get head references from GPU model
-    model_module = model.module if isinstance(model, DDP) else model
+    # Get head references from the underlying model before optional compile.
+    model_module = unwrap_training_model(model)
     heads = {modality: model_module.heads[modality] for modality in heads}
 
     # Optionally compile
@@ -865,13 +908,14 @@ def create_model(
         import torch._inductor.config as inductor_config
         inductor_config.group_fusion = False
         model = torch.compile(model)
+        model_module = unwrap_training_model(model)
 
     # Count parameters
     n_trainable = sum(p.numel() for p in trainable_params)
     n_total = sum(p.numel() for p in model_module.parameters())
     print_rank0(f"Trainable: {n_trainable:,} / {n_total:,} ({100*n_trainable/n_total:.2f}%)", rank)
 
-    return model, heads, trainable_params
+    return model, heads, trainable_params, transfer_config
 
 
 # =============================================================================
@@ -959,7 +1003,7 @@ def main() -> None:
     modality_track_means = broadcast_object(modality_track_means, src=0)
 
     # Create model
-    model, heads, trainable_params = create_model(
+    model, heads, trainable_params, transfer_config = create_model(
         args,
         modality_track_names,
         modality_track_means,
@@ -969,7 +1013,7 @@ def main() -> None:
         world_size,
         local_rank,
     )
-    model_module = model.module if isinstance(model, DDP) else model
+    model_module = unwrap_training_model(model)
 
     # Sequence parallelism setup
     sequence_parallel = None
@@ -1118,6 +1162,7 @@ def main() -> None:
                 scheduler=scheduler,
                 best_val_loss=best_val_loss,
                 wandb_run_id=logger.wandb_run_id,
+                transfer_config=transfer_config_to_dict(transfer_config) if transfer_config is not None else None,
             )
             print(f"Preemption checkpoint saved to {output_dir / 'checkpoint_preempt.pth'}")
 
@@ -1272,23 +1317,8 @@ def main() -> None:
             if is_main_process(rank) and not args.no_save_checkpoints:
                 if is_best:
                     best_val_loss = val_loss
-                    save_checkpoint(
-                        path=output_dir / "best_model.pth",
-                        epoch=epoch,
-                        model=model_module,
-                        optimizer=optimizer,
-                        val_loss=val_loss,
-                        track_names=modality_track_names,
-                        modality=args.modalities,
-                        resolutions=modality_resolutions,
-                        scheduler=scheduler,
-                        best_val_loss=best_val_loss,
-                        wandb_run_id=logger.wandb_run_id,
-                    )
-                    print(f"  Saved best model (val_loss={val_loss:.4f})")
-
-                    # Save delta checkpoint (adapter + head weights only)
                     if args.save_delta and transfer_config is not None:
+                        # Delta-only: skip full checkpoint for best model
                         save_delta_checkpoint(
                             path=output_dir / "best_model.delta.pth",
                             model=model_module,
@@ -1302,7 +1332,23 @@ def main() -> None:
                             modality=args.modalities,
                             resolutions=modality_resolutions,
                         )
-                        print(f"  Saved delta checkpoint (adapter + head weights)")
+                        print(f"  Saved best delta checkpoint (val_loss={val_loss:.4f})")
+                    else:
+                        save_checkpoint(
+                            path=output_dir / "best_model.pth",
+                            epoch=epoch,
+                            model=model_module,
+                            optimizer=optimizer,
+                            val_loss=val_loss,
+                            track_names=modality_track_names,
+                            modality=args.modalities,
+                            resolutions=modality_resolutions,
+                            scheduler=scheduler,
+                            best_val_loss=best_val_loss,
+                            wandb_run_id=logger.wandb_run_id,
+                            transfer_config=transfer_config_to_dict(transfer_config) if transfer_config is not None else None,
+                        )
+                        print(f"  Saved best model (val_loss={val_loss:.4f})")
 
                 if epoch % args.save_every == 0:
                     save_checkpoint(
@@ -1317,6 +1363,7 @@ def main() -> None:
                         scheduler=scheduler,
                         best_val_loss=best_val_loss,
                         wandb_run_id=logger.wandb_run_id,
+                        transfer_config=transfer_config_to_dict(transfer_config) if transfer_config is not None else None,
                     )
 
             barrier()
@@ -1327,6 +1374,15 @@ def main() -> None:
         logger.finish()
         handler.unregister()
         cleanup_distributed()
+
+    # Export transfer config if requested
+    if args.export_transfer_config and transfer_config is not None and is_main_process(rank):
+        import json
+        config_path = Path(args.export_transfer_config)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, "w") as f:
+            json.dump(transfer_config_to_dict(transfer_config), f, indent=2)
+        print(f"Exported TransferConfig to {config_path}")
 
     print_rank0(f"\nTraining complete! Best val_loss: {best_val_loss:.4f}", rank)
     print_rank0(f"Output: {output_dir}", rank)
