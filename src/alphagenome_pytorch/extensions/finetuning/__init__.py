@@ -11,6 +11,7 @@ from alphagenome_pytorch.extensions.finetuning.training import (
     train_epoch, validate,
     ProfilingStats, train_epoch_ddp, validate_ddp,
     train_epoch_multihead, validate_multihead,
+    train_epoch_sequence_parallel,
 )
 from alphagenome_pytorch.extensions.finetuning.transfer import TransferConfig
 
@@ -108,7 +109,7 @@ __all__ = [
     "validate_ddp",
     # Multi-head training
     "train_epoch_multihead",
-    "validate_multihead",
+    "train_epoch_sequence_parallel",
     # Distributed utilities
     "setup_distributed",
     "cleanup_distributed",
