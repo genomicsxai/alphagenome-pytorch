@@ -135,7 +135,6 @@ DEFAULTS = {
     "sequence_length": 131072,
     "resolutions": "1",
     # Model
-    "modality": "atac",
     "lora_rank": 8,
     "lora_alpha": 16,
     "lora_targets": "q_proj,v_proj",
@@ -519,7 +518,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     cli_modality_to_bigwigs: dict[str, list[str]] = {}
     if args.bigwigs is not None:
         if args.modalities is None:
-            args.modalities = [DEFAULTS["modality"]]
+            parser.error(
+                "--modality is required when --bigwig is provided. "
+                f"Pass one of: {sorted(MODALITY_CONFIGS.keys())}."
+            )
         if len(args.modalities) != len(args.bigwigs):
             parser.error(
                 f"Number of --modality ({len(args.modalities)}) must match number of --bigwig groups ({len(args.bigwigs)}). "

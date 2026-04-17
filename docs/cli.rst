@@ -154,67 +154,262 @@ JSON output
 ``agt predict``
 ---------------
 
-Full-chromosome inference — tiles across chromosomes, runs the model,
-writes predictions to BigWig files.
+Run the model and write predictions to disk. Four input modes:
+
+=================== =============================================== ========================
+Input mode          What it does                                    Output
+=================== =============================================== ========================
+``--chromosomes``   Full-chromosome tiling                          BigWig per track
+``--locus``         One genomic interval                            BigWig per track
+``--bed``           Many genomic regions from a BED file            BigWig per track (merged)
+``--sequences``     Raw FASTA sequences (no genomic coordinates)    NPZ per sequence
+=================== =============================================== ========================
+
+``--locus``, ``--bed``, and ``--sequences`` are mutually exclusive. When
+``--bed`` is given, ``--chromosomes`` can additionally be passed as a
+chromosome filter over the BED rows (see below).
 
 Requires: ``pip install alphagenome-pytorch[inference]``
 
+How size mismatches are handled
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The model expects a fixed input window of ``W`` bp, where ``W`` is set by
+``--window-size`` (default: 131 072). When an input region or sequence does
+not match ``W``, the CLI dispatches by mode and the ``--tile`` flag:
+
++------------------------+------------------------------+-------------------------+------------------------------+
+| Mode                   | Input < ``W``                | Input == ``W``          | Input > ``W``                |
++========================+==============================+=========================+==============================+
+| ``--locus`` / ``--bed``| padded with real reference   | single window           | **cut** to center            |
+| (default)              | flanks (with warning)        |                         | (with warning)               |
++------------------------+------------------------------+-------------------------+------------------------------+
+| ``--locus`` / ``--bed``| padded with real reference   | single window           | stitched tiles               |
+| ``--tile``             | flanks (with warning)        |                         |                              |
++------------------------+------------------------------+-------------------------+------------------------------+
+| ``--sequences``        | **error** (cannot fake       | single window           | **error** (pass ``--tile``)  |
+| (default)              | reference context)           |                         |                              |
++------------------------+------------------------------+-------------------------+------------------------------+
+| ``--sequences``        | **error**                    | single window           | stitched tiles               |
+| ``--tile``             |                              |                         |                              |
++------------------------+------------------------------+-------------------------+------------------------------+
+| ``--chromosomes``      | n/a                          | n/a                     | stitched tiles (always)      |
++------------------------+------------------------------+-------------------------+------------------------------+
+
+Input validation
+""""""""""""""""
+
+Chromosome coordinates must be non-negative and must fit inside the
+chromosome. The CLI rejects invalid input up front rather than clamping
+silently:
+
+.. code-block:: text
+
+   Error: Invalid locus 'chr1:-100-500': start (-100) must be ≥ 0
+   Error: chr1:248000000-250000000: end (250000000) exceeds chromosome length (248956422)
+
+When a short region is padded, the fitted ``W``-bp window is also required
+to be in-bounds. If the region sits near a chromosome edge the window is
+shifted inward (never clamped to negative coordinates), and a warning
+describes the shift.
+
+Per-region logging
+""""""""""""""""""
+
+Each processed region prints a one-line status to stdout (suppressed under
+``--quiet`` / ``--json``), plus any warning lines to stderr:
+
+.. code-block:: text
+
+   chr2:5000-7000        (2000bp)    → padded
+     WARNING: chr2:5000-7000 (2000bp) padded with reference flanks; window shifted to [0, 131072) because region sits near chromosome start.
+   chr3:10000000-10002000 (2000bp)   → padded
+     WARNING: chr3:10000000-10002000 (2000bp) padded with reference flanks to a 131072bp window [9935464, 10066536); output covers only the region.
+   chr4:1000000-2000000  (1000000bp) → tiled (12 tiles)
+   chr4:100-131172       (131072bp)  → single
+   chr5:50000-1050000    (1000000bp) → cut
+     WARNING: chr5:50000-1050000 (1000000bp) center-cut to chr5:484464-615536 (131072bp); pass --tile to predict the full region.
+
+Full chromosomes
+^^^^^^^^^^^^^^^^
+
 .. code-block:: bash
 
-   # Basic — predict ATAC track 0 for chr1
+   # Predict ATAC for chr1 and chr2
    agt predict \
-       --model model.pth \
-       --fasta hg38.fa \
-       --output predictions/ \
-       --head atac \
-       --tracks 0 \
-       --chromosomes chr1
+       --model model.pth --fasta hg38.fa --output predictions/ \
+       --head atac --chromosomes chr1,chr2
 
-   # Full genome at 128bp resolution
+   # Whole genome, 1bp resolution (slower), torch.compile for speed
    agt predict \
-       --model model.pth \
-       --fasta hg38.fa \
-       --output predictions/ \
-       --head atac \
-       --resolution 128 \
-       --batch-size 8
+       --model model.pth --fasta hg38.fa --output predictions/ \
+       --head atac --chromosomes chr1,chr2,chr3,chr4,chr5,chr6,chr7,chr8,chr9,chr10 \
+       --resolution 1 --compile
 
-   # With center cropping to reduce edge artifacts
+   # Reduce edge artifacts with overlapping tiles
    agt predict \
-       --model model.pth \
-       --fasta hg38.fa \
-       --output predictions/ \
-       --head atac \
-       --crop-bp 32768 \
-       --resolution 128
+       --model model.pth --fasta hg38.fa --output predictions/ \
+       --head atac --chromosomes chr1 --crop-bp 32768
 
-   # 1bp resolution (slower, uses decoder)
+Locus (single interval)
+^^^^^^^^^^^^^^^^^^^^^^^
+
+.. code-block:: bash
+
+   # Exactly one window — single forward pass
    agt predict \
-       --model model.pth \
-       --fasta hg38.fa \
-       --output predictions/ \
-       --head atac \
-       --resolution 1
+       --model model.pth --fasta hg38.fa --output out/ \
+       --head atac --locus chr1:10000000-10131072
 
-   # Use torch.compile for faster inference
+   # Short locus — padded with real reference flanks
    agt predict \
-       --model model.pth \
-       --fasta hg38.fa \
-       --output predictions/ \
-       --head atac \
-       --compile
+       --model model.pth --fasta hg38.fa --output out/ \
+       --head atac --locus chr1:10000000-10005000
 
-JSON output:
+   # Long locus (default) — center-cut to 131 072 bp, warning printed
+   agt predict \
+       --model model.pth --fasta hg38.fa --output out/ \
+       --head atac --locus chr1:10000000-11000000
+
+   # Long locus with --tile — full region predicted via stitched tiles
+   agt predict \
+       --model model.pth --fasta hg38.fa --output out/ \
+       --head atac --locus chr1:10000000-11000000 \
+       --tile --crop-bp 16384
+
+Output file name:
+``{output}/{head}_{chrom}_{start}_{end}.bw`` (or per-track when multiple tracks).
+
+BED file (many regions)
+^^^^^^^^^^^^^^^^^^^^^^^
+
+BED columns: ``chrom``, ``start``, ``end``, optional ``name``. Lines
+starting with ``#``, ``track``, or ``browser`` are skipped. Each region is
+processed independently with the same size-handling rules as ``--locus``;
+all region predictions are merged into a single BigWig per track (gaps
+between regions are left as no-data).
+
+.. code-block:: bash
+
+   # Default — short regions padded, exact = single, long = cut (warns)
+   agt predict \
+       --model model.pth --fasta hg38.fa --output out/ \
+       --head atac --bed regions.bed
+
+   # --tile — long regions are stitched instead of cut
+   agt predict \
+       --model model.pth --fasta hg38.fa --output out/ \
+       --head atac --bed regions.bed --tile --crop-bp 16384
+
+   # Filter: predict only the rows on chr1 / chr2
+   agt predict \
+       --model model.pth --fasta hg38.fa --output out/ \
+       --head atac --bed regions.bed --chromosomes chr1,chr2
+
+When ``--chromosomes`` is passed alongside ``--bed`` it acts as a whitelist
+filter on the BED rows — useful for re-running a per-chromosome subset
+without having to edit the BED. If the filter removes every row the CLI
+errors out.
+
+Output file name: ``{output}/{head}.bw`` (or per-track).
+
+Raw FASTA sequences
+^^^^^^^^^^^^^^^^^^^
+
+Predict on arbitrary DNA that isn't tied to a reference genome. No
+``--fasta`` (reference) is needed — the sequences themselves are the input.
+Because there is no genome to fetch flanks from, short sequences are
+rejected outright rather than N-padded; pre-pad them yourself if you need
+that.
+
+.. code-block:: bash
+
+   # Sequences exactly the window size — one forward pass each
+   agt predict \
+       --model model.pth --output out/ \
+       --head atac --sequences window_sized.fa
+
+   # Longer sequences — tiling must be explicit
+   agt predict \
+       --model model.pth --output out/ \
+       --head atac --sequences long_seqs.fa --tile --crop-bp 16384
+
+Output: one ``{head}_{seq_name}.npz`` file per sequence (with metadata)
+plus a ``manifest.json`` listing all outputs when in ``--json`` mode.
+
+Errors you'll see:
+
+.. code-block:: text
+
+   Error: Sequence 'seq2' (5000bp) is shorter than the model window
+   (131072bp); not supported for --sequences.
+
+   Error: Sequence 'seq1' (500000bp) is longer than the model window
+   (131072bp); pass --tile to enable tiling.
+
+Common options
+^^^^^^^^^^^^^^
+
+======================== =================================================================
+Flag                     Meaning
+======================== =================================================================
+``--head NAME``          Prediction head (``atac``, ``dnase``, ``cage``, …)
+``--tracks 0,1,2``       Comma-separated track indices (default: all tracks)
+``--track-names``        Comma-separated output track names
+``--resolution {1,128}`` Output resolution in bp (128 is faster)
+``--crop-bp N``          Per-tile edge crop; use with ``--tile`` to reduce edge artifacts
+``--batch-size N``       Inference batch size (default 4)
+``--window-size N``      Override model input window (default 131 072)
+``--organism {0,1}``     0 = human, 1 = mouse
+``--device STR``         PyTorch device (``cuda``, ``cpu``, ``mps``)
+``--dtype-policy``       ``full_float32`` (default) or ``mixed_precision``
+``--compile``            Wrap model with ``torch.compile``
+``--checkpoint PATH``    Finetuned checkpoint (LoRA, full, etc.)
+``--transfer-config``    TransferConfig JSON for adapter models
+``--no-merge-adapters``  Keep LoRA/adapter modules separate from base weights
+``--quiet``              Suppress progress bars and per-region status lines
+======================== =================================================================
+
+JSON output
+^^^^^^^^^^^
+
+For ``--locus`` / ``--bed``:
 
 .. code-block:: json
 
    {
      "output_files": [
        {
-         "path": "predictions/atac_track0_chr1.bw",
+         "path": "out/atac_chr1_10000000_10131072.bw",
          "head": "atac",
-         "track": 0,
          "chromosome": "chr1",
+         "start": 10000000,
+         "end": 10131072,
+         "length_bp": 131072,
+         "handling": "single",
+         "tile_count": 1,
+         "resolution_bp": 128
+       }
+     ],
+     "warnings": []
+   }
+
+For ``--bed`` an additional ``regions`` array lists per-region metadata
+(``handling``, ``tile_count``, ``warnings``).
+
+For ``--sequences``:
+
+.. code-block:: json
+
+   {
+     "output_files": [
+       {
+         "path": "out/atac_seq1.npz",
+         "head": "atac",
+         "sequence": "seq1",
+         "length_bp": 500000,
+         "handling": "tiled",
+         "tile_count": 4,
          "resolution_bp": 128
        }
      ],
