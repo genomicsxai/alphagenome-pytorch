@@ -75,6 +75,7 @@ GenomeTracksHead for each assay type
 - `src/alphagenome_pytorch/convolutions.py` - StandardizedConv1d, DownResBlock, UpResBlock
 - `src/alphagenome_pytorch/heads.py` - GenomeTracksHead, ContactMapsHead, predictions_scaling
 - `src/alphagenome_pytorch/embeddings.py` - OutputEmbedder, OutputPair
+- `src/alphagenome_pytorch/sequence_parallel.py` - SequenceParallelism for multi-GPU inference and training
 
 ### Output Heads
 
@@ -107,12 +108,27 @@ GenomeTracksHead for each assay type
 - Separate embeddings/heads per organism (index 0=human, 1=mouse)
 - Track means provide per-organism scaling factors
 
+### Sequence Parallelism
+- `SequenceParallelism` splits the input sequence across GPUs instead of splitting the batch
+- Works for both inference (`torch.no_grad()`) and training (`train_epoch_sequence_parallel`)
+- Encoder and decoder run locally per rank; transformer runs globally after an all-gather of the trunk
+- Embeddings returned are local to each rank (`S_local`, not full `S`)
+- Enable in finetune.py with `--sequence-parallel [--overlap-highres N] [--overlap-lowres N]`
+
+```bash
+torchrun --nproc_per_node=2 scripts/finetune.py \
+    --sequence-parallel --overlap-highres 1024 --overlap-lowres 32 \
+    --genome hg38.fa --modality atac --bigwig *.bw \
+    --train-bed train.bed --val-bed val.bed --pretrained-weights model.pth
+```
+
 ### Test Strategy
 - Unit tests (`tests/unit/`): Fast, no JAX required, verify PyTorch components
 - Integration tests (`tests/integration/`): PyTorch-only full model tests (backward pass, finetuning, variant scoring)
 - JAX integration tests (`tests/integration_jax/`): Compare JAX vs PyTorch outputs, require JAX checkpoint
 - JAX comparison tests (`tests/jax_comparison/`): Component-level JAX vs PyTorch parity
 - Use `-k` to filter by organism or resolution: `pytest -k "human"` or `pytest -k "128-"`
+- Sequence parallel tests use mocked dist on CPU; GPU/multi-GPU variants skip automatically when hardware is absent (`pytest -m slow` to include multi-GPU tests)
 
 ## Reference Documentation
 
