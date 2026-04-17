@@ -520,21 +520,27 @@ class AlphaGenome(nn.Module):
 
     @staticmethod
     def _normalize_organism_index(organism_index, dna_sequence):
-        """Coerce ``organism_index`` to a (B,) long tensor.
+        """Coerce ``organism_index`` to a (B,) long tensor on ``dna_sequence``'s device.
 
         ``organism_index`` may be passed as a Python int for single-organism
         batches, but downstream code (embedding lookups, named-output metadata
-        selection, head dispatch) expects a per-batch tensor. This helper
-        accepts either an int or a tensor and returns a tensor on
-        ``dna_sequence``'s device. Already-tensor inputs are returned unchanged.
+        selection, head dispatch) expects a per-batch long tensor. Tensor
+        inputs are moved to ``dna_sequence``'s device, cast to ``torch.long``,
+        and scalar / ``(1,)`` shapes are broadcast to ``(B,)``.
         """
+        batch_size = dna_sequence.shape[0]
+        device = dna_sequence.device
         if isinstance(organism_index, int):
-            batch_size = dna_sequence.shape[0]
-            organism_index = torch.full(
-                (batch_size,),
-                organism_index,
-                dtype=torch.long,
-                device=dna_sequence.device,
+            return torch.full((batch_size,), organism_index, dtype=torch.long, device=device)
+
+        organism_index = organism_index.to(device=device, dtype=torch.long)
+        if organism_index.ndim == 0:
+            organism_index = organism_index.unsqueeze(0)
+        if organism_index.shape == (1,):
+            organism_index = organism_index.expand(batch_size)
+        elif organism_index.shape != (batch_size,):
+            raise ValueError(
+                f"organism_index has shape {tuple(organism_index.shape)}, expected (), (1,), or ({batch_size},)"
             )
         return organism_index
 

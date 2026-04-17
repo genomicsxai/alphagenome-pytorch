@@ -9,6 +9,8 @@ from alphagenome_pytorch.attention import (
     apply_rope,
 )
 
+pytestmark = pytest.mark.unit
+
 
 class TestApplyRope:
     """Tests for Rotary Position Embeddings (RoPE) implementation."""
