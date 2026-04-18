@@ -6,6 +6,7 @@ import enum
 import json
 import logging
 import threading
+from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -18,7 +19,23 @@ from alphagenome.data import junction_data as ag_junction_data
 from alphagenome.data import track_data as ag_track_data
 from alphagenome.models import dna_output
 
-from .adapter import LocalDnaModelAdapter, _normalize_output_type
+from alphagenome_pytorch.variant_scoring.scorers import (
+    BaseVariantScorer as PTBaseVariantScorer,
+    CenterMaskScorer as PTCenterMaskScorer,
+    ContactMapScorer as PTContactMapScorer,
+    GeneMaskActiveScorer as PTGeneMaskActiveScorer,
+    GeneMaskLFCScorer as PTGeneMaskLFCScorer,
+    GeneMaskSplicingScorer as PTGeneMaskSplicingScorer,
+    PolyadenylationScorer as PTPolyadenylationScorer,
+    SpliceJunctionScorer as PTSpliceJunctionScorer,
+)
+from alphagenome_pytorch.variant_scoring.scorers.gene_mask import GeneMaskMode
+from alphagenome_pytorch.variant_scoring.types import (
+    AggregationType as PTAggregationType,
+    OutputType as PTOutputType,
+)
+
+from .adapter import LocalDnaModelAdapter, _OFFICIAL_TO_PT_OUTPUT, _normalize_output_type
 
 LOGGER = logging.getLogger(__name__)
 
@@ -62,6 +79,148 @@ def _variant_from_payload(payload: dict[str, Any]) -> genome.Variant:
         reference_bases=payload['reference_bases'],
         alternate_bases=payload['alternate_bases'],
     )
+
+
+# Variant scorer JSON schema (tagged union on "type"):
+#
+#   {"type": "center_mask", "requested_output": "DNASE", "width": 501,
+#    "aggregation_type": "DIFF_SUM"}
+#   {"type": "contact_map"}
+#   {"type": "gene_mask_lfc", "requested_output": "RNA_SEQ", "mask_mode": "EXONS"}
+#   {"type": "gene_mask_active", "requested_output": "DNASE", "mask_mode": "EXONS"}
+#   {"type": "gene_mask_splicing", "requested_output": "SPLICE_SITES", "width": 501}
+#   {"type": "polyadenylation", "min_pas_count": 2, "min_pas_coverage": 0.8}
+#   {"type": "splice_junction", "filter_protein_coding": true}
+#
+# Enum fields accept member names (case-insensitive). An empty or omitted
+# "variant_scorers" list triggers adapter fallback to recommended scorers.
+
+
+def _scorer_pt_output(payload: dict[str, Any]) -> PTOutputType:
+    value = payload.get('requested_output')
+    if value is None:
+        raise ValueError(
+            f'Variant scorer "{payload.get("type")}" missing required field "requested_output".'
+        )
+    official = _normalize_output_type(value)
+    pt = _OFFICIAL_TO_PT_OUTPUT.get(official)
+    if pt is None:
+        raise ValueError(f'Output type {official.name} is not supported for variant scorers.')
+    return pt
+
+
+def _scorer_enum(
+    payload: dict[str, Any],
+    field: str,
+    enum_cls: type[enum.Enum],
+    *,
+    default: Any = ...,
+) -> Any:
+    value = payload.get(field)
+    if value is None:
+        if default is ...:
+            raise ValueError(
+                f'Variant scorer "{payload.get("type")}" missing required field "{field}".'
+            )
+        return default
+    if isinstance(value, enum_cls):
+        return value
+    if isinstance(value, str):
+        try:
+            return enum_cls[value.upper()]
+        except KeyError:
+            valid = ', '.join(m.name for m in enum_cls)
+            raise ValueError(
+                f'Unknown {enum_cls.__name__} value "{value}". Valid: {valid}.'
+            ) from None
+    raise ValueError(f'Field "{field}" must be a string naming a {enum_cls.__name__} member.')
+
+
+def _center_mask_from_json(payload: dict[str, Any]) -> PTCenterMaskScorer:
+    width = payload.get('width')
+    return PTCenterMaskScorer(
+        requested_output=_scorer_pt_output(payload),
+        width=int(width) if width is not None else None,
+        aggregation_type=_scorer_enum(payload, 'aggregation_type', PTAggregationType),
+    )
+
+
+def _contact_map_from_json(payload: dict[str, Any]) -> PTContactMapScorer:
+    del payload
+    return PTContactMapScorer()
+
+
+def _gene_mask_lfc_from_json(payload: dict[str, Any]) -> PTGeneMaskLFCScorer:
+    return PTGeneMaskLFCScorer(
+        requested_output=_scorer_pt_output(payload),
+        mask_mode=_scorer_enum(payload, 'mask_mode', GeneMaskMode, default=GeneMaskMode.EXONS),
+    )
+
+
+def _gene_mask_active_from_json(payload: dict[str, Any]) -> PTGeneMaskActiveScorer:
+    return PTGeneMaskActiveScorer(
+        requested_output=_scorer_pt_output(payload),
+        mask_mode=_scorer_enum(payload, 'mask_mode', GeneMaskMode, default=GeneMaskMode.EXONS),
+    )
+
+
+def _gene_mask_splicing_from_json(payload: dict[str, Any]) -> PTGeneMaskSplicingScorer:
+    width = payload.get('width')
+    return PTGeneMaskSplicingScorer(
+        requested_output=_scorer_pt_output(payload),
+        width=int(width) if width is not None else None,
+    )
+
+
+def _polyadenylation_from_json(payload: dict[str, Any]) -> PTPolyadenylationScorer:
+    return PTPolyadenylationScorer(
+        min_pas_count=int(payload.get('min_pas_count', 2)),
+        min_pas_coverage=float(payload.get('min_pas_coverage', 0.8)),
+    )
+
+
+def _splice_junction_from_json(payload: dict[str, Any]) -> PTSpliceJunctionScorer:
+    return PTSpliceJunctionScorer(
+        filter_protein_coding=bool(payload.get('filter_protein_coding', True)),
+    )
+
+
+_SCORER_BUILDERS: dict[str, Callable[[dict[str, Any]], PTBaseVariantScorer]] = {
+    'center_mask': _center_mask_from_json,
+    'contact_map': _contact_map_from_json,
+    'gene_mask_lfc': _gene_mask_lfc_from_json,
+    'gene_mask_active': _gene_mask_active_from_json,
+    'gene_mask_splicing': _gene_mask_splicing_from_json,
+    'polyadenylation': _polyadenylation_from_json,
+    'splice_junction': _splice_junction_from_json,
+}
+
+
+def _parse_variant_scorers(raw: Any) -> list[PTBaseVariantScorer]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError('"variant_scorers" must be a JSON list of scorer objects.')
+    scorers: list[PTBaseVariantScorer] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f'variant_scorers[{index}] must be a JSON object, got {type(item).__name__}.'
+            )
+        scorer_type = item.get('type')
+        if not isinstance(scorer_type, str):
+            raise ValueError(
+                f'variant_scorers[{index}] missing required string field "type". '
+                f'Supported types: {", ".join(sorted(_SCORER_BUILDERS))}.'
+            )
+        builder = _SCORER_BUILDERS.get(scorer_type)
+        if builder is None:
+            raise ValueError(
+                f'Unknown variant scorer type "{scorer_type}" at variant_scorers[{index}]. '
+                f'Supported: {", ".join(sorted(_SCORER_BUILDERS))}.'
+            )
+        scorers.append(builder(item))
+    return scorers
 
 
 def _serialize_interval(interval: genome.Interval | None) -> dict[str, Any] | None:
@@ -233,7 +392,7 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 scores = self.adapter.score_variant(
                     interval=_interval_from_payload(body['interval']),
                     variant=_variant_from_payload(body['variant']),
-                    variant_scorers=body.get('variant_scorers', ()),
+                    variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
                     organism=body.get('organism', 'HOMO_SAPIENS'),
                 )
                 self._write_json({'scores': [_serialize_anndata(s) for s in scores]})
@@ -250,7 +409,7 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 scores = self.adapter.score_variants(
                     intervals=intervals,
                     variants=variants,
-                    variant_scorers=body.get('variant_scorers', ()),
+                    variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
                     organism=body.get('organism', 'HOMO_SAPIENS'),
                     progress_bar=False,
                     max_workers=int(body.get('max_workers', 5)),
@@ -265,7 +424,7 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 scores = self.adapter.score_ism_variants(
                     interval=_interval_from_payload(body['interval']),
                     ism_interval=_interval_from_payload(body['ism_interval']),
-                    variant_scorers=body.get('variant_scorers', ()),
+                    variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
                     organism=body.get('organism', 'HOMO_SAPIENS'),
                     interval_variant=_variant_from_payload(interval_variant_payload)
                     if interval_variant_payload

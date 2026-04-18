@@ -207,7 +207,8 @@ def _normalize_output_type(value: Any) -> dna_output.OutputType:
         name = getattr(value, 'name')
         if isinstance(name, str):
             normalized = name.upper().removeprefix('OUTPUT_TYPE_')
-            return dna_output.OutputType[normalized]
+            if normalized in dna_output.OutputType.__members__:
+                return dna_output.OutputType[normalized]
     if isinstance(value, str):
         normalized = value.upper().removeprefix('OUTPUT_TYPE_')
         if normalized in dna_output.OutputType.__members__:
@@ -536,7 +537,11 @@ class LocalDnaModelAdapter:
     ) -> tuple[np.ndarray, int]:
         key = pt_output_type.value
         if key not in outputs:
-            raise KeyError(f'Requested output "{key}" not found in model outputs.')
+            available = ', '.join(sorted(outputs.keys())) or '<none>'
+            raise ValueError(
+                f'Requested output "{key}" not produced by this model. '
+                f'Available outputs: {available}.'
+            )
         raw = outputs[key]
 
         if pt_output_type == PTOutputType.SPLICE_SITES and isinstance(raw, Mapping):

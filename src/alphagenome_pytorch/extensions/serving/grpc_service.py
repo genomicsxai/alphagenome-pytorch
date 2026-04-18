@@ -419,9 +419,13 @@ def serve_grpc(
     )
 
     bind_address = f'{host}:{port}'
-    server.add_insecure_port(bind_address)
+    bound_port = server.add_insecure_port(bind_address)
+    if bound_port == 0:
+        raise RuntimeError(
+            f'Failed to bind gRPC server to {bind_address}; the port may already be in use.'
+        )
     server.start()
-    LOGGER.info('Local gRPC serving started at %s', bind_address)
+    LOGGER.info('Local gRPC serving started at %s:%d', host, bound_port)
 
     if wait:
         server.wait_for_termination()
