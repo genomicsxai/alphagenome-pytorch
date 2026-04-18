@@ -319,3 +319,46 @@ Example Configurations
          - /data/bigwigs/rna_s2.bw
        resolutions: "128"
        task_weight: 0.5
+
+Generating Predictions (BigWig)
+-------------------------------
+
+After training, generate chromosome-wide predictions using
+``scripts/predict_full_chromosome.py``. Pass your base pretrained weights
+as ``--model`` and the finetuned checkpoint as ``--checkpoint``:
+
+.. code-block:: bash
+
+   # Delta checkpoint
+   python scripts/predict_full_chromosome.py \
+       --model pretrained.pth \
+       --checkpoint best_model.delta.pth \
+       --fasta hg38.fa \
+       --output predictions/ \
+       --head my_atac \
+       --chromosomes chr21
+
+   # Full checkpoint (with embedded TransferConfig)
+   python scripts/predict_full_chromosome.py \
+       --model pretrained.pth \
+       --checkpoint best_model.pth \
+       --fasta hg38.fa \
+       --output predictions/ \
+       --head my_atac \
+       --chromosomes chr21
+
+   # Full checkpoint (with external TransferConfig)
+   python scripts/predict_full_chromosome.py \
+       --model pretrained.pth \
+       --checkpoint best_model.pth \
+       --transfer-config transfer_config.json \
+       --fasta hg38.fa \
+       --output predictions/ \
+       --head my_atac
+
+The transfer config is embedded in checkpoints but you can 
+also export it from a training run as a separate file:
+
+.. code-block:: bash
+
+   python scripts/finetune.py ... --export-transfer-config transfer_config.json
