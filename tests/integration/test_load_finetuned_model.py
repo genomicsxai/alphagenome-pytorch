@@ -1,11 +1,14 @@
 """
 Tests for load_finetuned_model() checkpoint-format detection.
 
-Covers the three checkpoint-format branches and the non-dict guard:
-  - Full checkpoint with embedded TransferConfig (adapter reconstruction)
-  - Full checkpoint with adapter keys but no config (error)
-  - Linear-probe full checkpoint without config (heads reconstructed from metadata)
-  - Non-dict checkpoint payload (clean ValueError, not TypeError)
+Covers:
+  - Path B, lora: full checkpoint with embedded lora TransferConfig.
+  - Path B, full: full checkpoint with embedded TransferConfig(mode="full"),
+    exercising custom head names decoupled from assay type.
+  - Path C guard: adapter keys without a TransferConfig raises ValueError.
+  - Path C legacy: linear-probe-style full checkpoint with head name
+    equal to modality (the legacy save convention).
+  - Non-dict payload raises ValueError (not TypeError).
 """
 
 import gc
@@ -30,8 +33,9 @@ from alphagenome_pytorch.model import AlphaGenome
 
 
 def _make_model(**kwargs):
+    # num_organisms defaults to 2 to match what load_finetuned_model
+    # constructs internally.
     model = AlphaGenome(
-        num_organisms=1,
         dtype_policy=DtypePolicy.full_float32(),
         **kwargs,
     )
@@ -68,6 +72,20 @@ def _lora_config(base_model):
     )
 
 
+def _full_mode_config(base_model):
+    return TransferConfig(
+        mode="full",
+        remove_heads=list(base_model.heads.keys()),
+        new_heads={
+            "my_atac": {
+                "modality": "atac",
+                "num_tracks": 4,
+                "resolutions": [128],
+            },
+        },
+    )
+
+
 @pytest.mark.integration
 class TestLoadFinetunedModel:
     @pytest.fixture(autouse=True)
@@ -75,8 +93,8 @@ class TestLoadFinetunedModel:
         yield
         gc.collect()
 
-    def test_full_checkpoint_with_embedded_config(self, base_weights_path):
-        """Path B: full checkpoint with embedded TransferConfig reconstructs adapters."""
+    def test_lora_checkpoint_with_embedded_config(self, base_weights_path):
+        """Path B: embedded lora TransferConfig reconstructs adapters and heads."""
         base_model = _make_model()
         config = _lora_config(base_model)
         adapted = _make_model()
@@ -106,16 +124,48 @@ class TestLoadFinetunedModel:
             )
 
         assert "my_atac" in model.heads
-        # LoRA adapters should have been rebuilt
         lora_names = [n for n, _ in model.named_parameters() if "lora_" in n]
         assert len(lora_names) > 0
         assert meta["head_names"] == ["my_atac"]
         assert meta["epoch"] == 3
 
-    def test_full_checkpoint_adapter_keys_without_config_raises(
-        self, base_weights_path,
-    ):
-        """Path C guard: adapter keys without a TransferConfig must error clearly."""
+    def test_full_mode_checkpoint_with_custom_head_name(self, base_weights_path):
+        """Path B: mode="full" TransferConfig round-trips a head whose name
+        differs from its assay type (e.g. head "my_atac", modality "atac")."""
+        base_model = _make_model()
+        config = _full_mode_config(base_model)
+        prepared = _make_model()
+        prepared.load_state_dict(
+            torch.load(base_weights_path, weights_only=True), strict=False
+        )
+        prepared = prepare_for_transfer(prepared, config)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt_path = Path(tmpdir) / "full_finetuned.pth"
+            torch.save(
+                {
+                    "model_state_dict": prepared.state_dict(),
+                    "transfer_config": transfer_config_to_dict(config),
+                    "modality": "atac",
+                    "track_names": ["t1", "t2", "t3", "t4"],
+                    "resolutions": (128,),
+                    "epoch": 2,
+                    "val_loss": 0.2,
+                },
+                ckpt_path,
+            )
+
+            model, meta = load_finetuned_model(ckpt_path, base_weights_path)
+
+        assert "my_atac" in model.heads
+        assert "atac" not in model.heads
+        assert meta["head_names"] == ["my_atac"]
+        # No LoRA adapters in full mode
+        assert not [n for n, _ in model.named_parameters() if "lora_" in n]
+
+    def test_adapter_keys_without_config_raises(self, base_weights_path):
+        """Path C guard: adapter-shaped keys without a TransferConfig must
+        produce a clear ValueError, not a silent partial load."""
         base_model = _make_model()
         config = _lora_config(base_model)
         adapted = _make_model()
@@ -140,15 +190,15 @@ class TestLoadFinetunedModel:
             with pytest.raises(ValueError, match="adapter parameters"):
                 load_finetuned_model(ckpt_path, base_weights_path)
 
-    def test_linear_probe_full_checkpoint_without_config(self, base_weights_path):
-        """Path C success: linear-probe checkpoint has no adapter keys and
-        heads are reconstructed from modality/track_names/resolutions metadata."""
+    def test_legacy_linear_probe_checkpoint_without_config(self, base_weights_path):
+        """Path C backward-compat: legacy checkpoints have no TransferConfig
+        and rely on the head-name==modality convention from finetune.py."""
         model = _make_model()
         model.load_state_dict(
             torch.load(base_weights_path, weights_only=True), strict=False
         )
         model = remove_all_heads(model)
-        model.heads["my_atac"] = create_finetuning_head(
+        model.heads["atac"] = create_finetuning_head(
             assay_type="atac", n_tracks=4, resolutions=(128,),
         )
 
@@ -157,7 +207,7 @@ class TestLoadFinetunedModel:
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
-                    "modality": "my_atac",
+                    "modality": "atac",
                     "track_names": ["t1", "t2", "t3", "t4"],
                     "resolutions": (128,),
                     "epoch": 1,
@@ -168,18 +218,14 @@ class TestLoadFinetunedModel:
 
             loaded, meta = load_finetuned_model(ckpt_path, base_weights_path)
 
-        assert "my_atac" in loaded.heads
-        # No adapters should have been created
+        assert "atac" in loaded.heads
         assert not [n for n, _ in loaded.named_parameters() if "lora_" in n]
-        assert meta["head_names"] == ["my_atac"]
+        assert meta["head_names"] == ["atac"]
 
     def test_non_dict_checkpoint_raises_value_error(self, base_weights_path):
-        """Guard: torch.save of a raw state_dict must produce ValueError, not TypeError."""
-        model = _make_model()
+        """Non-dict payload (e.g. a raw tensor) must raise ValueError, not TypeError."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            ckpt_path = Path(tmpdir) / "raw_state.pth"
-            # A raw state_dict is an OrderedDict subclass of dict — also try a
-            # genuinely non-dict payload (a single tensor) to exercise the guard.
+            ckpt_path = Path(tmpdir) / "raw_tensor.pth"
             torch.save(torch.zeros(3), ckpt_path)
 
             with pytest.raises(ValueError, match="Expected dict"):

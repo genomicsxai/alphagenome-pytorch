@@ -364,8 +364,14 @@ def parse_args() -> argparse.Namespace:
     resume.add_argument(
         "--save-delta",
         action="store_true",
-        help="Save delta checkpoints (adapter + head weights only, much smaller). "
-             "Delta files saved as best_model.delta.pth",
+        help="Save delta checkpoints (adapter + head weights only, much smaller) "
+             "for both best-model and per-epoch saves, alongside full checkpoints.",
+    )
+    resume.add_argument(
+        "--no-full-checkpoint",
+        action="store_true",
+        help="Skip writing full checkpoints (best_model.pth, checkpoint_epoch*.pth). "
+             "Requires --save-delta so the run still produces loadable checkpoints.",
     )
     resume.add_argument(
         "--export-transfer-config",
@@ -377,6 +383,17 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
+    if args.no_full_checkpoint and not args.save_delta:
+        parser.error(
+            "--no-full-checkpoint requires --save-delta (otherwise the run "
+            "would produce no loadable checkpoints)."
+        )
+    if args.no_full_checkpoint and args.mode == "full":
+        parser.error(
+            "--no-full-checkpoint cannot be used with --mode full: delta "
+            "checkpoints only store adapter/head/norm weights, so resume "
+            "would lose all fine-tuning updates to the trunk."
+        )
     cli_flags = {
         token.split("=", 1)[0]
         for token in sys.argv[1:]
@@ -882,7 +899,10 @@ def create_model(
     elif args.mode == "full":
         # All parameters trainable (model was not frozen above)
         trainable_params = list(model.parameters())
-        # Delta checkpoints don't make sense for full mode (all weights change)
+        # Embed TransferConfig so checkpoints are self-describing at load time
+        # (head names, modalities, resolutions). Delta save is still a no-op
+        # in this mode since all weights change.
+        transfer_config = TransferConfig(mode="full", new_heads=new_heads_config)
         if args.save_delta:
             print_rank0("Warning: --save-delta ignored for --mode full (all weights trained)", rank)
         print_rank0("Mode: full (all parameters trainable)", rank)
@@ -1156,11 +1176,14 @@ def main() -> None:
     current_epoch = start_epoch
 
     def _save_preempt():
-        """Save preemption checkpoint."""
-        if is_main_process(rank) and not args.no_save_checkpoints:
+        """Save preemption checkpoint, honoring --save-delta / --no-full-checkpoint."""
+        if not (is_main_process(rank) and not args.no_save_checkpoints):
+            return
+        last_completed = max(0, current_epoch - 1)
+        if not args.no_full_checkpoint:
             save_checkpoint(
                 path=output_dir / "checkpoint_preempt.pth",
-                epoch=max(0, current_epoch - 1),  # Last completed epoch
+                epoch=last_completed,
                 model=model_module,
                 optimizer=optimizer,
                 val_loss=best_val_loss,
@@ -1173,6 +1196,22 @@ def main() -> None:
                 **transfer_config_kwargs,
             )
             print(f"Preemption checkpoint saved to {output_dir / 'checkpoint_preempt.pth'}")
+        if args.save_delta and transfer_config is not None:
+            save_delta_checkpoint(
+                path=output_dir / "checkpoint_preempt.delta.pth",
+                model=model_module,
+                config=transfer_config,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=last_completed,
+                val_loss=best_val_loss,
+                best_val_loss=best_val_loss,
+                track_names=modality_track_names,
+                modality=args.modalities,
+                resolutions=modality_resolutions,
+                wandb_run_id=logger.wandb_run_id,
+            )
+            print(f"Preemption delta checkpoint saved to {output_dir / 'checkpoint_preempt.delta.pth'}")
 
     handler = setup_preemption_handler(_save_preempt, rank, world_size)
 
@@ -1323,25 +1362,15 @@ def main() -> None:
 
             # Save checkpoints
             if is_main_process(rank) and not args.no_save_checkpoints:
+                # Delta saves require a transfer_config (full mode now also
+                # builds one, so this only skips the delta write in legacy
+                # paths where transfer_config is None).
+                write_delta = args.save_delta and transfer_config is not None
+                write_full = not args.no_full_checkpoint
+
                 if is_best:
                     best_val_loss = val_loss
-                    if args.save_delta and transfer_config is not None:
-                        # Delta-only: skip full checkpoint for best model
-                        save_delta_checkpoint(
-                            path=output_dir / "best_model.delta.pth",
-                            model=model_module,
-                            config=transfer_config,
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            epoch=epoch,
-                            val_loss=val_loss,
-                            best_val_loss=best_val_loss,
-                            track_names=modality_track_names,
-                            modality=args.modalities,
-                            resolutions=modality_resolutions,
-                        )
-                        print(f"  Saved best delta checkpoint (val_loss={val_loss:.4f})")
-                    else:
+                    if write_full:
                         save_checkpoint(
                             path=output_dir / "best_model.pth",
                             epoch=epoch,
@@ -1357,22 +1386,54 @@ def main() -> None:
                             **transfer_config_kwargs,
                         )
                         print(f"  Saved best model (val_loss={val_loss:.4f})")
+                    if write_delta:
+                        save_delta_checkpoint(
+                            path=output_dir / "best_model.delta.pth",
+                            model=model_module,
+                            config=transfer_config,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            epoch=epoch,
+                            val_loss=val_loss,
+                            best_val_loss=best_val_loss,
+                            track_names=modality_track_names,
+                            modality=args.modalities,
+                            resolutions=modality_resolutions,
+                            wandb_run_id=logger.wandb_run_id,
+                        )
+                        print(f"  Saved best delta checkpoint (val_loss={val_loss:.4f})")
 
                 if epoch % args.save_every == 0:
-                    save_checkpoint(
-                        path=output_dir / f"checkpoint_epoch{epoch}.pth",
-                        epoch=epoch,
-                        model=model_module,
-                        optimizer=optimizer,
-                        val_loss=val_loss,
-                        track_names=modality_track_names,
-                        modality=args.modalities,
-                        resolutions=modality_resolutions,
-                        scheduler=scheduler,
-                        best_val_loss=best_val_loss,
-                        wandb_run_id=logger.wandb_run_id,
-                        **transfer_config_kwargs,
-                    )
+                    if write_full:
+                        save_checkpoint(
+                            path=output_dir / f"checkpoint_epoch{epoch}.pth",
+                            epoch=epoch,
+                            model=model_module,
+                            optimizer=optimizer,
+                            val_loss=val_loss,
+                            track_names=modality_track_names,
+                            modality=args.modalities,
+                            resolutions=modality_resolutions,
+                            scheduler=scheduler,
+                            best_val_loss=best_val_loss,
+                            wandb_run_id=logger.wandb_run_id,
+                            **transfer_config_kwargs,
+                        )
+                    if write_delta:
+                        save_delta_checkpoint(
+                            path=output_dir / f"checkpoint_epoch{epoch}.delta.pth",
+                            model=model_module,
+                            config=transfer_config,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            epoch=epoch,
+                            val_loss=val_loss,
+                            best_val_loss=best_val_loss,
+                            track_names=modality_track_names,
+                            modality=args.modalities,
+                            resolutions=modality_resolutions,
+                            wandb_run_id=logger.wandb_run_id,
+                        )
 
             barrier()
 

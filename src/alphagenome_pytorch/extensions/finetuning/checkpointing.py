@@ -144,8 +144,10 @@ def save_checkpoint(
 def find_latest_checkpoint(output_dir: Path) -> Path | None:
     """Find the most recent checkpoint in output_dir.
 
-    Prefers ``checkpoint_preempt.pth`` (saved mid-epoch by the signal
-    handler) over ``checkpoint_epoch*.pth`` when it is newer.
+    Matches both full (``checkpoint_epoch{N}.pth``) and delta
+    (``checkpoint_epoch{N}.delta.pth``) checkpoints, plus
+    ``checkpoint_preempt[.delta].pth``. Prefers the preempt checkpoint
+    when it is newer than the latest epoch checkpoint.
 
     Args:
         output_dir: Directory to search for checkpoints.
@@ -158,20 +160,31 @@ def find_latest_checkpoint(output_dir: Path) -> Path | None:
         >>> if ckpt_path:
         ...     checkpoint = torch.load(ckpt_path)
     """
-    preempt = output_dir / "checkpoint_preempt.pth"
-
     def _epoch_num(p: Path) -> int:
-        return int(p.stem.replace("checkpoint_epoch", ""))
+        stem = p.name.removesuffix(".delta.pth").removesuffix(".pth")
+        return int(stem.replace("checkpoint_epoch", ""))
 
-    epoch_ckpts = list(output_dir.glob("checkpoint_epoch*.pth"))
-    epoch_ckpts.sort(key=_epoch_num)
+    epoch_ckpts = [
+        *output_dir.glob("checkpoint_epoch*.pth"),
+        *output_dir.glob("checkpoint_epoch*.delta.pth"),
+    ]
+    # Dedupe in case a glob overlaps (belt and braces).
+    epoch_ckpts = sorted(set(epoch_ckpts), key=lambda p: (_epoch_num(p), p.stat().st_mtime))
 
-    if not epoch_ckpts and not preempt.exists():
+    preempt_candidates = [
+        p for p in (
+            output_dir / "checkpoint_preempt.pth",
+            output_dir / "checkpoint_preempt.delta.pth",
+        ) if p.exists()
+    ]
+    preempt = max(preempt_candidates, key=lambda p: p.stat().st_mtime, default=None)
+
+    if not epoch_ckpts and preempt is None:
         return None
 
-    # If preempt checkpoint exists, prefer it when it's newer than the
-    # latest epoch checkpoint (it was saved *after* the last completed epoch).
-    if preempt.exists():
+    # If preempt exists, prefer it when it's newer than the latest epoch
+    # checkpoint (it was saved *after* the last completed epoch).
+    if preempt is not None:
         if not epoch_ckpts or preempt.stat().st_mtime >= epoch_ckpts[-1].stat().st_mtime:
             return preempt
 
@@ -1238,6 +1251,8 @@ def load_finetuned_model(
         track_names_meta = ckpt.get("track_names")
         resolutions_meta = ckpt.get("resolutions")
 
+        # Legacy format: head name == modality by convention (see finetune.py).
+        # Modern checkpoints embed a TransferConfig and take Path B instead.
         if isinstance(modality, list):
             head_names = list(modality)
             for mod in modality:
