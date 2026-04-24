@@ -208,6 +208,7 @@ def evaluate_split(
             outputs = model(
                 sequences, organism_idx,
                 embeddings_only=True, resolutions=resolutions,
+                channels_last=False,
             )
             embeddings_dict = {
                 res: outputs[f"embeddings_{res}bp"]
@@ -286,14 +287,13 @@ def evaluate_native_split(
         ):
             outputs = model(sequences, organism_idx)
 
+        if modality not in outputs:
+            continue
+        head_outputs = outputs[modality]  # dict[int, (B, S, T)] channels_last by default
         for res in resolutions:
-            key = f"{modality}_{res}bp"
-            if key not in outputs:
-                # Try without _bp suffix for 128bp-only heads
-                key = modality
-                if key not in outputs:
-                    continue
-            pred = outputs[key]  # (B, S, T) channels_last by default
+            if res not in head_outputs:
+                continue
+            pred = head_outputs[res]
             # Extract single track
             pred_track = pred[:, :, track_index : track_index + 1]
             preds_by_res[res].append(pred_track.float().cpu().numpy())

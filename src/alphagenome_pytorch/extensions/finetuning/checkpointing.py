@@ -1191,6 +1191,11 @@ def load_finetuned_model(
 
     # --- Path B/C: Full checkpoint ---
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if not isinstance(ckpt, dict):
+        raise ValueError(
+            f"Unrecognized checkpoint format. Expected dict, got "
+            f"{type(ckpt).__name__}."
+        )
     if "model_state_dict" not in ckpt:
         raise ValueError(
             f"Unrecognized checkpoint format. Keys: {list(ckpt.keys())[:10]}"
@@ -1198,10 +1203,13 @@ def load_finetuned_model(
 
     state_dict = _strip_orig_mod(ckpt["model_state_dict"])
 
-    # Determine TransferConfig: external > embedded > None
+    # Determine TransferConfig: external > embedded > None.
+    # Older checkpoints may have "transfer_config": None explicitly stored.
     effective_config = transfer_config
-    if effective_config is None and "transfer_config" in ckpt:
-        effective_config = transfer_config_from_dict(ckpt["transfer_config"])
+    if effective_config is None:
+        embedded = ckpt.get("transfer_config")
+        if embedded is not None:
+            effective_config = transfer_config_from_dict(embedded)
 
     model = AlphaGenome(dtype_policy=dtype_policy)
     model = load_trunk(model, str(pretrained_weights), exclude_heads=True)

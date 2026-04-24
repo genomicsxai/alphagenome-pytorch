@@ -1035,6 +1035,14 @@ def main() -> None:
                 rank,
             )
 
+    # Only include transfer_config in checkpoints when one exists, so loaders
+    # can cleanly distinguish "no config saved" from "config was None".
+    transfer_config_kwargs = (
+        {"transfer_config": transfer_config_to_dict(transfer_config)}
+        if transfer_config is not None
+        else {}
+    )
+
     # Optimizer
     optimizer = torch.optim.AdamW(
         trainable_params,
@@ -1162,7 +1170,7 @@ def main() -> None:
                 scheduler=scheduler,
                 best_val_loss=best_val_loss,
                 wandb_run_id=logger.wandb_run_id,
-                transfer_config=transfer_config_to_dict(transfer_config) if transfer_config is not None else None,
+                **transfer_config_kwargs,
             )
             print(f"Preemption checkpoint saved to {output_dir / 'checkpoint_preempt.pth'}")
 
@@ -1346,7 +1354,7 @@ def main() -> None:
                             scheduler=scheduler,
                             best_val_loss=best_val_loss,
                             wandb_run_id=logger.wandb_run_id,
-                            transfer_config=transfer_config_to_dict(transfer_config) if transfer_config is not None else None,
+                            **transfer_config_kwargs,
                         )
                         print(f"  Saved best model (val_loss={val_loss:.4f})")
 
@@ -1363,7 +1371,7 @@ def main() -> None:
                         scheduler=scheduler,
                         best_val_loss=best_val_loss,
                         wandb_run_id=logger.wandb_run_id,
-                        transfer_config=transfer_config_to_dict(transfer_config) if transfer_config is not None else None,
+                        **transfer_config_kwargs,
                     )
 
             barrier()
