@@ -81,6 +81,7 @@ torch._dynamo.config.suppress_errors = True
 # AlphaGenome imports
 from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.config import DtypePolicy
+from alphagenome_pytorch.sequence_parallel import SequenceParallelism
 from alphagenome_pytorch.extensions.finetuning import (
     # Data
     CachedGenome,
@@ -94,10 +95,9 @@ from alphagenome_pytorch.extensions.finetuning import (
     TransferConfig,
     # Training
     create_lr_scheduler,
-    train_epoch_ddp,
-    validate_ddp,
     train_epoch_multihead,
     validate_multihead,
+    train_epoch_sequence_parallel,
     # Distributed
     setup_distributed,
     cleanup_distributed,
@@ -325,6 +325,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     train.add_argument("--compile", action="store_true", help="Use torch.compile")
     train.add_argument("--seed", type=int, default=None, help="Random seed")
 
+    # Distributed/Sequence Parallel arguments
+    dist = parser.add_argument_group("Distributed")
+    dist.add_argument(
+        "--sequence-parallel",
+        action="store_true",
+        help="Enable sequence parallelism (split sequence across GPUs)",
+    )
+    dist.add_argument(
+        "--overlap-highres",
+        type=int,
+        default=1024,
+        help="Overlap for high-resolution (1bp) sequence splits. Low-resolution overlap is computed as overlap_highres // 128.",
+    )
+
     # Logging arguments
     log = parser.add_argument_group("Logging")
     log.add_argument("--wandb", action="store_true", help="Enable W&B logging")
@@ -337,6 +351,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     out.add_argument("--output-dir", type=str, default=DEFAULTS["output_dir"])
     out.add_argument("--run-name", type=str, default=None)
     out.add_argument("--save-every", type=int, default=DEFAULTS["save_every"])
+    out.add_argument("--no-save-checkpoints", action="store_true", help="Skip saving model checkpoints (keeps logs/config)")
 
     # Resume arguments
     resume = parser.add_argument_group("Resume / Checkpointing")
@@ -627,45 +642,15 @@ def create_datasets(
             rank,
         )
 
-    if args.is_multimodal:
-        # Multi-modality: create per-modality datasets and wrap in MultimodalDataset
-        print_rank0("Creating multi-modality train datasets...", rank)
-        train_datasets = {}
-        val_datasets = {}
+    # Always create MultimodalDataset (even for single modality) to have a unified interface
+    # This is required by train_epoch_sequence_parallel
+    print_rank0("Creating datasets...", rank)
+    train_datasets = {}
+    val_datasets = {}
 
-        for modality, bigwigs in args.modality_to_bigwigs.items():
-            resolutions = args.modality_resolutions[modality]
-            train_datasets[modality] = GenomicDataset(
-                genome_fasta=genome,
-                bigwig_files=bigwigs,
-                bed_file=args.train_bed,
-                resolutions=resolutions,
-                sequence_length=args.sequence_length,
-                cache_genome=cache_genome,
-                cache_signals=cache_signals,
-                max_io_workers=max_io_workers,
-            )
-            val_datasets[modality] = GenomicDataset(
-                genome_fasta=genome,
-                bigwig_files=bigwigs,
-                bed_file=args.val_bed,
-                resolutions=resolutions,
-                sequence_length=args.sequence_length,
-                cache_genome=cache_genome,
-                cache_signals=cache_signals,
-                max_io_workers=max_io_workers,
-            )
-
-        train_dataset = MultimodalDataset(train_datasets)
-        val_dataset = MultimodalDataset(val_datasets)
-    else:
-        # Single-modality: create simple GenomicDataset
-        modality = args.modalities[0]
-        bigwigs = args.modality_to_bigwigs[modality]
+    for modality, bigwigs in args.modality_to_bigwigs.items():
         resolutions = args.modality_resolutions[modality]
-
-        print_rank0("Creating train dataset...", rank)
-        train_dataset = GenomicDataset(
+        train_datasets[modality] = GenomicDataset(
             genome_fasta=genome,
             bigwig_files=bigwigs,
             bed_file=args.train_bed,
@@ -675,9 +660,7 @@ def create_datasets(
             cache_signals=cache_signals,
             max_io_workers=max_io_workers,
         )
-
-        print_rank0("Creating validation dataset...", rank)
-        val_dataset = GenomicDataset(
+        val_datasets[modality] = GenomicDataset(
             genome_fasta=genome,
             bigwig_files=bigwigs,
             bed_file=args.val_bed,
@@ -687,6 +670,9 @@ def create_datasets(
             cache_signals=cache_signals,
             max_io_workers=max_io_workers,
         )
+
+    train_dataset = MultimodalDataset(train_datasets)
+    val_dataset = MultimodalDataset(val_datasets)
 
     print_rank0(f"Train: {len(train_dataset):,}  Val: {len(val_dataset):,}", rank)
 
@@ -701,12 +687,23 @@ def create_dataloaders(
     world_size: int,
     rank: int,
     is_multimodal: bool = False,
+    sequence_parallel_mode: bool = False,
 ) -> tuple[DataLoader, DataLoader, DistributedSampler | None, DistributedSampler | None]:
-    """Create data loaders with optional distributed samplers."""
-    train_sampler = DistributedSampler(train_dataset, shuffle=True) if world_size > 1 else None
-    val_sampler = DistributedSampler(val_dataset, shuffle=False) if world_size > 1 else None
+    """Create data loaders with optional distributed samplers.
 
-    collate_fn = collate_multimodal if is_multimodal else collate_genomic
+    Args:
+        sequence_parallel_mode: If True, use non-distributed sampler (all ranks see same data).
+    """
+    # In sequence-parallel mode, all ranks must process the same sequence (shards of it)
+    if sequence_parallel_mode:
+        train_sampler = None
+        val_sampler = None
+    else:
+        train_sampler = DistributedSampler(train_dataset, shuffle=True) if world_size > 1 else None
+        val_sampler = DistributedSampler(val_dataset, shuffle=False) if world_size > 1 else None
+
+    # Always use collate_multimodal since we now always use MultimodalDataset
+    collate_fn = collate_multimodal
 
     train_loader = DataLoader(
         train_dataset,
@@ -988,7 +985,8 @@ def main(args: argparse.Namespace | None = None) -> None:
         args.num_workers,
         world_size,
         rank,
-        is_multimodal=args.is_multimodal,
+        is_multimodal=True,  # Always multimodal now
+        sequence_parallel_mode=args.sequence_parallel,
     )
     print_rank0(f"Train batches: {len(train_loader):,}, Val batches: {len(val_loader):,}", rank)
 
@@ -1018,6 +1016,26 @@ def main(args: argparse.Namespace | None = None) -> None:
         local_rank,
     )
     model_module = unwrap_training_model(model)
+
+    # Sequence parallelism setup
+    sequence_parallel = None
+    if args.sequence_parallel:
+        if world_size == 1:
+            print_rank0(
+                "Warning: --sequence-parallel requires multiple GPUs. Running with single GPU.",
+                rank,
+            )
+        else:
+            sequence_parallel = SequenceParallelism(
+                overlap_highres=args.overlap_highres,
+                overlap_lowres=args.overlap_highres // 128,
+            )
+            overlap_lowres = args.overlap_highres // 128
+            print_rank0(
+                f"Sequence parallelism enabled: overlap_highres={args.overlap_highres}, "
+                f"overlap_lowres={overlap_lowres}",
+                rank,
+            )
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -1133,7 +1151,7 @@ def main(args: argparse.Namespace | None = None) -> None:
 
     def _save_preempt():
         """Save preemption checkpoint."""
-        if is_main_process(rank):
+        if is_main_process(rank) and not args.no_save_checkpoints:
             save_checkpoint(
                 path=output_dir / "checkpoint_preempt.pth",
                 epoch=max(0, current_epoch - 1),  # Last completed epoch
@@ -1182,7 +1200,37 @@ def main(args: argparse.Namespace | None = None) -> None:
                 torch.cuda.empty_cache()
 
             # Training
-            if args.is_multimodal:
+            if args.sequence_parallel and sequence_parallel is not None:
+                # Sequence parallel training (distributes sequence across GPUs)
+                train_loss, per_modality_train_loss = train_epoch_sequence_parallel(
+                    model=model,
+                    heads=heads,
+                    train_loader=train_loader,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    device=device,
+                    modality_weights=args.modality_weight_dict,
+                    resolution_weights=resolution_weights_per_modality,
+                    positional_weight=args.positional_weight,
+                    count_weight=args.count_weight,
+                    sequence_parallel=sequence_parallel,
+                    epoch=epoch,
+                    log_every=args.log_every,
+                    use_amp=use_amp,
+                    accumulation_steps=args.gradient_accumulation_steps,
+                    frozen_backbone=frozen_backbone,
+                    num_segments=args.num_segments,
+                    min_segment_size=args.min_segment_size,
+                    train_sampler=train_sampler,
+                    rank=rank,
+                    world_size=world_size,
+                    max_grad_norm=args.max_grad_norm,
+                    profile_batches=args.profile_batches if epoch == start_epoch else 0,
+                    log_fn=logger.log_step if is_main_process(rank) else None,
+                    encoder_only=encoder_only,
+                )
+            else:
+                # Standard multimodal training (uses multihead functions)
                 train_loss, per_modality_train_loss = train_epoch_multihead(
                     model=model,
                     heads=heads,
@@ -1209,77 +1257,30 @@ def main(args: argparse.Namespace | None = None) -> None:
                     log_fn=logger.log_step if is_main_process(rank) else None,
                     encoder_only=encoder_only,
                 )
-            else:
-                # Single modality: use the standard train_epoch_ddp
-                primary_modality = args.modalities[0]
-                train_loss = train_epoch_ddp(
-                    model=model,
-                    head=heads[primary_modality],
-                    train_loader=train_loader,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    device=device,
-                    resolution_weights=resolution_weights_per_modality[primary_modality],
-                    positional_weight=args.positional_weight,
-                    count_weight=args.count_weight,
-                    epoch=epoch,
-                    log_every=args.log_every,
-                    use_amp=use_amp,
-                    accumulation_steps=args.gradient_accumulation_steps,
-                    frozen_backbone=frozen_backbone,
-                    train_sampler=train_sampler,
-                    rank=rank,
-                    world_size=world_size,
-                    max_grad_norm=args.max_grad_norm,
-                    num_segments=args.num_segments,
-                    min_segment_size=args.min_segment_size,
-                    profile_batches=args.profile_batches if epoch == start_epoch else 0,
-                    log_fn=logger.log_step if is_main_process(rank) else None,
-                    encoder_only=encoder_only,
-                )
 
             if handler.preempted:
                 print_rank0("Preemption flag set - saving and exiting.", rank)
                 handler.save_and_exit()
                 break
 
-            # Validation
-            if args.is_multimodal:
-                val_loss, val_metrics = validate_multihead(
-                    model=model,
-                    heads=heads,
-                    val_loader=val_loader,
-                    device=device,
-                    modality_weights=args.modality_weight_dict,
-                    resolution_weights=resolution_weights_per_modality,
-                    positional_weight=args.positional_weight,
-                    count_weight=args.count_weight,
-                    use_amp=use_amp,
-                    num_segments=args.num_segments,
-                    min_segment_size=args.min_segment_size,
-                    compute_pearson=True,
-                    rank=rank,
-                    world_size=world_size,
-                    encoder_only=encoder_only,
-                )
-            else:
-                primary_modality = args.modalities[0]
-                val_loss, val_metrics = validate_ddp(
-                    model=model,
-                    head=heads[primary_modality],
-                    val_loader=val_loader,
-                    device=device,
-                    resolution_weights=resolution_weights_per_modality[primary_modality],
-                    positional_weight=args.positional_weight,
-                    count_weight=args.count_weight,
-                    use_amp=use_amp,
-                    num_segments=args.num_segments,
-                    min_segment_size=args.min_segment_size,
-                    compute_pearson=True,
-                    rank=rank,
-                    world_size=world_size,
-                    encoder_only=encoder_only,
-                )
+            # Validation (always use multihead since we always have multimodal dataset format now)
+            val_loss, val_metrics = validate_multihead(
+                model=model,
+                heads=heads,
+                val_loader=val_loader,
+                device=device,
+                modality_weights=args.modality_weight_dict,
+                resolution_weights=resolution_weights_per_modality,
+                positional_weight=args.positional_weight,
+                count_weight=args.count_weight,
+                use_amp=use_amp,
+                num_segments=args.num_segments,
+                min_segment_size=args.min_segment_size,
+                compute_pearson=True,
+                rank=rank,
+                world_size=world_size,
+                encoder_only=encoder_only,
+            )
 
             # Synchronize CUDA to ensure all validation ops complete before next epoch
             if torch.cuda.is_available():
@@ -1291,9 +1292,9 @@ def main(args: argparse.Namespace | None = None) -> None:
             # Print epoch summary
             if is_main_process(rank):
                 summary = f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}"
-                if args.is_multimodal:
-                    for mod, mod_loss in per_modality_train_loss.items():
-                        summary += f", {mod}_train={mod_loss:.4f}"
+                # Always print per-modality losses (we always have multimodal dataset format now)
+                for mod, mod_loss in per_modality_train_loss.items():
+                    summary += f", {mod}_train={mod_loss:.4f}"
                 for key, val in val_metrics.items():
                     if key.endswith("_values") or key.endswith("_std"):
                         continue
@@ -1315,7 +1316,7 @@ def main(args: argparse.Namespace | None = None) -> None:
             logger.log_epoch(epoch, train_loss, val_loss, current_lr, is_best, extra, histograms)
 
             # Save checkpoints
-            if is_main_process(rank):
+            if is_main_process(rank) and not args.no_save_checkpoints:
                 if is_best:
                     best_val_loss = val_loss
                     if args.save_delta and transfer_config is not None:
