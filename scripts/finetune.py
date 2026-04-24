@@ -388,11 +388,11 @@ def parse_args() -> argparse.Namespace:
             "--no-full-checkpoint requires --save-delta (otherwise the run "
             "would produce no loadable checkpoints)."
         )
-    if args.no_full_checkpoint and args.mode == "full":
+    if args.save_delta and args.mode == "full":
         parser.error(
-            "--no-full-checkpoint cannot be used with --mode full: delta "
-            "checkpoints only store adapter/head/norm weights, so resume "
-            "would lose all fine-tuning updates to the trunk."
+            "--save-delta cannot be used with --mode full: delta checkpoints "
+            "only store adapter/head/norm weights, so they would omit all "
+            "fine-tuning updates to the trunk."
         )
     cli_flags = {
         token.split("=", 1)[0]
@@ -900,11 +900,9 @@ def create_model(
         # All parameters trainable (model was not frozen above)
         trainable_params = list(model.parameters())
         # Embed TransferConfig so checkpoints are self-describing at load time
-        # (head names, modalities, resolutions). Delta save is still a no-op
-        # in this mode since all weights change.
+        # (head names, modalities, resolutions). --save-delta is rejected at
+        # parse time because delta checkpoints cannot capture trunk updates.
         transfer_config = TransferConfig(mode="full", new_heads=new_heads_config)
-        if args.save_delta:
-            print_rank0("Warning: --save-delta ignored for --mode full (all weights trained)", rank)
         print_rank0("Mode: full (all parameters trainable)", rank)
 
     else:
