@@ -81,9 +81,6 @@ def main(argv: list[str] | None = None) -> int:
             parser.print_help()
             return 1
         return runner(args)
-    except SystemExit as exc:
-        # Re-raise sys.exit() from dep gating etc.
-        raise
     except KeyboardInterrupt:
         return 130
     except Exception as exc:

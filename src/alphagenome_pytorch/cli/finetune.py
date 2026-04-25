@@ -33,6 +33,8 @@ def run(args: argparse.Namespace) -> int:
     # Forward to the finetune script
     from scripts.finetune import parse_args, main as finetune_main
 
-    # Parse the forwarded args through the script's own parser
-    ft_args = parse_args(args.finetune_args if args.finetune_args else None)
+    # Parse only the forwarded args; pass an empty list when none were
+    # provided so the finetune parser does not fall back to the outer
+    # CLI's sys.argv (which would contain "finetune" and fail).
+    ft_args = parse_args(args.finetune_args if args.finetune_args else [])
     return finetune_main(ft_args) or 0
