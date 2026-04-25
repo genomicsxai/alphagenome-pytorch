@@ -40,6 +40,25 @@ Examples:
         --head atac \\
         --resolution 1 \\
         --batch-size 2
+
+    # Finetuned model with delta checkpoint
+    python scripts/predict_full_chromosome.py \\
+        --model pretrained.pth \\
+        --checkpoint best_model.delta.pth \\
+        --fasta hg38.fa \\
+        --output predictions/ \\
+        --head my_atac \\
+        --chromosomes chr21
+
+    # Finetuned model with full checkpoint + external transfer config
+    python scripts/predict_full_chromosome.py \\
+        --model pretrained.pth \\
+        --checkpoint best_model.pth \\
+        --transfer-config transfer_config.json \\
+        --fasta hg38.fa \\
+        --output predictions/ \\
+        --head my_atac \\
+        --chromosomes chr21
 """
 
 import argparse
@@ -73,8 +92,7 @@ def main():
     parser.add_argument(
         "--head",
         required=True,
-        choices=["atac", "dnase", "cage", "rna_seq", "chip_tf", "chip_histone", "procap"],
-        help="Prediction head to use",
+        help="Prediction head to use (e.g., 'atac', 'dnase', or a custom finetuned head name)",
     )
 
     # Track selection
@@ -158,6 +176,29 @@ def main():
         help="Use torch.compile for faster inference (first batch is slower due to compilation)",
     )
 
+    # Finetuned model options
+    finetune = parser.add_argument_group("Finetuned model (optional)")
+    finetune.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to finetuned checkpoint (.pth or .delta.pth). "
+             "When set, --model is used as the base pretrained weights.",
+    )
+    finetune.add_argument(
+        "--transfer-config",
+        type=str,
+        default=None,
+        help="Path to TransferConfig JSON file. Required for full checkpoints "
+             "that don't embed their config (e.g., older Locon/Houlsby checkpoints).",
+    )
+    finetune.add_argument(
+        "--no-merge-adapters",
+        action="store_true",
+        help="Keep adapter modules separate instead of merging into base weights. "
+             "By default, mergeable adapters (LoRA, IA3) are merged for faster inference.",
+    )
+
     # Output options
     parser.add_argument(
         "--quiet",
@@ -176,6 +217,14 @@ def main():
     fasta_path = Path(args.fasta)
     if not fasta_path.exists():
         print(f"Error: FASTA file not found: {fasta_path}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.checkpoint and not Path(args.checkpoint).exists():
+        print(f"Error: Checkpoint not found: {args.checkpoint}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.transfer_config and not Path(args.transfer_config).exists():
+        print(f"Error: Transfer config not found: {args.transfer_config}", file=sys.stderr)
         sys.exit(1)
 
     # Parse track indices
@@ -208,14 +257,63 @@ def main():
     else:
         dtype_policy = DtypePolicy.full_float32()
 
-    # Load model (track means are bundled with weights)
-    print(f"Loading model from {model_path}...")
-    model = AlphaGenome.from_pretrained(
-        model_path,
-        device=args.device,
-        dtype_policy=dtype_policy,
-    )
+    # Load model
+    if args.checkpoint:
+        # Finetuned model: --model is base weights, --checkpoint is finetuned
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            load_finetuned_model,
+        )
+
+        ext_config = None
+        if args.transfer_config:
+            import json
+            from alphagenome_pytorch.extensions.finetuning.transfer import (
+                transfer_config_from_dict,
+            )
+            with open(args.transfer_config) as f:
+                ext_config = transfer_config_from_dict(json.load(f))
+
+        print(f"Loading finetuned model...")
+        print(f"  Base weights: {model_path}")
+        print(f"  Checkpoint: {args.checkpoint}")
+        model, meta = load_finetuned_model(
+            checkpoint_path=args.checkpoint,
+            pretrained_weights=str(model_path),
+            device=args.device,
+            dtype_policy=dtype_policy,
+            transfer_config=ext_config,
+            merge=not args.no_merge_adapters,
+        )
+        print(f"  Epoch: {meta.get('epoch')}, val_loss: {meta.get('val_loss')}")
+        print(f"  Available heads: {meta.get('head_names')}")
+
+        # Auto-populate track names from checkpoint metadata
+        if track_names is None and meta.get("track_names"):
+            ckpt_track_names = meta["track_names"]
+            if isinstance(ckpt_track_names, dict):
+                track_names = ckpt_track_names.get(args.head)
+            else:
+                track_names = ckpt_track_names
+    else:
+        # Standard pretrained model (existing behavior)
+        print(f"Loading model from {model_path}...")
+        model = AlphaGenome.from_pretrained(
+            model_path,
+            device=args.device,
+            dtype_policy=dtype_policy,
+        )
+
     model.eval()
+
+    # Validate head exists
+    if args.head not in model.heads:
+        available = list(model.heads.keys())
+        print(
+            f"Error: Head '{args.head}' not found. "
+            f"Available heads: {available}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if args.compile:
         print("Compiling model with torch.compile...")

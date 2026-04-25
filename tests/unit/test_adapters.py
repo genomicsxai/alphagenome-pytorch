@@ -99,6 +99,17 @@ class TestLoRA:
             merged_output = merged(x)
         
         torch.testing.assert_close(merged_output, lora_output, rtol=1e-5, atol=1e-5)
+
+    def test_merge_weights_preserves_dtype(self):
+        """Merged LoRA layer should keep the original layer dtype."""
+        linear = nn.Linear(64, 32, dtype=torch.float64)
+        lora = LoRA(linear, rank=8)
+
+        merged = lora.merge_weights()
+
+        assert merged.weight.dtype == torch.float64
+        if merged.bias is not None:
+            assert merged.bias.dtype == torch.float64
     
     def test_trainable_param_count(self):
         """Test significantly fewer trainable params than full layer."""
@@ -166,6 +177,13 @@ class TestLocon:
         
         torch.testing.assert_close(locon_output, original_output)
 
+    def test_rejects_grouped_conv(self):
+        """Locon should fail clearly for grouped Conv1d layers."""
+        conv = nn.Conv1d(64, 64, kernel_size=3, padding=1, groups=4)
+
+        with pytest.raises(ValueError, match="grouped Conv1d"):
+            Locon(conv, rank=4)
+
 
 
 @pytest.mark.unit
@@ -203,6 +221,17 @@ class TestIA3:
         
         torch.testing.assert_close(ia3_output, original_output)
 
+    def test_merge_weights_preserves_dtype(self):
+        """Merged IA3 layer should keep the original layer dtype."""
+        linear = nn.Linear(64, 32, dtype=torch.float64)
+        ia3 = IA3(linear)
+
+        merged = ia3.merge_weights()
+
+        assert merged.weight.dtype == torch.float64
+        if merged.bias is not None:
+            assert merged.bias.dtype == torch.float64
+
 
 @pytest.mark.unit
 class TestIA3FF:
@@ -225,6 +254,17 @@ class TestIA3FF:
         
         trainable = sum(p.numel() for p in ia3_ff.parameters() if p.requires_grad)
         assert trainable == 64  # Just the input scaling vector
+
+    def test_merge_weights_preserves_dtype(self):
+        """Merged IA3_FF layer should keep the original layer dtype."""
+        linear = nn.Linear(64, 32, dtype=torch.float64)
+        ia3_ff = IA3_FF(linear)
+
+        merged = ia3_ff.merge_weights()
+
+        assert merged.weight.dtype == torch.float64
+        if merged.bias is not None:
+            assert merged.bias.dtype == torch.float64
 
 
 @pytest.mark.unit

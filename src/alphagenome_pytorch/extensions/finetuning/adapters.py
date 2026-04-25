@@ -100,6 +100,8 @@ class LoRA(nn.Module):
             self.in_features,
             self.out_features,
             bias=self.original_layer.bias is not None,
+            device=self.original_layer.weight.device,
+            dtype=self.original_layer.weight.dtype,
         )
         merged_layer.weight.data = merged_weight
         if self.original_layer.bias is not None:
@@ -199,6 +201,12 @@ class Locon(nn.Module):
         self.dilation = original_layer.dilation[0]
         self.groups = original_layer.groups
         self.padding_mode = _resolve_conv_padding(original_layer)
+
+        if self.groups != 1:
+            raise ValueError(
+                "Locon does not support grouped Conv1d layers "
+                f"(got groups={self.groups})."
+            )
         
         if rank > self.out_channels:
             raise ValueError(
@@ -297,6 +305,8 @@ class IA3(nn.Module):
                 self.original_layer.in_features,
                 self.out_features,
                 bias=self.original_layer.bias is not None,
+                device=self.original_layer.weight.device,
+                dtype=self.original_layer.weight.dtype,
             )
             merged_layer.weight.data = merged_weight
             if self.original_layer.bias is not None:
@@ -347,6 +357,8 @@ class IA3_FF(nn.Module):
                 self.in_features,
                 self.original_layer.out_features,
                 bias=self.original_layer.bias is not None,
+                device=self.original_layer.weight.device,
+                dtype=self.original_layer.weight.dtype,
             )
             merged_layer.weight.data = merged_weight
             # bias is added after matmul, unaffected by input scaling

@@ -19,9 +19,11 @@ from alphagenome_pytorch.extensions.finetuning.checkpointing import (
     get_new_head_state_dict,
     get_norm_state_dict,
     get_trunk_state_dict,
+    is_delta_checkpoint,
     load_delta_checkpoint,
     load_delta_config,
     load_delta_weights,
+    save_checkpoint,
     save_delta_checkpoint,
     DELTA_CHECKPOINT_VERSION,
 )
@@ -241,6 +243,39 @@ class TestNewHeadStateDict:
 
 class TestDeltaCheckpointSaveLoad:
     """Test save/load delta checkpoint roundtrip."""
+
+    def test_is_delta_checkpoint_recognizes_saved_delta_file(self):
+        """A save_delta_checkpoint output should be detected as delta."""
+        model = nn.Sequential(nn.Linear(64, 64))
+        model.heads = nn.ModuleDict()
+        config = TransferConfig(mode="linear", new_heads={})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.delta.pth"
+            save_delta_checkpoint(path, model, config)
+
+            assert is_delta_checkpoint(path) is True
+
+    def test_is_delta_checkpoint_rejects_full_checkpoint(self):
+        """A normal full checkpoint should not be detected as delta."""
+        model = nn.Sequential(nn.Linear(64, 64))
+        model.heads = nn.ModuleDict()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.full.pth"
+            save_checkpoint(
+                path=path,
+                epoch=1,
+                model=model,
+                optimizer=optimizer,
+                val_loss=0.1,
+                track_names=[],
+                modality="atac",
+                resolutions=(1,),
+            )
+
+            assert is_delta_checkpoint(path) is False
 
     def test_save_requires_adapters_when_expected(self):
         """Should raise if adapters expected but not found."""
@@ -737,3 +772,101 @@ class TestNormLayerDeltaCheckpoint:
                                   torch.full((64,), 3.0))
             assert torch.allclose(model2.norm.bias,
                                   torch.full((64,), 0.7))
+
+
+class TestLoadFinetunedModelNullTransferConfig:
+    """Regression tests for full checkpoints saved with ``transfer_config=None``.
+
+    Older finetune.py unconditionally wrote ``transfer_config=None`` into
+    full checkpoints when no TransferConfig existed (linear-probe, merged
+    adapters). ``load_finetuned_model`` then called
+    ``transfer_config_from_dict(None)`` and crashed with AttributeError.
+    The fix ignores embedded ``None`` and treats the ckpt as having no
+    config, falling through to the Path C head-reconstruction branch.
+    """
+
+    @staticmethod
+    def _stub_heavy_deps(monkeypatch):
+        """Stub AlphaGenome + trunk loading so no real weights are needed.
+
+        ``load_finetuned_model`` imports these inside the function body via
+        ``from pkg import name``, which resolves the attribute on the source
+        module at call time — so module-level monkeypatch reaches it.
+        """
+        import alphagenome_pytorch as agp
+        from alphagenome_pytorch.extensions.finetuning import adapters as ad_mod
+        from alphagenome_pytorch.extensions.finetuning import heads as hd_mod
+        from alphagenome_pytorch.extensions.finetuning import transfer as tr_mod
+
+        class _Stub(nn.Module):
+            def __init__(self, *_, **__):
+                super().__init__()
+                self.heads = nn.ModuleDict()
+
+            def load_state_dict(self, _state, strict=True):
+                return nn.modules.module._IncompatibleKeys([], [])
+
+        monkeypatch.setattr(agp, "AlphaGenome", lambda **_: _Stub())
+        monkeypatch.setattr(tr_mod, "load_trunk", lambda m, *_, **__: m)
+        monkeypatch.setattr(tr_mod, "remove_all_heads", lambda m: m)
+        monkeypatch.setattr(tr_mod, "prepare_for_transfer", lambda m, _c: m)
+        monkeypatch.setattr(hd_mod, "create_finetuning_head",
+                            lambda **_: nn.Linear(1, 1))
+        monkeypatch.setattr(ad_mod, "merge_adapters", lambda m: m)
+
+    def test_null_embedded_transfer_config_does_not_crash(self, tmp_path,
+                                                          monkeypatch):
+        """Old-format ckpt with ``"transfer_config": None`` must load cleanly.
+
+        Pre-fix this crashed in ``transfer_config_from_dict(None)`` with
+        ``AttributeError: 'NoneType' object has no attribute 'items'``.
+        """
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            load_finetuned_model,
+        )
+        self._stub_heavy_deps(monkeypatch)
+
+        ckpt_path = tmp_path / "old.pth"
+        torch.save({
+            "model_state_dict": {},
+            "transfer_config": None,  # the bug trigger
+            "modality": "atac",
+            "track_names": ["t0"],
+            "resolutions": (1, 128),
+            "epoch": 7,
+            "val_loss": 0.25,
+        }, ckpt_path)
+
+        _model, meta = load_finetuned_model(
+            ckpt_path, "unused.pth", device="cpu", merge=False,
+        )
+        assert meta["modality"] == "atac"
+        assert meta["epoch"] == 7
+        assert meta["head_names"] == ["atac"]
+
+    def test_null_embedded_config_with_adapter_keys_raises_clear_error(
+        self, tmp_path, monkeypatch,
+    ):
+        """With adapter keys and no usable config, raise a helpful error
+        (not AttributeError from ``transfer_config_from_dict(None)``)."""
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            load_finetuned_model,
+        )
+        self._stub_heavy_deps(monkeypatch)
+
+        ckpt_path = tmp_path / "old_adapter.pth"
+        torch.save({
+            "model_state_dict": {
+                "tower.blocks.0.mha.q_proj.lora_A.weight": torch.zeros(8, 8),
+            },
+            "transfer_config": None,
+            "modality": "atac",
+            "track_names": ["t0"],
+            "resolutions": (1, 128),
+        }, ckpt_path)
+
+        with pytest.raises(ValueError,
+                           match="adapter parameters but no TransferConfig"):
+            load_finetuned_model(
+                ckpt_path, "unused.pth", device="cpu", merge=False,
+            )
