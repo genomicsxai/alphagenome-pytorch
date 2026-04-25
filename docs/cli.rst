@@ -22,8 +22,8 @@ Global options
    agt [--json] <command> [options]
 
 ``--json``
-   Machine-readable JSON output on stdout.  Suppresses progress bars and
-   human formatting.
+   Machine-readable JSON output on stdout for commands that support structured
+   output.  Suppresses progress bars and human formatting where implemented.
 
    Errors produce a JSON object on stderr with a nonzero exit code:
 
@@ -462,16 +462,8 @@ Requires: ``pip install alphagenome-pytorch[finetuning]``
        --train-bed train.bed --val-bed val.bed \
        --pretrained-weights model.pth
 
-JSON output (JSONL — one line per event):
-
-.. code-block:: text
-
-   {"event": "start", "mode": "lora", "lora_rank": 8, "total_params": 2457600}
-   {"event": "step", "epoch": 1, "step": 100, "loss": 0.4231, "lr": 0.0001}
-   {"event": "step", "epoch": 1, "step": 200, "loss": 0.3892, "lr": 0.0001}
-   {"event": "validation", "epoch": 1, "val_loss": 0.3654, "pearson_r": 0.82}
-   {"event": "checkpoint", "path": "checkpoints/epoch_1.pth"}
-   {"event": "end", "best_val_loss": 0.3201, "best_epoch": 3}
+``agt finetune`` forwards arguments to the training script and currently emits
+the script's normal console logs.
 
 
 ``agt score``

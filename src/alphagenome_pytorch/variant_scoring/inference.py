@@ -270,10 +270,16 @@ class VariantScoringModel:
             
             tracks = []
             for i, (_, row) in enumerate(group_df.iterrows()):
+                track_strand = row.get('strand', row.get('track_strand', '.'))
+                if pd.isna(track_strand):
+                    track_strand = row.get('track_strand', '.')
+                if pd.isna(track_strand):
+                    track_strand = '.'
+
                 meta = TrackMetadata(
                     track_index=i,
                     track_name=row.get('track_name', f'track_{i}'),
-                    track_strand=row.get('strand', '.'),
+                    track_strand=track_strand,
                     output_type=output_type,
                     ontology_curie=row.get('ontology_curie'),
                     gtex_tissue=row.get('gtex_tissue'),

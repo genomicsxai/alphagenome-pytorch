@@ -472,7 +472,8 @@ def serve_rest(
 ) -> ThreadingHTTPServer:
     """Start a local REST server with JSON endpoints."""
     server = ThreadingHTTPServer((host, port), _make_handler(adapter))
-    LOGGER.info('Local REST serving started at http://%s:%d', host, port)
+    bound_host, bound_port = server.server_address
+    LOGGER.info('Local REST serving started at http://%s:%d', bound_host, bound_port)
 
     if wait:
         server.serve_forever()
@@ -480,4 +481,3 @@ def serve_rest(
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
     return server
-
