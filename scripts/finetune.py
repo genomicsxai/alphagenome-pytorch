@@ -380,14 +380,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Export TransferConfig to JSON file at end of training. "
              "Useful for loading full checkpoints in predict scripts.",
     )
-    resume.add_argument(
-        "--export-transfer-config",
-        type=str,
-        default=None,
-        metavar="PATH",
-        help="Export TransferConfig to JSON file at end of training. "
-             "Useful for loading full checkpoints in predict scripts.",
-    )
 
     args = parser.parse_args(argv)
     tokens = argv if argv is not None else sys.argv[1:]

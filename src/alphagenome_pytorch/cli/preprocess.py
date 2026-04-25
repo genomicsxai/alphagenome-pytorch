@@ -122,6 +122,14 @@ def _run_scale_bigwig(args: argparse.Namespace) -> int:
     bigwig_files = args.input
     dry_run = args.dry_run
 
+    if not dry_run and not args.output:
+        print(
+            "Error: --output is required unless --dry-run is set "
+            "(otherwise scale-bigwig would compute scale factors but write nothing).",
+            file=sys.stderr,
+        )
+        return 1
+
     results = []
     for bw_path in bigwig_files:
         bw_path = str(bw_path)
