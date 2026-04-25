@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+import types
 from unittest import mock
 
 import pytest
@@ -85,21 +86,22 @@ class TestParser:
 
     def test_json_flag(self):
         parser = build_parser()
-        args = parser.parse_args(["--json", "serve"])
+        args = parser.parse_args(["--json", "serve", "--weights", "model.pth", "--fasta", "hg38.fa"])
         assert args.json_output is True
         assert args.command == "serve"
 
     def test_no_json_flag(self):
         parser = build_parser()
-        args = parser.parse_args(["serve"])
+        args = parser.parse_args(["serve", "--weights", "model.pth", "--fasta", "hg38.fa"])
         assert args.json_output is False
 
     def test_subcommands_registered(self):
         parser = build_parser()
-        # Verify each known command name can be parsed (only commands without required args)
-        for cmd in ["info", "serve"]:
-            args = parser.parse_args([cmd])
-            assert args.command == cmd
+        args = parser.parse_args(["info"])
+        assert args.command == "info"
+
+        args = parser.parse_args(["serve", "--weights", "model.pth", "--fasta", "hg38.fa"])
+        assert args.command == "serve"
 
     def test_all_subcommand_names(self):
         """Verify all expected subcommands are present by checking --help output."""
@@ -122,9 +124,22 @@ class TestDispatch:
         rc = main([])
         assert rc == 0
 
-    def test_serve_returns_1(self):
-        rc = main(["serve"])
-        assert rc == 1
+    def test_serve_requires_args(self):
+        with pytest.raises(SystemExit) as excinfo:
+            main(["serve"])
+        assert excinfo.value.code == 2
+
+    def test_serve_dispatches_to_extension(self):
+        fake_cli = types.ModuleType("alphagenome_pytorch.extensions.serving.cli")
+        fake_cli.run = mock.Mock(return_value=0)
+        with mock.patch("alphagenome_pytorch.cli.serve.require_extra") as require_extra, mock.patch.dict(
+            sys.modules, {"alphagenome_pytorch.extensions.serving.cli": fake_cli}
+        ):
+            rc = main(["serve", "--weights", "model.pth", "--fasta", "hg38.fa"])
+
+        assert rc == 0
+        require_extra.assert_called_once_with("serving", "serve")
+        fake_cli.run.assert_called_once()
 
     def test_unknown_error_emits_json(self, capsys):
         """Exceptions are caught and formatted as JSON when --json is set."""

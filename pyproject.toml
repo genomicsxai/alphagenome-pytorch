@@ -58,6 +58,12 @@ scoring = [
     "pyranges",
     "alphagenome",
 ]
+serving = [
+    "grpcio",
+    "pandas",
+    "pyfaidx",
+    "alphagenome",
+]
 docs = [
     "sphinx>=7.0.0",
     "sphinx-book-theme",
@@ -74,6 +80,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = ["-v", "--strict-markers"]
+
 markers = [
     "unit: Unit tests (no external dependencies)",
     "integration: Integration tests with full model (PyTorch only, no JAX required)",

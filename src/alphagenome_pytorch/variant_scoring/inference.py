@@ -152,9 +152,7 @@ class VariantScoringModel:
             # Default to 0 (Human) if no default set, for backward compatibility
             return 0
             
-        if isinstance(organism, int):
-            idx = organism
-        elif isinstance(organism, str):
+        if isinstance(organism, str):
             normalized = organism.lower()
             if normalized in self.organism_map:
                 idx = self.organism_map[normalized]
@@ -163,8 +161,13 @@ class VariantScoringModel:
                     idx = int(organism)
                 except ValueError:
                     raise ValueError(f"Unknown organism name: {organism}")
+        elif hasattr(organism, '__index__'):
+            # Accept Python int, numpy integers, and any other int-like value
+            # (parquet-backed metadata surfaces organism as numpy.int64, which
+            # is not a subclass of Python int and used to be silently skipped).
+            idx = int(organism)
         else:
-             raise ValueError(f"Invalid organism type: {type(organism)}")
+            raise ValueError(f"Invalid organism type: {type(organism)}")
              
         if idx < 0 or idx >= self.num_organisms:
             raise ValueError(
@@ -267,10 +270,16 @@ class VariantScoringModel:
             
             tracks = []
             for i, (_, row) in enumerate(group_df.iterrows()):
+                track_strand = row.get('strand', row.get('track_strand', '.'))
+                if pd.isna(track_strand):
+                    track_strand = row.get('track_strand', '.')
+                if pd.isna(track_strand):
+                    track_strand = '.'
+
                 meta = TrackMetadata(
                     track_index=i,
                     track_name=row.get('track_name', f'track_{i}'),
-                    track_strand=row.get('track_strand', '.'),
+                    track_strand=track_strand,
                     output_type=output_type,
                     ontology_curie=row.get('ontology_curie'),
                     gtex_tissue=row.get('gtex_tissue'),

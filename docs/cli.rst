@@ -12,6 +12,7 @@ After installing the package the command is available globally:
    pip install alphagenome-pytorch[inference]  # + predict
    pip install alphagenome-pytorch[finetuning] # + finetune
    pip install alphagenome-pytorch[scoring]    # + score
+   pip install alphagenome-pytorch[serving]    # + serve
 
 Global options
 --------------
@@ -21,8 +22,8 @@ Global options
    agt [--json] <command> [options]
 
 ``--json``
-   Machine-readable JSON output on stdout.  Suppresses progress bars and
-   human formatting.
+   Machine-readable JSON output on stdout for commands that support structured
+   output.  Suppresses progress bars and human formatting where implemented.
 
    Errors produce a JSON object on stderr with a nonzero exit code:
 
@@ -461,16 +462,8 @@ Requires: ``pip install alphagenome-pytorch[finetuning]``
        --train-bed train.bed --val-bed val.bed \
        --pretrained-weights model.pth
 
-JSON output (JSONL — one line per event):
-
-.. code-block:: text
-
-   {"event": "start", "mode": "lora", "lora_rank": 8, "total_params": 2457600}
-   {"event": "step", "epoch": 1, "step": 100, "loss": 0.4231, "lr": 0.0001}
-   {"event": "step", "epoch": 1, "step": 200, "loss": 0.3892, "lr": 0.0001}
-   {"event": "validation", "epoch": 1, "val_loss": 0.3654, "pearson_r": 0.82}
-   {"event": "checkpoint", "path": "checkpoints/epoch_1.pth"}
-   {"event": "end", "best_val_loss": 0.3201, "best_epoch": 3}
+``agt finetune`` forwards arguments to the training script and currently emits
+the script's normal console logs.
 
 
 ``agt score``
@@ -657,20 +650,39 @@ JSON output:
 ``agt serve``
 -------------
 
-Serve the model via REST or gRPC.
+Serve AlphaGenome predictions/scoring locally over gRPC and/or REST.
 
-.. note::
-
-   Not yet implemented. This command is reserved for a future release.
+Requires: ``pip install alphagenome-pytorch[serving]``
 
 .. code-block:: bash
 
-   agt serve --model model.pth --port 8080
+   # gRPC on 127.0.0.1:50051
+   agt serve \
+       --weights model.pth \
+       --fasta hg38.fa
 
-.. code-block:: text
+   # gRPC + REST
+   agt serve \
+       --weights model.pth \
+       --fasta hg38.fa \
+       --rest-port 8080
 
-   Error: 'agt serve' is not yet implemented.
-   Follow https://github.com/user/alphagenome-pytorch for updates.
+Common options:
+
+========================== ==========================================================
+Flag                       Meaning
+========================== ==========================================================
+``--weights PATH``         PyTorch weights file.
+``--fasta PATH``           Reference FASTA file.
+``--gtf PATH``             Optional gene annotations for gene-centric scoring.
+``--polya PATH``           Optional polyA annotations.
+``--track-metadata PATH``  Optional parquet metadata for output metadata endpoints.
+``--host HOST``            Bind host (default: ``127.0.0.1``).
+``--grpc-port N``          gRPC port (default: ``50051``).
+``--disable-grpc``         Disable gRPC serving.
+``--rest-port N``          Enable REST serving on this port.
+``--device STR``           Torch device (default: ``cpu``).
+========================== ==========================================================
 
 
 Dependency Gating
