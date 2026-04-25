@@ -712,6 +712,22 @@ def write_regions_merged_bigwig(
     chrom_idx = {c: i for i, c in enumerate(chrom_order)}
     sorted_entries = sorted(entries, key=lambda e: (chrom_idx.get(e[1], 1 << 30), e[2]))
 
+    # BigWig requires non-overlapping entries within a chromosome. Detect overlaps
+    # now and raise a clear error rather than letting pyBigWig fail cryptically.
+    prev_chrom: str | None = None
+    prev_start: int = 0
+    prev_end: int = 0
+    for preds, chrom, start in sorted_entries:
+        end = start + preds.shape[0] * resolution
+        if chrom == prev_chrom and start < prev_end:
+            raise ValueError(
+                f"Overlapping regions on {chrom}: "
+                f"[{prev_start}, {prev_end}) overlaps [{start}, {end}). "
+                f"BigWig requires non-overlapping entries — deduplicate or merge "
+                f"input regions before writing."
+            )
+        prev_chrom, prev_start, prev_end = chrom, start, end
+
     written: list[Path] = []
     for i, tname in enumerate(track_names):
         if n_tracks > 1:

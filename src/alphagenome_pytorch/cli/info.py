@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -365,18 +366,83 @@ def _pick_display_columns(
     return [c for c in cols if c in available]
 
 
-def _load_state_dict(path: str) -> tuple[dict, str]:
-    """Load a state dict from .pth or .safetensors file.
+def _is_tensor_like(value: Any) -> bool:
+    """Return True for tensor objects without importing torch at module load."""
+    return (
+        hasattr(value, "numel")
+        and hasattr(value, "dtype")
+        and hasattr(value, "shape")
+    )
+
+
+def _as_tensor_state_dict(obj: Any, source: str) -> dict[str, Any]:
+    """Validate and copy a flat ``name -> tensor`` mapping."""
+    if not isinstance(obj, Mapping):
+        raise ValueError(
+            f"Expected {source} to be a state dict, got {type(obj).__name__}"
+        )
+
+    non_tensors = [
+        f"{key} ({type(value).__name__})"
+        for key, value in obj.items()
+        if not isinstance(key, str) or not _is_tensor_like(value)
+    ]
+    if non_tensors:
+        preview = ", ".join(non_tensors[:5])
+        suffix = (
+            ""
+            if len(non_tensors) <= 5
+            else f", ... and {len(non_tensors) - 5} more"
+        )
+        raise ValueError(
+            f"Expected {source} to contain only string tensor entries; "
+            f"found {preview}{suffix}"
+        )
+
+    return dict(obj)
+
+
+def _normalize_loaded_weights(obj: Any) -> dict[str, Any]:
+    """Extract the inspectable tensor state dict from known checkpoint shapes."""
+    if not isinstance(obj, Mapping):
+        return _as_tensor_state_dict(obj, "weights file")
+
+    if "model_state_dict" in obj:
+        return _as_tensor_state_dict(obj["model_state_dict"], "model_state_dict")
+
+    if "delta_checkpoint_version" in obj:
+        state_dict: dict[str, Any] = {}
+        for key in ("adapter_state_dict", "head_state_dict", "norm_state_dict"):
+            section = obj.get(key, {})
+            if section is None:
+                continue
+            state_dict.update(_as_tensor_state_dict(section, key))
+        if not state_dict:
+            raise ValueError(
+                "Delta checkpoint does not contain adapter, head, or norm weights"
+            )
+        return state_dict
+
+    return _as_tensor_state_dict(obj, "weights file")
+
+
+def _load_state_dict(path: str) -> tuple[dict[str, Any], str]:
+    """Load an inspectable state dict from .pth or .safetensors file.
 
     Returns (state_dict, format_name).
     """
     p = Path(path)
     if p.suffix == ".safetensors" or p.suffixes[-2:] == [".delta", ".safetensors"]:
         from safetensors.torch import load_file
-        return load_file(str(p)), "safetensors"
+        return _normalize_loaded_weights(load_file(str(p))), "safetensors"
     else:
         import torch
-        return torch.load(str(p), map_location="cpu", weights_only=True), "pth"
+        return (
+            _normalize_loaded_weights(
+                torch.load(str(p), map_location="cpu", weights_only=True)
+            ),
+            "pth",
+        )
 
 
 def _run_weights(args: argparse.Namespace) -> int:

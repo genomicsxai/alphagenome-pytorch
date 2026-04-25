@@ -8,7 +8,7 @@ After installing the package the command is available globally:
 
 .. code-block:: bash
 
-   pip install alphagenome-pytorch          # minimal — info/convert only
+   pip install alphagenome-pytorch
    pip install alphagenome-pytorch[inference]  # + predict
    pip install alphagenome-pytorch[finetuning] # + finetune
    pip install alphagenome-pytorch[scoring]    # + score
@@ -22,8 +22,7 @@ Global options
 
 ``--json``
    Machine-readable JSON output on stdout.  Suppresses progress bars and
-   human formatting.  Long-running commands (``predict``, ``finetune``)
-   emit JSONL (one JSON object per line).
+   human formatting.
 
    Errors produce a JSON object on stderr with a nonzero exit code:
 
@@ -334,8 +333,9 @@ that.
        --model model.pth --output out/ \
        --head atac --sequences long_seqs.fa --tile --crop-bp 16384
 
-Output: one ``{head}_{seq_name}.npz`` file per sequence (with metadata)
-plus a ``manifest.json`` listing all outputs when in ``--json`` mode.
+Output: one ``{head}_{seq_name}.npz`` file per sequence (with metadata).
+In ``--json`` mode, stdout includes an ``output_files`` array listing the
+written NPZ files.
 
 Errors you'll see:
 
@@ -494,16 +494,31 @@ Requires: ``pip install alphagenome-pytorch[scoring]``
        --model model.pth \
        --fasta hg38.fa \
        --vcf variants.vcf \
-       --head atac \
+       --scorer atac \
        --output scores.tsv
 
-   # Score with specific aggregation method
+   # Score with the recommended variant scorers (default)
    agt score \
        --model model.pth \
        --fasta hg38.fa \
        --vcf variants.vcf \
-       --scorer logfc_max \
+       --scorer recommended \
        --output scores.tsv
+
+   # Score gene-centric/polyA scorers with annotations
+   agt score \
+       --model model.pth \
+       --fasta hg38.fa \
+       --gtf gencode.v49.parquet \
+       --polya gencode.polyas.parquet \
+       --variant "chr22:36201698:A>C" \
+       --scorer rna_seq,polyadenylation
+
+``--scorer`` accepts comma-separated scorer names: ``atac``, ``dnase``,
+``chip_tf``, ``chip_histone``, ``cage``, ``procap``, ``contact_maps``,
+``rna_seq``, ``rna_seq_active``, ``splice_sites``, ``splice_site_usage``,
+``splice_junctions``, and ``polyadenylation``. The default is
+``recommended``.
 
 JSON output:
 
@@ -512,17 +527,25 @@ JSON output:
    {
      "variants": [
        {
-         "chrom": "chr22",
-         "pos": 36201698,
-         "ref": "A",
-         "alt": "C",
-         "scores": {
-           "atac": {"logfc_max": 0.42, "logfc_mean": 0.11},
-           "dnase": {"logfc_max": 0.38, "logfc_mean": 0.09}
-         }
+         "variant": "chr22:36201698:A>C",
+         "interval": "chr22:36136162-36267234",
+         "scorer": "CenterMaskScorer(output=atac, width=501, agg=diff_log2_sum)",
+         "output_type": "atac",
+         "is_signed": true,
+         "gene_id": null,
+         "gene_name": null,
+         "gene_type": null,
+         "gene_strand": null,
+         "junction_start": null,
+         "junction_end": null,
+         "scores": [0.42, 0.11]
        }
      ]
    }
+
+TSV output contains one row per scored track with columns:
+``variant``, ``interval``, ``scorer``, ``output_type``, ``gene_id``,
+``gene_name``, ``track_index``, and ``raw_score``.
 
 
 ``agt convert``
