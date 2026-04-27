@@ -272,6 +272,7 @@ class PolyadenylationScorer(BaseVariantScorer):
         gene_annotation: 'GeneAnnotation | None' = None,
         polya_annotation: 'PolyAAnnotation | None' = None,
         gene_ids: list[str] | None = None,
+        device: torch.device = torch.device("cpu"),
         **kwargs,
     ) -> list[VariantScore]:
         """Compute polyadenylation QTL scores.
@@ -322,7 +323,8 @@ class PolyadenylationScorer(BaseVariantScorer):
             alt_preds = alt_preds.squeeze(0)
 
         S, T = ref_preds.shape
-
+        ref_preds = ref_preds.to(device)
+        alt_preds = alt_preds.to(device)
         # Apply indel alignment if needed
         if variant.is_indel:
             alt_preds = align_alternate(
