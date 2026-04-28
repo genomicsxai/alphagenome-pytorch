@@ -156,6 +156,13 @@ class TestSpliceSitesJunction:
         jax_arr = jax_out[self.JAX_OUTPUT_NAME]["predictions"]
         pt_arr = pt_out[self.PT_OUTPUT_NAME]["pred_counts"]
 
+        # Junction predictions are softplus counts (range ~0 to hundreds)
+        # accumulated through a pairwise einsum over 192M elements. Bulk
+        # parity is excellent (mean rel diff ~5e-5), but a few isolated
+        # outliers — both small-magnitude (where one side rounds to ~0)
+        # and high-magnitude (where 1% rtol leaves <1 absolute headroom)
+        # — fail np.allclose's all-elements check. Use a generous atol
+        # floor plus a modest rtol bump for this head specifically.
         result = compare_arrays(
             f"splice_junction_{organism}",
             pt_arr,
