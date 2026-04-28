@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from alphagenome_pytorch.convolutions import StandardizedConv1d
 from alphagenome_pytorch.extensions.finetuning.adapters import (
     LoRA,
     Locon,
@@ -22,6 +23,7 @@ from alphagenome_pytorch.extensions.finetuning.adapters import (
     merge_adapters,
     get_adapter_params,
 )
+
 
 
 
@@ -97,6 +99,17 @@ class TestLoRA:
             merged_output = merged(x)
         
         torch.testing.assert_close(merged_output, lora_output, rtol=1e-5, atol=1e-5)
+
+    def test_merge_weights_preserves_dtype(self):
+        """Merged LoRA layer should keep the original layer dtype."""
+        linear = nn.Linear(64, 32, dtype=torch.float64)
+        lora = LoRA(linear, rank=8)
+
+        merged = lora.merge_weights()
+
+        assert merged.weight.dtype == torch.float64
+        if merged.bias is not None:
+            assert merged.bias.dtype == torch.float64
     
     def test_trainable_param_count(self):
         """Test significantly fewer trainable params than full layer."""
@@ -123,6 +136,26 @@ class TestLocon:
         output = locon(x)
         
         assert output.shape == (2, 32, 100)
+
+    def test_forward_shape_same_padding_string(self):
+        """Locon should preserve output shape for Conv1d(padding='same')."""
+        conv = nn.Conv1d(64, 32, kernel_size=5, padding='same')
+        locon = Locon(conv, rank=4)
+
+        x = torch.randn(2, 64, 100)
+        output = locon(x)
+
+        assert output.shape == (2, 32, 100)
+
+    def test_forward_shape_standardized_conv(self):
+        """Locon should preserve output shape for StandardizedConv1d."""
+        conv = StandardizedConv1d(64, 32, kernel_size=5, padding='same')
+        locon = Locon(conv, rank=4)
+
+        x = torch.randn(2, 64, 100)
+        output = locon(x)
+
+        assert output.shape == (2, 32, 100)
     
     def test_original_frozen(self):
         """Test original layer is frozen."""
@@ -143,6 +176,14 @@ class TestLocon:
             locon_output = locon(x)
         
         torch.testing.assert_close(locon_output, original_output)
+
+    def test_rejects_grouped_conv(self):
+        """Locon should fail clearly for grouped Conv1d layers."""
+        conv = nn.Conv1d(64, 64, kernel_size=3, padding=1, groups=4)
+
+        with pytest.raises(ValueError, match="grouped Conv1d"):
+            Locon(conv, rank=4)
+
 
 
 @pytest.mark.unit
@@ -180,6 +221,17 @@ class TestIA3:
         
         torch.testing.assert_close(ia3_output, original_output)
 
+    def test_merge_weights_preserves_dtype(self):
+        """Merged IA3 layer should keep the original layer dtype."""
+        linear = nn.Linear(64, 32, dtype=torch.float64)
+        ia3 = IA3(linear)
+
+        merged = ia3.merge_weights()
+
+        assert merged.weight.dtype == torch.float64
+        if merged.bias is not None:
+            assert merged.bias.dtype == torch.float64
+
 
 @pytest.mark.unit
 class TestIA3FF:
@@ -202,6 +254,17 @@ class TestIA3FF:
         
         trainable = sum(p.numel() for p in ia3_ff.parameters() if p.requires_grad)
         assert trainable == 64  # Just the input scaling vector
+
+    def test_merge_weights_preserves_dtype(self):
+        """Merged IA3_FF layer should keep the original layer dtype."""
+        linear = nn.Linear(64, 32, dtype=torch.float64)
+        ia3_ff = IA3_FF(linear)
+
+        merged = ia3_ff.merge_weights()
+
+        assert merged.weight.dtype == torch.float64
+        if merged.bias is not None:
+            assert merged.bias.dtype == torch.float64
 
 
 @pytest.mark.unit
@@ -340,6 +403,53 @@ class TestMergeAdapters:
         
         torch.testing.assert_close(output_after, output_before, rtol=1e-5, atol=1e-5)
 
+    def test_locon_left_unchanged(self):
+        """Test Locon adapters are left in place (not mergeable)."""
+        model = SimpleModel()
+        model = apply_locon(model, ['conv1'], rank=2)
+        assert isinstance(model.conv1, Locon)
+
+        model = merge_adapters(model)
+        assert isinstance(model.conv1, Locon)
+
+    def test_merges_ia3(self):
+        """Test IA3 adapters are merged into plain Linear."""
+        model = SimpleModel()
+        model = apply_ia3(model, ['linear1'])
+        assert isinstance(model.linear1, IA3)
+
+        with torch.no_grad():
+            model.linear1.scale.fill_(0.5)
+
+        x = torch.randn(2, 64)
+        with torch.no_grad():
+            output_before = model(x)
+            model = merge_adapters(model)
+            output_after = model(x)
+
+        assert isinstance(model.linear1, nn.Linear)
+        assert not isinstance(model.linear1, IA3)
+        torch.testing.assert_close(output_after, output_before, rtol=1e-5, atol=1e-5)
+
+    def test_merges_ia3_ff(self):
+        """Test IA3_FF adapters are merged into plain Linear."""
+        model = SimpleModel()
+        model = apply_ia3(model, [], ff_modules=['linear1'])
+        assert isinstance(model.linear1, IA3_FF)
+
+        with torch.no_grad():
+            model.linear1.scale.fill_(0.5)
+
+        x = torch.randn(2, 64)
+        with torch.no_grad():
+            output_before = model(x)
+            model = merge_adapters(model)
+            output_after = model(x)
+
+        assert isinstance(model.linear1, nn.Linear)
+        assert not isinstance(model.linear1, IA3_FF)
+        torch.testing.assert_close(output_after, output_before, rtol=1e-5, atol=1e-5)
+
 
 @pytest.mark.unit
 class TestGetAdapterParams:
@@ -444,4 +554,3 @@ class TestAdapterComposition:
         # Both should be wrapped
         assert isinstance(model.linear1, LoRA)
         assert isinstance(model.linear2, HoulsbyWrapper)
-

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Unified AlphaGenome training script.
 
-Supports: linear probing, LoRA, full finetuning, encoder-only.
+Supports: linear probing, LoRA, Locon, LoRA+Locon, full finetuning, encoder-only.
 Features: DDP, resume, preemption handling, W&B, profiling, multi-modality.
 
 Usage:
@@ -16,6 +16,17 @@ Usage:
     # LoRA finetuning (single modality)
     python scripts/finetune.py --mode lora \\
         --lora-rank 8 --lora-alpha 16 \\
+        --genome hg38.fa \\
+        --modality atac --bigwig *.bw \\
+        --train-bed train.bed --val-bed val.bed \\
+        --pretrained-weights model.pth \\
+        --resolutions 1
+
+    # LoRA + Locon finetuning (Baskerville-style Locon parity)
+    python scripts/finetune.py --mode lora+locon \\
+        --lora-rank 8 --lora-alpha 16 \\
+        --locon-rank 4 --locon-alpha 1 \\
+        --locon-targets down_blocks.4,down_blocks.5 \\
         --genome hg38.fa \\
         --modality atac --bigwig *.bw \\
         --train-bed train.bed --val-bed val.bed \\
@@ -122,6 +133,7 @@ from alphagenome_pytorch.extensions.finetuning.transfer import (
     remove_all_heads,
     add_head,
     prepare_for_transfer,
+    validate_locon_targets,
     transfer_config_to_dict,
 )
 
@@ -138,6 +150,9 @@ DEFAULTS = {
     "lora_rank": 8,
     "lora_alpha": 16,
     "lora_targets": "q_proj,v_proj",
+    "locon_rank": 4,
+    "locon_alpha": 1,
+    "locon_targets": "",
     # Training
     "epochs": 10,
     "batch_size": 1,
@@ -203,12 +218,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["linear-probe", "lora", "full", "encoder-only"],
+        choices=["linear-probe", "lora", "locon", "lora+locon", "full", "encoder-only"],
         default="lora",
         help=(
             "Training mode: "
             "'linear-probe' (frozen backbone, train heads on full transformer embeddings), "
             "'lora' (LoRA adapters + heads), "
+            "'locon' (Locon adapters on convolutional layers + heads), "
+            "'lora+locon' (LoRA on transformer targets plus Locon on convolutional targets + heads), "
             "'full' (all parameters), "
             "'encoder-only' (frozen backbone, train heads on raw CNN encoder output at 128bp; "
             "supports short sequences such as MPRA; forces --resolutions 128)"
@@ -276,6 +293,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         default=DEFAULTS["lora_targets"],
         help="Comma-separated modules for LoRA",
+    )
+    model.add_argument("--locon-rank", type=int, default=DEFAULTS["locon_rank"], help="Locon rank (0 to disable)")
+    model.add_argument("--locon-alpha", type=int, default=DEFAULTS["locon_alpha"], help="Locon alpha scaling")
+    model.add_argument(
+        "--locon-targets",
+        type=str,
+        default=DEFAULTS["locon_targets"],
+        help=(
+            "Comma-separated modules for Locon (required when Locon is enabled). Examples: "
+            "'down_blocks.5' for Locon2, 'down_blocks.4,down_blocks.5' for Locon4."
+        ),
     )
     model.add_argument(
         "--dtype",
@@ -474,6 +502,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "lora_rank",
         "lora_alpha",
         "lora_targets",
+        "locon_rank",
+        "locon_alpha",
+        "locon_targets",
         "dtype",
         "head_init_scheme",
         "gradient_checkpointing",
@@ -821,10 +852,15 @@ def create_model(
             "init_scheme": args.head_init_scheme,
         }
 
-    # Create heads directly except in LoRA mode, where prepare_for_transfer()
-    # constructs the actual trainable heads we want the optimizer to own.
+    # Create heads directly except in active adapter modes, where
+    # prepare_for_transfer() constructs the actual trainable heads we want the
+    # optimizer to own.
     heads: dict[str, nn.Module] = {}
-    create_heads_directly = not (args.mode == "lora" and args.lora_rank > 0)
+    has_active_adapters = (
+        (args.mode in {"lora", "lora+locon"} and args.lora_rank > 0)
+        or (args.mode in {"locon", "lora+locon"} and args.locon_rank > 0)
+    )
+    create_heads_directly = not has_active_adapters
     if create_heads_directly:
         for modality, track_names in modality_track_names.items():
             head = create_finetuning_head(
@@ -864,17 +900,36 @@ def create_model(
         transfer_config = TransferConfig(mode="encoder-only", new_heads=new_heads_config)
         print_rank0("Mode: encoder-only (frozen backbone, raw CNN encoder output to head)", rank)
 
-    elif args.mode == "lora":
-        if args.lora_rank > 0:
-            lora_targets = [t.strip() for t in args.lora_targets.split(",")]
+    elif args.mode in {"lora", "locon", "lora+locon"}:
+        lora_enabled = args.mode in {"lora", "lora+locon"} and args.lora_rank > 0
+        locon_enabled = args.mode in {"locon", "lora+locon"} and args.locon_rank > 0
+
+        lora_targets = [t.strip() for t in args.lora_targets.split(",") if t.strip()]
+        locon_targets = [t.strip() for t in args.locon_targets.split(",") if t.strip()]
+
+        adapter_modes: list[str] = []
+        if lora_enabled:
+            adapter_modes.append("lora")
             print_rank0(f"Applying LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}", rank)
             print_rank0(f"  Target modules: {lora_targets}", rank)
+        if locon_enabled:
+            validate_locon_targets(model, locon_targets)
+            adapter_modes.append("locon")
+            print_rank0(f"Applying Locon: rank={args.locon_rank}, alpha={args.locon_alpha}", rank)
+            print_rank0(f"  Target modules: {locon_targets}", rank)
+
+        if adapter_modes:
+            transfer_mode: str | list[str]
+            transfer_mode = adapter_modes[0] if len(adapter_modes) == 1 else adapter_modes
 
             transfer_config = TransferConfig(
-                mode="lora",
+                mode=transfer_mode,
                 lora_targets=lora_targets,
                 lora_rank=args.lora_rank,
                 lora_alpha=args.lora_alpha,
+                locon_targets=locon_targets,
+                locon_rank=args.locon_rank,
+                locon_alpha=args.locon_alpha,
                 new_heads=new_heads_config,
             )
             model = prepare_for_transfer(model, transfer_config)
@@ -888,16 +943,16 @@ def create_model(
                     f"at resolutions {tuple(new_heads_config[modality]['resolutions'])}",
                     rank,
                 )
-            # LoRA adapters + the freshly registered heads
+            # Adapter weights + the freshly registered heads.
             trainable_params = get_adapter_params(model)
             for head in heads.values():
                 trainable_params.extend(list(head.parameters()))
         else:
-            # LoRA rank 0 means just train heads
+            # Adapter rank 0 means just train heads
             for head in heads.values():
                 trainable_params.extend(list(head.parameters()))
             transfer_config = TransferConfig(mode="linear", new_heads=new_heads_config)
-            print_rank0("Mode: lora (rank=0, heads only)", rank)
+            print_rank0(f"Mode: {args.mode} (adapter rank=0, heads only)", rank)
 
     elif args.mode == "full":
         # All parameters trainable (model was not frozen above)
@@ -1132,9 +1187,12 @@ def main(args: argparse.Namespace | None = None) -> None:
         "modality_resolutions": {m: list(r) for m, r in modality_resolutions.items()},
         "track_names": modality_track_names,
         "pretrained_weights": args.pretrained_weights,
-        "lora_rank": args.lora_rank if args.mode == "lora" else None,
-        "lora_alpha": args.lora_alpha if args.mode == "lora" else None,
-        "lora_targets": args.lora_targets if args.mode == "lora" else None,
+        "lora_rank": args.lora_rank if args.mode in ("lora", "lora+locon") else None,
+        "lora_alpha": args.lora_alpha if args.mode in ("lora", "lora+locon") else None,
+        "lora_targets": args.lora_targets if args.mode in ("lora", "lora+locon") else None,
+        "locon_rank": args.locon_rank if args.mode in ("locon", "lora+locon") else None,
+        "locon_alpha": args.locon_alpha if args.mode in ("locon", "lora+locon") else None,
+        "locon_targets": args.locon_targets if args.mode in ("locon", "lora+locon") else None,
         "head_init_scheme": args.head_init_scheme,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
@@ -1223,13 +1281,16 @@ def main(args: argparse.Namespace | None = None) -> None:
     print_rank0("=" * 60, rank)
 
     # Freeze backbone (use torch.no_grad) when no backbone params need gradients.
-    # - linear-probe: only heads train
-    # - encoder-only: only heads train (backbone always frozen; uses encoder_only forward)
-    # - lora with rank=0: only heads train (no LoRA adapters)
-    # - lora with rank>0: LoRA adapters need gradients, can't freeze
+    # - linear-probe / encoder-only: only heads train
+    # - lora / locon / lora+locon with all adapter ranks == 0: only heads train
+    # - adapter modes with active adapters: adapters need gradients, can't freeze
     # - full: all params need gradients
+    has_active_adapters = (
+        (args.mode in ("lora", "lora+locon") and args.lora_rank > 0)
+        or (args.mode in ("locon", "lora+locon") and args.locon_rank > 0)
+    )
     frozen_backbone = args.mode in ("linear-probe", "encoder-only") or (
-        args.mode == "lora" and args.lora_rank == 0
+        args.mode in ("lora", "locon", "lora+locon") and not has_active_adapters
     )
     encoder_only = args.mode == "encoder-only"
 

@@ -140,10 +140,20 @@ def mock_data_dir(project_root):
         # Generate mock data
         import subprocess, sys
         script = project_root / "tests" / "create_mock_data.py"
-        subprocess.run(
+        result = subprocess.run(
             [sys.executable, str(script), "--output_dir", str(mock_dir)],
-            check=True
+            capture_output=True,
+            text=True,
         )
+        still_missing = [f for f in required_files if not (mock_dir / f).exists()]
+        if result.returncode != 0 or still_missing:
+            raise RuntimeError(
+                f"Mock data regeneration failed (exit {result.returncode}).\n"
+                f"Initially missing: {missing}\n"
+                f"Still missing after regen: {still_missing}\n"
+                f"--- stdout ---\n{result.stdout}\n"
+                f"--- stderr ---\n{result.stderr}"
+            )
 
     return mock_dir
 

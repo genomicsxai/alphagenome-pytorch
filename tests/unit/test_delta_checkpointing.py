@@ -45,23 +45,30 @@ class TestTransferConfigSerialization:
         assert restored.lora_rank == config.lora_rank
         assert restored.lora_alpha == config.lora_alpha
         assert restored.lora_targets == config.lora_targets
+        assert restored.locon_targets == config.locon_targets
 
     def test_roundtrip_custom_config(self):
         """Custom config should roundtrip exactly."""
         config = TransferConfig(
-            mode="lora",
+            mode=["lora", "locon"],
             lora_rank=16,
             lora_alpha=32,
             lora_targets=["q_proj", "k_proj", "v_proj"],
+            locon_rank=4,
+            locon_alpha=1,
+            locon_targets=["down_blocks.4", "down_blocks.5"],
             new_heads={"my_head": {"modality": "atac", "num_tracks": 5}},
         )
         data = transfer_config_to_dict(config)
         restored = transfer_config_from_dict(data)
 
-        assert restored.mode == "lora"
+        assert restored.mode == ["lora", "locon"]
         assert restored.lora_rank == 16
         assert restored.lora_alpha == 32
         assert restored.lora_targets == ["q_proj", "k_proj", "v_proj"]
+        assert restored.locon_rank == 4
+        assert restored.locon_alpha == 1
+        assert restored.locon_targets == ["down_blocks.4", "down_blocks.5"]
         assert restored.new_heads == {"my_head": {"modality": "atac", "num_tracks": 5}}
 
     def test_tensor_track_means_is_json_safe(self):

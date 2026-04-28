@@ -45,6 +45,12 @@ from alphagenome_pytorch.extensions.finetuning.adapters import (
 )
 from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head
 
+_ALPHAGENOME_LOCON_PRESETS = (
+    "Locon2=['down_blocks.5'], "
+    "Locon4=['down_blocks.4', 'down_blocks.5'], "
+    "Locon6=['down_blocks.3', 'down_blocks.4', 'down_blocks.5']"
+)
+
 
 @dataclass
 class TransferConfig:
@@ -69,6 +75,9 @@ class TransferConfig:
         locon_rank: Locon rank (default: 4).
         locon_alpha: Locon alpha scaling factor (default: 1).
         locon_targets: Module name substrings to apply Locon to.
+            Required when Locon is enabled.
+            For AlphaGenome, block-level targets like ``['down_blocks.5']``
+            adapt the last two encoder conv layers before attention.
         ia3_targets: Module name substrings for IA3 output-scaling.
         ia3_ff_targets: Module name substrings for IA3 input-scaling
             (feed-forward down-projections).
@@ -108,10 +117,10 @@ class TransferConfig:
     # Locon settings
     locon_rank: int = 4
     locon_alpha: int = 1
-    locon_targets: list[str] = field(default_factory=lambda: ['conv_tower'])
+    locon_targets: list[str] = field(default_factory=list)
     
     # IA3 settings
-    ia3_targets: list[str] = field(default_factory=lambda: ['to_k', 'to_v'])
+    ia3_targets: list[str] = field(default_factory=lambda: ['k_proj', 'v_proj'])
     ia3_ff_targets: list[str] = field(default_factory=list)
     
     # Houlsby settings
@@ -244,6 +253,47 @@ def _freeze_trunk(
     return model
 
 
+def _get_conv1d_module_names(model: nn.Module) -> list[str]:
+    """Return all Conv1d-like module names available for Locon targeting."""
+    return [
+        name for name, module in model.named_modules()
+        if isinstance(module, nn.Conv1d)
+    ]
+
+
+def validate_locon_targets(
+    model: nn.Module,
+    target_modules: list[str],
+) -> list[str]:
+    """Validate Locon target patterns and return matching conv module names."""
+    if not target_modules:
+        raise ValueError(
+            "locon mode requires explicit locon_targets. "
+            "For AlphaGenome, common presets are "
+            f"{_ALPHAGENOME_LOCON_PRESETS}."
+        )
+
+    conv_names = _get_conv1d_module_names(model)
+    matched = [
+        name for name in conv_names
+        if any(target in name for target in target_modules)
+    ]
+    if matched:
+        return matched
+
+    sample_names = conv_names[:8]
+    sample_text = ", ".join(repr(name) for name in sample_names) or "none"
+    if len(conv_names) > len(sample_names):
+        sample_text += ", ..."
+
+    raise ValueError(
+        "locon_targets did not match any Conv1d modules. "
+        f"Requested patterns: {target_modules}. "
+        f"Available Conv1d module examples: {sample_text}. "
+        f"For AlphaGenome, common presets are {_ALPHAGENOME_LOCON_PRESETS}."
+    )
+
+
 def prepare_for_transfer(
     model: nn.Module,
     config: TransferConfig,
@@ -372,9 +422,10 @@ def prepare_for_transfer(
         )
     
     if 'locon' in modes:
+        matched_locon_targets = validate_locon_targets(model, config.locon_targets)
         model = apply_locon(
             model,
-            config.locon_targets,
+            matched_locon_targets,
             rank=config.locon_rank,
             alpha=config.locon_alpha,
         )
@@ -527,6 +578,7 @@ __all__ = [
     'remove_all_heads',
     'prepare_for_transfer',
     'count_trainable_params',
+    'validate_locon_targets',
     'transfer_config_to_dict',
     'transfer_config_from_dict',
 ]

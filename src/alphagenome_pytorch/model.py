@@ -278,7 +278,7 @@ class AlphaGenome(nn.Module):
         elif num_organisms == 2:
             # Human/mouse defaults matching the current pretrained setup.
             splice_usage_tracks_per_organism = (734, 180)
-            splice_junction_tracks_per_organism = (367, 90)
+            splice_junction_tracks_per_organism = (367, 367)
         else:
             warnings.warn(
                 "AlphaGenome currently only supports num_organisms in {1, 2}. "
@@ -443,6 +443,9 @@ class AlphaGenome(nn.Module):
                 (default), padding tracks are stripped.
         """
         catalog = metadata_catalog if metadata_catalog is not None else self._track_metadata_catalog
+        if catalog is None and not include_padding:
+            catalog = TrackMetadataCatalog.load_builtin()
+            self._track_metadata_catalog = catalog
         return NamedOutputs.from_raw(
             outputs,
             organism=organism,

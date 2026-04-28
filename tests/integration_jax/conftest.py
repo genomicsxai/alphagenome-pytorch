@@ -97,6 +97,60 @@ def run_jax_inference(jax_model):
 
 
 @pytest.fixture(scope="session")
+def run_jax_inference_with_splice_site_positions(jax_model):
+    """Factory fixture to run JAX inference with fixed splice site positions."""
+    import jax
+    import jax.numpy as jnp
+    import haiku as hk
+    import jmp
+    from alphagenome_research.model import model
+    from alphagenome_research.model import splicing
+    from .fixture_utils import jax_to_numpy
+
+    jmp_policy = jmp.get_policy('params=float32,compute=float32,output=float32')
+
+    @hk.transform_with_state
+    def _forward(dna_sequence, organism_index, splice_site_positions):
+        original_generate = splicing.generate_splice_site_positions
+
+        def _fixed_splice_site_positions(*args, **kwargs):
+            return splice_site_positions
+
+        splicing.generate_splice_site_positions = _fixed_splice_site_positions
+        try:
+            with hk.mixed_precision.push_policy(model.AlphaGenome, jmp_policy):
+                return model.AlphaGenome(jax_model._metadata)(
+                    dna_sequence,
+                    organism_index,
+                )
+        finally:
+            splicing.generate_splice_site_positions = original_generate
+
+    def _run(
+        sequence: np.ndarray,
+        organism_index: int,
+        splice_site_positions: np.ndarray,
+    ):
+        batch_size = sequence.shape[0]
+        jax_input = jnp.array(sequence)
+        jax_org = jnp.array([organism_index] * batch_size, dtype=jnp.int32)
+        jax_positions = jnp.array(splice_site_positions, dtype=jnp.int32)
+
+        (outputs, _), _ = _forward.apply(
+            jax_model._params,
+            jax_model._state,
+            None,
+            jax_input,
+            jax_org,
+            jax_positions,
+        )
+
+        return jax.tree.map(jax_to_numpy, outputs)
+
+    return _run
+
+
+@pytest.fixture(scope="session")
 def run_pytorch_inference(pytorch_model):
     """Factory fixture to run PyTorch inference."""
     import torch
@@ -192,18 +246,57 @@ def cached_predictions(cached_jax_predictions, cached_pytorch_predictions):
 
 
 @pytest.fixture(scope="session")
+def synthetic_splice_site_positions(batch_size, sequence_length):
+    """Deterministic valid positions for splice junction parity tests.
+
+    Random DNA often produces no human splice-site probabilities above the
+    reference threshold, which makes the human junction output all zeros. These
+    positions keep the random sequence embeddings but exercise junction math for
+    both species.
+    """
+    num_positions = 512
+    positions = np.full((batch_size, 4, num_positions), -1, dtype=np.int32)
+
+    pos_donors = np.array([1024, 2048, 4096, 6144], dtype=np.int32)
+    pos_acceptors = np.array([1280, 2304, 4352, 6400], dtype=np.int32)
+    neg_donors = np.array([1536, 3072, 5120, 7168], dtype=np.int32)
+    neg_acceptors = np.array([1280, 2816, 4864, 6912], dtype=np.int32)
+
+    max_position = max(
+        pos_donors.max(),
+        pos_acceptors.max(),
+        neg_donors.max(),
+        neg_acceptors.max(),
+    )
+    if max_position >= sequence_length:
+        raise ValueError(
+            f"Synthetic splice positions require sequence_length > {max_position}, "
+            f"got {sequence_length}"
+        )
+
+    positions[:, 0, :len(pos_donors)] = pos_donors
+    positions[:, 1, :len(pos_acceptors)] = pos_acceptors
+    positions[:, 2, :len(neg_donors)] = neg_donors
+    positions[:, 3, :len(neg_acceptors)] = neg_acceptors
+    return positions
+
+
+@pytest.fixture(scope="session")
 def cached_junction_with_shared_positions(
-    random_dna_sequence, cached_jax_predictions, pytorch_model
+    random_dna_sequence,
+    run_jax_inference_with_splice_site_positions,
+    pytorch_model,
+    synthetic_splice_site_positions,
 ):
-    """Cache junction predictions using JAX's actual splice_site_positions.
+    """Cache junction predictions using deterministic shared positions.
 
-    This fixture extracts the splice_site_positions that JAX actually used
-    (from its junction output), then re-runs PyTorch with those same positions.
-    This ensures both frameworks compute junction outputs at identical positions.
+    The random DNA sequence is still used for trunk embeddings, but the junction
+    head receives fixed valid splice_site_positions in both frameworks. This
+    avoids a degenerate all-zero human junction output when random DNA produces
+    no splice-site class probabilities above the reference threshold.
 
-    This is necessary because JAX uses approx_max_k (approximate top-k) while
-    PyTorch uses exact top-k, leading to different position selections even
-    with identical classification probabilities.
+    It also avoids JAX approx_max_k vs PyTorch exact top-k differences in
+    position selection, so this fixture tests junction-head parity directly.
 
     Returns dict with structure:
     {
@@ -218,13 +311,17 @@ def cached_junction_with_shared_positions(
     device = next(pytorch_model.parameters()).device
 
     for org_name, org_idx in iterate_organisms():
-        jax_out = cached_jax_predictions[org_name]
+        jax_out = run_jax_inference_with_splice_site_positions(
+            random_dna_sequence,
+            org_idx,
+            synthetic_splice_site_positions,
+        )
+        positions_tensor = torch.tensor(
+            synthetic_splice_site_positions,
+            dtype=torch.long,
+            device=device,
+        )
 
-        # Use the actual positions JAX used (from its junction output)
-        jax_positions = jax_out["splice_junctions"]["splice_site_positions"]
-        positions_tensor = torch.tensor(jax_positions, dtype=torch.long, device=device)
-
-        # Re-run PyTorch with JAX's actual positions
         batch_size = random_dna_sequence.shape[0]
         pt_input = torch.tensor(random_dna_sequence).to(device)
         pt_org = torch.tensor([org_idx] * batch_size, dtype=torch.long).to(device)
@@ -549,5 +646,3 @@ def cleanup_after_test():
     """Clear GPU memory after each test to prevent OOM errors."""
     yield
     clear_gpu_memory()
-
-
