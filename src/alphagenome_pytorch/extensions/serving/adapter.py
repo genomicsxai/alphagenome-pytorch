@@ -23,6 +23,13 @@ from alphagenome.models import dna_output
 from alphagenome.protos import dna_model_pb2
 
 from alphagenome_pytorch.prediction import AlphaGenomePredictionRuntime
+from alphagenome_pytorch.extensions.attribution import (
+    AttributionResult,
+    get_method,
+    UnsupportedMethodError,
+)
+from alphagenome_pytorch.extensions.attribution.heads import default_head_selector
+from alphagenome_pytorch.extensions.attribution.window import target_slice_for_resolution
 from alphagenome_pytorch.variant_scoring.types import (
     Interval as PTInterval,
     OutputType as PTOutputType,
@@ -199,24 +206,10 @@ class LocalDnaModelAdapter:
     """
 
     supports_variant_scoring = False
-    supports_attribution = False
+    supports_attribution = True
 
     def __init__(self, runtime: AlphaGenomePredictionRuntime):
         self.runtime = runtime
-
-    def explain_interval(self, *args, **kwargs):
-        """Attribution placeholder.
-
-        The attribution endpoint (``/v1/explain_interval``) is being added on a
-        separate branch. The base prediction-only adapter doesn't implement it
-        yet, so we expose a clean ``NotImplementedError`` rather than letting
-        the route blow up with ``AttributeError``. The REST/gRPC layers should
-        gate on ``self.supports_attribution`` before calling this.
-        """
-        del args, kwargs
-        raise NotImplementedError(
-            'Attribution (explain_interval) is not implemented on this adapter.'
-        )
 
     def predict_sequence(
         self,
@@ -316,6 +309,118 @@ class LocalDnaModelAdapter:
     def score_ism_variants(self, *args, **kwargs):
         del args, kwargs
         raise NotImplementedError('Variant scoring not available for this model.')
+
+    def explain_interval(
+        self,
+        *,
+        interval: genome.Interval,
+        target_interval: genome.Interval,
+        organism: Any = dna_model_pb2.ORGANISM_HOMO_SAPIENS,
+        requested_output: str,
+        resolution: int,
+        track_indices: Sequence[int],
+        method: str,
+        reduction: str = "sum",
+        include_raw_gradient: bool = False,
+        strand_averaged: bool = False,
+        batch_size: int = 8,
+    ) -> 'AttributionResult':
+        """Nucleotide attribution over a target window inside an interval.
+
+        This is the serving surface for per-base attribution (gradient × input
+        and saturation ISM).  It calls into
+        :mod:`alphagenome_pytorch.extensions.attribution` — **not** through
+        ``VariantScoringModel.predict()`` — because gradient methods require an
+        active autograd graph.
+
+        Args:
+            interval: Full input interval (must be a supported sequence length).
+            target_interval: Sub-interval to attribute over — must be contained
+                in ``interval``.
+            organism: Organism identifier (proto enum, string, or int).
+            requested_output: Head name, e.g. ``"dnase"``.
+            resolution: Output resolution in bp (1 or 128).
+            track_indices: Which tracks to attribute.
+            method: ``"input_x_gradient"`` or ``"saturation_ism"``.
+            reduction: Window reduction (``"sum"``, ``"mean"``, ``"peak"``).
+            include_raw_gradient: Return full ``(W, 4, T)`` gradient tensor
+                (only valid for gradient-based methods).
+            strand_averaged: Average forward and reverse-complement attributions.
+            batch_size: Batch size for ISM mutation loop.
+
+        Returns:
+            :class:`~alphagenome_pytorch.extensions.attribution.types.AttributionResult`.
+
+        Raises:
+            ValueError: On invalid inputs (containment, unknown head, bad indices, …).
+            UnsupportedMethodError: If ``method`` is not in the registry.
+        """
+        # --- validation -------------------------------------------------
+        _validate_sequence_length(interval.width)
+
+        if target_interval.chromosome != interval.chromosome:
+            raise ValueError(
+                f"target_interval chromosome ({target_interval.chromosome}) "
+                f"must match interval chromosome ({interval.chromosome})."
+            )
+        if target_interval.start < interval.start or target_interval.end > interval.end:
+            raise ValueError(
+                f"target_interval {target_interval.chromosome}:"
+                f"{target_interval.start}-{target_interval.end} is not "
+                f"contained within interval {interval.chromosome}:"
+                f"{interval.start}-{interval.end}."
+            )
+
+        # Method lookup (raises UnsupportedMethodError on unknown method).
+        method_spec = get_method(method)
+
+        if include_raw_gradient and not method_spec.supports_raw_gradient:
+            raise ValueError(
+                f"include_raw_gradient is not supported for method {method!r}."
+            )
+
+        if not track_indices:
+            raise ValueError("track_indices must be non-empty.")
+
+        # --- sequence → one-hot -----------------------------------------
+        organism_index = self.runtime.resolve_organism_index(organism)
+        sequence = self.runtime.get_sequence(interval)
+
+        from alphagenome_pytorch.utils.sequence import sequence_to_onehot_tensor
+
+        device = self.runtime.device
+        onehot = sequence_to_onehot_tensor(
+            sequence, dtype=torch.float32, device=device,
+        ).unsqueeze(0)  # (1, L, 4)
+
+        # --- target window bookkeeping -----------------------------------
+        target_slice = target_slice_for_resolution(
+            interval.start, target_interval.start, target_interval.end, resolution,
+        )
+
+        # --- dispatch ----------------------------------------------------
+        model = self.runtime.model
+
+        kwargs: dict[str, Any] = dict(
+            onehot=onehot,
+            organism_index=organism_index,
+            output_type=requested_output,
+            resolution=resolution,
+            target_slice=target_slice,
+            track_indices=track_indices,
+            reduction=reduction,
+            strand_averaged=strand_averaged,
+            head_selector=default_head_selector,
+            sequence=sequence,
+            target_start=target_interval.start,
+            target_end=target_interval.end,
+        )
+        if method_spec.supports_raw_gradient:
+            kwargs["include_raw_gradient"] = include_raw_gradient
+        if method == "saturation_ism":
+            kwargs["batch_size"] = batch_size
+
+        return method_spec.func(model, **kwargs)
 
     def output_metadata(
         self,

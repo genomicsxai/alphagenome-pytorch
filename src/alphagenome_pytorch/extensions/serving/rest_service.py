@@ -22,6 +22,7 @@ from alphagenome.models import dna_output
 from alphagenome_pytorch.variant_scoring.types import OutputType as PTOutputType
 
 from .adapter import LocalDnaModelAdapter, _OFFICIAL_TO_PT_OUTPUT, _normalize_output_type
+from alphagenome_pytorch.extensions.attribution import UnsupportedMethodError
 
 # NOTE: variant-scoring scorer classes (``CenterMaskScorer`` etc.) and
 # ``GeneMaskMode`` / ``AggregationType`` are deliberately *not* imported at
@@ -348,6 +349,49 @@ def _serialize_output_metadata(metadata: dna_output.OutputMetadata) -> dict[str,
     }
 
 
+def _nan_to_none(arr: np.ndarray) -> list:
+    """Convert a numpy array to a nested list with NaN replaced by None.
+
+    ``ndarray.tolist()`` maps NaN to ``float('nan')``, which ``json.dumps``
+    serializes as the non-standard ``NaN`` token.  We want ``null`` instead,
+    so we replace NaN values with ``None`` in a Python object array first.
+    """
+    if not np.issubdtype(arr.dtype, np.floating):
+        return arr.tolist()
+    mask = np.isnan(arr)
+    if not mask.any():
+        return arr.tolist()
+    obj = arr.astype(object)
+    obj[mask] = None
+    return obj.tolist()
+
+
+def _serialize_attribution(result: 'AttributionResult') -> dict[str, Any]:
+    """Convert an :class:`AttributionResult` to a JSON-serializable dict.
+
+    NaN values in the numpy arrays are mapped to ``null`` via
+    :func:`_nan_to_none`.
+    """
+    payload: dict[str, Any] = {
+        'method': result.method,
+        'kind': result.kind,
+        'bases': list(result.bases),
+        'values': _nan_to_none(result.values),
+        'sequence': result.sequence,
+        'target_start': result.target_start,
+        'target_end': result.target_end,
+        'resolution': result.resolution,
+        'track_indices': list(result.track_indices),
+        'reduction': result.reduction,
+        'metadata': result.metadata,
+    }
+    if result.raw_gradient is not None:
+        payload['raw_gradient'] = _nan_to_none(result.raw_gradient)
+    else:
+        payload['raw_gradient'] = None
+    return payload
+
+
 class _ServingHandler(BaseHTTPRequestHandler):
     adapter: LocalDnaModelAdapter
 
@@ -478,6 +522,27 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 self._write_json(
                     {'scores': [[_serialize_anndata(s) for s in group] for group in scores]}
                 )
+                return
+
+            if path == '/v1/explain_interval':
+                try:
+                    result = self.adapter.explain_interval(
+                        interval=_interval_from_payload(body['interval']),
+                        target_interval=_interval_from_payload(body['target_interval']),
+                        organism=body.get('organism', 'HOMO_SAPIENS'),
+                        requested_output=body['requested_output'],
+                        resolution=int(body.get('resolution', 128)),
+                        track_indices=[int(i) for i in body['track_indices']],
+                        method=body['method'],
+                        reduction=body.get('reduction', 'sum'),
+                        include_raw_gradient=bool(body.get('include_raw_gradient', False)),
+                        strand_averaged=bool(body.get('strand_averaged', False)),
+                        batch_size=int(body.get('batch_size', 8)),
+                    )
+                except UnsupportedMethodError as exc:
+                    self._write_json({'error': str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                self._write_json({'attribution': _serialize_attribution(result)})
                 return
 
             self._write_json({'error': 'Not found'}, status=HTTPStatus.NOT_FOUND)

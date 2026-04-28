@@ -208,3 +208,74 @@ def test_parse_variant_scorers_empty_returns_empty_list():
 
     assert _parse_variant_scorers(None) == []
     assert _parse_variant_scorers([]) == []
+
+
+# ---------------------------------------------------------------------------
+# /v1/explain_interval tests
+# ---------------------------------------------------------------------------
+
+
+def test_explain_interval_gradient_round_trip(rest_server):
+    host, port = rest_server
+    body = json.dumps({
+        'interval': {'chromosome': 'chr1', 'start': 0, 'end': SEQUENCE_LENGTH_16KB},
+        'target_interval': {'chromosome': 'chr1', 'start': 100, 'end': 200},
+        'organism': 'HOMO_SAPIENS',
+        'requested_output': 'dnase',
+        'resolution': 1,
+        'track_indices': [0],
+        'method': 'input_x_gradient',
+        'reduction': 'sum',
+    }).encode('utf-8')
+    status, payload = _post(host, port, '/v1/explain_interval', body)
+    assert status == 200
+    assert 'attribution' in payload
+    attr = payload['attribution']
+    assert attr['method'] == 'input_x_gradient'
+    assert attr['kind'] == 'base_matrix'
+    # values shape should be (100, 4, 1) encoded as nested lists
+    values = np.asarray(attr['values'])
+    assert values.shape == (100, 4, 1)
+    assert attr['target_start'] == 100
+    assert attr['target_end'] == 200
+    assert attr['raw_gradient'] is None
+
+
+def test_explain_interval_ism_round_trip(rest_server):
+    host, port = rest_server
+    body = json.dumps({
+        'interval': {'chromosome': 'chr1', 'start': 0, 'end': SEQUENCE_LENGTH_16KB},
+        'target_interval': {'chromosome': 'chr1', 'start': 100, 'end': 108},
+        'requested_output': 'dnase',
+        'resolution': 1,
+        'track_indices': [0],
+        'method': 'saturation_ism',
+        'batch_size': 4,
+    }).encode('utf-8')
+    status, payload = _post(host, port, '/v1/explain_interval', body)
+    assert status == 200
+    attr = payload['attribution']
+    assert attr['method'] == 'saturation_ism'
+    # ISM reference-base cells are NaN → serialized as null
+    values = attr['values']  # nested list
+    # Check that at least one cell is null (the reference base for each position)
+    flat = json.dumps(values)
+    assert 'null' in flat, 'Reference-base cells should serialize as null'
+
+
+def test_explain_interval_unknown_method_400(rest_server):
+    host, port = rest_server
+    body = json.dumps({
+        'interval': {'chromosome': 'chr1', 'start': 0, 'end': SEQUENCE_LENGTH_16KB},
+        'target_interval': {'chromosome': 'chr1', 'start': 100, 'end': 200},
+        'requested_output': 'dnase',
+        'resolution': 1,
+        'track_indices': [0],
+        'method': 'nonexistent_method',
+    }).encode('utf-8')
+    status, payload = _post(host, port, '/v1/explain_interval', body)
+    assert status == 400
+    assert 'nonexistent_method' in payload['error']
+    # Error should list known methods
+    assert 'input_x_gradient' in payload['error']
+    assert 'saturation_ism' in payload['error']

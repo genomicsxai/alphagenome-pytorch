@@ -7,6 +7,7 @@ from alphagenome.data import genome
 from alphagenome.models import dna_output
 from alphagenome.protos import dna_model_pb2
 
+from alphagenome_pytorch.extensions.attribution import UnsupportedMethodError
 from alphagenome_pytorch.extensions.serving.adapter import LocalDnaModelAdapter, SEQUENCE_LENGTH_16KB
 from alphagenome_pytorch.extensions.serving.variant_scoring_adapter import VariantScoringAdapter
 from alphagenome_pytorch.variant_scoring.scorers import CenterMaskScorer
@@ -89,3 +90,107 @@ def test_score_variant_returns_anndata_compatible_shape(scoring_adapter, monkeyp
     assert adata.obs.loc['0', 'gene_name'] == 'GENE1'
     assert adata.uns['variant'] == variant
     assert adata.uns['interval'] == interval
+
+
+# ---------------------------------------------------------------------------
+# explain_interval tests
+# ---------------------------------------------------------------------------
+
+
+class TestExplainIntervalValidation:
+    """explain_interval request-validation tests."""
+
+    def test_target_interval_not_contained_raises(self, adapter):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr1', SEQUENCE_LENGTH_16KB - 10, SEQUENCE_LENGTH_16KB + 10)
+        with pytest.raises(ValueError, match='not contained'):
+            adapter.explain_interval(
+                interval=interval,
+                target_interval=target,
+                requested_output='dnase',
+                resolution=1,
+                track_indices=[0],
+                method='input_x_gradient',
+            )
+
+    def test_chromosome_mismatch_raises(self, adapter):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr2', 100, 200)
+        with pytest.raises(ValueError, match='chromosome'):
+            adapter.explain_interval(
+                interval=interval,
+                target_interval=target,
+                requested_output='dnase',
+                resolution=1,
+                track_indices=[0],
+                method='input_x_gradient',
+            )
+
+    def test_unknown_method_raises(self, adapter):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr1', 100, 200)
+        with pytest.raises(UnsupportedMethodError, match='bogus_method'):
+            adapter.explain_interval(
+                interval=interval,
+                target_interval=target,
+                requested_output='dnase',
+                resolution=1,
+                track_indices=[0],
+                method='bogus_method',
+            )
+
+    def test_include_raw_gradient_rejected_for_ism(self, adapter):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr1', 100, 200)
+        with pytest.raises(ValueError, match='include_raw_gradient'):
+            adapter.explain_interval(
+                interval=interval,
+                target_interval=target,
+                requested_output='dnase',
+                resolution=1,
+                track_indices=[0],
+                method='saturation_ism',
+                include_raw_gradient=True,
+            )
+
+    def test_empty_track_indices_raises(self, adapter):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr1', 100, 200)
+        with pytest.raises(ValueError, match='track_indices'):
+            adapter.explain_interval(
+                interval=interval,
+                target_interval=target,
+                requested_output='dnase',
+                resolution=1,
+                track_indices=[],
+                method='input_x_gradient',
+            )
+
+    def test_gradient_happy_path(self, adapter):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr1', 100, 200)
+        result = adapter.explain_interval(
+            interval=interval,
+            target_interval=target,
+            requested_output='dnase',
+            resolution=1,
+            track_indices=[0],
+            method='input_x_gradient',
+        )
+        assert result.method == 'input_x_gradient'
+        assert result.values.shape == (100, 4, 1)
+
+    def test_ism_happy_path(self, adapter):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr1', 100, 108)
+        result = adapter.explain_interval(
+            interval=interval,
+            target_interval=target,
+            requested_output='dnase',
+            resolution=1,
+            track_indices=[0],
+            method='saturation_ism',
+            batch_size=4,
+        )
+        assert result.method == 'saturation_ism'
+        assert result.values.shape == (8, 4, 1)
