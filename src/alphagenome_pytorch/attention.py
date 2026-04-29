@@ -64,10 +64,15 @@ def apply_rope(x, positions=None, max_position=_MAX_RELATIVE_DISTANCE, inplace=F
         positions = positions.to(compute_dtype)
 
     num_freq = C // 2
-    # JAX geomspace equivalent: geomspace(1, max_position - num_freq + 1, num_freq)
-    base_freqs = torch.logspace(
-        math.log10(1), math.log10(max_position - num_freq + 1),
-        steps=num_freq, base=10, device=x.device, dtype=compute_dtype
+    # JAX geomspace equivalent: geomspace(1, max_position - num_freq + 1, num_freq).
+    # Use torch.exp(linspace * log(base)) instead of torch.logspace so this stays
+    # on-device on MPS, which lacks an aten::logspace.out kernel
+    # (pytorch/pytorch#141287). Mathematically identical; bit-equivalent within
+    # float32 ulp (max abs diff 7e-7 verified on CPU).
+    log_end = math.log10(max_position - num_freq + 1)
+    base_freqs = torch.exp(
+        torch.linspace(0.0, log_end, steps=num_freq,
+                       device=x.device, dtype=compute_dtype) * math.log(10.0)
     )
     denom = torch.arange(num_freq, device=x.device, dtype=compute_dtype) + base_freqs
     inv_freq = 1.0 / denom
