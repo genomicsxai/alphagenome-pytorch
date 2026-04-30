@@ -8,6 +8,7 @@ user actually invokes the ``serve`` subcommand.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import time
 from pathlib import Path
@@ -15,11 +16,15 @@ from pathlib import Path
 import torch
 
 from alphagenome_pytorch import AlphaGenome
+from alphagenome_pytorch.config import DtypePolicy
+from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
+from alphagenome_pytorch.prediction import AlphaGenomePredictionRuntime
 from alphagenome_pytorch.variant_scoring.inference import VariantScoringModel
 
 from .adapter import LocalDnaModelAdapter
 from .grpc_service import serve_grpc
 from .rest_service import serve_rest
+from .variant_scoring_adapter import VariantScoringAdapter
 
 LOGGER = logging.getLogger(__name__)
 
@@ -61,34 +66,61 @@ def _resolve_bundled_metadata_paths() -> list[Path]:
     return paths
 
 
-def run(args: argparse.Namespace) -> int:
-    """Start the serving process based on parsed *args*."""
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format='%(asctime)s %(levelname)s %(name)s - %(message)s',
+def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
+    """Construct a prediction-only adapter from a fine-tuned checkpoint."""
+    from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+        load_finetuned_model,
+    )
+    from alphagenome_pytorch.extensions.finetuning.transfer import (
+        transfer_config_from_dict,
     )
 
+    transfer_config = None
+    if args.transfer_config:
+        with open(args.transfer_config) as f:
+            transfer_config = transfer_config_from_dict(json.load(f))
+
+    model, meta = load_finetuned_model(
+        checkpoint_path=args.checkpoint,
+        pretrained_weights=args.weights,
+        device=args.device,
+        dtype_policy=DtypePolicy.default(),
+        transfer_config=transfer_config,
+        merge=not args.no_merge_adapters,
+    )
+    runtime = AlphaGenomePredictionRuntime(
+        model=model,
+        fasta_path=args.fasta,
+        track_names=meta.get('track_names'),
+        device=args.device,
+    )
+    LOGGER.info(
+        'Loaded fine-tuned checkpoint %s; variant scoring routes disabled.',
+        args.checkpoint,
+    )
+    return LocalDnaModelAdapter(runtime)
+
+
+def _build_weights_adapter(args: argparse.Namespace) -> VariantScoringAdapter:
+    """Construct a variant-scoring adapter from a pretrained weights file."""
     model = AlphaGenome(num_organisms=2)
     state_dict = torch.load(args.weights, map_location=args.device, weights_only=True)
     model.load_state_dict(state_dict, strict=False)
     model.to(args.device)
     model.eval()
 
-    scoring_model = VariantScoringModel(
-        model=model,
-        fasta_path=args.fasta,
-        gtf_path=args.gtf,
-        polya_path=args.polya,
-        device=args.device,
-    )
+    # Load track metadata via the canonical catalog path.
+    metadata_catalog = None
     if args.track_metadata:
-        scoring_model.load_all_metadata(args.track_metadata)
+        metadata_catalog = TrackMetadataCatalog.from_file(args.track_metadata)
         LOGGER.info('Loaded track metadata from %s', args.track_metadata)
     else:
         bundled_paths = _resolve_bundled_metadata_paths()
         if bundled_paths:
-            for path in bundled_paths:
-                scoring_model.load_all_metadata(path)
+            metadata_catalog = TrackMetadataCatalog.from_file(bundled_paths[0])
+            for path in bundled_paths[1:]:
+                extra = TrackMetadataCatalog.from_file(path)
+                metadata_catalog._tracks_by_organism.update(extra._tracks_by_organism)
             LOGGER.info(
                 'Loaded built-in track metadata: %s',
                 ', '.join(p.name for p in bundled_paths),
@@ -100,7 +132,75 @@ def run(args: argparse.Namespace) -> int:
                 'bundled parquets ship under alphagenome_pytorch/data/.'
             )
 
-    adapter = LocalDnaModelAdapter(scoring_model)
+    # Construct the runtime directly — no VariantScoringModel bridge.
+    runtime = AlphaGenomePredictionRuntime(
+        model=model,
+        fasta_path=args.fasta,
+        metadata_catalog=metadata_catalog,
+        device=args.device,
+    )
+
+    # VariantScoringModel is only needed for variant scoring routes.
+    scoring_model = VariantScoringModel(
+        model=model,
+        fasta_path=args.fasta,
+        gtf_path=args.gtf,
+        polya_path=args.polya,
+        device=args.device,
+    )
+    if metadata_catalog is not None:
+        # Sync legacy track metadata into scoring_model for scorer compatibility.
+        from alphagenome_pytorch.variant_scoring.types import (
+            OutputType as PTOutputType,
+            TrackMetadata as PTTrackMetadata,
+        )
+        for org_idx in metadata_catalog.organisms:
+            for output_name in metadata_catalog.outputs(organism=org_idx):
+                tracks = metadata_catalog.get_tracks(output_name, organism=org_idx)
+                try:
+                    pt_output = PTOutputType(output_name)
+                except ValueError:
+                    continue
+                legacy_tracks = [
+                    PTTrackMetadata(
+                        track_index=t.track_index,
+                        track_name=t.track_name,
+                        track_strand=t.get('strand', t.get('track_strand', '.')),
+                        output_type=pt_output,
+                        ontology_curie=t.get('ontology_curie'),
+                        gtex_tissue=t.get('gtex_tissue'),
+                        assay_title=t.get('assay_title'),
+                        biosample_name=t.get('biosample_name'),
+                        biosample_type=t.get('biosample_type'),
+                        transcription_factor=t.get('transcription_factor'),
+                        histone_mark=t.get('histone_mark'),
+                    )
+                    for t in tracks
+                ]
+                scoring_model.set_track_metadata(pt_output, legacy_tracks, organism=org_idx)
+
+    return VariantScoringAdapter(runtime, scoring_model)
+
+
+def _build_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
+    """Pick the right adapter construction path based on CLI args.
+
+    * ``--checkpoint`` → fine-tuned, prediction-only ``LocalDnaModelAdapter``
+    * ``--weights``   → pretrained, variant-scoring-capable ``VariantScoringAdapter``
+    """
+    if args.checkpoint:
+        return _build_checkpoint_adapter(args)
+    return _build_weights_adapter(args)
+
+
+def run(args: argparse.Namespace) -> int:
+    """Start the serving process based on parsed *args*."""
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format='%(asctime)s %(levelname)s %(name)s - %(message)s',
+    )
+
+    adapter = _build_adapter(args)
 
     grpc_server = None
     if not args.disable_grpc:

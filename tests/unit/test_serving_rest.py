@@ -4,14 +4,13 @@ import http.client
 import json
 
 import numpy as np
-import pandas as pd
 import pytest
-import torch
 
 from alphagenome.models import dna_output
 
 from alphagenome_pytorch.extensions.serving.adapter import LocalDnaModelAdapter, SEQUENCE_LENGTH_16KB
 from alphagenome_pytorch.extensions.serving.rest_service import serve_rest
+from alphagenome_pytorch.extensions.serving.variant_scoring_adapter import VariantScoringAdapter
 from alphagenome_pytorch.variant_scoring.scorers import (
     CenterMaskScorer as PTCenterMaskScorer,
     ContactMapScorer as PTContactMapScorer,
@@ -24,75 +23,13 @@ from alphagenome_pytorch.variant_scoring.scorers import (
 from alphagenome_pytorch.variant_scoring.scorers.gene_mask import GeneMaskMode
 from alphagenome_pytorch.variant_scoring.types import (
     AggregationType as PTAggregationType,
-    Interval as PTInterval,
     OutputType as PTOutputType,
-    TrackMetadata as PTTrackMetadata,
-    Variant as PTVariant,
-    VariantScore,
 )
 
-
-class _FakeAnndataModule:
-    class AnnData:
-        def __init__(self, X, obs=None, var=None, uns=None, layers=None):
-            self.X = X
-            self.obs = obs if obs is not None else pd.DataFrame()
-            self.var = var if var is not None else pd.DataFrame()
-            self.uns = uns if uns is not None else {}
-            self.layers = layers if layers is not None else {}
+from .serving_fakes import FakeAnndataModule, FakeRuntime, FakeScoringModel
 
 
-class _FakeScoringModel:
-    def __init__(self):
-        self._metadata = {
-            0: {
-                PTOutputType.DNASE: [
-                    PTTrackMetadata(0, 'track_a', '.', PTOutputType.DNASE, ontology_curie='CL:0001'),
-                    PTTrackMetadata(1, 'track_b', '.', PTOutputType.DNASE, ontology_curie='CL:0002'),
-                ]
-            }
-        }
-
-    def get_track_metadata(self, organism=None):
-        del organism
-        return self._metadata[0]
-
-    def predict(self, sequence, organism=None, **kwargs):
-        del organism, kwargs
-        seq_len = len(sequence)
-        values = np.ones((1, seq_len, 2), dtype=np.float32)
-        return {'dnase': {1: values}}
-
-    def get_sequence(self, interval, variant=None):
-        del variant
-        return 'A' * interval.width
-
-    def predict_variant(self, interval, variant, organism=None):
-        del variant, organism
-        ref = self.predict('A' * interval.width)
-        alt = self.predict('A' * interval.width)
-        alt['dnase'][1] = alt['dnase'][1] + 1.0
-        return ref, alt
-
-    def score_variant(self, interval, variant, scorers, organism=None):
-        del interval, variant, organism
-        result = []
-        for scorer in scorers:
-            result.append(
-                VariantScore(
-                    variant=PTVariant('chr1', 10, 'A', 'C'),
-                    interval=PTInterval('chr1', 0, SEQUENCE_LENGTH_16KB),
-                    scorer=scorer,
-                    scores=torch.tensor([1.0, 2.0]),
-                )
-            )
-        return result
-
-
-@pytest.fixture
-def rest_server(monkeypatch):
-    monkeypatch.setitem(__import__('sys').modules, 'anndata', _FakeAnndataModule)
-    adapter = LocalDnaModelAdapter(_FakeScoringModel())
+def _start_rest(adapter):
     server = serve_rest(adapter, host='127.0.0.1', port=0, wait=False)
     host, port = server.server_address
     try:
@@ -100,6 +37,20 @@ def rest_server(monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.fixture
+def rest_server(monkeypatch):
+    monkeypatch.setitem(__import__('sys').modules, 'anndata', FakeAnndataModule)
+    adapter = VariantScoringAdapter(FakeRuntime(), FakeScoringModel())
+    yield from _start_rest(adapter)
+
+
+@pytest.fixture
+def prediction_only_rest_server(monkeypatch):
+    monkeypatch.setitem(__import__('sys').modules, 'anndata', FakeAnndataModule)
+    adapter = LocalDnaModelAdapter(FakeRuntime())
+    yield from _start_rest(adapter)
 
 
 def _post(host: str, port: int, path: str, body: bytes) -> tuple[int, dict]:
@@ -193,6 +144,21 @@ def test_score_variant_missing_required_field(rest_server):
     status, payload = _post(host, port, '/v1/score_variant', body)
     assert status == 400
     assert 'aggregation_type' in payload['error']
+
+
+def test_score_variant_prediction_only_adapter_returns_501(prediction_only_rest_server):
+    host, port = prediction_only_rest_server
+    body = json.dumps({
+        'interval': {'chromosome': 'chr1', 'start': 0, 'end': SEQUENCE_LENGTH_16KB},
+        'variant': {
+            'chromosome': 'chr1', 'position': 10,
+            'reference_bases': 'A', 'alternate_bases': 'C',
+        },
+        'variant_scorers': [],
+    }).encode('utf-8')
+    status, payload = _post(host, port, '/v1/score_variant', body)
+    assert status == 501
+    assert 'Variant scoring not available' in payload['error']
 
 
 def test_parse_variant_scorers_all_types():

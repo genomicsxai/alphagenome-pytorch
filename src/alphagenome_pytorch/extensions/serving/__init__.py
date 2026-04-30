@@ -11,9 +11,11 @@ from .adapter import (
     SUPPORTED_SEQUENCE_LENGTHS,
     LocalDnaModelAdapter,
 )
+from .variant_scoring_adapter import VariantScoringAdapter
 
 __all__ = [
     'LocalDnaModelAdapter',
+    'VariantScoringAdapter',
     'SUPPORTED_SEQUENCE_LENGTHS',
     'SEQUENCE_LENGTH_16KB',
     'SEQUENCE_LENGTH_100KB',

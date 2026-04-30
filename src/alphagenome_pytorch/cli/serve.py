@@ -23,7 +23,13 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     )
 
     p.add_argument("--weights", required=True,
-                   help="Path to AlphaGenome PyTorch weights file.")
+                   help="Path to AlphaGenome PyTorch weights file. With --checkpoint, this is the base/pretrained weights path.")
+    p.add_argument("--checkpoint", default=None,
+                   help="Optional fine-tuned checkpoint to serve for raw predictions.")
+    p.add_argument("--transfer-config", default=None,
+                   help="Optional TransferConfig JSON for older fine-tuned checkpoints.")
+    p.add_argument("--no-merge-adapters", action="store_true",
+                   help="Keep fine-tuned adapter modules separate instead of merging.")
     p.add_argument("--fasta", required=True,
                    help="Path to reference FASTA file.")
     p.add_argument("--gtf", default=None,
