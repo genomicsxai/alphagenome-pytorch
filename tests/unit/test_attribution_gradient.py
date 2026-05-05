@@ -11,7 +11,10 @@ import torch
 from torch import nn
 
 from alphagenome_pytorch.extensions.attribution.gradient import gradient_x_input
-from alphagenome_pytorch.extensions.attribution.heads import HeadSelector
+from alphagenome_pytorch.extensions.attribution.heads import (
+    HeadSelector,
+    default_head_selector,
+)
 from alphagenome_pytorch.extensions.attribution.types import AttributionResult
 
 
@@ -89,6 +92,32 @@ def _asymmetric_head(
     pos = torch.arange(L, dtype=onehot.dtype, device=onehot.device)
     weighted = onehot.sum(-1) * pos  # (B, L)
     return weighted.unsqueeze(-1)  # (B, L, 1) — single track
+
+
+class _AlphaGenomeLikeAdapterModel(nn.Module):
+    """Fake adapter-backed/fine-tuned model with the public AlphaGenome contract."""
+
+    def __init__(self):
+        super().__init__()
+        self.adapter_weight = nn.Parameter(torch.tensor([2.0]))
+
+    def forward(
+        self,
+        onehot,
+        organism_index,
+        *,
+        heads=None,
+        resolutions=None,
+        channels_last=True,
+        return_scaled_predictions=False,
+    ):
+        assert heads == ("custom_dnase",)
+        assert resolutions == (1,)
+        assert channels_last is True
+        assert return_scaled_predictions is False
+        assert organism_index.shape == (onehot.shape[0],)
+        values = onehot.sum(dim=-1, keepdim=True) * self.adapter_weight
+        return {"custom_dnase": {1: values}}
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +208,40 @@ class TestGradientXInput:
         )
         assert result.raw_gradient is not None
         assert result.raw_gradient.shape == (W, 4, 1)
+
+    def test_default_selector_uses_alphagenome_forward_contract(self):
+        """Adapter-backed/fine-tuned models should not need a special selector."""
+        model = _AlphaGenomeLikeAdapterModel()
+        onehot = _make_onehot("ACGTACGT")
+
+        selected = default_head_selector(
+            model,
+            onehot,
+            torch.zeros(1, dtype=torch.long),
+            output_type="custom_dnase",
+            resolution=1,
+        )
+
+        assert selected.shape == (1, 8, 1)
+        np.testing.assert_allclose(
+            selected.detach().numpy(),
+            np.full((1, 8, 1), 2.0, dtype=np.float32),
+        )
+
+        result = gradient_x_input(
+            model,
+            onehot=onehot,
+            organism_index=0,
+            output_type="custom_dnase",
+            resolution=1,
+            target_slice=slice(0, 8),
+            track_indices=[0],
+        )
+        finite_values = result.values[np.isfinite(result.values)]
+        np.testing.assert_allclose(
+            finite_values,
+            np.full_like(finite_values, 2.0),
+        )
 
     def test_raw_gradient_not_returned_by_default(self):
         model = _LinearFakeModel(n_tracks=1)

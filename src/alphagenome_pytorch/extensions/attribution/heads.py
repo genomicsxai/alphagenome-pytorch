@@ -1,10 +1,10 @@
 """Head selection strategy for attribution.
 
 Attribution methods need a thin abstraction over "run the model and give me
-``(B, T_bins, n_tracks)`` for the requested head + resolution." Both the base
-pretrained AlphaGenome and a fine-tuned variant share this signature, so a
-single default selector works for both — it just calls ``model.forward`` with
-``heads=`` and ``resolutions=`` filters and indexes the result.
+``(B, T_bins, n_tracks)`` for the requested head + resolution." Base,
+adapter-backed, and fine-tuned AlphaGenome models share this public forward
+contract, so a single default selector works for all of them. Adapters are an
+internal implementation detail of the model trunk, not a separate serving API.
 
 Callers can pass a custom ``HeadSelector`` for non-standard wrapping.
 """
@@ -40,7 +40,7 @@ def default_head_selector(
     output_type: str,
     resolution: int,
 ) -> torch.Tensor:
-    """Run AlphaGenome.forward filtered to one head and resolution.
+    """Run an AlphaGenome-compatible forward pass for one head/resolution.
 
     Returns predictions in experimental space (``return_scaled_predictions=False``)
     in NLC layout, matching what ``GenomeTracksHead`` produces by default.

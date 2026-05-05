@@ -127,7 +127,8 @@ def gradient_x_input(
             reverse-complement input and average the projected (and raw)
             attributions. Doubles compute. Recommended only for unstranded heads.
         head_selector: Strategy for forward + head extraction. Defaults to the
-            base AlphaGenome path.
+            AlphaGenome-compatible forward path used by base, adapter-backed,
+            and fine-tuned models.
         sequence: Optional reference sequence for the result; passed through to
             the dataclass for downstream serialization.
         target_start, target_end: Absolute genomic coordinates of the target
