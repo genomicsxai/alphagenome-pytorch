@@ -9,7 +9,7 @@ from alphagenome.protos import dna_model_pb2
 
 from alphagenome_pytorch.extensions.attribution import UnsupportedMethodError
 from alphagenome_pytorch.extensions.serving.adapter import LocalDnaModelAdapter, SEQUENCE_LENGTH_16KB
-from alphagenome_pytorch.extensions.serving.variant_scoring_adapter import VariantScoringAdapter
+from alphagenome_pytorch.extensions.serving.scorer import VariantScorer
 from alphagenome_pytorch.variant_scoring.scorers import CenterMaskScorer
 from alphagenome_pytorch.variant_scoring.types import (
     AggregationType as PTAggregationType,
@@ -26,7 +26,8 @@ def adapter():
 
 @pytest.fixture
 def scoring_adapter():
-    return VariantScoringAdapter(FakeRuntime(), FakeScoringModel())
+    runtime = FakeRuntime()
+    return LocalDnaModelAdapter(runtime, scorer=VariantScorer(runtime, FakeScoringModel()))
 
 
 def test_predict_sequence_filters_ontology_and_preserves_track_ops(adapter):

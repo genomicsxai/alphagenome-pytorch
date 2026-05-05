@@ -3,7 +3,7 @@
 This module provides a local implementation of the notebook-facing AlphaGenome
 prediction surface (`predict_*`, `output_metadata`) by wrapping the shared
 ``AlphaGenomePredictionRuntime`` and converting outputs to upstream-compatible
-containers. Variant scoring lives in ``variant_scoring_adapter.py``.
+containers. Variant scoring lives in ``scorer.py``.
 """
 
 from __future__ import annotations
@@ -197,6 +197,81 @@ def _normalize_ontology_terms(ontology_terms: Iterable[Any] | None) -> list[str]
     return list(dict.fromkeys(normalized))
 
 
+def _pt_metadata_to_track_df(
+    metadata: Sequence[PTTrackMetadata],
+    num_tracks: int | None = None,
+) -> pd.DataFrame:
+    rows = []
+    for i, meta in enumerate(metadata):
+        extras_get = getattr(meta, 'get', None)
+        get = extras_get if callable(extras_get) else lambda name, default=None: getattr(meta, name, default)
+        track_name = getattr(meta, 'track_name', None) or get('name', None)
+        track_strand = getattr(meta, 'track_strand', None) or get('strand', '.')
+        rows.append(
+            {
+                'name': track_name or f'track_{i}',
+                'strand': track_strand or '.',
+                'ontology_curie': get('ontology_curie', None),
+                'gtex_tissue': get('gtex_tissue', None),
+                'Assay title': get('assay_title', None) or get('Assay title', None),
+                'biosample_name': get('biosample_name', None),
+                'biosample_type': get('biosample_type', None),
+                'transcription_factor': get('transcription_factor', None),
+                'histone_mark': get('histone_mark', None),
+            }
+        )
+    if not rows and num_tracks is not None:
+        rows = [{'name': f'track_{i}', 'strand': '.'} for i in range(num_tracks)]
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame(columns=['name', 'strand'])
+    if num_tracks is not None:
+        if len(df) < num_tracks:
+            for i in range(len(df), num_tracks):
+                df.loc[i] = {'name': f'track_{i}', 'strand': '.'}
+        elif len(df) > num_tracks:
+            df = df.iloc[:num_tracks].copy()
+    df = df.reset_index(drop=True)
+    if 'name' not in df.columns:
+        df['name'] = [f'track_{i}' for i in range(len(df))]
+    if 'strand' not in df.columns:
+        df['strand'] = '.'
+    return df
+
+
+def _pt_metadata_to_junction_df(
+    metadata: Sequence[PTTrackMetadata],
+    num_tracks: int | None = None,
+) -> pd.DataFrame:
+    rows = []
+    for i, meta in enumerate(metadata):
+        extras_get = getattr(meta, 'get', None)
+        get = extras_get if callable(extras_get) else lambda name, default=None: getattr(meta, name, default)
+        track_name = getattr(meta, 'track_name', None) or get('name', None)
+        rows.append(
+            {
+                'name': track_name or f'track_{i}',
+                'ontology_curie': get('ontology_curie', None),
+                'gtex_tissue': get('gtex_tissue', None),
+                'Assay title': get('assay_title', None) or get('Assay title', None),
+                'biosample_name': get('biosample_name', None),
+                'biosample_type': get('biosample_type', None),
+            }
+        )
+    if not rows and num_tracks is not None:
+        rows = [{'name': f'track_{i}'} for i in range(num_tracks)]
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame(columns=['name'])
+    if num_tracks is not None:
+        if len(df) < num_tracks:
+            for i in range(len(df), num_tracks):
+                df.loc[i] = {'name': f'track_{i}'}
+        elif len(df) > num_tracks:
+            df = df.iloc[:num_tracks].copy()
+    return df.reset_index(drop=True)
+
+
 class LocalDnaModelAdapter:
     """Notebook-compatible local model adapter.
 
@@ -205,11 +280,14 @@ class LocalDnaModelAdapter:
     `output_metadata`.
     """
 
-    supports_variant_scoring = False
-    supports_attribution = True
-
-    def __init__(self, runtime: AlphaGenomePredictionRuntime):
+    def __init__(
+        self,
+        runtime: AlphaGenomePredictionRuntime,
+        *,
+        scorer: 'VariantScorer | None' = None,
+    ):
         self.runtime = runtime
+        self.scorer = scorer
 
     def predict_sequence(
         self,
@@ -296,19 +374,22 @@ class LocalDnaModelAdapter:
 
     def score_interval(self, *args, **kwargs):
         del args, kwargs  # Unused for the local serving MVP.
-        raise NotImplementedError('score_interval is not implemented in LocalDnaModelAdapter.')
+        raise NotImplementedError('score_interval is not implemented.')
 
     def score_variant(self, *args, **kwargs):
-        del args, kwargs
-        raise NotImplementedError('Variant scoring not available for this model.')
+        if self.scorer is None:
+            raise NotImplementedError('Variant scoring not available for this model.')
+        return self.scorer.score_variant(*args, **kwargs)
 
     def score_variants(self, *args, **kwargs):
-        del args, kwargs
-        raise NotImplementedError('Variant scoring not available for this model.')
+        if self.scorer is None:
+            raise NotImplementedError('Variant scoring not available for this model.')
+        return self.scorer.score_variants(*args, **kwargs)
 
     def score_ism_variants(self, *args, **kwargs):
-        del args, kwargs
-        raise NotImplementedError('Variant scoring not available for this model.')
+        if self.scorer is None:
+            raise NotImplementedError('Variant scoring not available for this model.')
+        return self.scorer.score_ism_variants(*args, **kwargs)
 
     def explain_interval(
         self,
@@ -634,75 +715,14 @@ class LocalDnaModelAdapter:
         metadata: Sequence[PTTrackMetadata],
         num_tracks: int | None = None,
     ) -> pd.DataFrame:
-        rows = []
-        for i, meta in enumerate(metadata):
-            extras_get = getattr(meta, 'get', None)
-            get = extras_get if callable(extras_get) else lambda name, default=None: getattr(meta, name, default)
-            track_name = getattr(meta, 'track_name', None) or get('name', None)
-            track_strand = getattr(meta, 'track_strand', None) or get('strand', '.')
-            rows.append(
-                {
-                    'name': track_name or f'track_{i}',
-                    'strand': track_strand or '.',
-                    'ontology_curie': get('ontology_curie', None),
-                    'gtex_tissue': get('gtex_tissue', None),
-                    'Assay title': get('assay_title', None) or get('Assay title', None),
-                    'biosample_name': get('biosample_name', None),
-                    'biosample_type': get('biosample_type', None),
-                    'transcription_factor': get('transcription_factor', None),
-                    'histone_mark': get('histone_mark', None),
-                }
-            )
-        if not rows and num_tracks is not None:
-            rows = [{'name': f'track_{i}', 'strand': '.'} for i in range(num_tracks)]
-        df = pd.DataFrame(rows)
-        if df.empty:
-            df = pd.DataFrame(columns=['name', 'strand'])
-        if num_tracks is not None:
-            if len(df) < num_tracks:
-                for i in range(len(df), num_tracks):
-                    df.loc[i] = {'name': f'track_{i}', 'strand': '.'}
-            elif len(df) > num_tracks:
-                df = df.iloc[:num_tracks].copy()
-        df = df.reset_index(drop=True)
-        if 'name' not in df.columns:
-            df['name'] = [f'track_{i}' for i in range(len(df))]
-        if 'strand' not in df.columns:
-            df['strand'] = '.'
-        return df
+        return _pt_metadata_to_track_df(metadata, num_tracks=num_tracks)
 
     def _pt_metadata_to_junction_df(
         self,
         metadata: Sequence[PTTrackMetadata],
         num_tracks: int | None = None,
     ) -> pd.DataFrame:
-        rows = []
-        for i, meta in enumerate(metadata):
-            extras_get = getattr(meta, 'get', None)
-            get = extras_get if callable(extras_get) else lambda name, default=None: getattr(meta, name, default)
-            track_name = getattr(meta, 'track_name', None) or get('name', None)
-            rows.append(
-                {
-                    'name': track_name or f'track_{i}',
-                    'ontology_curie': get('ontology_curie', None),
-                    'gtex_tissue': get('gtex_tissue', None),
-                    'Assay title': get('assay_title', None) or get('Assay title', None),
-                    'biosample_name': get('biosample_name', None),
-                    'biosample_type': get('biosample_type', None),
-                }
-            )
-        if not rows and num_tracks is not None:
-            rows = [{'name': f'track_{i}'} for i in range(num_tracks)]
-        df = pd.DataFrame(rows)
-        if df.empty:
-            df = pd.DataFrame(columns=['name'])
-        if num_tracks is not None:
-            if len(df) < num_tracks:
-                for i in range(len(df), num_tracks):
-                    df.loc[i] = {'name': f'track_{i}'}
-            elif len(df) > num_tracks:
-                df = df.iloc[:num_tracks].copy()
-        return df.reset_index(drop=True)
+        return _pt_metadata_to_junction_df(metadata, num_tracks=num_tracks)
 
     @staticmethod
     def _squeeze_batch(values: np.ndarray) -> np.ndarray:

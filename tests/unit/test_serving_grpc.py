@@ -12,7 +12,7 @@ from alphagenome.protos import dna_model_pb2, dna_model_service_pb2, dna_model_s
 
 from alphagenome_pytorch.extensions.serving.adapter import LocalDnaModelAdapter, SEQUENCE_LENGTH_16KB
 from alphagenome_pytorch.extensions.serving.grpc_service import LocalDnaModelService
-from alphagenome_pytorch.extensions.serving.variant_scoring_adapter import VariantScoringAdapter
+from alphagenome_pytorch.extensions.serving.scorer import VariantScorer
 
 from .serving_fakes import FakeAnndataModule, FakeRuntime, FakeScoringModel
 
@@ -37,7 +37,10 @@ def _start_grpc(adapter):
 @pytest.fixture
 def grpc_server(monkeypatch):
     monkeypatch.setitem(__import__('sys').modules, 'anndata', FakeAnndataModule)
-    adapter = VariantScoringAdapter(FakeRuntime(), FakeScoringModel())
+    runtime = FakeRuntime()
+    adapter = LocalDnaModelAdapter(
+        runtime, scorer=VariantScorer(runtime, FakeScoringModel()),
+    )
     yield from _start_grpc(adapter)
 
 

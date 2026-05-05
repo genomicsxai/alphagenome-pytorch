@@ -317,8 +317,6 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
 
     def ScoreVariant(self, request_iterator, context):
         try:
-            if not getattr(self.adapter, 'supports_variant_scoring', False):
-                raise NotImplementedError('Variant scoring not available for this model.')
             request = _first_request(request_iterator, 'ScoreVariant')
             interval = genome.Interval.from_proto(request.interval)
             variant = genome.Variant.from_proto(request.variant)
@@ -342,8 +340,6 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
 
     def ScoreIsmVariant(self, request_iterator, context):
         try:
-            if not getattr(self.adapter, 'supports_variant_scoring', False):
-                raise NotImplementedError('Variant scoring not available for this model.')
             request = _first_request(request_iterator, 'ScoreIsmVariant')
             interval = genome.Interval.from_proto(request.interval)
             ism_interval = genome.Interval.from_proto(request.ism_interval)

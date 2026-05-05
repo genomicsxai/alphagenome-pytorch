@@ -458,12 +458,6 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 return
 
             if path == '/v1/score_variant':
-                if not getattr(self.adapter, 'supports_variant_scoring', False):
-                    self._write_json(
-                        {'error': 'Variant scoring not available for this model.'},
-                        status=HTTPStatus.NOT_IMPLEMENTED,
-                    )
-                    return
                 scores = self.adapter.score_variant(
                     interval=_interval_from_payload(body['interval']),
                     variant=_variant_from_payload(body['variant']),
@@ -474,12 +468,6 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 return
 
             if path == '/v1/score_variants':
-                if not getattr(self.adapter, 'supports_variant_scoring', False):
-                    self._write_json(
-                        {'error': 'Variant scoring not available for this model.'},
-                        status=HTTPStatus.NOT_IMPLEMENTED,
-                    )
-                    return
                 intervals_payload = body['intervals']
                 variants_payload = body['variants']
                 if isinstance(intervals_payload, dict):
@@ -501,12 +489,6 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 return
 
             if path == '/v1/score_ism_variants':
-                if not getattr(self.adapter, 'supports_variant_scoring', False):
-                    self._write_json(
-                        {'error': 'Variant scoring not available for this model.'},
-                        status=HTTPStatus.NOT_IMPLEMENTED,
-                    )
-                    return
                 interval_variant_payload = body.get('interval_variant')
                 scores = self.adapter.score_ism_variants(
                     interval=_interval_from_payload(body['interval']),
@@ -546,6 +528,8 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 return
 
             self._write_json({'error': 'Not found'}, status=HTTPStatus.NOT_FOUND)
+        except NotImplementedError as exc:
+            self._write_json({'error': str(exc)}, status=HTTPStatus.NOT_IMPLEMENTED)
         except Exception as exc:  # pragma: no cover - exercised in integration.
             self._write_json({'error': str(exc)}, status=HTTPStatus.BAD_REQUEST)
 

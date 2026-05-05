@@ -10,7 +10,7 @@ from alphagenome.models import dna_output
 
 from alphagenome_pytorch.extensions.serving.adapter import LocalDnaModelAdapter, SEQUENCE_LENGTH_16KB
 from alphagenome_pytorch.extensions.serving.rest_service import serve_rest
-from alphagenome_pytorch.extensions.serving.variant_scoring_adapter import VariantScoringAdapter
+from alphagenome_pytorch.extensions.serving.scorer import VariantScorer
 from alphagenome_pytorch.variant_scoring.scorers import (
     CenterMaskScorer as PTCenterMaskScorer,
     ContactMapScorer as PTContactMapScorer,
@@ -42,7 +42,10 @@ def _start_rest(adapter):
 @pytest.fixture
 def rest_server(monkeypatch):
     monkeypatch.setitem(__import__('sys').modules, 'anndata', FakeAnndataModule)
-    adapter = VariantScoringAdapter(FakeRuntime(), FakeScoringModel())
+    runtime = FakeRuntime()
+    adapter = LocalDnaModelAdapter(
+        runtime, scorer=VariantScorer(runtime, FakeScoringModel()),
+    )
     yield from _start_rest(adapter)
 
 
