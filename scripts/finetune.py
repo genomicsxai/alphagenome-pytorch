@@ -92,6 +92,7 @@ torch._dynamo.config.suppress_errors = True
 # AlphaGenome imports
 from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.config import DtypePolicy
+from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
 from alphagenome_pytorch.sequence_parallel import SequenceParallelism
 from alphagenome_pytorch.extensions.finetuning import (
     # Data
@@ -245,6 +246,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     data.add_argument("--train-bed", type=str, required=False, help="Training positions BED")
     data.add_argument("--val-bed", type=str, required=False, help="Validation positions BED")
+    data.add_argument(
+        "--track-metadata",
+        type=str,
+        default=None,
+        help=(
+            "Optional parquet/CSV/TSV with rich track metadata "
+            "(ontology_curie, biosample_name, assay_title, ...). "
+            "Embedded into checkpoints and exported delta weights so "
+            "served models populate /v1/output_metadata without "
+            "re-supplying --track-metadata at serve time. The 'output_type' "
+            "column must match the head name (= --modality)."
+        ),
+    )
     data.add_argument("--sequence-length", type=int, default=DEFAULTS["sequence_length"])
     data.add_argument(
         "--resolutions",
@@ -534,6 +548,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "save_every",
         "resume",
         "modality_weights",
+        "track_metadata",
     ):
         _apply_config_scalar(attr, config_data)
 
@@ -727,6 +742,51 @@ def create_datasets(
     print_rank0(f"Train: {len(train_dataset):,}  Val: {len(val_dataset):,}", rank)
 
     return train_dataset, val_dataset, modality_track_names, args.modality_resolutions
+
+
+def load_track_metadata_for_finetune(
+    path: str | None,
+    modality_track_names: dict[str, list[str]],
+    rank: int,
+) -> tuple[dict[str, list[str]], list[dict[str, Any]] | None]:
+    """Load and validate user-supplied track metadata for fine-tuning.
+
+    Returns ``(track_names, metadata_rows)``:
+
+    * ``track_names`` — possibly updated track-name dict (rows in the parquet
+      override BigWig stems so checkpoint and embedded catalog agree).
+    * ``metadata_rows`` — list-of-dicts ready for embedding into checkpoints,
+      or ``None`` when ``path`` is ``None``.
+
+    Validates that every fine-tuning head has a matching ``output_type`` in
+    the catalog with the right number of tracks. Head name == ``--modality``
+    by convention in this script.
+    """
+    if path is None:
+        return modality_track_names, None
+
+    catalog = TrackMetadataCatalog.from_file(path)
+    print_rank0(f"Loaded track metadata from {path}", rank)
+
+    updated_names: dict[str, list[str]] = {}
+    for head_name, bigwig_names in modality_track_names.items():
+        tracks = catalog.get_tracks(head_name, organism=0)
+        if not tracks:
+            available = catalog.outputs(organism=0)
+            raise ValueError(
+                f"--track-metadata has no entries for head/output '{head_name}'. "
+                f"Available outputs: {available}. The 'output_type' column "
+                "must match the head name (= --modality)."
+            )
+        if len(tracks) != len(bigwig_names):
+            raise ValueError(
+                f"--track-metadata has {len(tracks)} tracks for '{head_name}', "
+                f"but {len(bigwig_names)} BigWig file(s) were provided. "
+                "Counts must match."
+            )
+        updated_names[head_name] = [t.track_name for t in tracks]
+
+    return updated_names, catalog.to_rows()
 
 
 def create_dataloaders(
@@ -1041,6 +1101,12 @@ def main(args: argparse.Namespace | None = None) -> None:
     # Create datasets
     train_dataset, val_dataset, modality_track_names, modality_resolutions = create_datasets(args, rank)
 
+    # Optional rich track metadata (overrides BigWig stems with parquet names
+    # and embeds the catalog into checkpoints / exported delta weights).
+    modality_track_names, track_metadata_rows = load_track_metadata_for_finetune(
+        args.track_metadata, modality_track_names, rank,
+    )
+
     # Build resolution weights per modality.
     # encoder-only mode always operates at 128bp (encoder output resolution).
     resolution_weights_per_modality: dict[str, dict[int, float]] = {}
@@ -1250,6 +1316,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 track_names=modality_track_names,
                 modality=args.modalities,
                 resolutions=modality_resolutions,
+                track_metadata=track_metadata_rows,
                 scheduler=scheduler,
                 best_val_loss=best_val_loss,
                 wandb_run_id=logger.wandb_run_id,
@@ -1269,6 +1336,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 track_names=modality_track_names,
                 modality=args.modalities,
                 resolutions=modality_resolutions,
+                track_metadata=track_metadata_rows,
                 wandb_run_id=logger.wandb_run_id,
             )
             print(f"Preemption delta checkpoint saved to {output_dir / 'checkpoint_preempt.delta.pth'}")
@@ -1443,6 +1511,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                             track_names=modality_track_names,
                             modality=args.modalities,
                             resolutions=modality_resolutions,
+                            track_metadata=track_metadata_rows,
                             scheduler=scheduler,
                             best_val_loss=best_val_loss,
                             wandb_run_id=logger.wandb_run_id,
@@ -1462,6 +1531,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                             track_names=modality_track_names,
                             modality=args.modalities,
                             resolutions=modality_resolutions,
+                            track_metadata=track_metadata_rows,
                             wandb_run_id=logger.wandb_run_id,
                         )
                         print(f"  Saved best delta checkpoint (val_loss={val_loss:.4f})")
@@ -1477,6 +1547,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                             track_names=modality_track_names,
                             modality=args.modalities,
                             resolutions=modality_resolutions,
+                            track_metadata=track_metadata_rows,
                             scheduler=scheduler,
                             best_val_loss=best_val_loss,
                             wandb_run_id=logger.wandb_run_id,
@@ -1495,6 +1566,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                             track_names=modality_track_names,
                             modality=args.modalities,
                             resolutions=modality_resolutions,
+                            track_metadata=track_metadata_rows,
                             wandb_run_id=logger.wandb_run_id,
                         )
 

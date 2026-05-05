@@ -655,7 +655,12 @@ def save_delta_checkpoint(
             adapters and new heads, with normalized key paths).
         optimizer: Optional optimizer to save state for training resume.
         scheduler: Optional LR scheduler to save state for training resume.
-        **metadata: Additional metadata (epoch, val_loss, track_names, etc.)
+        **metadata: Additional metadata (``epoch``, ``val_loss``,
+            ``track_names``, ``modality``, ``resolutions``,
+            ``track_metadata``, etc.). ``track_metadata`` should be a
+            list of row-dicts (e.g. from ``TrackMetadataCatalog.to_rows``)
+            so the served checkpoint is self-describing without
+            ``--track-metadata`` at serve time.
 
     Raises:
         ValueError: If adapters appear to be merged (no adapter params found
@@ -920,6 +925,9 @@ def export_delta_weights(
     config: "TransferConfig",
     path: Path | str,
     format: str = "safetensors",
+    *,
+    track_names: dict[str, list[str]] | list[str] | None = None,
+    track_metadata: list[dict[str, Any]] | None = None,
 ) -> None:
     """Export only delta weights (adapters + new heads) for sharing.
 
@@ -932,6 +940,12 @@ def export_delta_weights(
         config: TransferConfig used for training (to identify new heads).
         path: Output path. Extension is added based on format if not present.
         format: 'safetensors' or 'pth'.
+        track_names: Optional per-head (or single-head) track-name list. When
+            provided, recipients can populate sparse ``TrackMetadata`` entries
+            without supplying ``--track-metadata`` at serve time.
+        track_metadata: Optional list of metadata row-dicts (e.g. from
+            ``TrackMetadataCatalog.to_rows``). When provided, embeds rich
+            biological metadata so the served model is fully self-describing.
 
     Example:
         >>> # Export just the LoRA weights + head for sharing
@@ -970,14 +984,69 @@ def export_delta_weights(
             path = path.with_suffix(".safetensors")
         # safetensors metadata must be str -> str
         metadata = {"transfer_config": json.dumps(config_dict)}
+        if track_names is not None:
+            metadata["track_names"] = json.dumps(track_names)
+        if track_metadata is not None:
+            metadata["track_metadata"] = json.dumps(track_metadata)
         save_file({k: v.cpu() for k, v in weights.items()}, path, metadata=metadata)
     elif format == "pth":
         if not path.suffix:
             path = path.with_suffix(".pth")
-        # For pth, we wrap in a dict with config
-        torch.save({"weights": weights, "transfer_config": config_dict}, path)
+        payload: dict[str, Any] = {"weights": weights, "transfer_config": config_dict}
+        if track_names is not None:
+            payload["track_names"] = track_names
+        if track_metadata is not None:
+            payload["track_metadata"] = track_metadata
+        torch.save(payload, path)
     else:
         raise ValueError(f"Unknown format: {format}. Use 'safetensors' or 'pth'.")
+
+
+def _read_delta_export_header(path: Path | str) -> dict[str, Any]:
+    """Read the embedded header of an exported delta-weights file.
+
+    Returns a dict with at least ``transfer_config`` (a dict ready for
+    ``transfer_config_from_dict``) and optionally ``track_names`` and
+    ``track_metadata``. Used internally by ``load_delta_config``,
+    ``is_delta_weights_export``, and the third branch of
+    ``load_finetuned_model``.
+    """
+    import json
+
+    path = Path(path)
+    header: dict[str, Any] = {}
+
+    if path.suffix == ".safetensors":
+        try:
+            from safetensors import safe_open
+        except ImportError:
+            raise ImportError(
+                "safetensors not installed. Install with: pip install safetensors"
+            )
+        with safe_open(path, framework="pt") as f:
+            metadata = f.metadata() or {}
+        if "transfer_config" not in metadata:
+            raise ValueError(
+                f"Delta weights file {path} is missing transfer_config metadata"
+            )
+        header["transfer_config"] = json.loads(metadata["transfer_config"])
+        if "track_names" in metadata:
+            header["track_names"] = json.loads(metadata["track_names"])
+        if "track_metadata" in metadata:
+            header["track_metadata"] = json.loads(metadata["track_metadata"])
+    else:
+        data = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(data, dict) or "transfer_config" not in data:
+            raise ValueError(
+                f"Delta weights file {path} is missing transfer_config key"
+            )
+        header["transfer_config"] = data["transfer_config"]
+        if "track_names" in data:
+            header["track_names"] = data["track_names"]
+        if "track_metadata" in data:
+            header["track_metadata"] = data["track_metadata"]
+
+    return header
 
 
 def load_delta_config(
@@ -1001,33 +1070,43 @@ def load_delta_config(
         >>> load_delta_weights(model, "colleague_lora.safetensors")
     """
     from alphagenome_pytorch.extensions.finetuning.transfer import transfer_config_from_dict
-    import json
 
-    path = Path(path)
+    header = _read_delta_export_header(path)
+    return transfer_config_from_dict(header["transfer_config"])
 
-    if path.suffix == ".safetensors":
+
+def is_delta_weights_export(path: Path | str) -> bool:
+    """Detect an ``export_delta_weights`` file (vs. delta checkpoint or full checkpoint).
+
+    Identified by the presence of an embedded ``transfer_config`` blob:
+    either a string entry in safetensors metadata, or a top-level key in a
+    ``.pth`` dict that also has a ``weights`` key but no
+    ``delta_checkpoint_version``. Returns False (rather than raising) on
+    unreadable or unrelated files so callers can fall through to other
+    format checks.
+    """
+    p = Path(path)
+    if p.suffix == ".safetensors":
         try:
             from safetensors import safe_open
         except ImportError:
-            raise ImportError(
-                "safetensors not installed. Install with: pip install safetensors"
-            )
-        with safe_open(path, framework="pt") as f:
-            metadata = f.metadata()
-            if not metadata or "transfer_config" not in metadata:
-                raise ValueError(
-                    f"Delta weights file {path} is missing transfer_config metadata"
-                )
-            config_dict = json.loads(metadata["transfer_config"])
-    else:
-        data = torch.load(path, map_location="cpu", weights_only=False)
-        if not isinstance(data, dict) or "transfer_config" not in data:
-            raise ValueError(
-                f"Delta weights file {path} is missing transfer_config key"
-            )
-        config_dict = data["transfer_config"]
+            return False
+        try:
+            with safe_open(p, framework="pt") as f:
+                metadata = f.metadata() or {}
+        except Exception:
+            return False
+        return "transfer_config" in metadata
 
-    return transfer_config_from_dict(config_dict)
+    try:
+        data = torch.load(p, map_location="cpu", weights_only=False)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    if "delta_checkpoint_version" in data:
+        return False
+    return "transfer_config" in data and "weights" in data
 
 
 def load_delta_weights(
@@ -1144,13 +1223,24 @@ def load_finetuned_model(
 
     Returns:
         Tuple of ``(model, metadata)``.  *metadata* contains keys:
-        ``modality``, ``resolutions``, ``track_names``, ``epoch``,
-        ``val_loss``, ``head_names``.
+        ``modality``, ``resolutions``, ``track_names``,
+        ``track_metadata`` (list of row-dicts, when the checkpoint
+        embedded a metadata catalog; otherwise ``None``),
+        ``epoch``, ``val_loss``, ``head_names``.
+
+    Supported formats: delta checkpoint (``.delta.pth`` from
+    ``--save-delta``), exported delta weights (``.safetensors`` or
+    ``.pth`` from ``export_delta_weights``), or full checkpoint
+    (``.pth`` from ``save_checkpoint``).
 
     Example:
         >>> # Delta checkpoint
         >>> model, meta = load_finetuned_model(
         ...     "best_model.delta.pth", "pretrained.pth", device="cuda",
+        ... )
+        >>> # Exported delta weights (sharing format)
+        >>> model, meta = load_finetuned_model(
+        ...     "shared.safetensors", "pretrained.pth", device="cuda",
         ... )
         >>> # Full checkpoint with external config
         >>> from alphagenome_pytorch.extensions.finetuning.transfer import (
@@ -1194,8 +1284,36 @@ def load_finetuned_model(
             "modality": metadata.get("modality"),
             "resolutions": metadata.get("resolutions"),
             "track_names": metadata.get("track_names"),
+            "track_metadata": metadata.get("track_metadata"),
             "epoch": metadata.get("epoch", -1),
             "val_loss": metadata.get("val_loss"),
+            "head_names": head_names,
+        }
+        model = model.to(device)
+        model.eval()
+        return model, meta
+
+    # --- Path A2: Exported delta weights (sharing format) ---
+    if is_delta_weights_export(ckpt_path):
+        header = _read_delta_export_header(ckpt_path)
+        config = transfer_config_from_dict(header["transfer_config"])
+        model = AlphaGenome(dtype_policy=dtype_policy)
+        model = load_trunk(model, str(pretrained_weights), exclude_heads=True)
+        model = remove_all_heads(model)
+        model = prepare_for_transfer(model, config)
+        # strict=False because exported deltas only carry adapter+head+norm
+        # weights; the trunk lives in the pretrained file.
+        load_delta_weights(model, ckpt_path, strict=False)
+        if merge:
+            model = merge_adapters(model)
+        head_names = list(config.new_heads.keys())
+        meta = {
+            "modality": None,
+            "resolutions": None,
+            "track_names": header.get("track_names"),
+            "track_metadata": header.get("track_metadata"),
+            "epoch": -1,
+            "val_loss": None,
             "head_names": head_names,
         }
         model = model.to(device)
@@ -1274,6 +1392,7 @@ def load_finetuned_model(
         "modality": ckpt.get("modality"),
         "resolutions": ckpt.get("resolutions"),
         "track_names": ckpt.get("track_names"),
+        "track_metadata": ckpt.get("track_metadata"),
         "epoch": ckpt.get("epoch", -1),
         "val_loss": ckpt.get("val_loss"),
         "head_names": head_names,
@@ -1301,6 +1420,7 @@ __all__ = [
     "export_delta_weights",
     "load_delta_config",
     "load_delta_weights",
+    "is_delta_weights_export",
     # Inference loading
     "load_finetuned_model",
     # Utilities

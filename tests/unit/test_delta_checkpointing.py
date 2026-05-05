@@ -20,12 +20,16 @@ from alphagenome_pytorch.extensions.finetuning.checkpointing import (
     get_norm_state_dict,
     get_trunk_state_dict,
     is_delta_checkpoint,
+    is_delta_weights_export,
     load_delta_checkpoint,
     load_delta_config,
     load_delta_weights,
     save_checkpoint,
     save_delta_checkpoint,
     DELTA_CHECKPOINT_VERSION,
+)
+from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+    _read_delta_export_header,
 )
 from alphagenome_pytorch.extensions.finetuning.transfer import (
     prepare_for_transfer,
