@@ -202,6 +202,54 @@ def _resolve_finetuned_metadata_catalog(
     return None
 
 
+def _resolve_checkpoint_arg(checkpoint: str) -> str:
+    """Map a ``--checkpoint`` value to a concrete weights path.
+
+    Accepts:
+    - a path to a `.delta.pth` checkpoint or `.safetensors` delta-weights export,
+    - a local bundle directory (one with ``alphagenome_adapter.json``),
+    - any URI parseable by :func:`parse_bundle_uri` (``local:``, ``file:``,
+      ``hf://``).
+
+    Bundle directories resolve to the bundle's adapter safetensors path. Any
+    other input — including missing files — is returned unchanged so the
+    downstream loader can surface its native error.
+    """
+    from pathlib import Path
+
+    from alphagenome_pytorch.extensions.serving.bundle import (
+        BundlePaths,
+        MANIFEST_FILENAME,
+    )
+    from alphagenome_pytorch.extensions.serving.uri import (
+        parse_bundle_uri,
+        resolve_bundle,
+    )
+
+    # Plain filesystem paths (no URI scheme): just check if it's a bundle dir.
+    if "://" not in checkpoint and not checkpoint.startswith(
+        ("local:", "file:", "hf:")
+    ):
+        p = Path(checkpoint)
+        if p.is_dir() and (p / MANIFEST_FILENAME).is_file():
+            return str(BundlePaths.resolve(p).adapter_safetensors)
+        return checkpoint
+
+    parsed = parse_bundle_uri(checkpoint)
+    if parsed.is_local:
+        local = Path(parsed.path)
+        if local.is_file():
+            return str(local)
+        if local.is_dir() and (local / MANIFEST_FILENAME).is_file():
+            paths = resolve_bundle(parsed)
+            return str(paths.adapter_safetensors)
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+
+    # Remote URI (hf://). Resolve to a local bundle and return its adapter file.
+    paths = resolve_bundle(parsed)
+    return str(paths.adapter_safetensors)
+
+
 def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
     """Construct a serving adapter from a fine-tuned checkpoint."""
     from alphagenome_pytorch.extensions.finetuning.checkpointing import (
@@ -216,8 +264,10 @@ def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
         with open(args.transfer_config) as f:
             transfer_config = transfer_config_from_dict(json.load(f))
 
+    checkpoint_path = _resolve_checkpoint_arg(args.checkpoint)
+
     model, meta = load_finetuned_model(
-        checkpoint_path=args.checkpoint,
+        checkpoint_path=checkpoint_path,
         pretrained_weights=args.weights,
         device=args.device,
         dtype_policy=DtypePolicy.default(),
@@ -239,9 +289,9 @@ def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
         metadata_catalog=metadata_catalog,
     )
     LOGGER.info(
-        'Loaded fine-tuned checkpoint %s; variant scoring routes enabled '
-        'for heads supported by the checkpoint.',
-        args.checkpoint,
+        'Loaded fine-tuned checkpoint %s (resolved to %s); variant scoring '
+        'routes enabled for heads supported by the checkpoint.',
+        args.checkpoint, checkpoint_path,
     )
     return LocalDnaModelAdapter(runtime, scorer=scorer)
 
@@ -285,6 +335,79 @@ def _build_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
     return _build_weights_adapter(args)
 
 
+def _build_catalog_router(args: argparse.Namespace):
+    """Construct a :class:`ServedModelRouter` from ``--adapter-catalog``."""
+    from alphagenome_pytorch.extensions.serving.bundle import (
+        BundlePaths,
+        Manifest,
+    )
+    from alphagenome_pytorch.extensions.serving.router import (
+        ServedModelRouter,
+        build_adapter_entry,
+        build_base_entry,
+        load_catalog,
+    )
+    from alphagenome_pytorch.extensions.serving.uri import resolve_bundle
+
+    catalog = load_catalog(args.adapter_catalog)
+
+    # Build base model + shared runtime exactly as in singleton-base mode, but
+    # without constructing a singleton scorer (each entry brings its own).
+    model = AlphaGenome(num_organisms=2)
+    state_dict = torch.load(args.weights, map_location=args.device, weights_only=True)
+    model.load_state_dict(state_dict, strict=False)
+    model.to(args.device)
+    model.eval()
+
+    base_metadata_catalog = _load_metadata_catalog(args, include_bundled=True)
+    runtime = AlphaGenomePredictionRuntime(
+        model=model,
+        fasta_path=args.fasta,
+        metadata_catalog=base_metadata_catalog,
+        device=args.device,
+    )
+
+    entries = []
+    if catalog.base.enabled:
+        base_scorer = _make_variant_scorer(
+            runtime=runtime, model=model, args=args,
+            metadata_catalog=base_metadata_catalog,
+        )
+        entries.append(build_base_entry(
+            base_model=model,
+            id=catalog.base.id,
+            label=catalog.base.label,
+            metadata_catalog=base_metadata_catalog,
+            scorer=base_scorer,
+        ))
+
+    for spec in catalog.adapters:
+        bundle_paths: BundlePaths = resolve_bundle(spec.source)
+        manifest = Manifest.load(bundle_paths.manifest)
+        if spec.label and not manifest.label:
+            manifest.label = spec.label
+        # Override the manifest id with the catalog's spec id so users can
+        # alias bundles in their catalog file without rebuilding them.
+        manifest.id = spec.id
+        # NB: build_adapter_entry mutates `model` and detaches before returning.
+        entries.append(build_adapter_entry(
+            base_model=model,
+            bundle_paths=bundle_paths,
+            manifest=manifest,
+            metadata_catalog=base_metadata_catalog,
+        ))
+
+    if not entries:
+        raise ValueError(
+            "Adapter catalog produced no entries. Add a 'base:' block or at "
+            "least one adapter to the catalog file."
+        )
+
+    return ServedModelRouter(
+        base_model=model, runtime=runtime, entries=entries,
+    )
+
+
 def run(args: argparse.Namespace) -> int:
     """Start the serving process based on parsed *args*."""
     logging.basicConfig(
@@ -292,16 +415,26 @@ def run(args: argparse.Namespace) -> int:
         format='%(asctime)s %(levelname)s %(name)s - %(message)s',
     )
 
-    adapter = _build_adapter(args)
+    catalog_path = getattr(args, "adapter_catalog", None)
+    if catalog_path and args.checkpoint:
+        raise SystemExit(
+            "agt serve: --adapter-catalog and --checkpoint are mutually exclusive."
+        )
+
+    if catalog_path:
+        target = _build_catalog_router(args)
+        LOGGER.info("Catalog mode: serving %d models", len(target.model_ids))
+    else:
+        target = _build_adapter(args)
 
     grpc_server = None
     if not args.disable_grpc:
-        grpc_server = serve_grpc(adapter, host=args.host, port=args.grpc_port, wait=False)
+        grpc_server = serve_grpc(target, host=args.host, port=args.grpc_port, wait=False)
         LOGGER.info('gRPC ready at %s:%d', args.host, args.grpc_port)
 
     rest_server = None
     if args.rest_port is not None:
-        rest_server = serve_rest(adapter, host=args.host, port=args.rest_port, wait=False)
+        rest_server = serve_rest(target, host=args.host, port=args.rest_port, wait=False)
         LOGGER.info('REST ready at http://%s:%d', args.host, args.rest_port)
 
     if grpc_server is None and rest_server is None:

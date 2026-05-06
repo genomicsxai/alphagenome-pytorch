@@ -14,3 +14,4 @@ It supports two transports:
 
    grpc
    rest
+   adapters
