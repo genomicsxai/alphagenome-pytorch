@@ -733,19 +733,21 @@ class VariantScoringModel:
 
         Creates a (sequence_length, 4) matrix where each position contains
         the contribution score for mutating the reference base to each
-        possible alternate base.
+        possible alternate base, mean-centered across alternatives. Mirrors
+        ``alphagenome.interpretation.ism.ism_matrix``.
 
         Args:
             variant_scores: List of scores for each variant (from ISM scoring).
             variants: List of Variant objects corresponding to scores.
             interval: Genomic interval that was scored.
-            multiply_by_sequence: If True, zero out the reference base positions
-                (since we only have alt scores). Default True.
+            multiply_by_sequence: If True, return non-zero values only at the
+                reference-base column (alt-base columns are zeroed). Default True,
+                matching ``alphagenome.interpretation.ism.ism_matrix``.
             vocabulary: Nucleotide vocabulary order. Default 'ACGT'.
 
         Returns:
             Tensor of shape (interval.width, 4) with mean-centered ISM scores.
-            
+
         Example:
             >>> ism_scores = scorer.score_ism_variants(interval, center, scorers)
             >>> # Flatten to get score per variant
@@ -753,35 +755,13 @@ class VariantScoringModel:
             >>> variants = [...]  # Same order as ism_scores
             >>> matrix = scorer.ism_matrix(flat_scores, variants, interval)
         """
-        import numpy as np
-
-        scores = np.zeros((interval.width, len(vocabulary)), dtype=np.float32)
-        filled = np.zeros((interval.width, len(vocabulary)), dtype=bool)
-        base_index = {base: i for i, base in enumerate(vocabulary)}
-
-        for variant, score in zip(variants, variant_scores):
-            if not variant.is_snv:
-                continue
-            position = variant.start - interval.start
-            if 0 <= position < interval.width:
-                alt_base = variant.alternate_bases.upper()
-                if alt_base in base_index:
-                    scores[position, base_index[alt_base]] = score
-                    filled[position, base_index[alt_base]] = True
-
-        # Mean-center across alternatives (excluding reference)
-        # For each position, subtract mean of filled values
-        for pos in range(interval.width):
-            n_filled = filled[pos].sum()
-            if n_filled > 0:
-                mean_score = scores[pos, filled[pos]].mean()
-                scores[pos] -= mean_score / (len(vocabulary) - 1)
-
-        if multiply_by_sequence:
-            # Zero out positions where we don't have data
-            scores = scores * (~filled).astype(np.float32)
-
-        return torch.from_numpy(scores)
+        return _ism_matrix(
+            variant_scores=variant_scores,
+            variants=variants,
+            interval=interval,
+            multiply_by_sequence=multiply_by_sequence,
+            vocabulary=vocabulary,
+        )
 
     def close(self):
         """Close any open file handles."""
@@ -793,6 +773,46 @@ class VariantScoringModel:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+
+def _ism_matrix(
+    variant_scores: list[float],
+    variants: list[Variant],
+    interval: Interval,
+    multiply_by_sequence: bool = True,
+    vocabulary: str = 'ACGT',
+) -> torch.Tensor:
+    """Construct mean-centered ISM contribution matrix.
+
+    Module-level helper underlying ``VariantScoringModel.ism_matrix``. Mirrors
+    ``alphagenome.interpretation.ism.ism_matrix``: per row, subtracts
+    ``sum(scores) / (V - 1)`` so the REF column (which starts at 0) holds
+    ``-mean(ALT scores)`` and each ALT column holds ``score - mean(ALT scores)``.
+    """
+    import numpy as np
+
+    scores = np.zeros((interval.width, len(vocabulary)), dtype=np.float32)
+    filled = np.zeros((interval.width, len(vocabulary)), dtype=bool)
+    base_index = {base: i for i, base in enumerate(vocabulary)}
+
+    for variant, score in zip(variants, variant_scores):
+        if not variant.is_snv:
+            continue
+        position = variant.start - interval.start
+        if 0 <= position < interval.width:
+            alt_base = variant.alternate_bases.upper()
+            if alt_base in base_index:
+                scores[position, base_index[alt_base]] = score
+                filled[position, base_index[alt_base]] = True
+
+    # Mean-center: subtract sum/(V-1) per position. Because the REF column is 0,
+    # this equals the mean of the (V-1) ALT scores.
+    scores -= scores.sum(axis=-1, keepdims=True) / (len(vocabulary) - 1)
+
+    if multiply_by_sequence:
+        scores = scores * (~filled).astype(np.float32)
+
+    return torch.from_numpy(scores)
 
 
 # Recommended scorer presets matching JAX reference
