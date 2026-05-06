@@ -674,6 +674,164 @@ class TestExportAndLoadDeltaWeights:
             with pytest.raises(ValueError, match="missing transfer_config"):
                 load_delta_config(path)
 
+    def test_export_embeds_track_names_and_metadata_pth(self):
+        """track_names + track_metadata round-trip through .pth exports."""
+        model, config = self._make_lora_model_and_config()
+        track_names = {"my_head": [f"bw_{i}" for i in range(10)]}
+        track_metadata = [
+            {
+                "track_index": i,
+                "output_name": "my_head",
+                "organism": 0,
+                "track_name": f"bw_{i}",
+                "biosample_name": "K562",
+                "assay_title": "ATAC-seq",
+            }
+            for i in range(10)
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "delta.pth"
+            export_delta_weights(
+                model, config, path, format="pth",
+                track_names=track_names, track_metadata=track_metadata,
+            )
+
+            header = _read_delta_export_header(path)
+            assert header["track_names"] == track_names
+            assert header["track_metadata"] == track_metadata
+            assert load_delta_config(path).mode == "lora"
+
+    def test_export_embeds_track_names_and_metadata_safetensors(self):
+        """track_names + track_metadata round-trip through .safetensors exports."""
+        pytest.importorskip("safetensors")
+        model, config = self._make_lora_model_and_config()
+        track_names = ["bw_a", "bw_b", "bw_c"]
+        track_metadata = [
+            {"output_name": "my_head", "track_name": "bw_a", "biosample_name": "K562"},
+            {"output_name": "my_head", "track_name": "bw_b", "biosample_name": "GM12878"},
+            {"output_name": "my_head", "track_name": "bw_c", "biosample_name": "HepG2"},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "delta.safetensors"
+            export_delta_weights(
+                model, config, path, format="safetensors",
+                track_names=track_names, track_metadata=track_metadata,
+            )
+
+            header = _read_delta_export_header(path)
+            assert header["track_names"] == track_names
+            assert header["track_metadata"] == track_metadata
+
+    def test_export_without_metadata_is_backwards_compatible(self):
+        """Old call sites without track_names/track_metadata still work."""
+        model, config = self._make_lora_model_and_config()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for fmt, ext in [("pth", ".pth"), ("safetensors", ".safetensors")]:
+                if fmt == "safetensors":
+                    pytest.importorskip("safetensors")
+                path = Path(tmpdir) / f"delta{ext}"
+                export_delta_weights(model, config, path, format=fmt)
+                header = _read_delta_export_header(path)
+                assert "track_names" not in header
+                assert "track_metadata" not in header
+                assert header["transfer_config"]["mode"] == "lora"
+
+
+class TestIsDeltaWeightsExport:
+    """is_delta_weights_export distinguishes export format from delta/full checkpoints."""
+
+    def _make_lora_model_and_config(self):
+        from alphagenome_pytorch.extensions.finetuning.adapters import LoRA
+        model = nn.Module()
+        model.q_proj = LoRA(nn.Linear(64, 64), rank=4)
+        model.heads = nn.ModuleDict({"my_head": nn.Linear(64, 10)})
+        config = TransferConfig(
+            mode="lora", lora_rank=4, lora_targets=["q_proj"],
+            new_heads={"my_head": {"modality": "atac", "num_tracks": 10}},
+        )
+        return model, config
+
+    def test_detects_pth_export(self):
+        model, config = self._make_lora_model_and_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "delta.pth"
+            export_delta_weights(model, config, path, format="pth")
+            assert is_delta_weights_export(path) is True
+
+    def test_detects_safetensors_export(self):
+        pytest.importorskip("safetensors")
+        model, config = self._make_lora_model_and_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "delta.safetensors"
+            export_delta_weights(model, config, path, format="safetensors")
+            assert is_delta_weights_export(path) is True
+
+    def test_rejects_delta_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "delta_ckpt.pth"
+            torch.save({
+                "delta_checkpoint_version": 1,
+                "transfer_config": {},
+                "adapter_state_dict": {},
+                "head_state_dict": {},
+            }, path)
+            assert is_delta_weights_export(path) is False
+
+    def test_rejects_full_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "full.pth"
+            torch.save({"model_state_dict": {}, "epoch": 1}, path)
+            assert is_delta_weights_export(path) is False
+
+    def test_rejects_random_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "noise.pth"
+            torch.save({"random_key": [1, 2, 3]}, path)
+            assert is_delta_weights_export(path) is False
+
+
+class TestSaveDeltaCheckpointEmbedsTrackMetadata:
+    """save_delta_checkpoint should round-trip track_metadata via load_delta_checkpoint."""
+
+    def test_track_metadata_round_trips(self):
+        from alphagenome_pytorch.extensions.finetuning.adapters import LoRA
+        model = nn.Module()
+        model.q_proj = LoRA(nn.Linear(64, 64), rank=4)
+        model.heads = nn.ModuleDict({"my_head": nn.Linear(64, 10)})
+        config = TransferConfig(
+            mode="lora", lora_rank=4, lora_targets=["q_proj"],
+            new_heads={"my_head": {"modality": "atac", "num_tracks": 10}},
+        )
+
+        track_metadata = [
+            {"output_name": "my_head", "track_name": f"bw_{i}", "biosample_name": "K562"}
+            for i in range(10)
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "delta.pth"
+            save_delta_checkpoint(
+                path=path,
+                model=model,
+                config=config,
+                track_names={"my_head": [f"bw_{i}" for i in range(10)]},
+                track_metadata=track_metadata,
+                modality="atac",
+                resolutions=(128,),
+                epoch=3,
+                val_loss=0.1,
+            )
+
+            target = nn.Module()
+            target.q_proj = LoRA(nn.Linear(64, 64), rank=4)
+            target.heads = nn.ModuleDict({"my_head": nn.Linear(64, 10)})
+            _, loaded_meta = load_delta_checkpoint(
+                path, target, verify_hash=False, strict=False,
+            )
+            assert loaded_meta.get("track_metadata") == track_metadata
+
 
 class TestNormLayerDeltaCheckpoint:
     """Test that unfrozen norm layers are saved/loaded in delta checkpoints (bug fix #3)."""

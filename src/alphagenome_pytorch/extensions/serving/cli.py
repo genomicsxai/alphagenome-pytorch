@@ -166,6 +166,42 @@ def _make_variant_scorer(
     return VariantScorer(runtime, scoring_model)
 
 
+def _resolve_finetuned_metadata_catalog(
+    args: argparse.Namespace,
+    meta: dict,
+) -> TrackMetadataCatalog | None:
+    """Pick the right metadata source for a fine-tuned checkpoint.
+
+    Order of precedence:
+
+    1. ``--track-metadata`` from the CLI (explicit user override). When the
+       checkpoint also embeds metadata, log a warning so the user knows the
+       embedded catalog is being ignored.
+    2. ``track_metadata`` rows embedded in the fine-tuned checkpoint
+       (``finetune.py --track-metadata`` or ``export_delta_weights(...,
+       track_metadata=...)``).
+    3. ``None`` — the runtime falls back to bare ``track_names`` and serves
+       sparse ``TrackMetadata`` entries.
+    """
+    embedded_rows = meta.get('track_metadata')
+
+    if args.track_metadata:
+        if embedded_rows:
+            LOGGER.warning(
+                'Both --track-metadata and an embedded metadata catalog were '
+                'provided; using --track-metadata=%s. Drop the flag to use '
+                'the embedded catalog.',
+                args.track_metadata,
+            )
+        return TrackMetadataCatalog.from_file(args.track_metadata)
+
+    if embedded_rows:
+        LOGGER.info('Using track metadata embedded in the fine-tuned checkpoint.')
+        return TrackMetadataCatalog.from_rows(embedded_rows)
+
+    return None
+
+
 def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
     """Construct a serving adapter from a fine-tuned checkpoint."""
     from alphagenome_pytorch.extensions.finetuning.checkpointing import (
@@ -188,7 +224,7 @@ def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
         transfer_config=transfer_config,
         merge=not args.no_merge_adapters,
     )
-    metadata_catalog = _load_metadata_catalog(args, include_bundled=False)
+    metadata_catalog = _resolve_finetuned_metadata_catalog(args, meta)
     runtime = AlphaGenomePredictionRuntime(
         model=model,
         fasta_path=args.fasta,
