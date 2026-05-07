@@ -55,10 +55,14 @@ class TestAlphaGenomeLoss:
     def test_initialization(self):
         """Test loss module initializes correctly."""
         loss_fn = AlphaGenomeLoss()
-        
-        assert len(loss_fn.heads) == 8
+
+        # 8 count/contact heads + 3 splice heads = 11
+        assert len(loss_fn.heads) == 11
         assert 'atac' in loss_fn.heads
         assert 'contact_maps' in loss_fn.heads
+        assert 'splice_sites' in loss_fn.heads
+        assert 'splice_site_usage' in loss_fn.heads
+        assert 'splice_junctions' in loss_fn.heads
     
     def test_custom_heads(self):
         """Test loss with subset of heads."""

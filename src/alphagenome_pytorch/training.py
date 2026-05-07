@@ -42,7 +42,10 @@ class AlphaGenomeTrainingConfig:
     positional_weight: float = 5.0  # JAX production value (AG_MODEL.md line 321)
 
 
-# Default head weights (equal for all heads)
+# Default per-head loss weights matching upstream JAX `HeadConfig.loss_weight`
+# (google-deepmind/alphagenome_research, commit 7046b72). All heads weight 1.0
+# except splice junctions, which upstream weights at 0.2 to balance the very
+# different magnitude of the junction loss against the count-based heads.
 DEFAULT_HEAD_WEIGHTS = {
     'atac': 1.0,
     'dnase': 1.0,
@@ -52,6 +55,9 @@ DEFAULT_HEAD_WEIGHTS = {
     'chip_tf': 1.0,
     'chip_histone': 1.0,
     'contact_maps': 1.0,
+    'splice_sites': 1.0,
+    'splice_site_usage': 1.0,
+    'splice_junctions': 0.2,
 }
 
 
@@ -66,11 +72,19 @@ class AlphaGenomeLoss(nn.Module):
     2. Call model with `return_scaled_predictions=True` during training
     3. Pass `organism_index` to the forward method
 
+    Aggregation: the total loss is `sum(head_weight * head_loss) / num_heads`,
+    where the divisor is the *count* of heads that produced a loss this step
+    (not the sum of weights). A weight of 0.2 therefore down-weights that
+    head's contribution by exactly 0.2× relative to a weight-1.0 head with
+    the same residual, matching upstream JAX `HeadConfig.loss_weight` semantics.
+
     Args:
         model: AlphaGenome model instance. Required to access head modules for target scaling.
             Without this, targets will not be scaled to model space, resulting in incorrect gradients.
         heads: List of head names to compute loss for. If None, uses all heads.
-        head_weights: Dict mapping head names to loss weights. If None, equal weights.
+        head_weights: Dict mapping head names to loss weights. If None, uses
+            `DEFAULT_HEAD_WEIGHTS`, which mirrors upstream JAX defaults
+            (1.0 for count and splice-site heads, 0.2 for splice junctions).
         multinomial_resolution: Resolution for multinomial loss computation. This is the
             segment size used to divide the sequence for multinomial loss. For JAX parity,
             use `seq_len` (full sequence as 1 segment) or `seq_len // 8` for 8 segments
