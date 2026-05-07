@@ -28,46 +28,56 @@ def align_alternate(
     For deletions: insert zeros at deletion locations.
 
     Args:
-        alt: ALT allele predictions of shape (S, T) where S=sequence, T=tracks.
+        alt: ALT allele tensor. Either ``(S, T)`` or ``(B, S, T)`` — the
+            sequence axis is the second-to-last dim. Used for predictions,
+            splice-site probs, and 1bp embeddings (channels_last NLC).
         variant_start: 0-based start position of the variant in genomic coords.
         ref_length: Length of reference allele.
         alt_length: Length of alternate allele.
         interval_start: 0-based start of the sequence interval.
 
     Returns:
-        Aligned ALT predictions of shape (S, T), matching REF coordinate space.
+        Aligned ALT tensor with the same shape as input, in REF coordinate
+        space. Identity when ``ref_length == alt_length`` (e.g. SNVs).
     """
+    squeeze_back = False
+    if alt.dim() == 2:
+        alt = alt.unsqueeze(0)  # (1, S, T)
+        squeeze_back = True
+    elif alt.dim() != 3:
+        raise ValueError(
+            f"align_alternate expects (S, T) or (B, S, T), got shape {tuple(alt.shape)}"
+        )
+
     insertion_length = alt_length - ref_length
     deletion_length = -insertion_length
     variant_start_in_vector = variant_start - interval_start
     # Assume left-aligned variants; adjustments occur at end of variant
     variant_start_in_vector += min(ref_length, alt_length) - 1
-    original_length = alt.shape[0]
+
+    B, S, C = alt.shape
+    original_length = S
 
     if insertion_length > 0:
         # Summarize insertion by computing max score across alternate bases
-        pool_range = slice(
-            variant_start_in_vector,
-            variant_start_in_vector + insertion_length + 1
-        )
-        pool_alt = alt[pool_range].max(dim=0, keepdim=True)[0]
-        alt = torch.cat([
-            alt[:variant_start_in_vector],
-            pool_alt,
-            alt[variant_start_in_vector + insertion_length + 1:],
-            torch.zeros(insertion_length, alt.shape[1], device=alt.device, dtype=alt.dtype),
-        ], dim=0)
-        # Truncate to original length
-        alt = alt[:original_length]
+        pool_alt = alt[
+            :, variant_start_in_vector:variant_start_in_vector + insertion_length + 1, :
+        ].max(dim=1, keepdim=True)[0]  # (B, 1, C)
+        before = alt[:, :variant_start_in_vector, :]
+        after = alt[:, variant_start_in_vector + insertion_length + 1:, :]
+        pad = torch.zeros(B, insertion_length, C, device=alt.device, dtype=alt.dtype)
+        alt = torch.cat([before, pool_alt, after, pad], dim=1)
+        alt = alt[:, :original_length, :]
     elif deletion_length > 0:
         # Insert zero signal at deletion locations
-        alt = torch.cat([
-            alt[:variant_start_in_vector + 1],
-            torch.zeros(deletion_length, alt.shape[1], device=alt.device, dtype=alt.dtype),
-            alt[variant_start_in_vector + 1:],
-        ], dim=0)
-        alt = alt[:original_length]
+        before = alt[:, :variant_start_in_vector + 1, :]
+        pad = torch.zeros(B, deletion_length, C, device=alt.device, dtype=alt.dtype)
+        after = alt[:, variant_start_in_vector + 1:, :]
+        alt = torch.cat([before, pad, after], dim=1)
+        alt = alt[:, :original_length, :]
 
+    if squeeze_back:
+        alt = alt.squeeze(0)
     return alt
 
 

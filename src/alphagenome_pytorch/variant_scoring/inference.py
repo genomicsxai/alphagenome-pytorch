@@ -356,6 +356,7 @@ class VariantScoringModel:
         organism: str | int | None = None,
         to_cpu: bool = False,
         unified_splicing: bool = False,
+        heads: tuple[str, ...] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Get reference and alternate predictions for a variant.
 
@@ -367,6 +368,8 @@ class VariantScoringModel:
                 Recommended for visualization or when processing many variants.
             unified_splicing: If True, performs a second pass to align splice
                 sites between Ref and Alt predictions. Required for SpliceJunctionScorer.
+            heads: Optional tuple of head names to compute. If None, all heads
+                run. Forwarded to the model forward pass to skip unused heads.
 
         Returns:
             Tuple of (ref_outputs, alt_outputs) dictionaries.
@@ -397,13 +400,32 @@ class VariantScoringModel:
 
         # First pass: Get standard predictions with embeddings if needed
         return_embeddings = unified_splicing
-        ref_outputs = self.predict(ref_seq, organism, return_embeddings=return_embeddings)
-        alt_outputs = self.predict(alt_seq, organism, return_embeddings=return_embeddings)
+        predict_kwargs: dict[str, Any] = {'return_embeddings': return_embeddings}
+        if heads is not None:
+            predict_kwargs['heads'] = heads
+        ref_outputs = self.predict(ref_seq, organism, **predict_kwargs)
+        alt_outputs = self.predict(alt_seq, organism, **predict_kwargs)
 
         if unified_splicing:
             # Calculate unified splice site positions (max of Ref and Alt)
             from ..utils.splicing import generate_splice_site_positions
-            
+            from .aggregations import align_alternate
+
+            # Align ALT embeddings + splice-site probs into REF coordinate
+            # space before generating unified positions and re-running the
+            # junction head. Identity for SNVs (ref_len == alt_len).
+            if variant.is_indel:
+                ref_len = len(variant.reference_bases)
+                alt_len = len(variant.alternate_bases)
+                alt_outputs['embeddings_1bp'] = align_alternate(
+                    alt_outputs['embeddings_1bp'],
+                    variant.start, ref_len, alt_len, interval.start,
+                )
+                alt_outputs['splice_sites']['probs'] = align_alternate(
+                    alt_outputs['splice_sites']['probs'],
+                    variant.start, ref_len, alt_len, interval.start,
+                )
+
             ref_probs = ref_outputs['splice_sites']['probs']
             alt_probs = alt_outputs['splice_sites']['probs']
             
@@ -505,9 +527,19 @@ class VariantScoringModel:
         # Alternative: isinstance(s, SpliceJunctionScorer) if imported
         # Let's check typical string representation
 
+        # Build the union of heads required by the active scorers so the model
+        # forward pass can skip unused heads. Empty union means no scorers
+        # declared requirements; in that case fall back to running all heads.
+        required_heads: set[str] = set()
+        for s in scorers:
+            required_heads.update(s.required_heads)
+        heads_arg = tuple(sorted(required_heads)) if required_heads else None
+
         # Get predictions
         ref_outputs, alt_outputs = self.predict_variant(
-            interval, variant, organism, unified_splicing=unified_splicing
+            interval, variant, organism,
+            unified_splicing=unified_splicing,
+            heads=heads_arg,
         )
 
         # Use instance gene annotation if not provided
