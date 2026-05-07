@@ -25,6 +25,7 @@ from alphagenome.protos import dna_model_pb2
 from alphagenome_pytorch.prediction import AlphaGenomePredictionRuntime
 from alphagenome_pytorch.variant_scoring.inference import (
     VariantScoringModel,
+    _build_ism_variants,
     get_recommended_scorers,
 )
 from alphagenome_pytorch.variant_scoring.scorers import (
@@ -199,25 +200,13 @@ class VariantScorer:
 
         sequence = self.runtime.get_sequence(interval, variant=interval_variant)
 
-        variants: list[genome.Variant] = []
-        for genomic_pos_0b in range(ism_interval.start, ism_interval.end):
-            rel = genomic_pos_0b - interval.start
-            if rel < 0 or rel >= len(sequence):
-                continue
-            ref_base = sequence[rel].upper()
-            if ref_base not in ISM_NUCLEOTIDES:
-                continue
-            for alt_base in ISM_NUCLEOTIDES:
-                if alt_base == ref_base:
-                    continue
-                variants.append(
-                    genome.Variant(
-                        chromosome=interval.chromosome,
-                        position=genomic_pos_0b + 1,
-                        reference_bases=ref_base,
-                        alternate_bases=alt_base,
-                    )
-                )
+        variants = _build_ism_variants(
+            sequence=sequence,
+            interval=interval,
+            ism_interval=ism_interval,
+            nucleotides=ISM_NUCLEOTIDES,
+            variant_cls=genome.Variant,
+        )
 
         if not variants:
             return []
