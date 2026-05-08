@@ -393,7 +393,10 @@ def _serialize_attribution(result: 'AttributionResult') -> dict[str, Any]:
 
 
 class _ServingHandler(BaseHTTPRequestHandler):
-    adapter: LocalDnaModelAdapter
+    # Either ``adapter`` (singleton mode) or ``router`` (catalog mode) is set
+    # on the subclass produced by ``_make_handler``.
+    adapter: LocalDnaModelAdapter | None = None
+    router: Any | None = None
 
     def _read_json(self) -> dict[str, Any]:
         content_length = int(self.headers.get('Content-Length', '0'))
@@ -410,24 +413,94 @@ class _ServingHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _resolve_adapter(
+        self,
+        body: dict[str, Any] | None = None,
+        scoped_model_id: str | None = None,
+    ) -> LocalDnaModelAdapter:
+        """Return the per-request adapter, raising on ambiguity / unknown id."""
+        if self.router is None:
+            return self.adapter  # singleton mode
+        from alphagenome_pytorch.extensions.serving.router import (
+            AmbiguousModelError,
+            ModelNotFoundError,
+        )
+        body_id = (body or {}).get('model_id')
+        if scoped_model_id and body_id and scoped_model_id != body_id:
+            raise ValueError(
+                f"model_id mismatch: URL={scoped_model_id!r} body={body_id!r}"
+            )
+        requested = scoped_model_id or body_id
+        try:
+            resolved = self.router.resolve_model_id(requested)
+        except AmbiguousModelError:
+            raise
+        except ModelNotFoundError:
+            raise
+        return self.router.select(resolved)
+
+    def _scoped_model_id(self, path: str) -> tuple[str | None, str]:
+        """Parse the request path into ``(model_id, route_suffix)``.
+
+        - ``/v1/predict_sequence`` → ``(None, '/predict_sequence')``
+        - ``/v1/models/foo/predict_sequence`` → ``('foo', '/predict_sequence')``
+        - ``/v1/models/foo`` → ``('foo', '')``
+        - any path not starting with ``/v1`` → ``(None, path)``
+        """
+        scoped_prefix = '/v1/models/'
+        v1_prefix = '/v1'
+        if path.startswith(scoped_prefix):
+            tail = path[len(scoped_prefix):]
+            if '/' not in tail:
+                return tail, ''
+            mid, _, rest = tail.partition('/')
+            return mid, '/' + rest
+        if path.startswith(v1_prefix):
+            return None, path[len(v1_prefix):]
+        return None, path
+
     def do_GET(self) -> None:  # noqa: N802
         try:
-            if self.path.startswith('/v1/output_metadata'):
+            path = self.path.split('?', 1)[0]
+
+            if path == '/v1/models':
+                if self.router is None:
+                    # Singleton mode: surface the implicit single model.
+                    self._write_json({'models': [{
+                        'id': 'default', 'kind': 'singleton', 'label': None,
+                    }]})
+                else:
+                    self._write_json({'models': self.router.list_models()})
+                return
+
+            scoped_id, rest = self._scoped_model_id(path)
+            if scoped_id is not None and rest == '/metadata':
                 organism = self._parse_query_value('organism')
-                metadata = self.adapter.output_metadata(organism=organism)
+                adapter = self._resolve_adapter(scoped_model_id=scoped_id)
+                metadata = adapter.output_metadata(organism=organism)
+                self._write_json({'metadata': _serialize_output_metadata(metadata)})
+                return
+
+            if path.startswith('/v1/output_metadata'):
+                organism = self._parse_query_value('organism')
+                adapter = self._resolve_adapter()
+                metadata = adapter.output_metadata(organism=organism)
                 self._write_json({'metadata': _serialize_output_metadata(metadata)})
                 return
             self._write_json({'error': 'Not found'}, status=HTTPStatus.NOT_FOUND)
-        except Exception as exc:  # pragma: no cover - exercised in integration.
-            self._write_json({'error': str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        except Exception as exc:
+            self._write_router_error(exc)
 
     def do_POST(self) -> None:  # noqa: N802
         try:
             body = self._read_json()
             path = self.path.split('?', 1)[0]
 
-            if path == '/v1/predict_sequence':
-                output = self.adapter.predict_sequence(
+            scoped_id, route = self._scoped_model_id(path)
+            adapter = self._resolve_adapter(body=body, scoped_model_id=scoped_id)
+
+            if route == '/predict_sequence':
+                output = adapter.predict_sequence(
                     sequence=body['sequence'],
                     organism=body.get('organism', 'HOMO_SAPIENS'),
                     requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
@@ -436,8 +509,8 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 self._write_json({'output': _serialize_output(output)})
                 return
 
-            if path == '/v1/predict_interval':
-                output = self.adapter.predict_interval(
+            if route == '/predict_interval':
+                output = adapter.predict_interval(
                     interval=_interval_from_payload(body['interval']),
                     organism=body.get('organism', 'HOMO_SAPIENS'),
                     requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
@@ -446,8 +519,8 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 self._write_json({'output': _serialize_output(output)})
                 return
 
-            if path == '/v1/predict_variant':
-                output = self.adapter.predict_variant(
+            if route == '/predict_variant':
+                output = adapter.predict_variant(
                     interval=_interval_from_payload(body['interval']),
                     variant=_variant_from_payload(body['variant']),
                     organism=body.get('organism', 'HOMO_SAPIENS'),
@@ -457,8 +530,8 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 self._write_json({'output': _serialize_variant_output(output)})
                 return
 
-            if path == '/v1/score_variant':
-                scores = self.adapter.score_variant(
+            if route == '/score_variant':
+                scores = adapter.score_variant(
                     interval=_interval_from_payload(body['interval']),
                     variant=_variant_from_payload(body['variant']),
                     variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
@@ -467,7 +540,7 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 self._write_json({'scores': [_serialize_anndata(s) for s in scores]})
                 return
 
-            if path == '/v1/score_variants':
+            if route == '/score_variants':
                 intervals_payload = body['intervals']
                 variants_payload = body['variants']
                 if isinstance(intervals_payload, dict):
@@ -475,7 +548,7 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 else:
                     intervals = [_interval_from_payload(i) for i in intervals_payload]
                 variants = [_variant_from_payload(v) for v in variants_payload]
-                scores = self.adapter.score_variants(
+                scores = adapter.score_variants(
                     intervals=intervals,
                     variants=variants,
                     variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
@@ -488,9 +561,9 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            if path == '/v1/score_ism_variants':
+            if route == '/score_ism_variants':
                 interval_variant_payload = body.get('interval_variant')
-                scores = self.adapter.score_ism_variants(
+                scores = adapter.score_ism_variants(
                     interval=_interval_from_payload(body['interval']),
                     ism_interval=_interval_from_payload(body['ism_interval']),
                     variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
@@ -506,9 +579,9 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            if path == '/v1/explain_interval':
+            if route == '/explain_interval':
                 try:
-                    result = self.adapter.explain_interval(
+                    result = adapter.explain_interval(
                         interval=_interval_from_payload(body['interval']),
                         target_interval=_interval_from_payload(body['target_interval']),
                         organism=body.get('organism', 'HOMO_SAPIENS'),
@@ -530,8 +603,22 @@ class _ServingHandler(BaseHTTPRequestHandler):
             self._write_json({'error': 'Not found'}, status=HTTPStatus.NOT_FOUND)
         except NotImplementedError as exc:
             self._write_json({'error': str(exc)}, status=HTTPStatus.NOT_IMPLEMENTED)
-        except Exception as exc:  # pragma: no cover - exercised in integration.
+        except Exception as exc:
+            self._write_router_error(exc)
+
+    def _write_router_error(self, exc: Exception) -> None:
+        from alphagenome_pytorch.extensions.serving.router import (
+            AmbiguousModelError,
+            ModelNotFoundError,
+        )
+        if isinstance(exc, AmbiguousModelError):
             self._write_json({'error': str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if isinstance(exc, ModelNotFoundError):
+            self._write_json({'error': f'Unknown model_id: {exc.args[0]!r}'},
+                             status=HTTPStatus.NOT_FOUND)
+            return
+        self._write_json({'error': str(exc)}, status=HTTPStatus.BAD_REQUEST)
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
         LOGGER.info('REST %s - %s', self.address_string(), format % args)
@@ -547,23 +634,32 @@ class _ServingHandler(BaseHTTPRequestHandler):
         return None
 
 
-def _make_handler(adapter: LocalDnaModelAdapter):
+def _make_handler(target: Any):
+    """Build a handler subclass bound to either a singleton adapter or a router."""
+    from alphagenome_pytorch.extensions.serving.router import ServedModelRouter
+
     class Handler(_ServingHandler):
         pass
 
-    Handler.adapter = adapter
+    if isinstance(target, ServedModelRouter):
+        Handler.router = target
+        Handler.adapter = None
+    else:
+        Handler.router = None
+        Handler.adapter = target
     return Handler
 
 
 def serve_rest(
-    adapter: LocalDnaModelAdapter,
+    target: Any,
     *,
     host: str = '127.0.0.1',
     port: int = 8080,
     wait: bool = True,
 ) -> ThreadingHTTPServer:
-    """Start a local REST server with JSON endpoints."""
-    server = ThreadingHTTPServer((host, port), _make_handler(adapter))
+    """Start a local REST server. ``target`` may be a :class:`LocalDnaModelAdapter`
+    (singleton) or a :class:`ServedModelRouter` (catalog mode)."""
+    server = ThreadingHTTPServer((host, port), _make_handler(target))
     bound_host, bound_port = server.server_address
     LOGGER.info('Local REST serving started at http://%s:%d', bound_host, bound_port)
 
