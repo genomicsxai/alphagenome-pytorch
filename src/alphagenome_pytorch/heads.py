@@ -1,9 +1,11 @@
 from typing import Literal
+import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+
 from alphagenome_pytorch.attention import apply_rope
 
 _SOFT_CLIP_VALUE = 10.0
@@ -15,6 +17,15 @@ CONTACT_MAPS_OUTPUT_TRACKS = 28
 NUM_SPLICE_TISSUES = 367
 SPLICE_USAGE_OUTPUT_TRACKS = NUM_SPLICE_TISSUES * 2
 
+def _parse_head_conv_chunk_size():
+    value = os.getenv("ALPHAGENOME_HEAD_CONV_CHUNK_SIZE")
+    if value is None or value == "":
+        return 524288
+    parsed = int(value)
+    return max(parsed, 0)
+
+
+_HEAD_CONV_CHUNK_SIZE = _parse_head_conv_chunk_size()
 
 def predictions_scaling(
     x: torch.Tensor,
@@ -39,24 +50,38 @@ def predictions_scaling(
     Returns:
         Scaled predictions in experimental data space (same format as input)
     """
-    # Soft clip: where x > soft_clip_value, apply quadratic expansion
-    x = torch.where(
-        x > soft_clip_value,
-        (x + soft_clip_value) ** 2 / (4 * soft_clip_value),
-        x,
-    )
+    if torch.is_grad_enabled():
+        # Training path: keep autograd-compatible out-of-place ops.
+        x = torch.where(
+            x > soft_clip_value,
+            (x + soft_clip_value) ** 2 / (4 * soft_clip_value),
+            x,
+        )
+        if apply_squashing:
+            x = torch.pow(x, 1.0 / 0.75)
+        if channels_last:
+            x = x * (track_means[:, None, :] * resolution)
+        else:
+            x = x * (track_means[:, :, None] * resolution)
+        return x
 
-    # Apply squashing inverse (power law expansion) for RNA-seq type heads
+    mask = x > soft_clip_value
+    if mask.any():
+        clipped = x[mask] + soft_clip_value   # 1-D, len = nnz(mask)
+        clipped.pow_(2).div_(4 * soft_clip_value)
+        x[mask] = clipped
+
+    # Power-law expansion for RNA-seq (in-place).
     if apply_squashing:
-        x = torch.pow(x, 1.0 / 0.75)
+        x.pow_(1.0 / 0.75)
 
-    # Scale by track means and resolution
+    # Scale by track means × resolution.
+    # track_means[:, None/None, :] is (B,1,C) or (B,C,1) — tiny.
+    # mul_ writes back into x with no extra allocation.
     if channels_last:
-        # NLC: track_means (B, C) → (B, 1, C)
-        x = x * (track_means[:, None, :] * resolution)
+        x.mul_(track_means[:, None, :] * resolution)
     else:
-        # NCL: track_means (B, C) → (B, C, 1)
-        x = x * (track_means[:, :, None] * resolution)
+        x.mul_(track_means[:, :, None] * resolution)
 
     return x
 
@@ -155,7 +180,10 @@ class MultiOrganismLinear(nn.Module):
 
         input_dtype = x.dtype
         out = torch.bmm(x.float(), w.float()).to(input_dtype)
-        return out + b.unsqueeze(1)
+        if torch.is_grad_enabled():
+            return out + b.unsqueeze(1)
+        out.add_(b.unsqueeze(1))
+        return out
 
 
 class MultiOrganismConv1d(nn.Module):
@@ -195,8 +223,28 @@ class MultiOrganismConv1d(nn.Module):
 
         # Batched 1x1 conv via einsum: (B, C_in, S) @ (B, C_out, C_in).T -> (B, C_out, S)
         input_dtype = x.dtype
+        if (not torch.is_grad_enabled()) and _HEAD_CONV_CHUNK_SIZE > 0 and x.shape[-1] > _HEAD_CONV_CHUNK_SIZE:
+            B, _, S = x.shape
+            out = torch.empty(
+                B, self.out_channels, S, device=x.device, dtype=input_dtype
+            )
+            w_float = w.float()
+            for start in range(0, S, _HEAD_CONV_CHUNK_SIZE):
+                end = min(start + _HEAD_CONV_CHUNK_SIZE, S)
+                out_chunk = torch.einsum(
+                    'bcs,boc->bos',
+                    x[:, :, start:end].float(),
+                    w_float,
+                ).to(input_dtype)
+                out_chunk.add_(b.unsqueeze(2))
+                out[:, :, start:end] = out_chunk
+            return out
+
         out = torch.einsum('bcs,boc->bos', x.float(), w.float()).to(input_dtype)
-        return out + b.unsqueeze(2)  # bias: (B, C_out, 1)
+        if torch.is_grad_enabled():
+            return out + b.unsqueeze(2)  # bias: (B, C_out, 1)
+        out.add_(b.unsqueeze(2))
+        return out
 
 class GenomeTracksHead(nn.Module):
     """Predicts genome tracks at multiple resolutions.
@@ -285,8 +333,28 @@ class GenomeTracksHead(nn.Module):
         # Residual Scale: (B, T) → (B, T, 1) for NCL broadcast
         scale = self.residual_scales[res_str][organism_index]
 
-        # Softplus: softplus(x) * softplus(scale)
-        x = F.softplus(x) * F.softplus(scale.unsqueeze(2))
+        if torch.is_grad_enabled():
+            # Training path: standard ops, autograd needs full tensors in memory.
+            # Softplus: softplus(x) * softplus(scale)
+            x = F.softplus(x) * F.softplus(scale.unsqueeze(2))
+        else:
+            # 1. Compute scale factor once — tiny (B, T, 1), negligible memory.
+            scale_factor = F.softplus(scale.unsqueeze(2))
+
+            # 2. Apply softplus to x in chunks along S, writing results back into
+            #    the same buffer.  Peak extra allocation = one chunk slice, not a
+            #    full duplicate of x.
+            chunk_size = int(os.getenv("ALPHAGENOME_SOFTPLUS_CHUNK_SIZE", "262144"))
+            S = x.shape[2]
+            if chunk_size <= 0 or chunk_size >= S:
+                x = F.softplus(x)
+            else:
+                for start in range(0, S, chunk_size):
+                    end = min(start + chunk_size, S)
+                    x[:, :, start:end] = F.softplus(x[:, :, start:end])
+
+            # 3. Multiply by scale in-place — no extra allocation.
+            x.mul_(scale_factor)
 
         return x
 
@@ -353,9 +421,9 @@ class GenomeTracksHead(nn.Module):
                 scaled_pred = scaled_pred.transpose(1, 2)  # (B, S, T)
 
             if return_scaled:
-                outputs[res] = scaled_pred
+                outputs[res] = scaled_pred.cpu()
             else:
-                outputs[res] = self.unscale(scaled_pred, organism_index, res, channels_last)
+                outputs[res] = self.unscale(scaled_pred, organism_index, res, channels_last).cpu()
 
         return outputs
 
@@ -393,7 +461,7 @@ class ContactMapsHead(nn.Module):
         if not channels_last:
             x = x.permute(0, 3, 1, 2).contiguous()  # (B, T, S, S)
 
-        return x
+        return x.cpu()
 
 class SpliceSitesClassificationHead(nn.Module):
     """Predicts splice site classification.
@@ -429,8 +497,8 @@ class SpliceSitesClassificationHead(nn.Module):
             probs = F.softmax(logits, dim=1)
 
         return {
-            "logits": logits,
-            "probs": probs,
+            "logits": logits.cpu(),
+            "probs": probs.cpu(),
         }
 
 class SpliceSitesUsageHead(nn.Module):
@@ -492,16 +560,26 @@ class SpliceSitesUsageHead(nn.Module):
             # Transpose to NLC: (B, T, S) -> (B, S, T)
             logits = logits_ncl.transpose(1, 2)
             mask = self.track_mask[organism_index][:, None, :]
+            chunk_dim = 1  # chunk over S
         else:
             logits = logits_ncl
             mask = self.track_mask[organism_index][:, :, None]
+            chunk_dim = 2  # chunk over S
 
-        predictions = torch.sigmoid(logits)
+        if torch.is_grad_enabled() or _HEAD_CONV_CHUNK_SIZE <= 0 or logits.size(chunk_dim) <= _HEAD_CONV_CHUNK_SIZE:
+            predictions = torch.sigmoid(logits)
+        else:
+            chunks = []
+            for start in range(0, logits.size(chunk_dim), _HEAD_CONV_CHUNK_SIZE):
+                end = start + _HEAD_CONV_CHUNK_SIZE
+                chunk = logits.narrow(chunk_dim, start, min(_HEAD_CONV_CHUNK_SIZE, logits.size(chunk_dim) - start))
+                chunks.append(torch.sigmoid(chunk).cpu())
+            predictions = torch.cat(chunks, dim=chunk_dim)
 
         return {
-            "logits": logits,
-            "predictions": predictions,
-            "track_mask": mask,
+            "logits": logits.cpu(),
+            "predictions": predictions.cpu(),
+            "track_mask": mask.cpu(),
         }
 
 class SpliceSitesJunctionHead(nn.Module):
@@ -652,7 +730,7 @@ class SpliceSitesJunctionHead(nn.Module):
             embeddings_1bp, splice_site_positions, organism_index
         )
         return {
-            "pred_counts": pred_counts,
-            "splice_site_positions": splice_site_positions,
-            "splice_junction_mask": splice_junction_mask,
+            "pred_counts": pred_counts.cpu(),
+            "splice_site_positions": splice_site_positions.cpu(),
+            "splice_junction_mask": splice_junction_mask.cpu(),
         }

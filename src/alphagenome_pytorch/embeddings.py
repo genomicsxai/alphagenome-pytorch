@@ -45,19 +45,38 @@ class OutputEmbedder(nn.Module):
             # Upsample sequence if needed (dim 2 in NCL)
             repeat_factor = x_proj.shape[2] // s_proj.shape[2]
             if repeat_factor > 1:
-                s_proj = s_proj.repeat_interleave(repeat_factor, dim=2)
+                if torch.is_grad_enabled():
+                    s_proj = s_proj.repeat_interleave(repeat_factor, dim=2)
+                    x_proj = x_proj + s_proj
+                else:
+                    # Inference path: avoid materializing full repeated skip tensor.
+                    # Add each low-res position directly to its repeated span in x_proj.
+                    s_len = s_proj.shape[2]
+                    for i in range(s_len):
+                        start = i * repeat_factor
+                        end = min(start + repeat_factor, x_proj.shape[2])
+                        x_proj[:, :, start:end].add_(s_proj[:, :, i:i + 1])
+            else:
+                if torch.is_grad_enabled():
+                    x_proj = x_proj + s_proj
+                else:
+                    x_proj.add_(s_proj)
 
-            x_proj = x_proj + s_proj
-
-        # Apply norm
-        out = self.norm(x_proj)
+        # Apply norm (use in-place ops during inference to reduce peak memory)
+        if torch.is_grad_enabled():
+            out = self.norm(x_proj)
+        else:
+            inv = self.norm.weight * torch.rsqrt(self.norm.running_var + self.norm.eps).to(x_proj.dtype)
+            x_proj.mul_(inv.view(1, -1, 1)).add_(self.norm.bias.view(1, -1, 1))
+            out = x_proj
 
         # Add organism embedding: (B, C) → (B, C, 1) for NCL broadcast
         emb = self.organism_embed(organism_index).unsqueeze(2)
-        out = out + emb
-        
+        if torch.is_grad_enabled():
+            out = out + emb
+        else:
+            out.add_(emb)
         out = layers.gelu(out)
-
         if channels_last:
             # (B, C, S) -> (B, S, C)
             out = out.transpose(1, 2)

@@ -72,6 +72,7 @@ class ContactMapScorer(BaseVariantScorer):
         variant: Variant,
         interval: Interval,
         organism_index: int,
+        device: torch.device = torch.device("cpu"),
         **kwargs,
     ) -> VariantScore:
         """Compute contact map disruption score.
@@ -97,7 +98,8 @@ class ContactMapScorer(BaseVariantScorer):
             alt_contacts = alt_contacts.unsqueeze(0)
 
         B, S, _, T = ref_contacts.shape
-
+        ref_contacts = ref_contacts.to(device)
+        alt_contacts = alt_contacts.to(device)
         # Find variant bin (128bp resolution)
         variant_pos_in_seq = variant.start - interval.start  # 0-based position
         variant_bin = variant_pos_in_seq // RESOLUTION

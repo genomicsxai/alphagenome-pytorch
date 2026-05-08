@@ -1,6 +1,19 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
+
+
+def _parse_gelu_chunk_size():
+    value = os.getenv("ALPHAGENOME_GELU_CHUNK_SIZE")
+    if value is None or value == "":
+        return 262148  #262144 + 4
+    parsed = int(value)
+    return max(parsed, 0)
+
+
+_GELU_CHUNK_SIZE = _parse_gelu_chunk_size()
+
 
 def gelu(x):
     """GELU using JAX's custom approximation: sigmoid(1.702 * x) * x
@@ -8,8 +21,22 @@ def gelu(x):
     Matches JAX: alphagenome_research.model.layers.gelu
     JAX explicitly converts coefficient to match input dtype.
     """
-    coef = torch.tensor(1.702, dtype=x.dtype, device=x.device)
-    return torch.sigmoid(coef * x) * x
+    coef = 1.702
+    if torch.is_grad_enabled():
+        return torch.sigmoid(coef * x) * x
+
+    # Inference path: do in-place updates to avoid allocating another full output tensor.
+    if _GELU_CHUNK_SIZE <= 0 or x.shape[-1] <= _GELU_CHUNK_SIZE:
+        x.mul_(torch.sigmoid(coef * x))
+        return x
+
+    # Chunk along last dimension to cap temporary working set.
+    for start in range(0, x.shape[-1], _GELU_CHUNK_SIZE):
+        end = min(start + _GELU_CHUNK_SIZE, x.shape[-1])
+        x_chunk = x[..., start:end]
+        x_chunk.mul_(torch.sigmoid(coef * x_chunk))
+    return x
+
 
 class Pool1d(nn.Module):
     """1D pooling with SAME padding. Expects NCL input (B, C, S).
@@ -74,10 +101,14 @@ class RMSBatchNorm(nn.Module):
         inv = self.weight * torch.rsqrt(self.running_var + self.eps).to(x.dtype)
         if self.channels_last:
             # NLC format (B, S, C) - parameters broadcast from the right
-            return x * inv + self.bias
+            out = x * inv
+            out.add_(self.bias)
+            return out
         else:
             # NCL format (B, C, S) - reshape for broadcasting
-            return x * inv.view(1, -1, 1) + self.bias.view(1, -1, 1)
+            out = x * inv.view(1, -1, 1)
+            out.add_(self.bias.view(1, -1, 1))
+            return out
 
 class LayerNorm(nn.Module):
     """Layer Normalization with optional RMSNorm mode (centering=False).

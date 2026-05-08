@@ -130,6 +130,7 @@ class GeneMaskLFCScorer(BaseVariantScorer):
         organism_index: int,
         gene_annotation: 'GeneAnnotation | None' = None,
         gene_ids: list[str] | None = None,
+        device: torch.device = torch.device("cpu"),
         **kwargs,
     ) -> list[VariantScore]:
         """Compute gene-level log fold change scores.
@@ -169,7 +170,8 @@ class GeneMaskLFCScorer(BaseVariantScorer):
             alt_preds = alt_preds.unsqueeze(0)
 
         B, S, T = ref_preds.shape
-
+        ref_preds = ref_preds.to(device)
+        alt_preds = alt_preds.to(device)
         # Apply indel alignment if needed
         if variant.is_indel:
             alt_preds_aligned = align_alternate(
@@ -337,6 +339,7 @@ class GeneMaskActiveScorer(BaseVariantScorer):
         organism_index: int,
         gene_annotation: 'GeneAnnotation | None' = None,
         gene_ids: list[str] | None = None,
+        device: torch.device = torch.device("cpu"),
         **kwargs,
     ) -> list[VariantScore]:
         """Compute gene-level active allele scores.
@@ -376,7 +379,8 @@ class GeneMaskActiveScorer(BaseVariantScorer):
             alt_preds = alt_preds.unsqueeze(0)
 
         B, S, T = ref_preds.shape
-
+        ref_preds = ref_preds.to(device)
+        alt_preds = alt_preds.to(device)
         # Apply indel alignment if needed
         if variant.is_indel:
             alt_preds_aligned = align_alternate(

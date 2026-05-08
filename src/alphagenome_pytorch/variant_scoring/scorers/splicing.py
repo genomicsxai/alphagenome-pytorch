@@ -91,6 +91,7 @@ class GeneMaskSplicingScorer(BaseVariantScorer):
         organism_index: int,
         gene_annotation: 'GeneAnnotation | None' = None,
         gene_ids: list[str] | None = None,
+        device: torch.device = torch.device("cpu"),
         **kwargs,
     ) -> list[VariantScore]:
         """Compute splicing impact scores.
@@ -145,7 +146,8 @@ class GeneMaskSplicingScorer(BaseVariantScorer):
             alt_preds = alt_preds.unsqueeze(0)
 
         B, S, T = ref_preds.shape
-
+        ref_preds = ref_preds.to(device)
+        alt_preds = alt_preds.to(device)
         # Apply indel alignment if needed
         if variant.is_indel:
             alt_preds_aligned = align_alternate(
@@ -289,6 +291,7 @@ class SpliceJunctionScorer(BaseVariantScorer):
         organism_index: int,
         gene_annotation: 'GeneAnnotation | None' = None,
         gene_ids: list[str] | None = None,
+        device: torch.device = torch.device("cpu"),
         **kwargs,
     ) -> list[VariantScore]:
         """Compute splice junction impact score.
@@ -313,11 +316,11 @@ class SpliceJunctionScorer(BaseVariantScorer):
         # Get junction predictions
         # These come as a dict with 'pred_counts', 'splice_site_positions'
         output_key = self.requested_output.value
-        ref_pred_counts = ref_outputs[output_key]['pred_counts']
-        ref_positions = ref_outputs[output_key]['splice_site_positions']
+        ref_pred_counts = ref_outputs[output_key]['pred_counts'].to(device)
+        ref_positions = ref_outputs[output_key]['splice_site_positions'].to(device)
 
-        alt_pred_counts = alt_outputs[output_key]['pred_counts']
-        alt_positions = alt_outputs[output_key]['splice_site_positions']
+        alt_pred_counts = alt_outputs[output_key]['pred_counts'].to(device)
+        alt_positions = alt_outputs[output_key]['splice_site_positions'].to(device)
 
         # Limit to MAX_SPLICE_SITES (matches JAX)
         if ref_pred_counts.shape[1] > _MAX_SPLICE_SITES:
