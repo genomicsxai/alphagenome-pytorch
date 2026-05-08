@@ -318,14 +318,26 @@ def predict_full_chromosome(
     """
     config = config or TilingConfig()
 
-    # Validate head
-    if head not in HEAD_CONFIGS:
+    # Validate head — introspect the model first, fall back to hardcoded
+    # HEAD_CONFIGS for pretrained heads.
+    _inner = getattr(model, '_orig_mod', model)  # unwrap torch.compile
+    heads = getattr(_inner, 'heads', None)
+    head_module = heads[head] if heads is not None and head in heads else None
+
+    if head_module is not None:
+        head_config = {
+            'num_tracks': head_module.num_tracks,
+            'resolutions': list(head_module.resolutions),
+        }
+    elif head in HEAD_CONFIGS:
+        head_config = HEAD_CONFIGS[head]
+    else:
+        available = list(heads.keys()) if heads is not None else list(HEAD_CONFIGS.keys())
         raise ValueError(
             f"Unknown head: {head}. "
-            f"Available: {list(HEAD_CONFIGS.keys())}"
+            f"Available: {available}"
         )
 
-    head_config = HEAD_CONFIGS[head]
     if config.resolution not in head_config['resolutions']:
         raise ValueError(
             f"Head '{head}' does not support resolution {config.resolution}. "

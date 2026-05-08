@@ -109,3 +109,11 @@ class TestHeadsParameter:
 
         assert "splice_junctions" in result
         assert "splice_sites" not in result
+
+    def test_default_splice_junction_mask_matches_reference_metadata(self):
+        """The reference metadata exposes 367 splice-junction tissues for human and mouse."""
+        from alphagenome_pytorch import AlphaGenome
+
+        model = AlphaGenome(num_organisms=2)
+        tissue_counts = model.splice_sites_junction_head.tissue_mask.sum(dim=1)
+        assert tissue_counts.tolist() == [367, 367]

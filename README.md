@@ -130,9 +130,19 @@ python scripts/finetune.py --mode lora --lora-rank 8 \
     --train-bed train.bed --val-bed val.bed \
     --pretrained-weights alphagenome.pt
 
+# LoRA + Locon on the last 4 encoder convs before attention
+python scripts/finetune.py --mode lora+locon --lora-rank 8 \
+    --locon-rank 4 --locon-targets down_blocks.4,down_blocks.5 \
+    --genome hg38.fa --modality atac --bigwig *.bw \
+    --train-bed train.bed --val-bed val.bed \
+    --pretrained-weights alphagenome.pt
+
 # Multi-GPU
 torchrun --nproc_per_node=4 scripts/finetune.py --mode lora ...
 ```
+
+Note that Locon targets are explicit by design. You can use the syntax 
+`down_blocks.3,down_blocks.4,down_blocks.5` to choose targets.
 
 See [`examples/notebooks/finetune_linear_probe.ipynb`](examples/notebooks/finetune_linear_probe.ipynb) for an example of linear probing on ATAC-seq data.
 
@@ -219,4 +229,3 @@ This port is licensed under the Apache License, Version 2.0 (Apache 2.0):
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use this except in compliance with the License.
 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
-

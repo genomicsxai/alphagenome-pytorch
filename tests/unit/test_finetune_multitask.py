@@ -12,10 +12,12 @@ import torch
 # Import script module symbols directly (tests run from repository root)
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
 
+import finetune as finetune_module  # noqa: E402
 from finetune import (  # noqa: E402
     MultimodalDataset,
     collate_multimodal,
     parse_args,
+    unwrap_training_model,
 )
 from alphagenome_pytorch.extensions.finetuning.training import (  # noqa: E402
     _compute_multinomial_resolution,
@@ -249,3 +251,38 @@ class TestCollateMultimodal:
         assert torch.equal(sequences[1], seq2)
         assert torch.equal(modality_targets["atac"][128][0], targets1)
         assert torch.equal(modality_targets["atac"][128][1], targets2)
+
+
+@pytest.mark.unit
+class TestUnwrapTrainingModel:
+    """Tests for finetune.py wrapper unwrapping."""
+
+    def test_unwraps_compile_wrapper(self):
+        base = torch.nn.Linear(4, 4)
+
+        class FakeCompiled(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self._orig_mod = module
+
+        wrapped = FakeCompiled(base)
+
+        assert unwrap_training_model(wrapped) is base
+
+    def test_unwraps_compile_then_ddp(self, monkeypatch):
+        base = torch.nn.Linear(4, 4)
+
+        class FakeDDP(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+        class FakeCompiled(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self._orig_mod = module
+
+        monkeypatch.setattr(finetune_module, "DDP", FakeDDP)
+        wrapped = FakeCompiled(FakeDDP(base))
+
+        assert unwrap_training_model(wrapped) is base

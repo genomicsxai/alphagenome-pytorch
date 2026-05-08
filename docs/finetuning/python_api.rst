@@ -66,6 +66,8 @@ Configure which heads to remove and add via :class:`~alphagenome_pytorch.extensi
        mode='lora',  # or a list: ['lora', 'locon']
        lora_rank=8,
        lora_alpha=16,
+       # For Locon, use block-level conv targets such as:
+       # locon_targets=['down_blocks.4', 'down_blocks.5'],  # Locon4
        # Remove original heads you don't need
        remove_heads=['atac', 'dnase', 'chip_tf', 'chip_histone'],
        # Or, alternatively, specify which to keep
@@ -108,10 +110,11 @@ End-to-end finetuning with LoRA adapters:
 
    # 3. Configure transfer learning
    config = TransferConfig(
-       mode='lora',  # or combine: ['lora', 'locon']
+       mode=['lora', 'locon'],  # Baskerville-style Locon parity
        lora_rank=8,
        lora_alpha=16,
        lora_targets=['q_proj', 'v_proj'],  # Apply LoRA to attention
+       locon_targets=['down_blocks.5'],    # Apply Locon to the last two encoder convs
        remove_heads=['atac', 'dnase', 'chip_tf', 'chip_histone'],
        new_heads={
            'my_atac': {'modality': 'atac', 'num_tracks': 10, 'resolutions': [1, 128]},

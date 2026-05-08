@@ -55,19 +55,29 @@ def _create_model_and_head(mode: str, lora_rank: int = 8, lora_alpha: int = 16):
     # Remove original heads
     model = remove_all_heads(model)
 
-    # Create head AFTER freeze (so it has requires_grad=True by default)
+    # Head config mirrors the training script. In LoRA mode the head is created
+    # by prepare_for_transfer(), so trainable_params must reference that module.
     n_tracks = 4
-    head = create_finetuning_head(
-        assay_type="atac",
-        n_tracks=n_tracks,
-        resolutions=(128,),  # 128bp only for speed
-        num_organisms=1,
-    )
-    add_head(model, "atac", head)
+    head_config = {
+        "modality": "atac",
+        "num_tracks": n_tracks,
+        "resolutions": [128],
+        "num_organisms": 1,
+        "init_scheme": "truncated_normal",
+    }
+
+    head = None
 
     trainable_params = []
 
     if mode == "linear-probe":
+        head = create_finetuning_head(
+            assay_type="atac",
+            n_tracks=n_tracks,
+            resolutions=(128,),
+            num_organisms=1,
+        )
+        add_head(model, "atac", head)
         # Head already has requires_grad=True
         trainable_params = list(head.parameters())
 
@@ -78,19 +88,36 @@ def _create_model_and_head(mode: str, lora_rank: int = 8, lora_alpha: int = 16):
                 lora_targets=["q_proj", "v_proj"],
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
+                new_heads={"atac": head_config},
             )
             model = prepare_for_transfer(model, config)
-            # LoRA adapters + head (head already has requires_grad=True)
+            head = model.heads["atac"]
+            # LoRA adapters + the registered transfer head
             trainable_params = get_adapter_params(model)
             trainable_params.extend(list(head.parameters()))
         else:
+            head = create_finetuning_head(
+                assay_type="atac",
+                n_tracks=n_tracks,
+                resolutions=(128,),
+                num_organisms=1,
+            )
+            add_head(model, "atac", head)
             # LoRA rank 0 = linear probe (head already has requires_grad=True)
             trainable_params = list(head.parameters())
 
     elif mode == "full":
+        head = create_finetuning_head(
+            assay_type="atac",
+            n_tracks=n_tracks,
+            resolutions=(128,),
+            num_organisms=1,
+        )
+        add_head(model, "atac", head)
         # All parameters trainable (model was not frozen)
         trainable_params = list(model.parameters())
 
+    assert head is not None
     return model, head, trainable_params
 
 
@@ -279,6 +306,230 @@ class TestLoRAMode:
         # All LoRA params should have requires_grad=True
         for param in lora_params:
             assert param.requires_grad, "LoRA params should be trainable"
+
+    def test_lora_uses_registered_head_params(self):
+        """Trainable params must include the head that remains on the model."""
+        model, head, trainable_params = _create_model_and_head("lora", lora_rank=8)
+
+        registered_head = model.heads["atac"]
+
+        assert registered_head is head
+        assert {id(p) for p in registered_head.parameters()}.issubset(
+            {id(p) for p in trainable_params}
+        )
+
+
+def _create_adapter_model(config: TransferConfig):
+    """Create a model with adapters applied via TransferConfig.
+
+    Returns (model, head, adapter_params) following the same pattern as
+    ``_create_model_and_head`` but driven entirely by a ``TransferConfig``.
+    """
+    model = AlphaGenome(
+        num_organisms=1,
+        dtype_policy=DtypePolicy.full_float32(),
+    )
+
+    # Freeze before adding heads so heads stay trainable
+    for param in model.parameters():
+        param.requires_grad = False
+
+    model = remove_all_heads(model)
+
+    n_tracks = 4
+    head = create_finetuning_head(
+        assay_type="atac",
+        n_tracks=n_tracks,
+        resolutions=(128,),
+        num_organisms=1,
+    )
+    add_head(model, "atac", head)
+
+    model = prepare_for_transfer(model, config)
+
+    adapter_params = get_adapter_params(model)
+    return model, head, adapter_params
+
+
+@pytest.mark.integration
+class TestLoconMode:
+    """Tests for Locon training mode."""
+
+    @pytest.fixture(autouse=True)
+    def cleanup(self):
+        yield
+        gc.collect()
+
+    def _make(self):
+        config = TransferConfig(
+            mode="locon",
+            locon_rank=4,
+            locon_alpha=1,
+            locon_targets=["down_blocks.5"],
+        )
+        return _create_adapter_model(config)
+
+    def test_forward_pass(self):
+        """Test forward pass works in Locon mode."""
+        model, head, _ = self._make()
+        model.eval()
+
+        seq = torch.randn(1, SEQ_LENGTH, 4)
+        organism_idx = torch.zeros(1, dtype=torch.long)
+
+        with torch.no_grad():
+            outputs = model(seq, organism_idx, return_embeddings=True, resolutions=(128,), channels_last=False)
+        embeddings = {128: outputs["embeddings_128bp"]}
+        preds = head(embeddings, organism_idx, return_scaled=True)
+
+        assert preds[128].shape == (1, SEQ_LENGTH // 128, 4)
+
+    def test_backward_pass(self):
+        """Test backward pass computes gradients for Locon + head params."""
+        model, head, adapter_params = self._make()
+        model.train()
+
+        seq = torch.randn(1, SEQ_LENGTH, 4)
+        organism_idx = torch.zeros(1, dtype=torch.long)
+
+        outputs = model(seq, organism_idx, return_embeddings=True, resolutions=(128,), channels_last=False)
+        embeddings = {128: outputs["embeddings_128bp"]}
+        preds = head(embeddings, organism_idx, return_scaled=True)
+
+        preds[128].sum().backward()
+
+        head_with_grad = [p for p in head.parameters() if p.grad is not None]
+        assert len(head_with_grad) > 0, "Head params should have gradients"
+
+        adapter_with_grad = [p for p in adapter_params if p.grad is not None]
+        assert len(adapter_with_grad) > 0, "Locon params should have gradients"
+
+    def test_adapter_params_are_trainable(self):
+        """Test Locon adapter params are marked trainable."""
+        _, _, adapter_params = self._make()
+        assert len(adapter_params) > 0, "Should have Locon adapter params"
+        for param in adapter_params:
+            assert param.requires_grad
+
+
+@pytest.mark.integration
+class TestIA3Mode:
+    """Tests for IA3 training mode."""
+
+    @pytest.fixture(autouse=True)
+    def cleanup(self):
+        yield
+        gc.collect()
+
+    def _make(self):
+        config = TransferConfig(
+            mode="ia3",
+            ia3_targets=["k_proj", "v_proj"],
+        )
+        return _create_adapter_model(config)
+
+    def test_forward_pass(self):
+        """Test forward pass works in IA3 mode."""
+        model, head, _ = self._make()
+        model.eval()
+
+        seq = torch.randn(1, SEQ_LENGTH, 4)
+        organism_idx = torch.zeros(1, dtype=torch.long)
+
+        with torch.no_grad():
+            outputs = model(seq, organism_idx, return_embeddings=True, resolutions=(128,), channels_last=False)
+        embeddings = {128: outputs["embeddings_128bp"]}
+        preds = head(embeddings, organism_idx, return_scaled=True)
+
+        assert preds[128].shape == (1, SEQ_LENGTH // 128, 4)
+
+    def test_backward_pass(self):
+        """Test backward pass computes gradients for IA3 + head params."""
+        model, head, adapter_params = self._make()
+        model.train()
+
+        seq = torch.randn(1, SEQ_LENGTH, 4)
+        organism_idx = torch.zeros(1, dtype=torch.long)
+
+        outputs = model(seq, organism_idx, return_embeddings=True, resolutions=(128,), channels_last=False)
+        embeddings = {128: outputs["embeddings_128bp"]}
+        preds = head(embeddings, organism_idx, return_scaled=True)
+
+        preds[128].sum().backward()
+
+        head_with_grad = [p for p in head.parameters() if p.grad is not None]
+        assert len(head_with_grad) > 0, "Head params should have gradients"
+
+        adapter_with_grad = [p for p in adapter_params if p.grad is not None]
+        assert len(adapter_with_grad) > 0, "IA3 params should have gradients"
+
+    def test_adapter_params_are_trainable(self):
+        """Test IA3 adapter params are marked trainable."""
+        _, _, adapter_params = self._make()
+        assert len(adapter_params) > 0, "Should have IA3 adapter params"
+        for param in adapter_params:
+            assert param.requires_grad
+
+
+@pytest.mark.integration
+class TestHoulsbyMode:
+    """Tests for Houlsby (block-level) training mode."""
+
+    @pytest.fixture(autouse=True)
+    def cleanup(self):
+        yield
+        gc.collect()
+
+    def _make(self):
+        config = TransferConfig(
+            mode="houlsby",
+            houlsby_latent_dim=8,
+            houlsby_placement="block",
+            houlsby_targets=["mha", "mlp"],
+        )
+        return _create_adapter_model(config)
+
+    def test_forward_pass(self):
+        """Test forward pass works in Houlsby mode."""
+        model, head, _ = self._make()
+        model.eval()
+
+        seq = torch.randn(1, SEQ_LENGTH, 4)
+        organism_idx = torch.zeros(1, dtype=torch.long)
+
+        with torch.no_grad():
+            outputs = model(seq, organism_idx, return_embeddings=True, resolutions=(128,), channels_last=False)
+        embeddings = {128: outputs["embeddings_128bp"]}
+        preds = head(embeddings, organism_idx, return_scaled=True)
+
+        assert preds[128].shape == (1, SEQ_LENGTH // 128, 4)
+
+    def test_backward_pass(self):
+        """Test backward pass computes gradients for Houlsby + head params."""
+        model, head, adapter_params = self._make()
+        model.train()
+
+        seq = torch.randn(1, SEQ_LENGTH, 4)
+        organism_idx = torch.zeros(1, dtype=torch.long)
+
+        outputs = model(seq, organism_idx, return_embeddings=True, resolutions=(128,), channels_last=False)
+        embeddings = {128: outputs["embeddings_128bp"]}
+        preds = head(embeddings, organism_idx, return_scaled=True)
+
+        preds[128].sum().backward()
+
+        head_with_grad = [p for p in head.parameters() if p.grad is not None]
+        assert len(head_with_grad) > 0, "Head params should have gradients"
+
+        adapter_with_grad = [p for p in adapter_params if p.grad is not None]
+        assert len(adapter_with_grad) > 0, "Houlsby params should have gradients"
+
+    def test_adapter_params_are_trainable(self):
+        """Test Houlsby adapter params are marked trainable."""
+        _, _, adapter_params = self._make()
+        assert len(adapter_params) > 0, "Should have Houlsby adapter params"
+        for param in adapter_params:
+            assert param.requires_grad
 
 
 @pytest.mark.integration

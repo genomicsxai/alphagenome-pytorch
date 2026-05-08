@@ -16,6 +16,9 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+from alphagenome_pytorch.convolutions import StandardizedConv1d
 
 
 class LoRA(nn.Module):
@@ -97,12 +100,76 @@ class LoRA(nn.Module):
             self.in_features,
             self.out_features,
             bias=self.original_layer.bias is not None,
+            device=self.original_layer.weight.device,
+            dtype=self.original_layer.weight.dtype,
         )
         merged_layer.weight.data = merged_weight
         if self.original_layer.bias is not None:
             merged_layer.bias.data = self.original_layer.bias.data.clone()
         
         return merged_layer
+
+
+def _normalize_conv_padding(
+    padding: str | int | tuple[int, ...],
+) -> str | int:
+    """Normalize Conv1d padding metadata to a simple scalar or string."""
+    if isinstance(padding, tuple):
+        if len(padding) != 1:
+            raise ValueError(f"Expected 1D padding tuple, got: {padding}")
+        return padding[0]
+    return padding
+
+
+def _resolve_conv_padding(
+    original_layer: nn.Conv1d,
+) -> str | int:
+    """Return the effective padding mode used by a Conv1d-like layer."""
+    if isinstance(original_layer, StandardizedConv1d):
+        return _normalize_conv_padding(original_layer.pad_mode)
+    return _normalize_conv_padding(original_layer.padding)
+
+
+def _apply_same_padding(
+    x: torch.Tensor,
+    kernel_size: int,
+    stride: int,
+    dilation: int,
+) -> torch.Tensor:
+    """Apply TensorFlow-style SAME padding for Conv1d."""
+    effective_kernel = dilation * (kernel_size - 1) + 1
+    output_length = math.ceil(x.shape[-1] / stride)
+    pad_total = max((output_length - 1) * stride + effective_kernel - x.shape[-1], 0)
+    if pad_total == 0:
+        return x
+
+    pad_left = pad_total // 2
+    pad_right = pad_total - pad_left
+    return F.pad(x, (pad_left, pad_right))
+
+
+def _apply_conv_padding(
+    x: torch.Tensor,
+    padding_mode: str | int,
+    kernel_size: int,
+    stride: int,
+    dilation: int,
+) -> torch.Tensor:
+    """Apply the effective padding for a Conv1d-like layer."""
+    if isinstance(padding_mode, str):
+        if padding_mode == 'same':
+            return _apply_same_padding(x, kernel_size, stride, dilation)
+        if padding_mode == 'valid':
+            return x
+        raise ValueError(
+            f"Unsupported Conv1d padding mode for Locon: {padding_mode!r}"
+        )
+
+    if padding_mode < 0:
+        raise ValueError(f"Padding must be non-negative, got: {padding_mode}")
+    if padding_mode == 0:
+        return x
+    return F.pad(x, (padding_mode, padding_mode))
 
 
 class Locon(nn.Module):
@@ -132,7 +199,14 @@ class Locon(nn.Module):
         self.kernel_size = original_layer.kernel_size[0]
         self.stride = original_layer.stride[0]
         self.dilation = original_layer.dilation[0]
-        self.padding = original_layer.padding[0]
+        self.groups = original_layer.groups
+        self.padding_mode = _resolve_conv_padding(original_layer)
+
+        if self.groups != 1:
+            raise ValueError(
+                "Locon does not support grouped Conv1d layers "
+                f"(got groups={self.groups})."
+            )
         
         if rank > self.out_channels:
             raise ValueError(
@@ -153,7 +227,7 @@ class Locon(nn.Module):
             rank,
             kernel_size=self.kernel_size,
             stride=self.stride,
-            padding=self.padding,
+            padding=0,
             dilation=self.dilation,
             bias=False,
         )
@@ -176,50 +250,16 @@ class Locon(nn.Module):
         original_output = self.original_layer(x)
         
         # Locon output
-        lora_output = self.locon_up(self.locon_down(x)) * self.scale
-        
-        return original_output + lora_output
-    
-    def merge_weights(self) -> nn.Conv1d:
-        """Merge Locon weights into original layer for efficient inference.
-        
-        Note: This is an approximation that works for 1x1 up-projection.
-        For full correctness, the merged conv may need adjustment.
-        
-        Returns:
-            New Conv1d layer with merged weights.
-        """
-        # For 1x1 up-conv, we can merge: W' = W + scale * up @ down
-        # down: (rank, in_channels, kernel_size)
-        # up: (out_channels, rank, 1)
-        # Result should be (out_channels, in_channels, kernel_size)
-        
-        with torch.no_grad():
-            # Reshape for matmul: up (out, rank) @ down (rank, in*k) -> (out, in*k)
-            down_w = self.locon_down.weight.data  # (rank, in_channels, kernel_size)
-            up_w = self.locon_up.weight.data.squeeze(-1)  # (out_channels, rank)
-            
-            # Merge: (out, rank) @ (rank, in, k) reshaped
-            rank, in_ch, k = down_w.shape
-            down_flat = down_w.view(rank, -1)  # (rank, in*k)
-            merged_delta = (up_w @ down_flat).view(self.out_channels, in_ch, k)
-            
-            merged_weight = self.original_layer.weight.data + self.scale * merged_delta
-        
-        merged_layer = nn.Conv1d(
-            self.in_channels,
-            self.out_channels,
+        locon_input = _apply_conv_padding(
+            x,
+            self.padding_mode,
             kernel_size=self.kernel_size,
             stride=self.stride,
-            padding=self.padding,
             dilation=self.dilation,
-            bias=self.original_layer.bias is not None,
         )
-        merged_layer.weight.data = merged_weight
-        if self.original_layer.bias is not None:
-            merged_layer.bias.data = self.original_layer.bias.data.clone()
+        lora_output = self.locon_up(self.locon_down(locon_input)) * self.scale
         
-        return merged_layer
+        return original_output + lora_output
 
 
 class IA3(nn.Module):
@@ -251,6 +291,29 @@ class IA3(nn.Module):
         original_output = self.original_layer(x)
         return original_output * self.scale
 
+    def merge_weights(self) -> nn.Linear:
+        """Merge IA3 scaling into original layer for efficient inference.
+
+        Returns:
+            New Linear layer with merged weights.
+        """
+        with torch.no_grad():
+            # output * scale  ≡  (W * scale[:, None]) @ x + bias * scale
+            merged_weight = self.original_layer.weight.data * self.scale.data.unsqueeze(1)
+
+            merged_layer = nn.Linear(
+                self.original_layer.in_features,
+                self.out_features,
+                bias=self.original_layer.bias is not None,
+                device=self.original_layer.weight.device,
+                dtype=self.original_layer.weight.dtype,
+            )
+            merged_layer.weight.data = merged_weight
+            if self.original_layer.bias is not None:
+                merged_layer.bias.data = self.original_layer.bias.data * self.scale.data
+
+        return merged_layer
+
 
 class IA3_FF(nn.Module):
     """IA3 adapter for feed-forward layers - scales input.
@@ -279,6 +342,30 @@ class IA3_FF(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         scaled_input = x * self.scale
         return self.original_layer(scaled_input)
+
+    def merge_weights(self) -> nn.Linear:
+        """Merge IA3_FF scaling into original layer for efficient inference.
+
+        Returns:
+            New Linear layer with merged weights.
+        """
+        with torch.no_grad():
+            # W @ (x * scale)  ≡  (W * scale[None, :]) @ x
+            merged_weight = self.original_layer.weight.data * self.scale.data.unsqueeze(0)
+
+            merged_layer = nn.Linear(
+                self.in_features,
+                self.original_layer.out_features,
+                bias=self.original_layer.bias is not None,
+                device=self.original_layer.weight.device,
+                dtype=self.original_layer.weight.dtype,
+            )
+            merged_layer.weight.data = merged_weight
+            # bias is added after matmul, unaffected by input scaling
+            if self.original_layer.bias is not None:
+                merged_layer.bias.data = self.original_layer.bias.data.clone()
+
+        return merged_layer
 
 
 class AdapterHoulsby(nn.Module):
@@ -708,33 +795,32 @@ def unfreeze_norm_layers(model: nn.Module) -> int:
 
 
 def merge_adapters(model: nn.Module) -> nn.Module:
-    """Merge all adapter weights into base layers for efficient inference.
-    
-    Handles LoRA and Locon adapters. After merging, adapters are replaced
-    with standard Linear/Conv1d layers containing the merged weights.
-    
+    """Merge adapter weights into base Linear layers for zero-overhead inference.
+
+    Supports LoRA, IA3, and IA3_FF adapters. After merging, each adapter is
+    replaced with a plain ``nn.Linear`` containing the exact merged weights.
+
+    Locon and Houlsby adapters are **not** mergeable and are left unchanged:
+
+    - Locon wraps ``StandardizedConv1d`` layers whose weight standardization
+      is not invertible, so the delta cannot be folded back in.
+    - Houlsby adapters contain a nonlinear bottleneck that cannot be
+      represented as a single linear transform.
+
     Args:
         model: Model with adapters.
-        
+
     Returns:
-        Model with merged weights (adapters replaced with base layers).
-        
-    Example:
-        >>> model = merge_adapters(model)
-        >>> model.save('merged_model.pt')
+        Model with merged weights (mergeable adapters replaced with
+        ``nn.Linear`` layers; non-mergeable adapters left in place).
     """
     for name, module in list(model.named_modules()):
-        if isinstance(module, LoRA):
+        if isinstance(module, (LoRA, IA3, IA3_FF)):
             parent_name, attr_name = _get_parent_and_attr(name)
             parent = _get_module_by_name(model, parent_name)
             merged = module.merge_weights()
             setattr(parent, attr_name, merged)
-        elif isinstance(module, Locon):
-            parent_name, attr_name = _get_parent_and_attr(name)
-            parent = _get_module_by_name(model, parent_name)
-            merged = module.merge_weights()
-            setattr(parent, attr_name, merged)
-    
+
     return model
 
 
@@ -811,4 +897,3 @@ __all__ = [
     # Deprecated
     'merge_lora_weights',
 ]
-

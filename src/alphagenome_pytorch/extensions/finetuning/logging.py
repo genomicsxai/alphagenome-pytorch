@@ -107,6 +107,11 @@ class TrainingLogger:
                     id=resume_id,
                     resume="allow" if resume_id else None,
                 )
+                if resume_id and wandb.run is not None:
+                    # wandb restored its internal step counter from the prior
+                    # run; sync ours so subsequent log_step/log_epoch calls
+                    # produce monotonically increasing steps.
+                    self.step = int(wandb.run.step or 0)
                 print(f"W&B initialized: {wandb.run.url}" + (" (resumed)" if resume_id else ""))
             except ImportError:
                 print("Warning: wandb not installed, disabling W&B logging")

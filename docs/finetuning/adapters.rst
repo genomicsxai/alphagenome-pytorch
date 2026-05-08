@@ -81,12 +81,8 @@ Reference: `LoRA: Low-Rank Adaptation of Large Language Models (Hu et al., 2021)
 - ``lora_alpha`` — scaling factor; effective scale is ``alpha / rank``
 - ``lora_targets`` — list of substrings to match in module names (e.g. ``['q_proj', 'v_proj']``)
 
-After training, LoRA weights can be merged into the base layers for zero-overhead inference:
-
-.. code-block:: python
-
-   from alphagenome_pytorch.extensions.finetuning import merge_adapters
-   model = merge_adapters(model)
+After training, LoRA weights can be merged into the base layers for
+zero-overhead inference — see :ref:`merging-adapters` below.
 
 Locon
 -----
@@ -99,10 +95,11 @@ Reference: `Navigating Text-To-Image Customization: From LyCORIS Fine-Tuning to 
 .. code-block:: python
 
    config = TransferConfig(
-       mode='locon',
+       mode=['lora', 'locon'],
+       lora_targets=['q_proj', 'v_proj'],
        locon_rank=4,         # Rank for conv decomposition
        locon_alpha=1,        # Scaling factor
-       locon_targets=['conv_tower'],  # Target conv modules
+       locon_targets=['down_blocks.4', 'down_blocks.5'],  # 4 Locon adapters on encoder
        remove_heads=['atac'],
        new_heads={'my_atac': {'modality': 'atac', 'num_tracks': 4}},
    )
@@ -112,7 +109,14 @@ Reference: `Navigating Text-To-Image Customization: From LyCORIS Fine-Tuning to 
 
 - ``locon_rank`` — rank of the decomposition (default: 4)
 - ``locon_alpha`` — scaling factor (default: 1)
-- ``locon_targets`` — list of substrings to match Conv1D module names
+- ``locon_targets`` — list of substrings to match Conv1D module names.
+  Required when Locon is enabled.
+
+Use block-level targets:
+
+- ``Locon2``: ``['down_blocks.5']`` (2 Locon adapters)
+- ``Locon4``: ``['down_blocks.4', 'down_blocks.5']`` (4 Locon adapters)
+- ``Locon6``: ``['down_blocks.3', 'down_blocks.4', 'down_blocks.5']`` (6 Locon adapters)
 
 IA3
 ---
@@ -127,7 +131,7 @@ Reference: `Few-Shot Parameter-Efficient Fine-Tuning is Better and Cheaper than 
 
    config = TransferConfig(
        mode='ia3',
-       ia3_targets=['to_k', 'to_v'],  # Output-scaling targets
+       ia3_targets=['k_proj', 'v_proj'],  # Output-scaling targets
        ia3_ff_targets=['fc2'],         # Input-scaling targets (feed-forward)
        remove_heads=['atac'],
        new_heads={'my_atac': {'modality': 'atac', 'num_tracks': 4}},
@@ -143,7 +147,7 @@ Houlsby Adapters
 ----------------
 
 **Classic bottleneck adapters** insert a down-projection → activation →
-up-projection block with a residual connection. Our implementation follows
+up-projection block with a residual connection. This implementation follows
 the `Baskerville <https://github.com/calico/baskerville>`_ TensorFlow reference,
 placing adapters at transformer block boundaries.
 
@@ -223,7 +227,7 @@ LoRA on attention layers and Locon on convolutional layers:
        # Locon settings (applied to convolutions)
        locon_rank=4,
        locon_alpha=1,
-       locon_targets=['conv_tower'],
+       locon_targets=['down_blocks.5'],
        remove_heads=['atac', 'dnase'],
        new_heads={'my_atac': {'modality': 'atac', 'num_tracks': 4}},
    )
@@ -235,3 +239,46 @@ Rules:
 - ``'linear'`` can appear alongside adapter modes — the trunk is frozen and
   adapter layers are injected on top.
 - Any subset of ``['lora', 'locon', 'ia3', 'houlsby']`` can be combined.
+
+.. _merging-adapters:
+
+Merging Adapters for Inference
+------------------------------
+
+Some adapters can be folded back into the base layer weights,
+eliminating all adapter overhead at inference time. After merging, the adapted
+layers become plain ``nn.Linear`` modules and the model's state dict is
+compatible with vanilla AlphaGenome.
+
+.. code-block:: python
+
+   from alphagenome_pytorch.extensions.finetuning import merge_adapters
+   model = merge_adapters(model)
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 15 70
+
+   * - Adapter
+     - Mergeable?
+     - Reason
+   * - LoRA
+     - Yes
+     - Linear decomposition ``B @ A`` folds into the weight matrix.
+   * - IA3 / IA3_FF
+     - Yes
+     - Multiplicative scaling folds into weight rows (IA3) or columns (IA3_FF).
+   * - Locon
+     - No
+     - AlphaGenome's convolutional layers use ``StandardizedConv1d``, which
+       applies weight standardization (mean subtraction + variance
+       normalization) on every forward pass. This transformation is not
+       invertible — the per-channel mean is destroyed — so a merged weight
+       tensor cannot be fed back through standardization and produce the
+       correct result. Locon adapters are left in place at inference time;
+       the overhead is one extra small convolution per adapted layer.
+   * - Houlsby
+     - No
+     - The bottleneck contains a nonlinear activation (ReLU) between
+       the down- and up-projections, so it cannot be represented as
+       a single linear transform.

@@ -295,12 +295,13 @@ def save_weights(state_dict, output_path, use_safetensors=False):
         print(f"Saved model to {output_path} (torch format)")
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> None:
+    """CLI entry point for weight conversion."""
     parser = argparse.ArgumentParser()
     parser.add_argument('checkpoint_path', help='Path to JAX checkpoint directory')
     parser.add_argument('--output', default=None, help='Output file path')
     parser.add_argument('--safetensors', action='store_true', help='Save as safetensors format')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Default output path based on format
     output_path = args.output
@@ -310,3 +311,7 @@ if __name__ == "__main__":
     state_dict = convert(args.checkpoint_path)
     # Note: transforms.py now handles NCL format conversion directly during weight mapping
     save_weights(state_dict, output_path, use_safetensors=args.safetensors)
+
+
+if __name__ == "__main__":
+    main()

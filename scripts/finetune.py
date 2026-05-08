@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Unified AlphaGenome training script.
 
-Supports: linear probing, LoRA, full finetuning, encoder-only.
+Supports: linear probing, LoRA, Locon, LoRA+Locon, full finetuning, encoder-only.
 Features: DDP, resume, preemption handling, W&B, profiling, multi-modality.
 
 Usage:
@@ -16,6 +16,17 @@ Usage:
     # LoRA finetuning (single modality)
     python scripts/finetune.py --mode lora \\
         --lora-rank 8 --lora-alpha 16 \\
+        --genome hg38.fa \\
+        --modality atac --bigwig *.bw \\
+        --train-bed train.bed --val-bed val.bed \\
+        --pretrained-weights model.pth \\
+        --resolutions 1
+
+    # LoRA + Locon finetuning (Baskerville-style Locon parity)
+    python scripts/finetune.py --mode lora+locon \\
+        --lora-rank 8 --lora-alpha 16 \\
+        --locon-rank 4 --locon-alpha 1 \\
+        --locon-targets down_blocks.4,down_blocks.5 \\
         --genome hg38.fa \\
         --modality atac --bigwig *.bw \\
         --train-bed train.bed --val-bed val.bed \\
@@ -122,6 +133,8 @@ from alphagenome_pytorch.extensions.finetuning.transfer import (
     remove_all_heads,
     add_head,
     prepare_for_transfer,
+    validate_locon_targets,
+    transfer_config_to_dict,
 )
 
 
@@ -134,10 +147,12 @@ DEFAULTS = {
     "sequence_length": 131072,
     "resolutions": "1",
     # Model
-    "modality": "atac",
     "lora_rank": 8,
     "lora_alpha": 16,
     "lora_targets": "q_proj,v_proj",
+    "locon_rank": 4,
+    "locon_alpha": 1,
+    "locon_targets": "",
     # Training
     "epochs": 10,
     "batch_size": 1,
@@ -162,11 +177,30 @@ DEFAULTS = {
 
 
 # =============================================================================
+# Utilities
+# =============================================================================
+
+
+def unwrap_training_model(model: nn.Module) -> nn.Module:
+    """Unwrap the exact wrapper stack used in this training script.
+
+    Wrapping order in finetune.py is deterministic:
+    1. base model
+    2. optional DDP
+    3. optional torch.compile
+    """
+    inner = getattr(model, "_orig_mod", model)
+    if isinstance(inner, DDP):
+        return inner.module
+    return inner
+
+
+# =============================================================================
 # CLI
 # =============================================================================
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Unified AlphaGenome training script",
@@ -184,12 +218,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["linear-probe", "lora", "full", "encoder-only"],
+        choices=["linear-probe", "lora", "locon", "lora+locon", "full", "encoder-only"],
         default="lora",
         help=(
             "Training mode: "
             "'linear-probe' (frozen backbone, train heads on full transformer embeddings), "
             "'lora' (LoRA adapters + heads), "
+            "'locon' (Locon adapters on convolutional layers + heads), "
+            "'lora+locon' (LoRA on transformer targets plus Locon on convolutional targets + heads), "
             "'full' (all parameters), "
             "'encoder-only' (frozen backbone, train heads on raw CNN encoder output at 128bp; "
             "supports short sequences such as MPRA; forces --resolutions 128)"
@@ -257,6 +293,17 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=DEFAULTS["lora_targets"],
         help="Comma-separated modules for LoRA",
+    )
+    model.add_argument("--locon-rank", type=int, default=DEFAULTS["locon_rank"], help="Locon rank (0 to disable)")
+    model.add_argument("--locon-alpha", type=int, default=DEFAULTS["locon_alpha"], help="Locon alpha scaling")
+    model.add_argument(
+        "--locon-targets",
+        type=str,
+        default=DEFAULTS["locon_targets"],
+        help=(
+            "Comma-separated modules for Locon (required when Locon is enabled). Examples: "
+            "'down_blocks.5' for Locon2, 'down_blocks.4,down_blocks.5' for Locon4."
+        ),
     )
     model.add_argument(
         "--dtype",
@@ -344,14 +391,40 @@ def parse_args() -> argparse.Namespace:
     resume.add_argument(
         "--save-delta",
         action="store_true",
-        help="Save delta checkpoints (adapter + head weights only, much smaller). "
-             "Delta files saved as best_model.delta.pth",
+        help="Save delta checkpoints (adapter + head weights only, much smaller) "
+             "for both best-model and per-epoch saves, alongside full checkpoints.",
+    )
+    resume.add_argument(
+        "--no-full-checkpoint",
+        action="store_true",
+        help="Skip writing full checkpoints (best_model.pth, checkpoint_epoch*.pth). "
+             "Requires --save-delta so the run still produces loadable checkpoints.",
+    )
+    resume.add_argument(
+        "--export-transfer-config",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Export TransferConfig to JSON file at end of training. "
+             "Useful for loading full checkpoints in predict scripts.",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    tokens = argv if argv is not None else sys.argv[1:]
+    if args.no_full_checkpoint and not args.save_delta:
+        parser.error(
+            "--no-full-checkpoint requires --save-delta (otherwise the run "
+            "would produce no loadable checkpoints)."
+        )
+    if args.save_delta and args.mode == "full":
+        parser.error(
+            "--save-delta cannot be used with --mode full: delta checkpoints "
+            "only store adapter/head/norm weights, so they would omit all "
+            "fine-tuning updates to the trunk."
+        )
     cli_flags = {
         token.split("=", 1)[0]
-        for token in sys.argv[1:]
+        for token in tokens
         if token.startswith("--")
     }
 
@@ -429,6 +502,9 @@ def parse_args() -> argparse.Namespace:
         "lora_rank",
         "lora_alpha",
         "lora_targets",
+        "locon_rank",
+        "locon_alpha",
+        "locon_targets",
         "dtype",
         "head_init_scheme",
         "gradient_checkpointing",
@@ -505,7 +581,10 @@ def parse_args() -> argparse.Namespace:
     cli_modality_to_bigwigs: dict[str, list[str]] = {}
     if args.bigwigs is not None:
         if args.modalities is None:
-            args.modalities = [DEFAULTS["modality"]]
+            parser.error(
+                "--modality is required when --bigwig is provided. "
+                f"Pass one of: {sorted(MODALITY_CONFIGS.keys())}."
+            )
         if len(args.modalities) != len(args.bigwigs):
             parser.error(
                 f"Number of --modality ({len(args.modalities)}) must match number of --bigwig groups ({len(args.bigwigs)}). "
@@ -717,7 +796,7 @@ def create_model(
     rank: int,
     world_size: int,
     local_rank: int,
-) -> tuple[nn.Module, dict[str, nn.Module], list[torch.nn.Parameter]]:
+) -> tuple[nn.Module, dict[str, nn.Module], list[torch.nn.Parameter], TransferConfig | None]:
     """Create and configure the model based on training mode.
 
     Args:
@@ -731,7 +810,7 @@ def create_model(
         local_rank: Local rank for GPU assignment.
 
     Returns:
-        Tuple of (model, heads_dict, trainable_params).
+        Tuple of (model, heads_dict, trainable_params, transfer_config).
     """
     print_rank0(f"Loading pretrained model from {args.pretrained_weights}", rank)
 
@@ -759,37 +838,47 @@ def create_model(
     # encoder-only mode forces 128bp resolution for all heads
     is_encoder_only = args.mode == "encoder-only"
 
-    # Create heads for each modality (after freeze, so they have requires_grad=True)
-    heads: dict[str, nn.Module] = {}
-    for modality, track_names in modality_track_names.items():
-        n_tracks = len(track_names)
-        track_means = modality_track_means.get(modality)
-        resolutions = modality_resolutions[modality]
-
-        head = create_finetuning_head(
-            assay_type=modality,
-            n_tracks=n_tracks,
-            resolutions=resolutions if not is_encoder_only else (128,),
-            num_organisms=1,
-            track_means=track_means,
-            init_scheme=args.head_init_scheme,
-            encoder_only=is_encoder_only,
-        )
-        add_head(model, modality, head)
-        heads[modality] = head
-        head_resolutions = (128,) if is_encoder_only else resolutions
-        print_rank0(f"Created {modality} head with {n_tracks} tracks at resolutions {head_resolutions}", rank)
-
     # Build new_heads dict for TransferConfig (used for delta checkpoints)
     new_heads_config: dict[str, dict] = {}
-    for modality in heads:
+    for modality, track_names in modality_track_names.items():
         head_res = (128,) if is_encoder_only else modality_resolutions[modality]
         new_heads_config[modality] = {
             "modality": modality,
-            "num_tracks": len(modality_track_names[modality]),
+            "num_tracks": len(track_names),
             "resolutions": list(head_res),
             "encoder_only": is_encoder_only,
+            "track_means": modality_track_means.get(modality),
+            "num_organisms": 1,
+            "init_scheme": args.head_init_scheme,
         }
+
+    # Create heads directly except in active adapter modes, where
+    # prepare_for_transfer() constructs the actual trainable heads we want the
+    # optimizer to own.
+    heads: dict[str, nn.Module] = {}
+    has_active_adapters = (
+        (args.mode in {"lora", "lora+locon"} and args.lora_rank > 0)
+        or (args.mode in {"locon", "lora+locon"} and args.locon_rank > 0)
+    )
+    create_heads_directly = not has_active_adapters
+    if create_heads_directly:
+        for modality, track_names in modality_track_names.items():
+            head = create_finetuning_head(
+                assay_type=modality,
+                n_tracks=len(track_names),
+                resolutions=tuple(new_heads_config[modality]["resolutions"]),
+                num_organisms=1,
+                track_means=modality_track_means.get(modality),
+                init_scheme=args.head_init_scheme,
+                encoder_only=is_encoder_only,
+            )
+            add_head(model, modality, head)
+            heads[modality] = head
+            print_rank0(
+                f"Created {modality} head with {len(track_names)} tracks "
+                f"at resolutions {tuple(new_heads_config[modality]['resolutions'])}",
+                rank,
+            )
 
     # Configure trainable params based on mode
     trainable_params: list[torch.nn.Parameter] = []
@@ -811,37 +900,67 @@ def create_model(
         transfer_config = TransferConfig(mode="encoder-only", new_heads=new_heads_config)
         print_rank0("Mode: encoder-only (frozen backbone, raw CNN encoder output to head)", rank)
 
-    elif args.mode == "lora":
-        if args.lora_rank > 0:
-            lora_targets = [t.strip() for t in args.lora_targets.split(",")]
+    elif args.mode in {"lora", "locon", "lora+locon"}:
+        lora_enabled = args.mode in {"lora", "lora+locon"} and args.lora_rank > 0
+        locon_enabled = args.mode in {"locon", "lora+locon"} and args.locon_rank > 0
+
+        lora_targets = [t.strip() for t in args.lora_targets.split(",") if t.strip()]
+        locon_targets = [t.strip() for t in args.locon_targets.split(",") if t.strip()]
+
+        adapter_modes: list[str] = []
+        if lora_enabled:
+            adapter_modes.append("lora")
             print_rank0(f"Applying LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}", rank)
             print_rank0(f"  Target modules: {lora_targets}", rank)
+        if locon_enabled:
+            validate_locon_targets(model, locon_targets)
+            adapter_modes.append("locon")
+            print_rank0(f"Applying Locon: rank={args.locon_rank}, alpha={args.locon_alpha}", rank)
+            print_rank0(f"  Target modules: {locon_targets}", rank)
+
+        if adapter_modes:
+            transfer_mode: str | list[str]
+            transfer_mode = adapter_modes[0] if len(adapter_modes) == 1 else adapter_modes
 
             transfer_config = TransferConfig(
-                mode="lora",
+                mode=transfer_mode,
                 lora_targets=lora_targets,
                 lora_rank=args.lora_rank,
                 lora_alpha=args.lora_alpha,
+                locon_targets=locon_targets,
+                locon_rank=args.locon_rank,
+                locon_alpha=args.locon_alpha,
                 new_heads=new_heads_config,
             )
             model = prepare_for_transfer(model, transfer_config)
-            # LoRA adapters + heads (heads already have requires_grad=True)
+            heads = {
+                modality: model.heads[modality]
+                for modality in modality_track_names
+            }
+            for modality, track_names in modality_track_names.items():
+                print_rank0(
+                    f"Created {modality} head with {len(track_names)} tracks "
+                    f"at resolutions {tuple(new_heads_config[modality]['resolutions'])}",
+                    rank,
+                )
+            # Adapter weights + the freshly registered heads.
             trainable_params = get_adapter_params(model)
             for head in heads.values():
                 trainable_params.extend(list(head.parameters()))
         else:
-            # LoRA rank 0 means just train heads
+            # Adapter rank 0 means just train heads
             for head in heads.values():
                 trainable_params.extend(list(head.parameters()))
             transfer_config = TransferConfig(mode="linear", new_heads=new_heads_config)
-            print_rank0("Mode: lora (rank=0, heads only)", rank)
+            print_rank0(f"Mode: {args.mode} (adapter rank=0, heads only)", rank)
 
     elif args.mode == "full":
         # All parameters trainable (model was not frozen above)
         trainable_params = list(model.parameters())
-        # Delta checkpoints don't make sense for full mode (all weights change)
-        if args.save_delta:
-            print_rank0("Warning: --save-delta ignored for --mode full (all weights trained)", rank)
+        # Embed TransferConfig so checkpoints are self-describing at load time
+        # (head names, modalities, resolutions). --save-delta is rejected at
+        # parse time because delta checkpoints cannot capture trunk updates.
+        transfer_config = TransferConfig(mode="full", new_heads=new_heads_config)
         print_rank0("Mode: full (all parameters trainable)", rank)
 
     else:
@@ -855,8 +974,8 @@ def create_model(
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         print_rank0("Model wrapped with DistributedDataParallel", rank)
 
-    # Get head references from GPU model
-    model_module = model.module if isinstance(model, DDP) else model
+    # Get head references from the underlying model before optional compile.
+    model_module = unwrap_training_model(model)
     heads = {modality: model_module.heads[modality] for modality in heads}
 
     # Optionally compile
@@ -865,13 +984,14 @@ def create_model(
         import torch._inductor.config as inductor_config
         inductor_config.group_fusion = False
         model = torch.compile(model)
+        model_module = unwrap_training_model(model)
 
     # Count parameters
     n_trainable = sum(p.numel() for p in trainable_params)
     n_total = sum(p.numel() for p in model_module.parameters())
     print_rank0(f"Trainable: {n_trainable:,} / {n_total:,} ({100*n_trainable/n_total:.2f}%)", rank)
 
-    return model, heads, trainable_params
+    return model, heads, trainable_params, transfer_config
 
 
 # =============================================================================
@@ -879,9 +999,10 @@ def create_model(
 # =============================================================================
 
 
-def main() -> None:
+def main(args: argparse.Namespace | None = None) -> None:
     """Main training function."""
-    args = parse_args()
+    if args is None:
+        args = parse_args()
 
     # Setup distributed
     rank, world_size, local_rank, device = setup_distributed()
@@ -959,7 +1080,7 @@ def main() -> None:
     modality_track_means = broadcast_object(modality_track_means, src=0)
 
     # Create model
-    model, heads, trainable_params = create_model(
+    model, heads, trainable_params, transfer_config = create_model(
         args,
         modality_track_names,
         modality_track_means,
@@ -969,7 +1090,7 @@ def main() -> None:
         world_size,
         local_rank,
     )
-    model_module = model.module if isinstance(model, DDP) else model
+    model_module = unwrap_training_model(model)
 
     # Sequence parallelism setup
     sequence_parallel = None
@@ -990,6 +1111,14 @@ def main() -> None:
                 f"overlap_lowres={overlap_lowres}",
                 rank,
             )
+
+    # Only include transfer_config in checkpoints when one exists, so loaders
+    # can cleanly distinguish "no config saved" from "config was None".
+    transfer_config_kwargs = (
+        {"transfer_config": transfer_config_to_dict(transfer_config)}
+        if transfer_config is not None
+        else {}
+    )
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -1058,9 +1187,12 @@ def main() -> None:
         "modality_resolutions": {m: list(r) for m, r in modality_resolutions.items()},
         "track_names": modality_track_names,
         "pretrained_weights": args.pretrained_weights,
-        "lora_rank": args.lora_rank if args.mode == "lora" else None,
-        "lora_alpha": args.lora_alpha if args.mode == "lora" else None,
-        "lora_targets": args.lora_targets if args.mode == "lora" else None,
+        "lora_rank": args.lora_rank if args.mode in ("lora", "lora+locon") else None,
+        "lora_alpha": args.lora_alpha if args.mode in ("lora", "lora+locon") else None,
+        "lora_targets": args.lora_targets if args.mode in ("lora", "lora+locon") else None,
+        "locon_rank": args.locon_rank if args.mode in ("locon", "lora+locon") else None,
+        "locon_alpha": args.locon_alpha if args.mode in ("locon", "lora+locon") else None,
+        "locon_targets": args.locon_targets if args.mode in ("locon", "lora+locon") else None,
         "head_init_scheme": args.head_init_scheme,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
@@ -1104,11 +1236,14 @@ def main() -> None:
     current_epoch = start_epoch
 
     def _save_preempt():
-        """Save preemption checkpoint."""
-        if is_main_process(rank) and not args.no_save_checkpoints:
+        """Save preemption checkpoint, honoring --save-delta / --no-full-checkpoint."""
+        if not (is_main_process(rank) and not args.no_save_checkpoints):
+            return
+        last_completed = max(0, current_epoch - 1)
+        if not args.no_full_checkpoint:
             save_checkpoint(
                 path=output_dir / "checkpoint_preempt.pth",
-                epoch=max(0, current_epoch - 1),  # Last completed epoch
+                epoch=last_completed,
                 model=model_module,
                 optimizer=optimizer,
                 val_loss=best_val_loss,
@@ -1118,8 +1253,25 @@ def main() -> None:
                 scheduler=scheduler,
                 best_val_loss=best_val_loss,
                 wandb_run_id=logger.wandb_run_id,
+                **transfer_config_kwargs,
             )
             print(f"Preemption checkpoint saved to {output_dir / 'checkpoint_preempt.pth'}")
+        if args.save_delta and transfer_config is not None:
+            save_delta_checkpoint(
+                path=output_dir / "checkpoint_preempt.delta.pth",
+                model=model_module,
+                config=transfer_config,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=last_completed,
+                val_loss=best_val_loss,
+                best_val_loss=best_val_loss,
+                track_names=modality_track_names,
+                modality=args.modalities,
+                resolutions=modality_resolutions,
+                wandb_run_id=logger.wandb_run_id,
+            )
+            print(f"Preemption delta checkpoint saved to {output_dir / 'checkpoint_preempt.delta.pth'}")
 
     handler = setup_preemption_handler(_save_preempt, rank, world_size)
 
@@ -1129,13 +1281,16 @@ def main() -> None:
     print_rank0("=" * 60, rank)
 
     # Freeze backbone (use torch.no_grad) when no backbone params need gradients.
-    # - linear-probe: only heads train
-    # - encoder-only: only heads train (backbone always frozen; uses encoder_only forward)
-    # - lora with rank=0: only heads train (no LoRA adapters)
-    # - lora with rank>0: LoRA adapters need gradients, can't freeze
+    # - linear-probe / encoder-only: only heads train
+    # - lora / locon / lora+locon with all adapter ranks == 0: only heads train
+    # - adapter modes with active adapters: adapters need gradients, can't freeze
     # - full: all params need gradients
+    has_active_adapters = (
+        (args.mode in ("lora", "lora+locon") and args.lora_rank > 0)
+        or (args.mode in ("locon", "lora+locon") and args.locon_rank > 0)
+    )
     frozen_backbone = args.mode in ("linear-probe", "encoder-only") or (
-        args.mode == "lora" and args.lora_rank == 0
+        args.mode in ("lora", "locon", "lora+locon") and not has_active_adapters
     )
     encoder_only = args.mode == "encoder-only"
 
@@ -1270,25 +1425,31 @@ def main() -> None:
 
             # Save checkpoints
             if is_main_process(rank) and not args.no_save_checkpoints:
+                # Delta saves require a transfer_config (full mode now also
+                # builds one, so this only skips the delta write in legacy
+                # paths where transfer_config is None).
+                write_delta = args.save_delta and transfer_config is not None
+                write_full = not args.no_full_checkpoint
+
                 if is_best:
                     best_val_loss = val_loss
-                    save_checkpoint(
-                        path=output_dir / "best_model.pth",
-                        epoch=epoch,
-                        model=model_module,
-                        optimizer=optimizer,
-                        val_loss=val_loss,
-                        track_names=modality_track_names,
-                        modality=args.modalities,
-                        resolutions=modality_resolutions,
-                        scheduler=scheduler,
-                        best_val_loss=best_val_loss,
-                        wandb_run_id=logger.wandb_run_id,
-                    )
-                    print(f"  Saved best model (val_loss={val_loss:.4f})")
-
-                    # Save delta checkpoint (adapter + head weights only)
-                    if args.save_delta and transfer_config is not None:
+                    if write_full:
+                        save_checkpoint(
+                            path=output_dir / "best_model.pth",
+                            epoch=epoch,
+                            model=model_module,
+                            optimizer=optimizer,
+                            val_loss=val_loss,
+                            track_names=modality_track_names,
+                            modality=args.modalities,
+                            resolutions=modality_resolutions,
+                            scheduler=scheduler,
+                            best_val_loss=best_val_loss,
+                            wandb_run_id=logger.wandb_run_id,
+                            **transfer_config_kwargs,
+                        )
+                        print(f"  Saved best model (val_loss={val_loss:.4f})")
+                    if write_delta:
                         save_delta_checkpoint(
                             path=output_dir / "best_model.delta.pth",
                             model=model_module,
@@ -1301,23 +1462,41 @@ def main() -> None:
                             track_names=modality_track_names,
                             modality=args.modalities,
                             resolutions=modality_resolutions,
+                            wandb_run_id=logger.wandb_run_id,
                         )
-                        print(f"  Saved delta checkpoint (adapter + head weights)")
+                        print(f"  Saved best delta checkpoint (val_loss={val_loss:.4f})")
 
                 if epoch % args.save_every == 0:
-                    save_checkpoint(
-                        path=output_dir / f"checkpoint_epoch{epoch}.pth",
-                        epoch=epoch,
-                        model=model_module,
-                        optimizer=optimizer,
-                        val_loss=val_loss,
-                        track_names=modality_track_names,
-                        modality=args.modalities,
-                        resolutions=modality_resolutions,
-                        scheduler=scheduler,
-                        best_val_loss=best_val_loss,
-                        wandb_run_id=logger.wandb_run_id,
-                    )
+                    if write_full:
+                        save_checkpoint(
+                            path=output_dir / f"checkpoint_epoch{epoch}.pth",
+                            epoch=epoch,
+                            model=model_module,
+                            optimizer=optimizer,
+                            val_loss=val_loss,
+                            track_names=modality_track_names,
+                            modality=args.modalities,
+                            resolutions=modality_resolutions,
+                            scheduler=scheduler,
+                            best_val_loss=best_val_loss,
+                            wandb_run_id=logger.wandb_run_id,
+                            **transfer_config_kwargs,
+                        )
+                    if write_delta:
+                        save_delta_checkpoint(
+                            path=output_dir / f"checkpoint_epoch{epoch}.delta.pth",
+                            model=model_module,
+                            config=transfer_config,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            epoch=epoch,
+                            val_loss=val_loss,
+                            best_val_loss=best_val_loss,
+                            track_names=modality_track_names,
+                            modality=args.modalities,
+                            resolutions=modality_resolutions,
+                            wandb_run_id=logger.wandb_run_id,
+                        )
 
             barrier()
 
@@ -1327,6 +1506,15 @@ def main() -> None:
         logger.finish()
         handler.unregister()
         cleanup_distributed()
+
+    # Export transfer config if requested
+    if args.export_transfer_config and transfer_config is not None and is_main_process(rank):
+        import json
+        config_path = Path(args.export_transfer_config)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(config_path, "w") as f:
+            json.dump(transfer_config_to_dict(transfer_config), f, indent=2)
+        print(f"Exported TransferConfig to {config_path}")
 
     print_rank0(f"\nTraining complete! Best val_loss: {best_val_loss:.4f}", rank)
     print_rank0(f"Output: {output_dir}", rank)

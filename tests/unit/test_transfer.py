@@ -64,8 +64,8 @@ class TestTransferConfig:
         assert config.lora_targets == ['q_proj', 'v_proj']
         assert config.locon_rank == 4
         assert config.locon_alpha == 1
-        assert config.locon_targets == ['conv_tower']
-        assert config.ia3_targets == ['to_k', 'to_v']
+        assert config.locon_targets == []
+        assert config.ia3_targets == ['k_proj', 'v_proj']
         assert config.ia3_ff_targets == []
         assert config.new_heads == {}
         assert config.remove_heads == []
