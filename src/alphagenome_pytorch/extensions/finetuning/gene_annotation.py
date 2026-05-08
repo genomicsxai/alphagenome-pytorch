@@ -208,14 +208,18 @@ class GeneMaskExtractor:
 def derive_g_max(
     extractor: GeneMaskExtractor,
     intervals: list[Tuple[str, int, int]],
-    *,
-    headroom: int = 16,
 ) -> int:
     """Scan training intervals once to pick a fixed `G_max`.
 
-    Returns `observed_max + headroom`. Any window exceeding
-    `PAD_NUM_GENES_CEILING` raises during the scan via the extractor's own
-    bound check; this function therefore needs no additional cap.
+    Returns the exact `observed_max` over the supplied intervals. Pass
+    every interval you intend to feed through the resulting dataset
+    (train + val + any held-out splits) so the returned width is tight.
+    Adding intervals later without re-running this scan and exceeding
+    the previous max will raise at `GenomicDataset.__getitem__`.
+
+    Any single window with more than `PAD_NUM_GENES_CEILING` genes raises
+    during the scan via the extractor's own bound check; this function
+    therefore needs no additional cap.
 
     Reuses the extractor's LRU cache so masks built here are still warm
     when training begins.
@@ -224,7 +228,7 @@ def derive_g_max(
     for chrom, start, end in intervals:
         mask, _ = extractor.extract(chrom, start, end)
         observed_max = max(observed_max, mask.shape[-1])
-    return observed_max + headroom
+    return observed_max
 
 
 @functools.lru_cache(maxsize=4)

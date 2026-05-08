@@ -169,12 +169,12 @@ class TestGeneMaskExtractor:
 @pytest.mark.unit
 class TestDeriveGMax:
 
-    def test_picks_max_plus_headroom(self):
-        # 3 genes in window 1, 1 gene in window 2 → max=2 (GENE-A + GENE-B)
+    def test_returns_exact_observed_max(self):
+        """3 genes in window 1, 0 in window 2 → max=2 (GENE-A + GENE-B contained)."""
         ex = GeneMaskExtractor(_toy_gene_table())
         intervals = [("chr1", 1000, 2000), ("chr1", 0, 500)]
-        g_max = derive_g_max(ex, intervals, headroom=4)
-        assert g_max == 2 + 4
+        g_max = derive_g_max(ex, intervals)
+        assert g_max == 2
 
     def test_propagates_extractor_ceiling_error(self):
         """If a scanned window blows past the extractor's PAD ceiling,
