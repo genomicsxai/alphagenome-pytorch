@@ -4,7 +4,7 @@ Losses for AlphaGenome PyTorch.
 Ported from alphagenome_research.model.losses (JAX implementation).
 """
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -264,3 +264,102 @@ def cross_entropy_loss(
     
     log_loss = log_normalizer - log_likelihood
     return _safe_masked_mean(log_loss, mask.any(dim=axis))
+
+
+def gene_lfc_loss(
+    *,
+    predictions: Tensor,
+    targets: Tensor,
+    targets_mask: Optional[Tensor],
+    gene_mask: Tensor,
+    strand_channel_mask: Tensor,
+    gene_cross_track_weight: float = 5.0,
+) -> Tuple[Tensor, Dict[str, Tensor]]:
+    """Cross-track gene-level loss (Decima-style).
+
+    PyTorch port of upstream JAX `GenomeTracksHead._compute_cross_track_loss`
+    (google-deepmind/alphagenome_research, commit fd44ed0). Aggregates
+    predictions and targets within gene boundaries, length-normalizes per
+    gene, then computes:
+      - Poisson NLL on the per-gene total expression across active tracks.
+      - Multinomial NLL on the cross-track (tissue) distribution per gene,
+        weighted by `gene_cross_track_weight` (paper default 5.0).
+
+    Strand-channel filtering is applied: positive-strand genes only see
+    `+`/`.` tracks, negative-strand genes only see `-`/`.` tracks.
+
+    Args:
+        predictions: Scaled predictions, shape `[B, S, C]` (channels-last).
+        targets: Scaled targets in model space, shape `[B, S, C]`.
+        targets_mask: Optional `[B, 1, C]` boolean availability mask over
+            tracks. If None, all tracks are treated as available.
+        gene_mask: Boolean gene mask, shape `[B, S, 2, G]`. Axis 2 dim 0
+            is positive-strand genes, dim 1 is negative-strand. The gene
+            axis must be zero-padded to a fixed `G` for batchability.
+        strand_channel_mask: Boolean track strand-compatibility mask,
+            shape `[2, 1, C]`. Built from per-track strand metadata.
+        gene_cross_track_weight: Inner multiplier on the multinomial term.
+
+    Returns:
+        (loss, aux) where aux carries `gene_loss_total_count` and
+        `gene_loss_positional` for logging/diagnostics.
+    """
+    if gene_mask.dim() != 4:
+        raise ValueError(
+            f"gene_mask must have shape [B, S, 2, G]; got {tuple(gene_mask.shape)}"
+        )
+
+    gene_mask_f = gene_mask.float()
+
+    # gene_length: [B, 2, G] (sum over S)
+    gene_length = gene_mask_f.sum(dim=-3)
+    safe_gene_length = gene_length.unsqueeze(-1).clamp(min=1.0)  # [B, 2, G, 1]
+
+    # Aggregate within gene boundaries, length-normalized: [B, 2, G, C]
+    y_true = torch.einsum('bsc,bszg->bzgc', targets.float(), gene_mask_f) / safe_gene_length
+    y_pred = torch.einsum('bsc,bszg->bzgc', predictions.float(), gene_mask_f) / safe_gene_length
+
+    batch_size, _, num_channels = predictions.shape
+
+    # Reduce track availability mask over S: [B, 1, C]
+    if targets_mask is not None:
+        targets_mask_f = targets_mask.float().amax(dim=-2, keepdim=True)
+    else:
+        targets_mask_f = torch.ones(
+            (batch_size, 1, num_channels), device=predictions.device
+        )
+
+    # Combined mask [B, 2, G, C]: gene present AND track available AND
+    # strand-channel compatibility.
+    gene_present = (gene_length > 0).unsqueeze(-1).float()  # [B, 2, G, 1]
+    track_avail = targets_mask_f.view(batch_size, 1, 1, num_channels)
+    combined_mask = gene_present * track_avail
+    combined_mask = combined_mask * strand_channel_mask.float().unsqueeze(0)
+    combined_mask = combined_mask.bool()
+    combined_mask_f = combined_mask.float()
+
+    # Poisson loss on per-gene totals (sum over channels weighted by combined_mask).
+    total_pred = torch.einsum('bzgc,bzgc->bzg', y_pred, combined_mask_f).unsqueeze(-1)
+    total_true = torch.einsum('bzgc,bzgc->bzg', y_true, combined_mask_f).unsqueeze(-1)
+
+    loss_total_count = poisson_loss(
+        y_true=total_true,
+        y_pred=total_pred,
+        mask=combined_mask.any(dim=-1, keepdim=True),
+    )
+
+    # Magnitude-invariance: divide by max number of active channels per gene.
+    num_active = combined_mask_f.sum(dim=-1, keepdim=True)  # [B, 2, G, 1]
+    loss_total_count = loss_total_count / num_active.max().clamp(min=1.0)
+
+    # Multinomial NLL on cross-track distribution per gene.
+    prob_predictions = y_pred / (total_pred + 1e-7)
+    loss_positional = -y_true * torch.log(prob_predictions + 1e-7)
+    loss_positional = _safe_masked_mean(loss_positional, combined_mask)
+
+    loss = loss_total_count + gene_cross_track_weight * loss_positional
+    aux = {
+        'gene_loss_total_count': loss_total_count,
+        'gene_loss_positional': loss_positional,
+    }
+    return loss, aux

@@ -13,6 +13,10 @@ from __future__ import annotations
 import pytest
 import torch
 
+from alphagenome_pytorch.extensions.finetuning.training import (
+    compute_finetuning_loss,
+)
+from alphagenome_pytorch.losses import gene_lfc_loss
 from alphagenome_pytorch.training import (
     AlphaGenomeLoss,
     _build_strand_channel_mask,
@@ -318,6 +322,116 @@ class TestPerHeadGating:
         # Forward without gene_mask → no gene LFC fires.
         loss_fn(outputs, targets, organism_index=torch.tensor([0]), masks=masks)
         assert calls == []
+
+
+@pytest.mark.unit
+class TestStandaloneVsMethod:
+
+    def test_alphagenomeloss_method_matches_standalone(self):
+        """The AlphaGenomeLoss method is now a thin wrapper around the
+        standalone losses.gene_lfc_loss; both must return identical values
+        for the same inputs."""
+        loss_fn = AlphaGenomeLoss(
+            gene_loss_weights={"rna_seq": 0.1},
+            track_strands={"rna_seq": "+-+-"},
+            gene_cross_track_weight=5.0,
+        )
+        torch.manual_seed(0)
+        B, S, C = 1, 64, 4
+        preds = torch.rand(B, S, C) + 0.5
+        targets = torch.rand(B, S, C) + 0.5
+        track_mask = torch.ones(B, 1, C, dtype=torch.bool)
+        gene_mask = torch.zeros(B, S, 2, 2, dtype=torch.bool)
+        gene_mask[:, 10:30, 0, 0] = True
+        gene_mask[:, 40:60, 1, 1] = True
+        strand_mask = loss_fn._get_strand_channel_mask("rna_seq")
+
+        loss_method, _ = loss_fn._compute_gene_lfc(
+            predictions=preds, targets=targets, targets_mask=track_mask,
+            gene_mask=gene_mask, strand_channel_mask=strand_mask,
+        )
+        loss_standalone, _ = gene_lfc_loss(
+            predictions=preds, targets=targets, targets_mask=track_mask,
+            gene_mask=gene_mask, strand_channel_mask=strand_mask,
+            gene_cross_track_weight=5.0,
+        )
+        assert torch.isclose(loss_method, loss_standalone)
+
+
+@pytest.mark.unit
+class TestComputeFinetuningLossGeneLFC:
+    """Verify compute_finetuning_loss adds the gene LFC term correctly."""
+
+    def _make_inputs(self, B=1, S=64, C=4, num_genes=2, seed=0):
+        torch.manual_seed(seed)
+        preds_dict = {1: torch.rand(B, S, C) + 0.5}
+        targets_dict = {1: torch.rand(B, S, C) + 0.5}
+        gene_mask = torch.zeros(B, S, 2, num_genes, dtype=torch.bool)
+        gene_mask[:, 10:30, 0, 0] = True
+        gene_mask[:, 40:60, 1, 1] = True
+        strand_mask = _build_strand_channel_mask("+-+-"[:C])
+        return preds_dict, targets_dict, gene_mask, strand_mask
+
+    def test_gene_lfc_off_when_weight_zero(self):
+        preds, targets, gene_mask, strand_mask = self._make_inputs()
+        loss_no_gene, dict_no_gene = compute_finetuning_loss(
+            predictions=preds, targets=targets,
+            resolution_weights={1: 1.0}, positional_weight=1.0,
+            device=torch.device("cpu"),
+        )
+        loss_with_zero, dict_with_zero = compute_finetuning_loss(
+            predictions=preds, targets=targets,
+            resolution_weights={1: 1.0}, positional_weight=1.0,
+            device=torch.device("cpu"),
+            gene_mask=gene_mask, gene_loss_weight=0.0,
+            strand_channel_mask=strand_mask,
+        )
+        # gene_loss_weight=0 must be exactly identical to "no gene config".
+        assert torch.isclose(loss_no_gene, loss_with_zero)
+        assert "loss_gene_lfc" not in dict_with_zero
+
+    def test_gene_lfc_increases_loss_when_enabled(self):
+        preds, targets, gene_mask, strand_mask = self._make_inputs()
+        loss_off, _ = compute_finetuning_loss(
+            predictions=preds, targets=targets,
+            resolution_weights={1: 1.0}, positional_weight=1.0,
+            device=torch.device("cpu"),
+        )
+        loss_on, dict_on = compute_finetuning_loss(
+            predictions=preds, targets=targets,
+            resolution_weights={1: 1.0}, positional_weight=1.0,
+            device=torch.device("cpu"),
+            gene_mask=gene_mask, gene_loss_weight=0.1,
+            strand_channel_mask=strand_mask,
+        )
+        assert loss_on.item() > loss_off.item()
+        assert "loss_gene_lfc" in dict_on
+        assert torch.isfinite(dict_on["loss_gene_lfc"])
+
+    def test_gene_lfc_only_at_resolution_1(self):
+        """When the only resolution available is 128, gene LFC must NOT fire
+        even if all params are set, because we gate on res == 1."""
+        torch.manual_seed(0)
+        B, S, C = 1, 8, 4  # 128 / 16 = 8 (S at 128bp)
+        preds = {128: torch.rand(B, S, C) + 0.5}
+        targets = {128: torch.rand(B, S, C) + 0.5}
+        # gene_mask shape uses raw seq length, but the gating checks res==1 only.
+        gene_mask = torch.zeros(B, 1024, 2, 1, dtype=torch.bool)
+        gene_mask[:, 100:200, 0, 0] = True
+        strand_mask = _build_strand_channel_mask("+-+-"[:C])
+
+        _, dict_on = compute_finetuning_loss(
+            predictions=preds, targets=targets,
+            resolution_weights={128: 1.0}, positional_weight=1.0,
+            device=torch.device("cpu"),
+            gene_mask=gene_mask, gene_loss_weight=0.1,
+            strand_channel_mask=strand_mask,
+        )
+        assert "loss_gene_lfc" not in dict_on
+
+
+@pytest.mark.unit
+class TestMissingStrandsValidation:
 
     def test_missing_track_strands_raises_when_gene_w_set(self):
         """If gene_loss_weights[head] > 0 but no track_strands provided,
