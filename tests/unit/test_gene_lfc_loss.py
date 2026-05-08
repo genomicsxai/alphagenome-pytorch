@@ -431,6 +431,67 @@ class TestComputeFinetuningLossGeneLFC:
 
 
 @pytest.mark.unit
+class TestSequenceParallelSlicing:
+    """Pin the contract used by train_epoch_sequence_parallel for slicing
+    gene_mask along S to per-rank shards. The implementation is inlined
+    inside the SP loop; this test mirrors that math and verifies that:
+      - Full-S mask split across W ranks reconstructs to the original.
+      - Each rank's slice has length S // W.
+      - gene_lfc_loss accepts the per-rank slice without shape errors.
+    """
+
+    def test_slice_reconstructs_full_mask(self):
+        torch.manual_seed(0)
+        B, S, G = 2, 1024, 3
+        world_size = 4
+        full_mask = torch.zeros(B, S, 2, G, dtype=torch.bool)
+        full_mask[:, 100:300, 0, 0] = True  # +-strand gene
+        full_mask[:, 500:700, 1, 1] = True  # --strand gene
+
+        slices = []
+        local_len = S // world_size
+        for rank in range(world_size):
+            slc = full_mask[:, rank * local_len:(rank + 1) * local_len, :, :]
+            assert slc.shape == (B, local_len, 2, G)
+            slices.append(slc)
+
+        reassembled = torch.cat(slices, dim=1)
+        assert torch.equal(reassembled, full_mask)
+
+    def test_per_rank_slice_runs_through_loss(self):
+        """A per-rank gene_mask slice (with matching local pred/target slice)
+        must run through gene_lfc_loss without shape errors."""
+        torch.manual_seed(0)
+        B, S, C, G = 1, 256, 4, 2
+        world_size = 4
+        rank = 1
+        local_len = S // world_size
+
+        preds = torch.rand(B, local_len, C) + 0.5
+        targets = torch.rand(B, local_len, C) + 0.5
+        track_mask = torch.ones(B, 1, C, dtype=torch.bool)
+
+        full_gene_mask = torch.zeros(B, S, 2, G, dtype=torch.bool)
+        # Place a gene that crosses the rank-1 shard.
+        full_gene_mask[:, 80:100, 0, 0] = True  # within rank 1's [64, 128) shard
+        full_gene_mask[:, 150:200, 1, 1] = True
+        local_gene_mask = full_gene_mask[
+            :, rank * local_len:(rank + 1) * local_len, :, :
+        ]
+        assert local_gene_mask.shape == (B, local_len, 2, G)
+
+        strand_mask = _build_strand_channel_mask("+-+-")
+        loss, aux = gene_lfc_loss(
+            predictions=preds,
+            targets=targets,
+            targets_mask=track_mask,
+            gene_mask=local_gene_mask,
+            strand_channel_mask=strand_mask,
+        )
+        assert torch.isfinite(loss)
+
+
+@pytest.mark.unit
 class TestMissingStrandsValidation:
 
     def test_missing_track_strands_raises_when_gene_w_set(self):

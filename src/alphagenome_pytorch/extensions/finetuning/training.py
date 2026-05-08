@@ -1789,6 +1789,10 @@ def train_epoch_sequence_parallel(
     profile_batches: int = 0,
     log_fn: Any | None = None,
     encoder_only: bool = False,
+    *,
+    gene_loss_weights: dict[str, float] | None = None,
+    gene_cross_track_weight: float = 5.0,
+    strand_channel_masks: dict[str, Tensor] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with sequence parallelism.
 
@@ -1862,7 +1866,16 @@ def train_epoch_sequence_parallel(
     else:
         pbar = train_loader
 
-    for batch_idx, (sequences, modality_targets) in enumerate(pbar):
+    gene_loss_weights = gene_loss_weights or {}
+
+    for batch_idx, batch_data in enumerate(pbar):
+        # Dataset returns 3-tuple when gene_mask is configured, else 2-tuple.
+        if len(batch_data) == 3:
+            sequences, modality_targets, gene_mask = batch_data
+            gene_mask = gene_mask.to(device)
+        else:
+            sequences, modality_targets = batch_data
+            gene_mask = None
         sequences = sequences.to(device)
         organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
 
@@ -1983,6 +1996,38 @@ def train_epoch_sequence_parallel(
                 )
 
                 res_loss = loss_dict["loss"] * weight
+
+                # Optional gene LFC term (Decima-style cross-track loss) for
+                # the rna_seq head at 1bp resolution. Slice gene_mask along
+                # S to match this rank's local shard, exactly as we sliced
+                # targets above.
+                gene_w = gene_loss_weights.get(modality, 0.0)
+                if (
+                    res == 1
+                    and gene_w > 0
+                    and gene_mask is not None
+                    and strand_channel_masks is not None
+                    and modality in strand_channel_masks
+                ):
+                    g_full_len = gene_mask.shape[1]
+                    g_local_len = g_full_len // world_size
+                    g_start = rank * g_local_len
+                    local_gene_mask = gene_mask[
+                        :, g_start:g_start + g_local_len, :, :
+                    ]
+                    gene_loss, gene_aux = losses.gene_lfc_loss(
+                        predictions=pred,
+                        targets=targets,
+                        targets_mask=mask,
+                        gene_mask=local_gene_mask,
+                        strand_channel_mask=strand_channel_masks[modality],
+                        gene_cross_track_weight=gene_cross_track_weight,
+                    )
+                    res_loss = res_loss + weight * gene_w * gene_loss
+                    loss_components[f"{modality}_gene_lfc"] = gene_loss.item()
+                    loss_components[f"{modality}_gene_total_count"] = gene_aux["gene_loss_total_count"].item()
+                    loss_components[f"{modality}_gene_positional"] = gene_aux["gene_loss_positional"].item()
+
                 modality_loss = modality_loss + res_loss
                 loss_components[f"{modality}_loss_{res}bp"] = res_loss.item()
 

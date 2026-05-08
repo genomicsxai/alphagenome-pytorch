@@ -1506,6 +1506,9 @@ def main(args: argparse.Namespace | None = None) -> None:
                     profile_batches=args.profile_batches if epoch == start_epoch else 0,
                     log_fn=logger.log_step if is_main_process(rank) else None,
                     encoder_only=encoder_only,
+                    gene_loss_weights=gene_loss_weights,
+                    gene_cross_track_weight=args.gene_cross_track_weight,
+                    strand_channel_masks=gene_strand_channel_masks,
                 )
             else:
                 # Standard multimodal training (uses multihead functions)
