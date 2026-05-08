@@ -285,7 +285,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Per-track strand string for the rna_seq modality, one char per "
             "BigWig in order. Each char must be '+', '-', or '.'. "
-            "Example: '+-+-' for 4 alternating-strand tracks. "
+            "Compact ('+-+-') or separated ('+,-,+,-' / '+ - + -') forms "
+            "are both accepted; commas and whitespace are stripped. "
             "Required when --gene-loss-weight > 0. Can also be supplied via "
             "the YAML config under modalities.<head>.strand."
         ),
@@ -699,13 +700,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             )
         args.modality_strands["rna_seq"] = args.track_strands
 
-    # Validate strand strings: one char per bigwig, each in {+, -, .}.
-    for modality, strands in args.modality_strands.items():
+    # Normalize and validate strand strings: accept both compact form
+    # ('+-+-.-') and comma/whitespace-separated form ('+,-,+,-,.,-' or
+    # '+ - + - . -'). After stripping separators, exactly one char per
+    # bigwig, each in {+, -, .}.
+    def _normalize_strand_string(s: str) -> str:
+        return "".join(c for c in s if c not in ", \t")
+
+    for modality, strands in list(args.modality_strands.items()):
+        strands = _normalize_strand_string(strands)
+        args.modality_strands[modality] = strands
         n_bw = len(args.modality_to_bigwigs[modality])
         if len(strands) != n_bw:
             parser.error(
-                f"strand string for modality '{modality}' has length "
-                f"{len(strands)} but there are {n_bw} bigwigs"
+                f"strand string for modality '{modality}' has {len(strands)} "
+                f"strand chars but there are {n_bw} bigwigs"
             )
         invalid = sorted({c for c in strands if c not in "+-."})
         if invalid:
