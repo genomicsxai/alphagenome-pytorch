@@ -616,68 +616,80 @@ class VariantScoringModel:
     def score_ism_variants(
         self,
         interval: Interval,
-        center_position: int,
         scorers: list[BaseVariantScorer],
+        *,
+        ism_interval: Interval | None = None,
+        center_position: int | None = None,
         window_size: int = 21,
+        interval_variant: Variant | None = None,
         organism: str | int | None = None,
         gene_annotation: GeneAnnotation | None = None,
         nucleotides: str = 'ACGT',
         to_cpu: bool = True,
         progress: bool = True,
     ) -> list[list[VariantScore | list[VariantScore]]]:
-        """Score all possible single-nucleotide mutations in a window.
+        """Score all possible single-nucleotide mutations across a region.
 
         In-silico mutagenesis (ISM) systematically evaluates all possible
-        SNVs within a window centered on a position of interest. This is
-        useful for identifying which positions are most sensitive to mutation.
+        SNVs within a region of interest. The region can be specified either
+        explicitly (``ism_interval``) or as a window centered on a position
+        (``center_position``/``window_size``) — supply exactly one.
 
         Args:
-            interval: Genomic interval for prediction context (must be 131072bp)
-            center_position: 1-based center position for the ISM window
-            scorers: List of scorer configurations
-            window_size: Size of the window to mutate (default 21bp, centered)
+            interval: Genomic interval for prediction context (must be 131072bp).
+            scorers: List of scorer configurations.
+            ism_interval: Genomic interval to mutate. Must be contained in
+                ``interval`` and on the same chromosome. Mutually exclusive
+                with ``center_position``.
+            center_position: 1-based center position for the ISM window.
+                Mutually exclusive with ``ism_interval``.
+            window_size: Size of the window to mutate when using
+                ``center_position`` (default 21bp, centered).
+            interval_variant: Optional variant to apply to the context
+                sequence before generating SNVs. SNV reference bases are
+                read from the variant-modified sequence.
             organism: 'human', 'mouse', or index. Uses default_organism if None.
-            gene_annotation: Optional GeneAnnotation for gene-centric scorers
-            nucleotides: Nucleotides to mutate to (default 'ACGT' = all 4 bases)
+            gene_annotation: Optional GeneAnnotation for gene-centric scorers.
+            nucleotides: Nucleotides to mutate to (default 'ACGT' = all 4 bases).
+                Reference bases not in this set are skipped.
             to_cpu: If True, move scores to CPU and clear GPU cache after each variant.
-            progress: Whether to show progress bar
+            progress: Whether to show progress bar.
 
         Returns:
             Nested list: [variant_idx][scorer_idx] of VariantScore.
-            Each variant is a possible SNV in the window.
+            Each variant is a possible SNV in the ISM region.
 
         Example:
-            >>> # Score all SNVs in a 21bp window
+            >>> # Score all SNVs in a 21bp window centered on a position
             >>> ism_scores = scoring_model.score_ism_variants(
             ...     interval=interval,
-            ...     center_position=36201698,
             ...     scorers=[CenterMaskScorer(OutputType.ATAC, 501, AggregationType.DIFF_LOG2_SUM)],
+            ...     center_position=36201698,
             ...     window_size=21,
             ... )
+
+            >>> # Or supply an explicit ISM interval
+            >>> ism_scores = scoring_model.score_ism_variants(
+            ...     interval=interval,
+            ...     scorers=[...],
+            ...     ism_interval=Interval('chr22', 36201688, 36201709),
+            ... )
         """
-        # Get reference sequence
-        ref_seq = self.get_sequence(interval)
+        ism_interval = _resolve_ism_interval(
+            interval=interval,
+            ism_interval=ism_interval,
+            center_position=center_position,
+            window_size=window_size,
+        )
 
-        # Generate all SNVs in window
-        variants = []
-        half_window = window_size // 2
+        sequence = self.get_sequence(interval, variant=interval_variant)
+        variants = _build_ism_variants(
+            sequence=sequence,
+            interval=interval,
+            ism_interval=ism_interval,
+            nucleotides=nucleotides,
+        )
 
-        for offset in range(-half_window, half_window + 1):
-            pos = center_position + offset
-            rel_pos = pos - 1 - interval.start  # 0-based relative position
-
-            if 0 <= rel_pos < len(ref_seq):
-                ref_base = ref_seq[rel_pos].upper()
-                for alt_base in nucleotides:
-                    if alt_base.upper() != ref_base:
-                        variants.append(Variant(
-                            chromosome=interval.chromosome,
-                            position=pos,
-                            reference_bases=ref_base,
-                            alternate_bases=alt_base.upper(),
-                        ))
-
-        # Score all variants
         return self.score_variants(
             intervals=interval,
             variants=variants,
@@ -793,6 +805,99 @@ class VariantScoringModel:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+
+def _resolve_ism_interval(
+    *,
+    interval: Interval,
+    ism_interval: Interval | None,
+    center_position: int | None,
+    window_size: int,
+) -> Interval:
+    """Validate and normalize the ISM region.
+
+    Returns the supplied ``ism_interval`` (after validation), or constructs one
+    from ``center_position`` + ``window_size`` (1-based VCF center, symmetric
+    window). Exactly one of the two must be provided.
+    """
+    if ism_interval is None and center_position is None:
+        raise ValueError(
+            "score_ism_variants requires either ism_interval or center_position."
+        )
+    if ism_interval is not None and center_position is not None:
+        raise ValueError(
+            "score_ism_variants accepts only one of ism_interval or center_position."
+        )
+
+    if ism_interval is None:
+        half = window_size // 2
+        start_0b = (center_position - 1) - half
+        ism_interval = Interval(
+            chromosome=interval.chromosome,
+            start=start_0b,
+            end=start_0b + window_size,
+        )
+
+    if ism_interval.chromosome != interval.chromosome:
+        raise ValueError(
+            f"ISM interval chromosome {ism_interval.chromosome!r} does not match "
+            f"context interval chromosome {interval.chromosome!r}."
+        )
+    if ism_interval.strand == '-':
+        raise ValueError("ISM interval must be on the positive strand.")
+    if ism_interval.start < interval.start or ism_interval.end > interval.end:
+        raise ValueError(
+            f"ISM interval [{ism_interval.start}, {ism_interval.end}) must be "
+            f"contained within context interval "
+            f"[{interval.start}, {interval.end})."
+        )
+    return ism_interval
+
+
+def _build_ism_variants(
+    sequence: str,
+    interval: Any,
+    ism_interval: Any,
+    nucleotides: str = 'ACGT',
+    *,
+    variant_cls: type = Variant,
+) -> list:
+    """Generate all SNVs covering ``ism_interval`` from ``sequence``.
+
+    ``sequence`` is the reference (or variant-modified) sequence at positions
+    ``[interval.start, interval.end)``. For each position in
+    ``[ism_interval.start, ism_interval.end)`` whose reference base is in
+    ``nucleotides``, one variant is emitted per alternate base in
+    ``nucleotides`` other than the reference. Positions whose reference base
+    falls outside ``nucleotides`` (e.g. ``N``) are skipped.
+
+    ``interval`` and ``ism_interval`` need only expose ``chromosome``,
+    ``start``, and ``end`` (PT ``Interval`` or ``genome.Interval`` both work).
+    ``variant_cls`` lets callers select the constructor — defaults to PT
+    ``Variant``; serving passes ``genome.Variant`` to avoid a back-conversion.
+
+    Variant positions are 1-based (VCF convention).
+    """
+    nuc_upper = {b.upper() for b in nucleotides}
+    variants: list = []
+    for pos_0b in range(ism_interval.start, ism_interval.end):
+        rel = pos_0b - interval.start
+        if rel < 0 or rel >= len(sequence):
+            continue
+        ref_base = sequence[rel].upper()
+        if ref_base not in nuc_upper:
+            continue
+        for alt_base in nucleotides:
+            alt_upper = alt_base.upper()
+            if alt_upper == ref_base:
+                continue
+            variants.append(variant_cls(
+                chromosome=interval.chromosome,
+                position=pos_0b + 1,
+                reference_bases=ref_base,
+                alternate_bases=alt_upper,
+            ))
+    return variants
 
 
 # Recommended scorer presets matching JAX reference
