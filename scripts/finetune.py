@@ -365,6 +365,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1024,
         help="Overlap for high-resolution (1bp) sequence splits. Low-resolution overlap is computed as overlap_highres // 128.",
     )
+    dist.add_argument(
+        "--sync-batchnorm",
+        action="store_true",
+        help="Sync RMSBatchNorm statistics across ranks (SyncBN). Recommended when "
+        "training the trunk (full fine-tuning / from scratch) under --sequence-parallel, "
+        "so batch stats cover the whole sequence rather than each rank's local slice.",
+    )
 
     # Logging arguments
     log = parser.add_argument_group("Logging")
@@ -977,6 +984,13 @@ def create_model(
     # Get head references from the underlying model before optional compile.
     model_module = unwrap_training_model(model)
     heads = {modality: model_module.heads[modality] for modality in heads}
+
+    # Enable SyncBN so RMSBatchNorm statistics cover the whole sequence under
+    # sequence parallelism (each rank otherwise only sees its local slice).
+    if args.sync_batchnorm:
+        from alphagenome_pytorch.layers import set_sync_batchnorm
+        n = set_sync_batchnorm(model_module, enabled=True)
+        print_rank0(f"SyncBN enabled on {n} RMSBatchNorm layers", rank)
 
     # Optionally compile
     if args.compile:
