@@ -374,6 +374,18 @@ class VariantScoringModel:
         Returns:
             Tuple of (ref_outputs, alt_outputs) dictionaries.
         """
+        # The unified-splicing second pass reads splice_sites['probs'] (and
+        # aligns it for indels) to derive unified positions, so a head filter
+        # that omits splice_sites would otherwise fail with an opaque KeyError.
+        # The junction head itself is recomputed from embeddings and need not be
+        # in `heads`. Embeddings come from return_embeddings, not the filter.
+        if unified_splicing and heads is not None and 'splice_sites' not in heads:
+            raise ValueError(
+                "unified_splicing=True requires 'splice_sites' in heads "
+                f"(got {heads}); it is needed to derive unified splice-site "
+                "positions for the junction head's second pass."
+            )
+
         # Handle indels: for deletions, extend extraction to compensate for
         # sequence shrinkage. For insertions, the alt is longer and gets
         # truncated. Both ref and alt are truncated to the original interval

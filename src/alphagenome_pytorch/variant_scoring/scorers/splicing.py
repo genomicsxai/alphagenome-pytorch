@@ -281,8 +281,11 @@ class SpliceJunctionScorer(BaseVariantScorer):
     @property
     def required_heads(self) -> frozenset[str]:
         # The unified-splicing flow needs splice_sites probs to derive unified
-        # site positions, then re-runs the junction head on cached embeddings.
-        return frozenset({'splice_sites', 'splice_junctions'})
+        # site positions. The junction head is re-run in the second pass on
+        # cached embeddings with those unified positions, which unconditionally
+        # overwrites any first-pass result, so requesting 'splice_junctions'
+        # here would just do a redundant junction-head forward per sequence.
+        return frozenset({'splice_sites'})
 
     @property
     def is_signed(self) -> bool:

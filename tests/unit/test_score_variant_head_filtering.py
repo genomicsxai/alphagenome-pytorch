@@ -87,9 +87,11 @@ def test_required_heads_default_uses_requested_output():
 
 
 @pytest.mark.unit
-def test_required_heads_splice_junction_includes_splice_sites():
+def test_required_heads_splice_junction_only_splice_sites():
+    # The junction head is recomputed in the unified-splicing second pass, so
+    # the first pass only needs splice_sites to derive unified positions.
     sj = SpliceJunctionScorer()
-    assert sj.required_heads == frozenset({'splice_sites', 'splice_junctions'})
+    assert sj.required_heads == frozenset({'splice_sites'})
 
 
 @pytest.mark.unit
@@ -127,7 +129,7 @@ def test_score_variant_forwards_union_of_required_heads(monkeypatch):
 
     scorers = [
         CenterMaskScorer(OutputType.ATAC, 501, AggregationType.DIFF_LOG2_SUM),
-        GeneMaskActiveScorer(OutputType.RNA_SEQ),  # needs gene_annotation, but we won't trigger if no scorers => abort early
+        GeneMaskActiveScorer(OutputType.RNA_SEQ),  # included so required_heads adds rna_seq; its score() still runs, but the stub annotation below returns no genes so it finishes quickly
     ]
 
     # GeneMaskActiveScorer requires gene_annotation; supply a stub to satisfy it
