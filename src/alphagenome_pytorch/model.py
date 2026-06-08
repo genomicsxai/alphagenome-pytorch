@@ -628,20 +628,23 @@ class AlphaGenome(nn.Module):
                 - 'embeddings_128bp': (B, S//128, 3072) or (B, 3072, S//128) at 128bp.
                 - 'embeddings_pair': (B, S//2048, S//2048, 128) pair embeddings.
 
+        Note:
+            Unlike ``predict()`` (wrapped in ``torch.no_grad()``), ``encode()``
+            honors the ambient autograd context so gradients can flow into the
+            backbone for end-to-end fine-tuning. Wrap the call in
+            ``torch.no_grad()`` for pure inference/analysis to avoid retaining
+            the activation graph; omit it when you intend to backpropagate.
+
         Example:
-            # Get embeddings for fine-tuning with a custom head
             model = AlphaGenome.from_pretrained('model.pth', device='cuda')
             model.eval()
 
-            # Freeze backbone
-            for param in model.parameters():
-                param.requires_grad = False
-
-            # Get embeddings (128bp only for efficiency)
+            # Inference / analysis: no gradients, lower memory
             with torch.no_grad():
                 emb = model.encode(dna_seq, organism_idx, resolutions=(128,))
 
-            # Use with custom head (NCL format for Conv1d)
+            # Fine-tuning: omit no_grad so gradients reach the backbone
+            # (NCL format for Conv1d heads)
             emb = model.encode(dna_seq, organism_idx, channels_last=False)
             custom_output = my_conv_head(emb['embeddings_128bp'])
         """
@@ -711,7 +714,8 @@ class AlphaGenome(nn.Module):
             Dict of predictions from each head. Keys are head names
             (atac, dnase, cage, etc.), values are dicts mapping
             resolution (1 or 128) to prediction tensors.
-            If return_embeddings is True, also contains 'embeddings_1bp' and 'embeddings_128bp'.
+            If return_embeddings is True, also contains 'embeddings_1bp',
+            'embeddings_128bp', and 'embeddings_pair'.
             If encoder_only is True, returns ``{"encoder_output": tensor}`` only.
 
         Raises:
@@ -845,6 +849,9 @@ class AlphaGenome(nn.Module):
                 if need_1bp:
                     outputs['embeddings_1bp'] = embeddings_1bp
                 outputs['embeddings_128bp'] = embeddings_128bp
+            # Pair embeddings have a (B, S, S, D) layout, not NCL, so they are
+            # added independently of channels_last (matching encode()).
+            outputs['embeddings_pair'] = embeddings_pair
 
         return self._cast_outputs(outputs)
 
