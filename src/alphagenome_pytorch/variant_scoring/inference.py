@@ -733,19 +733,28 @@ class VariantScoringModel:
 
         Creates a (sequence_length, 4) matrix where each position contains
         the contribution score for mutating the reference base to each
-        possible alternate base.
+        possible alternate base, mean-centered across alternatives.
 
         Args:
             variant_scores: List of scores for each variant (from ISM scoring).
             variants: List of Variant objects corresponding to scores.
             interval: Genomic interval that was scored.
-            multiply_by_sequence: If True, zero out the reference base positions
-                (since we only have alt scores). Default True.
+            multiply_by_sequence: If True, zero every scored ALT column, leaving
+                non-zero values only at unscored columns. For a normal ACGT position
+                (all 3 ALT bases scored) that is exactly the reference-base column;
+                for an ``N`` reference (all 4 ALT bases scored) the whole row is
+                zeroed. Default True. 
+                Positions with only 1 or 2 scored ALT bases are rejected.
             vocabulary: Nucleotide vocabulary order. Default 'ACGT'.
 
         Returns:
             Tensor of shape (interval.width, 4) with mean-centered ISM scores.
-            
+
+        Raises:
+            ValueError: If any position has only 1 or 2 scored ALT bases. A real
+                ACGT reference must contribute all 3 alternates (an ``N`` reference
+                contributes 4); a partially scored position would be mis-centered.
+
         Example:
             >>> ism_scores = scorer.score_ism_variants(interval, center, scorers)
             >>> # Flatten to get score per variant
@@ -753,35 +762,13 @@ class VariantScoringModel:
             >>> variants = [...]  # Same order as ism_scores
             >>> matrix = scorer.ism_matrix(flat_scores, variants, interval)
         """
-        import numpy as np
-
-        scores = np.zeros((interval.width, len(vocabulary)), dtype=np.float32)
-        filled = np.zeros((interval.width, len(vocabulary)), dtype=bool)
-        base_index = {base: i for i, base in enumerate(vocabulary)}
-
-        for variant, score in zip(variants, variant_scores):
-            if not variant.is_snv:
-                continue
-            position = variant.start - interval.start
-            if 0 <= position < interval.width:
-                alt_base = variant.alternate_bases.upper()
-                if alt_base in base_index:
-                    scores[position, base_index[alt_base]] = score
-                    filled[position, base_index[alt_base]] = True
-
-        # Mean-center across alternatives (excluding reference)
-        # For each position, subtract mean of filled values
-        for pos in range(interval.width):
-            n_filled = filled[pos].sum()
-            if n_filled > 0:
-                mean_score = scores[pos, filled[pos]].mean()
-                scores[pos] -= mean_score / (len(vocabulary) - 1)
-
-        if multiply_by_sequence:
-            # Zero out positions where we don't have data
-            scores = scores * (~filled).astype(np.float32)
-
-        return torch.from_numpy(scores)
+        return _ism_matrix(
+            variant_scores=variant_scores,
+            variants=variants,
+            interval=interval,
+            multiply_by_sequence=multiply_by_sequence,
+            vocabulary=vocabulary,
+        )
 
     def close(self):
         """Close any open file handles."""
@@ -793,6 +780,70 @@ class VariantScoringModel:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+
+def _ism_matrix(
+    variant_scores: list[float],
+    variants: list[Variant],
+    interval: Interval,
+    multiply_by_sequence: bool = True,
+    vocabulary: str = 'ACGT',
+) -> torch.Tensor:
+    """Construct mean-centered ISM contribution matrix.
+
+    Module-level helper underlying ``VariantScoringModel.ism_matrix``. Mirrors
+    ``alphagenome.interpretation.ism.ism_matrix``: per row, subtracts
+    ``sum(scores) / (V - 1)``. For a normal ACGT position all 3 ALT columns are
+    scored and the REF column starts at 0, so the divisor ``V - 1`` is the ALT
+    count and the REF column holds ``-mean(ALT scores)`` while each ALT column
+    holds ``score - mean(ALT scores)``.
+
+    Positions with only 1 or 2 scored ALT bases are rejected with ``ValueError``:
+    the incomplete sum would still be divided by ``V - 1``, yielding a
+    wrong-magnitude row. A position with 4 scored ALTs (an ``N`` reference) is
+    allowed; under ``multiply_by_sequence`` its row zeros out entirely.
+    """
+    import numpy as np
+
+    scores = np.zeros((interval.width, len(vocabulary)), dtype=np.float32)
+    filled = np.zeros((interval.width, len(vocabulary)), dtype=bool)
+    base_index = {base: i for i, base in enumerate(vocabulary)}
+
+    for variant, score in zip(variants, variant_scores):
+        if not variant.is_snv:
+            continue
+        position = variant.start - interval.start
+        if 0 <= position < interval.width:
+            alt_base = variant.alternate_bases.upper()
+            if alt_base in base_index:
+                scores[position, base_index[alt_base]] = score
+                filled[position, base_index[alt_base]] = True
+
+    # Per-position coverage guard. A real ACGT reference has exactly 3 possible
+    # ALT bases, so a scored row holds 3 (normal) or 4 (non-ACGT/N reference, which
+    # yields all four ACGT as alts). 0 means the position fell outside the scored
+    # window (edge) and is intentionally left as zeros. 1 or 2 means a real base is
+    # missing some alternates: centering would then divide an incomplete sum by
+    # (V-1), silently producing a wrong-magnitude row, so we reject it rather than
+    # emit a misleading matrix.
+    per_pos = filled.sum(axis=-1)
+    partial = np.where((per_pos == 1) | (per_pos == 2))[0]
+    if partial.size:
+        positions_1based = (partial + interval.start + 1).tolist()
+        raise ValueError(
+            'ism_matrix: positions have only 1 or 2 alternate bases (expected 3 '
+            'for an ACGT reference, or 4 for N). 1-based positions: '
+            f'{positions_1based}'
+        )
+
+    # Mean-center: subtract sum/(V-1) per position. Because the REF column is 0,
+    # this equals the mean of the (V-1) ALT scores.
+    scores -= scores.sum(axis=-1, keepdims=True) / (len(vocabulary) - 1)
+
+    if multiply_by_sequence:
+        scores = scores * (~filled).astype(np.float32)
+
+    return torch.from_numpy(scores)
 
 
 # Recommended scorer presets matching JAX reference

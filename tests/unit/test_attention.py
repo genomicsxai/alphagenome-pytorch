@@ -3,7 +3,13 @@
 import pytest
 import torch
 
-from alphagenome_pytorch.attention import apply_rope
+from alphagenome_pytorch.attention import (
+    MHABlock,
+    RowAttentionBlock,
+    apply_rope,
+)
+
+pytestmark = pytest.mark.unit
 
 
 class TestApplyRope:
@@ -383,3 +389,118 @@ class TestMHABlock:
             dots1, dots2, atol=1e-4, rtol=1e-4,
             msg="RoPE relative position inner products should be translation-invariant"
         )
+
+
+class TestAttentionWeightHooks:
+    """Verify that attention weights can be extracted via forward hooks on
+    the attn_softmax submodule. This is the supported interpretability API —
+    users can register a hook without modifying forward signatures.
+    """
+
+    def test_mha_hook_captures_attention_weights(self):
+        """Hook on MHABlock.attn_softmax should capture (B, 8, S, S) weights."""
+        torch.manual_seed(0)
+        d_model, seq_len = 64, 32
+        mha = MHABlock(d_model=d_model).eval()
+
+        captured = {}
+
+        def hook(module, inputs, output):
+            captured["input"] = inputs[0].detach()
+            captured["output"] = output.detach()
+
+        handle = mha.attn_softmax.register_forward_hook(hook)
+        try:
+            x = torch.randn(2, seq_len, d_model)
+            bias = torch.randn(2, 8, seq_len, seq_len)
+            with torch.no_grad():
+                _ = mha(x, bias)
+        finally:
+            handle.remove()
+
+        assert "output" in captured, "Hook was not fired"
+        attn = captured["output"]
+        # GQA: 8 query heads, shape (B, H=8, S, S)
+        assert attn.shape == (2, 8, seq_len, seq_len), (
+            f"Unexpected attention shape: {attn.shape}"
+        )
+        # Valid probability distribution along the key axis
+        row_sums = attn.float().sum(dim=-1)
+        torch.testing.assert_close(
+            row_sums, torch.ones_like(row_sums), rtol=1e-5, atol=1e-5,
+            msg="Attention rows should sum to 1",
+        )
+        assert (attn >= 0).all(), "Attention weights must be non-negative"
+
+        # Output should equal softmax(input) — sanity check that the module
+        # really is the softmax and nothing mutates between pre/post-hook.
+        torch.testing.assert_close(
+            captured["output"],
+            torch.softmax(captured["input"], dim=-1),
+            rtol=1e-6, atol=1e-6,
+        )
+
+    def test_row_attention_hook_captures_attention_weights(self):
+        """Hook on RowAttentionBlock.attn_softmax should capture per-row weights."""
+        torch.manual_seed(0)
+        pair_dim, s = 128, 16
+        block = RowAttentionBlock(pair_dim=pair_dim).eval()
+
+        captured = {}
+
+        def hook(module, inputs, output):
+            captured["output"] = output.detach()
+
+        handle = block.attn_softmax.register_forward_hook(hook)
+        try:
+            x = torch.randn(2, s, s, pair_dim)
+            with torch.no_grad():
+                _ = block(x)
+        finally:
+            handle.remove()
+
+        assert "output" in captured, "Hook was not fired"
+        attn = captured["output"]
+        # Row-attention: softmax along the last axis of (B, s, s, s)
+        assert attn.shape == (2, s, s, s), f"Unexpected shape: {attn.shape}"
+        row_sums = attn.float().sum(dim=-1)
+        torch.testing.assert_close(
+            row_sums, torch.ones_like(row_sums), rtol=1e-5, atol=1e-5,
+            msg="Row-attention rows should sum to 1",
+        )
+
+    def test_hook_does_not_change_forward_output(self):
+        """Registering a hook must not affect the block's return value —
+        guards against accidental in-place mutation in user hooks.
+        """
+        torch.manual_seed(0)
+        d_model, seq_len = 64, 32
+        mha = MHABlock(d_model=d_model).eval()
+        x = torch.randn(1, seq_len, d_model)
+        bias = torch.randn(1, 8, seq_len, seq_len)
+
+        with torch.no_grad():
+            out_no_hook = mha(x, bias)
+
+        handle = mha.attn_softmax.register_forward_hook(
+            lambda module, inputs, output: None
+        )
+        try:
+            with torch.no_grad():
+                out_with_hook = mha(x, bias)
+        finally:
+            handle.remove()
+
+        torch.testing.assert_close(out_no_hook, out_with_hook, rtol=0, atol=0)
+
+    def test_attn_softmax_has_no_parameters(self):
+        """nn.Softmax adds zero parameters — loading existing checkpoints
+        must continue to work without state_dict changes.
+        """
+        mha = MHABlock(d_model=64)
+        assert list(mha.attn_softmax.parameters()) == []
+        assert list(mha.attn_softmax.state_dict().keys()) == []
+
+        row = RowAttentionBlock(pair_dim=128)
+        assert list(row.attn_softmax.parameters()) == []
+        assert list(row.attn_softmax.state_dict().keys()) == []
