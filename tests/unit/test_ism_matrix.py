@@ -4,6 +4,12 @@ The upstream contract: per row, subtract `sum(scores) / (V - 1)`. With REF colum
 and three ALT columns filled, this equals the mean of the three ALT scores. After
 mean-centering, REF holds `-mean(ALT)` and each ALT holds `score - mean(ALT)`. With
 `multiply_by_sequence=True`, only the REF column survives.
+
+Coverage guard: a real ACGT reference contributes exactly 3 ALT bases, so a scored
+row holds 3 (normal) or 4 (an `N` reference yields all four ACGT as alts). A row with
+only 1 or 2 scored ALTs would be mis-centered (incomplete sum still divided by V-1),
+so `_ism_matrix` raises `ValueError`. Rows with 0 scored ALTs (window edges) are left
+as zeros.
 """
 
 import numpy as np
@@ -107,36 +113,65 @@ def test_matches_upstream_vectorized_formula():
     np.testing.assert_allclose(got_post, expected_masked, atol=1e-6)
 
 
-def test_partially_filled_position_still_centered_uniformly():
-    """Even if a position has fewer than 3 ALT scores, the (V-1) divisor stays.
+def test_partially_filled_position_raises():
+    """A position with only 1 or 2 scored ALT bases is rejected.
 
-    Upstream uses `sum/(V-1)` regardless of how many cells are filled — it doesn't
-    re-divide by the number of filled entries. Lock that in.
+    Centering divides by (V-1)=3 regardless of how many cells are filled, so a
+    partially scored position would silently produce a wrong-magnitude row. The
+    coverage guard raises instead, reporting the offending 1-based position.
     """
     interval = Interval(chromosome='chr1', start=100, end=101)
     variants = [Variant('chr1', 101, 'A', 'C'), Variant('chr1', 101, 'A', 'G')]  # missing A->T
     scores = [3.0, 6.0]
 
-    matrix = _ism_matrix(scores, variants, interval, multiply_by_sequence=False).numpy()
+    with pytest.raises(ValueError, match=r'1 or 2 alternate bases.*101'):
+        _ism_matrix(scores, variants, interval, multiply_by_sequence=False)
 
-    # sum = 0+3+6+0 = 9; subtract 9/3 = 3 from each cell.
-    # ACGT -> [A=-3, C=0, G=3, T=-3]
-    assert np.allclose(matrix[0], [-3.0, 0.0, 3.0, -3.0])
+
+def test_n_reference_four_alts_allowed():
+    """A non-ACGT (N) reference yields all 4 ALT bases and is allowed.
+
+    A real ACGT base can only have 3 alternates, so 4 scored ALTs uniquely signals
+    an N reference. It must not trip the partial-coverage guard. Under the default
+    `multiply_by_sequence=True` mask, every column is filled so the row zeros out.
+    """
+    interval = Interval(chromosome='chr1', start=100, end=101)
+    variants = [
+        Variant('chr1', 101, 'N', 'A'), Variant('chr1', 101, 'N', 'C'),
+        Variant('chr1', 101, 'N', 'G'), Variant('chr1', 101, 'N', 'T'),
+    ]
+    scores = [1.0, 2.0, 3.0, 4.0]
+
+    # Default mask: all four columns filled -> whole row zeroed, no error.
+    post = _ism_matrix(scores, variants, interval, multiply_by_sequence=True).numpy()
+    assert np.allclose(post[0], [0.0, 0.0, 0.0, 0.0])
+
+    # Pre-mask: centered by sum/(V-1)=10/3 per cell, still no error.
+    pre = _ism_matrix(scores, variants, interval, multiply_by_sequence=False).numpy()
+    assert np.allclose(pre[0], np.array([1.0, 2.0, 3.0, 4.0]) - 10.0 / 3)
 
 
 def test_skips_non_snv_and_oob_variants():
-    """Indels and out-of-interval variants are silently ignored, matching prior behavior."""
+    """Indels and out-of-interval variants are silently ignored.
+
+    Position 0 still gets its full 3 SNVs (so the coverage guard is satisfied); the
+    insertion and the out-of-interval SNV must not contribute. Position 1 stays empty
+    (0 filled is allowed — it is left as zeros, not raised).
+    """
     interval = Interval(chromosome='chr1', start=100, end=102)
     variants = [
-        Variant('chr1', 101, 'A', 'C'),  # in-interval SNV
+        Variant('chr1', 101, 'A', 'C'),   # in-interval SNV
+        Variant('chr1', 101, 'A', 'G'),   # in-interval SNV
+        Variant('chr1', 101, 'A', 'T'),   # in-interval SNV
         Variant('chr1', 101, 'A', 'CG'),  # insertion: skipped
-        Variant('chr1', 200, 'A', 'C'),  # out of interval: skipped
+        Variant('chr1', 200, 'A', 'C'),   # out of interval: skipped
     ]
-    scores = [2.0, 99.0, 99.0]
+    scores = [2.0, 4.0, 6.0, 99.0, 99.0]
 
     matrix = _ism_matrix(scores, variants, interval, multiply_by_sequence=False).numpy()
 
-    # Only the first variant counted: position 0, sum = 2, subtract 2/3 from each cell.
-    assert np.allclose(matrix[0], [-2.0 / 3, 2.0 - 2.0 / 3, -2.0 / 3, -2.0 / 3])
+    # Only the 3 valid SNVs counted: position 0, sum = 12, subtract 12/3 = 4 per cell.
+    # ACGT -> [A=-4, C=-2, G=0, T=2]; the skipped variants leave no trace.
+    assert np.allclose(matrix[0], [-4.0, -2.0, 0.0, 2.0])
     # Position 1 untouched: all zero.
     assert np.allclose(matrix[1], [0.0, 0.0, 0.0, 0.0])
