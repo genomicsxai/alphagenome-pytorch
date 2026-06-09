@@ -347,8 +347,8 @@ class TestCrossEntropyLoss:
 class TestCrossEntropyLossSmoothingFix:
     """Tests for cross_entropy_loss post-smoothing (B3.4 / upstream de264f5).
 
-    Golden values produced by running the upstream JAX `cross_entropy_loss`
-    on the same inputs (see plan handover for generation script).
+    Golden values produced by running the upstream JAX
+    `cross_entropy_loss` on the same inputs
     """
 
     # Inputs reused across cases.
