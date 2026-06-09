@@ -1259,3 +1259,164 @@ class TestAllScorersComprehensive:
             f"Found {unexpected_failures} unexpected failures! "
             f"See test output for details."
         )
+
+
+# =============================================================================
+# Quantile-score parity vs API
+# =============================================================================
+
+
+def match_quantiles_by_track_name(
+    pt_quantiles: np.ndarray,
+    pt_track_metadata: list,
+    api_adata: 'anndata.AnnData',
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Align PyTorch and API quantile scores by track name (+strand).
+
+    Mirrors ``match_scores_by_track_name`` but reads the API's
+    ``layers['quantiles']`` instead of ``X``, and drops any pair where either
+    side is non-finite (uncalibrated tracks carry NaN).
+    """
+    if "quantiles" not in api_adata.layers:
+        return np.array([]), np.array([]), 0
+
+    api_q = np.asarray(api_adata.layers["quantiles"]).reshape(-1)
+
+    if "name" in api_adata.var:
+        api_track_names = api_adata.var["name"].tolist()
+    else:
+        api_track_names = list(api_adata.var.index)
+    api_strands = api_adata.var["strand"].tolist() if "strand" in api_adata.var else []
+
+    key_to_idx, name_to_idx = {}, {}
+    for i, meta in enumerate(pt_track_metadata):
+        if hasattr(meta, "track_name"):
+            name_to_idx[meta.track_name] = i
+            key_to_idx[f"{meta.track_name}|{getattr(meta, 'track_strand', '.')}"] = i
+
+    aligned_pt, aligned_api = [], []
+    for ai, name in enumerate(api_track_names):
+        idx = None
+        if api_strands:
+            idx = key_to_idx.get(f"{name}|{api_strands[ai]}")
+        if idx is None:
+            idx = name_to_idx.get(name)
+        if idx is not None and idx < len(pt_quantiles) and ai < len(api_q):
+            aligned_pt.append(pt_quantiles[idx])
+            aligned_api.append(api_q[ai])
+
+    apt = np.asarray(aligned_pt, dtype=np.float64)
+    aapi = np.asarray(aligned_api, dtype=np.float64)
+    finite = np.isfinite(apt) & np.isfinite(aapi)
+    return apt[finite], aapi[finite], int(finite.sum())
+
+
+@pytest.mark.integration
+@pytest.mark.api
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestQuantileScoresVsAPI:
+    """Quantile-score parity against the API for signed CenterMask scorers.
+
+    Quantiles are *opt-in* (pass ``calibration="human"``). Because they use the
+    same calibration table we converted from the API's protobuf, this test
+    validates the end-to-end quantile path — in particular that our model emits
+    tracks in the API's calibration order (a misalignment would assign quantiles
+    to the wrong tracks and only this test would catch it) and that raw-score
+    agreement propagates into quantile agreement.
+
+    Comparison uses Pearson correlation (ordering/alignment), a robust median
+    |quantile diff| gate (magnitude), and a coarse fraction-within-tolerance
+    backstop — not exact equality: quantiles are discretized to 999 levels, our
+    raw scores differ from the API's by ~1%, and tracks with duplicated breakpoints
+    are tie-broken at random with an independent seed. Restricted to the low-tie
+    signed scorers (ATAC/DNASE/CAGE/PROCAP); fully-tied scorers (CHIP-TF/Histone)
+    and per-gene/junction scorers are intentionally out of scope here.
+    """
+
+    # Correlation is the strong ordering/alignment gate (quantile is a deterministic
+    # monotone transform of the raw score per track, and raw scores agree to ~1%,
+    # so cross-track correlation should be very high).
+    QUANTILE_CORR_THRESHOLD = 0.95
+    # Primary magnitude gate: the *median* per-track |quantile diff| must be tiny.
+    # Median ignores the minority of large flips caused by ±1 saturation and steep
+    # regions of the calibration CDF amplifying the ~1% raw-score gap, so it is both
+    # tighter and not hostage to that heavy tail. Signed quantiles span [-1, 1].
+    QUANTILE_MEDIAN_ATOL = 0.02
+    # Coarse gross-error backstop only (median above is the real magnitude gate):
+    # most tracks must land within QUANTILE_ATOL of the API quantile.
+    QUANTILE_FRAC_CLOSE = 0.75
+    QUANTILE_ATOL = 0.15
+
+    @pytest.mark.parametrize(
+        "output_type,width,test_id",
+        [
+            (OutputType.ATAC, 501, "quantile_atac_diff_log2_sum"),
+            (OutputType.DNASE, 501, "quantile_dnase_diff_log2_sum"),
+            (OutputType.CAGE, 501, "quantile_cage_diff_log2_sum"),
+            (OutputType.PROCAP, 501, "quantile_procap_diff_log2_sum"),
+        ],
+    )
+    def test_quantiles_match_api(
+        self,
+        cached_api_scores,
+        pytorch_scoring_model,
+        test_variant,
+        test_interval,
+        output_type,
+        width,
+        test_id,
+    ):
+        pt_scorer = CenterMaskScorer(
+            requested_output=output_type,
+            width=width,
+            aggregation_type=AggregationType.DIFF_LOG2_SUM,
+        )
+
+        # Opt-in to quantile scoring via the bundled human calibration table.
+        pt_scores = pytorch_scoring_model.score_variant(
+            interval=test_interval,
+            variant=test_variant,
+            scorers=[pt_scorer],
+            organism="human",
+            to_cpu=True,
+            calibration="human",
+        )
+        pt_quantiles = pt_scores[0].quantile_scores
+        assert pt_quantiles is not None, "calibration='human' did not attach quantiles"
+        pt_quantiles = pt_quantiles.numpy()
+
+        api_adata = find_matching_api_scorer(pt_scorer, cached_api_scores)
+        assert api_adata is not None, f"No matching API scorer for {test_id}"
+        if "quantiles" not in api_adata.layers:
+            pytest.skip("API cache has no 'quantiles' layer; re-fetch to enable.")
+
+        pt_meta = pytorch_scoring_model.get_track_metadata("human").get(output_type, [])
+        aligned_pt, aligned_api, n_matched = match_quantiles_by_track_name(
+            pt_quantiles, pt_meta, api_adata
+        )
+        assert n_matched > 0, f"{test_id}: no calibrated tracks aligned"
+
+        abs_diff = np.abs(aligned_pt - aligned_api)
+        corr = float(np.corrcoef(aligned_pt, aligned_api)[0, 1])
+        median_abs = float(np.median(abs_diff))
+        frac_close = float(np.mean(abs_diff <= self.QUANTILE_ATOL))
+        sign_agree = float(np.mean(np.sign(aligned_pt) == np.sign(aligned_api)))
+
+        print(f"\n[{test_id}] matched={n_matched} corr={corr:.4f} "
+              f"median_abs={median_abs:.4f} frac_close={frac_close:.3f} "
+              f"sign_agree={sign_agree:.3f} "
+              f"pt_range=[{aligned_pt.min():.3f},{aligned_pt.max():.3f}] "
+              f"api_range=[{aligned_api.min():.3f},{aligned_api.max():.3f}]")
+
+        assert corr >= self.QUANTILE_CORR_THRESHOLD, (
+            f"{test_id}: quantile correlation {corr:.4f} "
+            f"< {self.QUANTILE_CORR_THRESHOLD}"
+        )
+        assert median_abs <= self.QUANTILE_MEDIAN_ATOL, (
+            f"{test_id}: median |quantile diff| {median_abs:.4f} "
+            f"> {self.QUANTILE_MEDIAN_ATOL}"
+        )
+        assert frac_close >= self.QUANTILE_FRAC_CLOSE, (
+            f"{test_id}: only {frac_close:.1%} of quantiles within "
+            f"{self.QUANTILE_ATOL} (need {self.QUANTILE_FRAC_CLOSE:.0%})"
+        )
