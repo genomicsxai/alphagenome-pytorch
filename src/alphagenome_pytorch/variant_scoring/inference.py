@@ -357,6 +357,7 @@ class VariantScoringModel:
         to_cpu: bool = False,
         unified_splicing: bool = False,
         heads: tuple[str, ...] | None = None,
+        ref_outputs: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Get reference and alternate predictions for a variant.
 
@@ -370,6 +371,13 @@ class VariantScoringModel:
                 sites between Ref and Alt predictions. Required for SpliceJunctionScorer.
             heads: Optional tuple of head names to compute. If None, all heads
                 run. Forwarded to the model forward pass to skip unused heads.
+            ref_outputs: Optional precomputed reference predictions to reuse
+                instead of running the reference forward pass. Every SNV in an ISM
+                window shares the same reference sequence, so score_ism_variants
+                computes the reference once and passes it here. When supplied it
+                is treated as a shared, read-only cache: the reference forward
+                pass is skipped and the cache is left on-device (never offloaded
+                to CPU) so the next variant can reuse it.
 
         Returns:
             Tuple of (ref_outputs, alt_outputs) dictionaries.
@@ -410,18 +418,31 @@ class VariantScoringModel:
             base_seq, variant, extraction_interval
         )[:interval_length]
 
-        # First pass: Get standard predictions with embeddings if needed
+        # First pass: Get standard predictions with embeddings if needed.
+        # When ref_outputs is supplied (ISM caching), the reference is identical
+        # across variants, so reuse it and skip the redundant reference forward.
+        ref_is_cached = ref_outputs is not None
         return_embeddings = unified_splicing
         predict_kwargs: dict[str, Any] = {'return_embeddings': return_embeddings}
         if heads is not None:
             predict_kwargs['heads'] = heads
-        ref_outputs = self.predict(ref_seq, organism, **predict_kwargs)
+        if ref_outputs is None:
+            ref_outputs = self.predict(ref_seq, organism, **predict_kwargs)
         alt_outputs = self.predict(alt_seq, organism, **predict_kwargs)
 
         if unified_splicing:
             # Calculate unified splice site positions (max of Ref and Alt)
             from ..utils.splicing import generate_splice_site_positions
             from .aggregations import align_alternate
+
+            # The junction head is re-run per variant from unified positions that
+            # depend on the alt, so when ref_outputs is a shared cache we must not
+            # mutate it in place. Shallow-copy first: the copy receives the
+            # per-variant 'splice_junctions' and has its embeddings popped, while
+            # the cached original keeps embeddings_1bp / splice_sites for the next
+            # variant.
+            if ref_is_cached:
+                ref_outputs = dict(ref_outputs)
 
             # Align ALT embeddings + splice-site probs into REF coordinate
             # space before generating unified positions and re-running the
@@ -489,13 +510,39 @@ class VariantScoringModel:
         # Move ref to CPU before alt prediction to free GPU memory
         # logic for to_cpu handled at end or between
         
-        if to_cpu:
+        # A supplied (cached) reference is kept on-device so the next variant can
+        # reuse it; offloading is skipped entirely in that case to keep ref and
+        # alt on the same device for scoring.
+        if to_cpu and not ref_is_cached:
             ref_outputs = self._outputs_to_cpu(ref_outputs)
             alt_outputs = self._outputs_to_cpu(alt_outputs)
             gc.collect()
             torch.cuda.empty_cache()
 
         return ref_outputs, alt_outputs
+
+    def _scorer_requirements(
+        self, scorers: list[BaseVariantScorer]
+    ) -> tuple[bool, tuple[str, ...] | None]:
+        """Derive the forward-pass settings a set of scorers requires.
+
+        Returns ``(unified_splicing, heads_arg)``:
+        - ``unified_splicing`` is True when any SpliceJunctionScorer is present
+          (it needs the second junction-alignment pass).
+        - ``heads_arg`` is the sorted union of heads the scorers declare, so the
+          forward pass can skip unused heads; ``None`` means run all heads.
+
+        Shared by score_variant and score_ism_variants so a cached reference is
+        computed with exactly the same settings as the per-variant path.
+        """
+        unified_splicing = any(
+            s.name == "SpliceJunctionScorer()" for s in scorers
+        )
+        required_heads: set[str] = set()
+        for s in scorers:
+            required_heads.update(s.required_heads)
+        heads_arg = tuple(sorted(required_heads)) if required_heads else None
+        return unified_splicing, heads_arg
 
     def _outputs_to_cpu(self, outputs: Any) -> Any:
         """Recursively move all tensors in outputs to CPU."""
@@ -517,6 +564,7 @@ class VariantScoringModel:
         organism: str | int | None = None,
         gene_annotation: GeneAnnotation | None = None,
         to_cpu: bool = False,
+        ref_outputs: dict[str, Any] | None = None,
     ) -> list[VariantScore | list[VariantScore]]:
         """Score a single variant with multiple scorers.
 
@@ -527,31 +575,26 @@ class VariantScoringModel:
             organism: 'human', 'mouse', or index. Uses default_organism if None.
             gene_annotation: Optional GeneAnnotation.
             to_cpu: If True, move scores to CPU and clear GPU cache.
+            ref_outputs: Optional precomputed reference predictions, forwarded to
+                predict_variant to skip the reference forward pass. Used by
+                score_ism_variants to share one reference across an ISM window.
 
         Returns:
             List of VariantScore objects
         """
         organism_index = self._resolve_organism_index(organism)
 
-        # Check if we need unified splicing pass
-        unified_splicing = any(s.name == "SpliceJunctionScorer()" for s in scorers)
-        # Note: checking by class name string is fragile but avoids circular imports
-        # Alternative: isinstance(s, SpliceJunctionScorer) if imported
-        # Let's check typical string representation
+        # Derive forward-pass settings (unified splicing + head filter) shared
+        # with the cached-reference path in score_ism_variants.
+        unified_splicing, heads_arg = self._scorer_requirements(scorers)
 
-        # Build the union of heads required by the active scorers so the model
-        # forward pass can skip unused heads. Empty union means no scorers
-        # declared requirements; in that case fall back to running all heads.
-        required_heads: set[str] = set()
-        for s in scorers:
-            required_heads.update(s.required_heads)
-        heads_arg = tuple(sorted(required_heads)) if required_heads else None
-
-        # Get predictions
+        # Get predictions (ref_outputs, when supplied, is a precomputed reference
+        # shared across an ISM window — see score_ism_variants).
         ref_outputs, alt_outputs = self.predict_variant(
             interval, variant, organism,
             unified_splicing=unified_splicing,
             heads=heads_arg,
+            ref_outputs=ref_outputs,
         )
 
         # Use instance gene annotation if not provided
@@ -721,16 +764,46 @@ class VariantScoringModel:
                             alternate_bases=alt_base.upper(),
                         ))
 
-        # Score all variants
-        return self.score_variants(
-            intervals=interval,
-            variants=variants,
-            scorers=scorers,
-            organism=organism,
-            gene_annotation=gene_annotation,
-            to_cpu=to_cpu,
-            progress=progress,
-        )
+        # Compute the reference prediction ONCE for the whole window. Every ISM
+        # variant is an SNV sharing this exact reference sequence, so the
+        # reference forward pass is identical across variants — caching it here
+        # removes ~3L redundant reference passes (one per variant), roughly
+        # halving the forward-pass cost. score_variant reuses ref_cache via the
+        # ref_outputs argument; the cache stays on-device until the loop ends.
+        unified_splicing, heads_arg = self._scorer_requirements(scorers)
+        predict_kwargs: dict[str, Any] = {'return_embeddings': unified_splicing}
+        if heads_arg is not None:
+            predict_kwargs['heads'] = heads_arg
+        ref_cache = self.predict(ref_seq, organism, **predict_kwargs)
+
+        if progress:
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(variants, desc="Scoring ISM variants")
+            except ImportError:
+                iterator = variants
+        else:
+            iterator = variants
+
+        try:
+            results = []
+            for variant in iterator:
+                scores = self.score_variant(
+                    interval=interval,
+                    variant=variant,
+                    scorers=scorers,
+                    organism=organism,
+                    gene_annotation=gene_annotation,
+                    to_cpu=to_cpu,
+                    ref_outputs=ref_cache,
+                )
+                results.append(scores)
+        finally:
+            del ref_cache
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return results
 
     def tidy_scores(
         self,
