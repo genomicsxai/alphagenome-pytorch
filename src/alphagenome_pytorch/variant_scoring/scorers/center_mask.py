@@ -147,6 +147,15 @@ class CenterMaskScorer(BaseVariantScorer):
     def is_signed(self) -> bool:
         return self._aggregation_type.is_signed()
 
+    @property
+    def calibration_key(self) -> str | None:
+        return (
+            f"CenterMaskScorer("
+            f"requested_output={self._requested_output.name}, "
+            f"width={self._width}, "
+            f"aggregation_type={self._aggregation_type.name})"
+        )
+
     def score(
         self,
         ref_outputs: dict[str, Any],

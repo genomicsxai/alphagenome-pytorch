@@ -413,7 +413,8 @@ The tidy DataFrame has one row per track with columns:
 - `gene_id`, `gene_name`, `gene_type`, `gene_strand` (if applicable)
 - `scorer`, `output_type`, `is_signed`
 - `track_index`, `track_name`, `track_strand`
-- `raw_score`, `quantile_score`
+- `raw_score` (always), `quantile_score` (only when calibration is enabled — see
+  [Quantile Scores](#quantile-scores))
 - Extended metadata: `ontology_curie`, `gtex_tissue`, `biosample_name`, etc.
 
 ### AnnData Output
@@ -428,6 +429,37 @@ adata = scores_to_anndata(scores, track_metadata=metadata_dict)
 # adata.obs: variant/gene metadata
 # adata.var: track metadata
 ```
+
+### Quantile Scores
+
+Raw variant scores are hard to compare across tracks and scorers. *Quantile scores*
+calibrate each raw per-track score against a fixed null distribution of scores over a
+background set of common variants (348,126 MAF>0.01 chr22 gnomAD v3 SNPs), answering
+"how extreme is this effect relative to common variation?" Signed scorers map to
+roughly `[-1, +1]` (sign = direction), unsigned scorers to `[0, 1]`. Variants with
+`|quantile| > 0.99` are high-confidence functional candidates and correlate well with
+measured eQTL effect sizes (Avsec et al. 2026, Extended Data Fig. 5).
+
+The calibration table is precomputed by DeepMind and bundled as package data
+(`data/variant_quantile_calibration_human.parquet`, human only). Enable it by passing
+`calibration` when constructing the model (or per call):
+
+```python
+scoring_model = VariantScoringModel(model, fasta_path=..., calibration='human')
+# or: scoring_model.score_variant(interval, variant, scorers, calibration='human')
+
+scores = scoring_model.score_variant(interval, variant, scorers=recommended)
+df = scoring_model.tidy_scores(scores)
+df[df['quantile_score'].abs() > 0.99]   # high-confidence hits
+```
+
+When enabled, each `VariantScore` gains a `quantile_scores` tensor (NaN for tracks or
+scorers without calibration), `tidy_scores`/`scores_to_dataframe` add a `quantile_score`
+column, and `scores_to_anndata` adds a `quantiles` layer (matching the official API).
+Without `calibration`, output is unchanged (raw scores only).
+
+The bundled parquet is regenerated from the upstream protobuf with
+`scripts/convert_calibration_to_parquet.py` (a one-time developer tool).
 
 ### Track Metadata
 

@@ -346,6 +346,7 @@ class VariantScore:
     gene_strand: str | None = None
     junction_start: int | None = None
     junction_end: int | None = None
+    quantile_scores: torch.Tensor | None = None  # (num_tracks,), NaN where uncalibrated
 
     @property
     def scorer_name(self) -> str:
@@ -377,6 +378,11 @@ class VariantScore:
             'junction_Start': self.junction_start,
             'junction_End': self.junction_end,
             'scores': self.scores.float().cpu().numpy(),
+            'quantile_scores': (
+                self.quantile_scores.float().cpu().numpy()
+                if self.quantile_scores is not None
+                else None
+            ),
         }
 
 
@@ -414,9 +420,12 @@ def scores_to_dataframe(
     for score in flat_scores:
         base = score.to_dict()
         track_scores = base.pop('scores')
+        quantile_scores = base.pop('quantile_scores')
 
         for i, s in enumerate(track_scores):
             row = {**base, 'track_index': i, 'raw_score': float(s)}
+            if quantile_scores is not None:
+                row['quantile_score'] = float(quantile_scores[i])
             rows.append(row)
 
     return pd.DataFrame(rows)
@@ -562,6 +571,11 @@ def tidy_scores(
         num_tracks = score.scores.shape[0]
         output_type = score.output_type
         track_scores = score.scores.float().cpu().numpy()
+        quantile_scores = (
+            score.quantile_scores.float().cpu().numpy()
+            if score.quantile_scores is not None
+            else None
+        )
 
         # Get track metadata for this output type if available
         output_track_meta = None
@@ -583,6 +597,8 @@ def tidy_scores(
                 'track_index': track_idx,
                 'raw_score': float(track_scores[track_idx]),
             }
+            if quantile_scores is not None:
+                row['quantile_score'] = float(quantile_scores[track_idx])
 
             # Add track metadata if available
             if output_track_meta is not None and track_idx < len(output_track_meta):
@@ -617,9 +633,12 @@ def tidy_scores(
         'track_name', 'track_strand', 
         'Assay title', 'ontology_curie', 
         'biosample_name', 'biosample_type', 
-        'transcription_factor', 'histone_mark', 'gtex_tissue', 
+        'transcription_factor', 'histone_mark', 'gtex_tissue',
         'raw_score'
     ]
+    # quantile_score only appears when calibration was applied; keep it next to raw_score.
+    if 'quantile_score' in df.columns:
+        requested_cols.append('quantile_score')
     for col in requested_cols:
         if col not in df.columns:
             df[col] = None
@@ -748,6 +767,8 @@ def scores_to_anndata(
     # Build observation (variant/gene) metadata and score matrix
     obs_data = []
     X_rows = []
+    quantile_rows = []
+    any_quantiles = any(s.quantile_scores is not None for s in flat_scores)
 
     for score in flat_scores:
         # Extract scores as numpy array
@@ -757,6 +778,14 @@ def scores_to_anndata(
             scores_np = np.asarray(score.scores)
 
         X_rows.append(scores_np)
+
+        if any_quantiles:
+            if score.quantile_scores is not None:
+                q = score.quantile_scores
+                q_np = q.float().cpu().numpy() if torch.is_tensor(q) else np.asarray(q)
+            else:
+                q_np = np.full(scores_np.shape, np.nan, dtype=np.float32)
+            quantile_rows.append(q_np)
 
         # Build obs row
         obs_row = {
@@ -821,6 +850,10 @@ def scores_to_anndata(
         obs=obs,
         var=var,
     )
+
+    # Add quantile scores as a layer (matches the official API output format)
+    if any_quantiles:
+        adata.layers['quantiles'] = np.stack(quantile_rows, axis=0).astype(np.float32)
 
     # Add scorer info to uns
     if flat_scores:

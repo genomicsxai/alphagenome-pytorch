@@ -58,6 +58,10 @@ class ContactMapScorer(BaseVariantScorer):
         return "ContactMapScorer()"
 
     @property
+    def calibration_key(self) -> str | None:
+        return "ContactMapScorer()"
+
+    @property
     def requested_output(self) -> OutputType:
         return OutputType.CONTACT_MAPS
 

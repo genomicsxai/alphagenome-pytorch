@@ -82,6 +82,14 @@ class GeneMaskSplicingScorer(BaseVariantScorer):
     def is_signed(self) -> bool:
         return False
 
+    @property
+    def calibration_key(self) -> str | None:
+        return (
+            f"GeneMaskSplicingScorer("
+            f"requested_output={self._requested_output.name}, "
+            f"width={self._width})"
+        )
+
     def score(
         self,
         ref_outputs: dict[str, Any],
@@ -272,6 +280,10 @@ class SpliceJunctionScorer(BaseVariantScorer):
 
     @property
     def name(self) -> str:
+        return "SpliceJunctionScorer()"
+
+    @property
+    def calibration_key(self) -> str | None:
         return "SpliceJunctionScorer()"
 
     @property

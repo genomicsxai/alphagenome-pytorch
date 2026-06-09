@@ -51,6 +51,17 @@ class BaseVariantScorer(ABC):
         """Whether scores are directional (can be negative)."""
         pass
 
+    @property
+    def calibration_key(self) -> str | None:
+        """Upstream canonical scorer name used to look up quantile calibration.
+
+        Quantile calibration tables (see ``variant_scoring.calibration``) are keyed
+        by the upstream AlphaGenome scorer string, which differs from this port's
+        ``name``. Subclasses that have calibration data override this to return the
+        matching key; returns ``None`` when no calibration is available.
+        """
+        return None
+
     @abstractmethod
     def score(
         self,

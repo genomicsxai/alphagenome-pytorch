@@ -157,6 +157,10 @@ class PolyadenylationScorer(BaseVariantScorer):
         return "PolyadenylationScorer()"
 
     @property
+    def calibration_key(self) -> str | None:
+        return "PolyadenylationScorer()"
+
+    @property
     def requested_output(self) -> OutputType:
         return OutputType.RNA_SEQ
 

@@ -19,6 +19,7 @@ from .types import Interval, OutputType, TrackMetadata, Variant, VariantScore, t
 
 if TYPE_CHECKING:
     from ..model import AlphaGenome
+    from .calibration import Calibration
 
 
 class VariantScoringModel:
@@ -80,6 +81,7 @@ class VariantScoringModel:
         polya_path: str | Path | None = None,
         device: str | torch.device | None = None,
         default_organism: str | int | None = 'human',
+        calibration: 'Calibration | str | Path | None' = None,
     ):
         """Initialize variant scoring wrapper.
 
@@ -93,6 +95,11 @@ class VariantScoringModel:
                 If None, PolyadenylationScorer will use peak detection fallback.
             device: Device to run inference on. If None, uses model's device.
             default_organism: Default organism to use for scoring ('human', 'mouse', or index).
+            calibration: Optional variant-score quantile calibration. Pass a
+                ``Calibration`` instance, an organism name (e.g. ``"human"``) to load
+                the bundled table, or a path to a calibration parquet. When set,
+                scoring also attaches per-track quantile scores. Defaults to None
+                (raw scores only).
         """
         self.model = model
         
@@ -133,6 +140,9 @@ class VariantScoringModel:
         self._gene_annotation: GeneAnnotation | None = None
         if gtf_path is not None:
             self._gene_annotation = GeneAnnotation(gtf_path)
+
+        # Initialize quantile calibration if provided
+        self._calibration: 'Calibration | None' = self._resolve_calibration(calibration)
 
         # Initialize polyA annotation if path provided
         self._polya_annotation: 'PolyAAnnotation | None' = None
@@ -194,6 +204,39 @@ class VariantScoringModel:
     def polya_annotation(self) -> 'PolyAAnnotation | None':
         """PolyA annotation for PolyadenylationScorer."""
         return self._polya_annotation
+
+    @property
+    def calibration(self) -> 'Calibration | None':
+        """Variant-score quantile calibration, if configured."""
+        return self._calibration
+
+    @staticmethod
+    def _resolve_calibration(
+        calibration: 'Calibration | str | Path | None',
+    ) -> 'Calibration | None':
+        """Coerce the constructor argument into a Calibration (or None)."""
+        if calibration is None:
+            return None
+        from .calibration import Calibration
+
+        if isinstance(calibration, Calibration):
+            return calibration
+        # Organism name (e.g. "human") -> bundled table; otherwise treat as a path.
+        if isinstance(calibration, str) and calibration in ("human", "mouse"):
+            return Calibration.from_package(calibration)
+        return Calibration.load(calibration)
+
+    def _apply_calibration(
+        self,
+        score_result: 'VariantScore | list[VariantScore]',
+        calibration: 'Calibration',
+    ) -> None:
+        """Attach quantile scores to a scorer's result in place."""
+        items = score_result if isinstance(score_result, list) else [score_result]
+        for item in items:
+            key = item.scorer.calibration_key
+            if calibration.has_scorer(key):
+                item.quantile_scores = calibration.quantile_scores(key, item.scores)
 
     @property
     def track_metadata(self) -> dict[OutputType, list[TrackMetadata]]:
@@ -517,6 +560,7 @@ class VariantScoringModel:
         organism: str | int | None = None,
         gene_annotation: GeneAnnotation | None = None,
         to_cpu: bool = False,
+        calibration: 'Calibration | str | Path | None' = None,
     ) -> list[VariantScore | list[VariantScore]]:
         """Score a single variant with multiple scorers.
 
@@ -527,11 +571,20 @@ class VariantScoringModel:
             organism: 'human', 'mouse', or index. Uses default_organism if None.
             gene_annotation: Optional GeneAnnotation.
             to_cpu: If True, move scores to CPU and clear GPU cache.
+            calibration: Optional quantile calibration overriding the instance
+                calibration. Accepts a ``Calibration``, an organism name
+                (e.g. ``"human"``), or a path to a calibration parquet. When
+                available, per-track quantile scores are attached to each result
+                (uncalibrated tracks/scorers get NaN/none).
 
         Returns:
             List of VariantScore objects
         """
         organism_index = self._resolve_organism_index(organism)
+        if calibration is None:
+            calibration = getattr(self, "_calibration", None)
+        else:
+            calibration = self._resolve_calibration(calibration)
 
         # Check if we need unified splicing pass
         unified_splicing = any(s.name == "SpliceJunctionScorer()" for s in scorers)
@@ -583,6 +636,9 @@ class VariantScoringModel:
                     if hasattr(s, 'scores') and torch.is_tensor(s.scores):
                         s.scores = s.scores.to(dtype=torch.float32, device='cpu')
 
+            if calibration is not None:
+                self._apply_calibration(score_result, calibration)
+
             scores.append(score_result)
 
         if to_cpu:
@@ -600,6 +656,7 @@ class VariantScoringModel:
         gene_annotation: GeneAnnotation | None = None,
         to_cpu: bool = False,
         progress: bool = True,
+        calibration: 'Calibration | str | Path | None' = None,
     ) -> list[list[VariantScore | list[VariantScore]]]:
         """Score multiple variants with multiple scorers.
 
@@ -629,6 +686,10 @@ class VariantScoringModel:
         if gene_annotation is None:
             gene_annotation = self._gene_annotation
 
+        # Resolve calibration once (avoids reloading a bundled table per variant)
+        if calibration is not None:
+            calibration = self._resolve_calibration(calibration)
+
         # Set up progress bar
         if progress:
             try:
@@ -652,6 +713,7 @@ class VariantScoringModel:
                 organism=organism,
                 gene_annotation=gene_annotation,
                 to_cpu=to_cpu,
+                calibration=calibration,
             )
             results.append(scores)
 
