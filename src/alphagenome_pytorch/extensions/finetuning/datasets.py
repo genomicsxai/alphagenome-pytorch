@@ -774,6 +774,7 @@ def compute_track_means(
     sequence_length: int = 1_048_576,
     resolution: int = 1,
     max_samples: int | None = None,
+    strand_pair_groups: list[tuple[int, int]] | None = None,
 ) -> torch.Tensor:
     """Compute nonzero_mean signal per track from training data.
 
@@ -790,6 +791,13 @@ def compute_track_means(
         max_samples: Maximum number of samples to use for computing means.
             If None, uses all samples. Using a subset (e.g., 1000) speeds
             up computation while giving a good estimate.
+        strand_pair_groups: Optional list of (plus_idx, minus_idx) track
+            index pairs. When provided, the per-track nonzero means within
+            each pair are averaged and broadcast back to both indices, so
+            paired strands share a scaling factor. Mirrors AlphaGenome's
+            official scaling semantics (upstream notebook averages plus/minus
+            strand means by track name). Default `None` keeps existing
+            per-track behavior bit-equal.
 
     Returns:
         Track means tensor of shape (1, n_tracks) suitable for passing
@@ -875,6 +883,31 @@ def compute_track_means(
         track_nonzero_sums / track_nonzero_counts,
         1.0,
     )
+
+    if strand_pair_groups is not None:
+        seen: set[int] = set()
+        for pair in strand_pair_groups:
+            plus_idx, minus_idx = (int(i) for i in pair)  # raises if not a 2-tuple
+            for idx in (plus_idx, minus_idx):
+                if not 0 <= idx < n_tracks:
+                    raise ValueError(
+                        f"strand_pair_groups index {idx} out of range "
+                        f"[0, {n_tracks})"
+                    )
+                if idx in seen:
+                    raise ValueError(
+                        f"strand_pair_groups index {idx} appears in more than "
+                        f"one pair; averaging would be order-dependent"
+                    )
+            if plus_idx == minus_idx:
+                raise ValueError(
+                    f"strand_pair_groups pair ({plus_idx}, {minus_idx}) must "
+                    f"reference two distinct tracks"
+                )
+            seen.update((plus_idx, minus_idx))
+            paired_mean = 0.5 * (track_means[plus_idx] + track_means[minus_idx])
+            track_means[plus_idx] = paired_mean
+            track_means[minus_idx] = paired_mean
 
     print(f"Computed nonzero_mean per track: {track_means}")
 

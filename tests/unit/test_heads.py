@@ -486,6 +486,29 @@ class TestSpliceSitesJunctionHead:
         assert bool(mask[0].all())
         assert bool(mask[1].all())
 
+    def test_rope_params_initialized_nonzero(self):
+        # Upstream switched zero-init → trunc-normal so the junction head
+        # converges when fine-tuned from scratch.
+        from alphagenome_pytorch.heads import SpliceSitesJunctionHead
+
+        num_organisms, T, in_channels, hidden_dim = 2, 367, 128, 64
+        head = SpliceSitesJunctionHead(
+            in_channels=in_channels,
+            hidden_dim=hidden_dim,
+            num_tissues=T,
+            num_organisms=num_organisms,
+        )
+
+        expected_shape = (num_organisms, 2, T, hidden_dim)
+        for key in ("pos_donor", "pos_acceptor", "neg_donor", "neg_acceptor"):
+            param = head.rope_params[key]
+            assert param.shape == expected_shape
+            assert torch.isfinite(param).all()
+            assert torch.any(param != 0), f"rope_params[{key!r}] should not be all zeros"
+            assert param.abs().max().item() < 1.0, (
+                f"trunc_normal_(std=0.1) produced unexpectedly large values for {key!r}"
+            )
+
 
 @pytest.mark.unit
 class TestScalingFunctions:
