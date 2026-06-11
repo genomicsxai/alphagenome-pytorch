@@ -142,6 +142,98 @@ class TestParseArgsMultimodal:
 
 
 @pytest.mark.unit
+class TestParseArgsStrandPairs:
+    """Tests for --strand-pairs / config strand_pairs parsing."""
+
+    def _stranded_argv(self, *extra: str) -> list[str]:
+        return (
+            _required_cli_args()
+            + [
+                "--modality", "atac", "--bigwig", "atac1.bw", "atac2.bw",
+                "--modality", "rna_seq", "--bigwig",
+                "rp1.bw", "rm1.bw", "rp2.bw", "rm2.bw",
+            ]
+            + list(extra)
+        )
+
+    def test_auto_pairs_consecutive_and_leaves_others_none(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", self._stranded_argv("--strand-pairs", "rna_seq:auto"))
+        args = parse_args()
+        assert args.modality_strand_pairs["rna_seq"] == [(0, 1), (2, 3)]
+        # Unstranded modality is untouched.
+        assert args.modality_strand_pairs["atac"] is None
+
+    def test_explicit_string_pairs(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", self._stranded_argv("--strand-pairs", "rna_seq:0,2;1,3"))
+        args = parse_args()
+        assert args.modality_strand_pairs["rna_seq"] == [(0, 2), (1, 3)]
+
+    def test_no_strand_pairs_all_none(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", self._stranded_argv())
+        args = parse_args()
+        assert args.modality_strand_pairs["atac"] is None
+        assert args.modality_strand_pairs["rna_seq"] is None
+
+    def test_auto_rejects_odd_bigwig_count(self, monkeypatch):
+        # atac has 2 bigwigs (even); point auto at a modality with an odd count.
+        argv = (
+            _required_cli_args()
+            + ["--modality", "rna_seq", "--bigwig", "rp1.bw", "rm1.bw", "rp2.bw"]
+            + ["--strand-pairs", "rna_seq:auto"]
+        )
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    def test_rejects_unknown_modality(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", self._stranded_argv("--strand-pairs", "cage:auto"))
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    def test_config_list_of_lists(self, monkeypatch, tmp_path):
+        yaml = pytest.importorskip("yaml")
+        config = {
+            "modalities": {
+                "atac": {"bigwig": ["atac1.bw", "atac2.bw"]},
+                "rna_seq": {
+                    "bigwig": ["rp1.bw", "rm1.bw", "rp2.bw", "rm2.bw"],
+                    "strand_pairs": [[0, 1], [2, 3]],
+                },
+            }
+        }
+        config_path = tmp_path / "train.yaml"
+        config_path.write_text(yaml.safe_dump(config))
+        monkeypatch.setattr(
+            sys, "argv", _required_cli_args() + ["--config", str(config_path)]
+        )
+        args = parse_args()
+        assert args.modality_strand_pairs["rna_seq"] == [(0, 1), (2, 3)]
+        assert args.modality_strand_pairs["atac"] is None
+
+    def test_cli_overrides_config_strand_pairs(self, monkeypatch, tmp_path):
+        yaml = pytest.importorskip("yaml")
+        config = {
+            "modalities": {
+                "rna_seq": {
+                    "bigwig": ["rp1.bw", "rm1.bw", "rp2.bw", "rm2.bw"],
+                    "strand_pairs": "auto",
+                },
+            }
+        }
+        config_path = tmp_path / "train.yaml"
+        config_path.write_text(yaml.safe_dump(config))
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            _required_cli_args()
+            + ["--config", str(config_path), "--strand-pairs", "rna_seq:0,2;1,3"],
+        )
+        args = parse_args()
+        # CLI explicit pairs win over config 'auto'.
+        assert args.modality_strand_pairs["rna_seq"] == [(0, 2), (1, 3)]
+
+
+@pytest.mark.unit
 class TestMultimodalDataset:
     """Tests for MultimodalDataset wrapper."""
 

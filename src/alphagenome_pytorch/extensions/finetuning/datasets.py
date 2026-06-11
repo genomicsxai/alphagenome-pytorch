@@ -885,7 +885,26 @@ def compute_track_means(
     )
 
     if strand_pair_groups is not None:
-        for plus_idx, minus_idx in strand_pair_groups:
+        seen: set[int] = set()
+        for pair in strand_pair_groups:
+            plus_idx, minus_idx = (int(i) for i in pair)  # raises if not a 2-tuple
+            for idx in (plus_idx, minus_idx):
+                if not 0 <= idx < n_tracks:
+                    raise ValueError(
+                        f"strand_pair_groups index {idx} out of range "
+                        f"[0, {n_tracks})"
+                    )
+                if idx in seen:
+                    raise ValueError(
+                        f"strand_pair_groups index {idx} appears in more than "
+                        f"one pair; averaging would be order-dependent"
+                    )
+            if plus_idx == minus_idx:
+                raise ValueError(
+                    f"strand_pair_groups pair ({plus_idx}, {minus_idx}) must "
+                    f"reference two distinct tracks"
+                )
+            seen.update((plus_idx, minus_idx))
             paired_mean = 0.5 * (track_means[plus_idx] + track_means[minus_idx])
             track_means[plus_idx] = paired_mean
             track_means[minus_idx] = paired_mean

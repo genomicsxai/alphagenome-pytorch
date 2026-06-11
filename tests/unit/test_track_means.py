@@ -6,9 +6,6 @@ scaling factor, matching upstream AlphaGenome's official scaling semantics.
 The default (None) is asserted to keep existing behavior bit-equal.
 """
 
-import os
-import tempfile
-
 import pytest
 import torch
 
@@ -18,14 +15,13 @@ from alphagenome_pytorch.extensions.finetuning.datasets import compute_track_mea
 
 
 @pytest.fixture
-def synthetic_bigwig_pair():
+def synthetic_bigwig_pair(tmp_path):
     """Create two tiny bigwigs whose nonzero means are exactly (2.0, 4.0)."""
-    tmp_dir = tempfile.mkdtemp()
     chrom = "chrFake"
     chrom_size = 4096
 
-    bw1_path = os.path.join(tmp_dir, "track_plus.bw")
-    bw2_path = os.path.join(tmp_dir, "track_minus.bw")
+    bw1_path = str(tmp_path / "track_plus.bw")
+    bw2_path = str(tmp_path / "track_minus.bw")
 
     # Track 1: ten positions all = 2.0 inside the central window → nonzero_mean = 2.0
     bw1 = pyBigWig.open(bw1_path, "w")
@@ -49,7 +45,7 @@ def synthetic_bigwig_pair():
     )
     bw2.close()
 
-    bed_path = os.path.join(tmp_dir, "regions.bed")
+    bed_path = str(tmp_path / "regions.bed")
     # One window centered at 2048 with width 2048 covers [1024, 3072) — includes
     # all our nonzero positions (2000..2009).
     with open(bed_path, "w") as f:
@@ -87,3 +83,23 @@ class TestComputeTrackMeansStrandPair:
         assert means.shape == (1, 2)
         assert torch.isclose(means[0, 0], torch.tensor(3.0))
         assert torch.isclose(means[0, 1], torch.tensor(3.0))
+
+    @pytest.mark.parametrize(
+        "bad_groups, match",
+        [
+            ([(0, 2)], "out of range"),        # index >= n_tracks
+            ([(-1, 0)], "out of range"),       # negative would silently wrap
+            ([(0, 0)], "two distinct tracks"),  # self-pair
+            ([(0, 1), (1, 0)], "more than one pair"),  # reused index
+        ],
+    )
+    def test_invalid_strand_pair_groups_raise(self, synthetic_bigwig_pair, bad_groups, match):
+        bigwigs, bed = synthetic_bigwig_pair
+        with pytest.raises(ValueError, match=match):
+            compute_track_means(
+                bigwig_files=bigwigs,
+                bed_file=bed,
+                sequence_length=2048,
+                resolution=1,
+                strand_pair_groups=bad_groups,
+            )
