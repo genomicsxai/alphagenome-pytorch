@@ -244,6 +244,11 @@ def _normalize_strand_pairs(
             )
     else:
         parser.error(f"strand_pairs for '{modality}' has unsupported type: {type(raw)}")
+    if not pairs:
+        parser.error(
+            f"strand_pairs for '{modality}' is empty; specify 'auto' or at least "
+            f"one 'plus,minus' pair, or omit it entirely to keep per-track means"
+        )
     for pair in pairs:
         if len(pair) != 2:
             parser.error(

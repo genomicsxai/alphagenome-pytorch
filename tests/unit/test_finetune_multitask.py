@@ -190,6 +190,29 @@ class TestParseArgsStrandPairs:
         with pytest.raises(SystemExit):
             parse_args()
 
+    @pytest.mark.parametrize("spec", ["rna_seq:", "rna_seq:;", "rna_seq: ; "])
+    def test_rejects_empty_explicit_spec(self, monkeypatch, spec):
+        # A blank explicit spec is almost certainly a typo: reject rather than
+        # silently apply no averaging.
+        monkeypatch.setattr(sys, "argv", self._stranded_argv("--strand-pairs", spec))
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    def test_rejects_empty_config_list(self, monkeypatch, tmp_path):
+        yaml = pytest.importorskip("yaml")
+        config = {
+            "modalities": {
+                "rna_seq": {"bigwig": ["rp1.bw", "rm1.bw"], "strand_pairs": []},
+            }
+        }
+        config_path = tmp_path / "train.yaml"
+        config_path.write_text(yaml.safe_dump(config))
+        monkeypatch.setattr(
+            sys, "argv", _required_cli_args() + ["--config", str(config_path)]
+        )
+        with pytest.raises(SystemExit):
+            parse_args()
+
     def test_config_list_of_lists(self, monkeypatch, tmp_path):
         yaml = pytest.importorskip("yaml")
         config = {
