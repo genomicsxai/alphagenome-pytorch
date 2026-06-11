@@ -200,6 +200,84 @@ def unwrap_training_model(model: nn.Module) -> nn.Module:
 # =============================================================================
 
 
+def _normalize_strand_pairs(
+    raw: object,
+    n_bigwigs: int,
+    modality: str,
+    parser: argparse.ArgumentParser,
+) -> list[tuple[int, int]] | None:
+    """Normalize a strand-pair spec into [(plus_idx, minus_idx), ...].
+
+    Accepts three forms (indices are 0-based into that modality's bigwig list):
+      - 'auto'            : pair consecutive bigwigs (0,1),(2,3),... (needs even count)
+      - 'p,m;p,m;...'     : CLI string of explicit pairs
+      - [[p, m], ...]     : config list-of-lists of explicit pairs
+
+    Index validity (bounds, distinctness, no reuse) is enforced downstream by
+    compute_track_means; this only handles syntax and the 'auto' expansion.
+    """
+    if raw is None:
+        return None
+    if raw == "auto":
+        if n_bigwigs % 2 != 0:
+            parser.error(
+                f"strand_pairs 'auto' for '{modality}' needs an even number of "
+                f"bigwigs; got {n_bigwigs}"
+            )
+        return [(i, i + 1) for i in range(0, n_bigwigs, 2)]
+    if isinstance(raw, str):
+        chunks = [c for c in (s.strip() for s in raw.split(";")) if c]
+        try:
+            pairs = [tuple(int(x) for x in c.split(",")) for c in chunks]
+        except ValueError:
+            parser.error(
+                f"strand_pairs for '{modality}' must be 'plus,minus' pairs; "
+                f"got {raw!r}"
+            )
+    elif isinstance(raw, (list, tuple)):
+        try:
+            pairs = [tuple(int(x) for x in pair) for pair in raw]
+        except (TypeError, ValueError):
+            parser.error(
+                f"strand_pairs for '{modality}' must be a list of [plus, minus] "
+                f"pairs; got {raw!r}"
+            )
+    else:
+        parser.error(f"strand_pairs for '{modality}' has unsupported type: {type(raw)}")
+    if not pairs:
+        parser.error(
+            f"strand_pairs for '{modality}' is empty; specify 'auto' or at least "
+            f"one 'plus,minus' pair, or omit it entirely to keep per-track means"
+        )
+    for pair in pairs:
+        if len(pair) != 2:
+            parser.error(
+                f"strand_pairs for '{modality}' must contain exactly two indices "
+                f"per pair; got {pair!r}"
+            )
+    return pairs
+
+
+def _parse_cli_strand_pairs(
+    spec: str | None,
+    modalities: list[str],
+    parser: argparse.ArgumentParser,
+) -> dict[str, str]:
+    """Parse '--strand-pairs' into {modality: raw_pairs_string} (unnormalized)."""
+    result: dict[str, str] = {}
+    if not spec:
+        return result
+    for entry in spec.split():
+        if ":" not in entry:
+            parser.error(f"--strand-pairs entry must be 'modality:pairs'; got {entry!r}")
+        modality, pairs_str = entry.split(":", 1)
+        modality = modality.strip()
+        if modality not in modalities:
+            parser.error(f"Unknown modality in --strand-pairs: {modality!r}")
+        result[modality] = pairs_str.strip()
+    return result
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -289,6 +367,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "are both accepted; commas and whitespace are stripped. "
             "Required when --gene-loss-weight > 0. Can also be supplied via "
             "the YAML config under modalities.<head>.strand."
+        ),
+    )
+    data.add_argument(
+        "--strand-pairs",
+        type=str,
+        default=None,
+        help=(
+            "Average +/- strand track means so paired strands share a scaling "
+            "factor (recommended for stranded RNA-seq/CAGE/PRO-cap). Format: "
+            "space-separated 'modality:pairs', where pairs is either 'auto' "
+            "(pair consecutive bigwigs: (0,1),(2,3),...) or semicolon-separated "
+            "'plus,minus' index pairs. Examples: --strand-pairs 'rna_seq:auto' "
+            "or --strand-pairs 'rna_seq:0,1;2,3 cage:0,1'. Indices are 0-based "
+            "into that modality's --bigwig list. Overrides per-modality "
+            "'strand_pairs' from --config."
         ),
     )
 
@@ -637,6 +730,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     f"+/-/. characters or a list, got {type(strand_val).__name__}"
                 )
             spec["strand"] = strand_val
+        if "strand_pairs" in mod_cfg and mod_cfg["strand_pairs"] is not None:
+            spec["strand_pairs"] = mod_cfg["strand_pairs"]
         modality_specs[modality] = spec
 
     cli_modality_to_bigwigs: dict[str, list[str]] = {}
@@ -677,10 +772,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if not value:
             parser.error(f"{flag} is required (or provide it in --config)")
 
+    cli_strand_pairs = _parse_cli_strand_pairs(args.strand_pairs, args.modalities, parser)
+
     args.modality_to_bigwigs = {}
     args.modality_resolutions = {}
     args.modality_weight_dict = {}
     args.modality_strands: dict[str, str] = {}
+    args.modality_strand_pairs = {}
     for modality in args.modalities:
         spec = modality_specs.get(modality, {})
         if "bigwig" not in spec or not spec["bigwig"]:
@@ -690,6 +788,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.modality_weight_dict[modality] = float(spec.get("task_weight", 1.0))
         if spec.get("strand"):
             args.modality_strands[modality] = str(spec["strand"])
+        # CLI --strand-pairs overrides per-modality config 'strand_pairs'.
+        raw_pairs = cli_strand_pairs.get(modality, spec.get("strand_pairs"))
+        args.modality_strand_pairs[modality] = _normalize_strand_pairs(
+            raw_pairs, len(args.modality_to_bigwigs[modality]), modality, parser
+        )
 
     # `--track-strands` CLI flag overrides any YAML strand for rna_seq.
     if args.track_strands:
@@ -1235,6 +1338,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 args.train_bed,
                 sequence_length=args.sequence_length,
                 max_samples=args.track_means_samples,
+                strand_pair_groups=args.modality_strand_pairs.get(modality),
             )
             print(f"  {modality}: mean={modality_track_means[modality].mean():.4f}")
     modality_track_means = broadcast_object(modality_track_means, src=0)

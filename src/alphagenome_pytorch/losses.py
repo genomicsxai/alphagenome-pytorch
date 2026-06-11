@@ -241,29 +241,39 @@ def cross_entropy_loss(
     eps: float = 1e-7,
 ) -> Tensor:
     """Cross entropy loss on counts.
-    
+
+    Mirrors upstream JAX `cross_entropy_loss` post-fix (see
+    google-deepmind/alphagenome_research@de264f5): adds eps smoothing to
+    targets and predictions, and skips fully-masked reduction axes so they
+    do not propagate NaNs from 0/0 normalization.
+
     Args:
         y_true: Target counts.
         y_pred: Predicted counts.
         mask: Boolean mask.
         axis: Axis for normalization.
-        eps: Small epsilon for numerical stability.
-        
+        eps: Small epsilon used both as smoothing and for numerical stability.
+
     Returns:
         Scalar loss.
     """
-    mask = mask.expand_as(y_true)
+    y_true = y_true.float() + eps
+    y_pred = y_pred.float() + eps
+    mask = mask.expand_as(y_true).bool()
     assert y_true.shape == y_pred.shape == mask.shape
-    
-    y_true = torch.where(mask, y_true.float(), torch.zeros_like(y_true.float()))
-    p_true = y_true / torch.clamp(y_true.sum(dim=axis, keepdim=True), min=eps)
-    
-    masked_pred = torch.where(mask, y_pred, torch.zeros_like(y_pred))
-    log_normalizer = torch.log((masked_pred + eps).sum(dim=axis))
-    log_likelihood = (p_true * torch.log(y_pred + eps)).sum(dim=axis)
-    
-    log_loss = log_normalizer - log_likelihood
-    return _safe_masked_mean(log_loss, mask.any(dim=axis))
+
+    # For axes where every element is masked, set the mask to True so the
+    # per-axis normalization does not divide by zero; we then drop those rows
+    # from the final mean via `axis_mask`.
+    axis_mask = mask.sum(dim=axis, keepdim=True) > 0
+    safe_mask = torch.where(axis_mask, mask, torch.ones_like(mask))
+    safe_mask_f = safe_mask.float()
+
+    p_true = y_true / (y_true * safe_mask_f).sum(dim=axis, keepdim=True)
+    p_pred = y_pred / (y_pred * safe_mask_f).sum(dim=axis, keepdim=True)
+    log_loss = (-p_true * torch.log(p_pred) * safe_mask_f).sum(dim=axis)
+
+    return _safe_masked_mean(log_loss, mask=axis_mask.squeeze(axis))
 
 
 def gene_lfc_loss(
