@@ -20,9 +20,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pyBigWig
 import pytest
 import torch
+
+pyBigWig = pytest.importorskip("pyBigWig")
 
 from alphagenome_pytorch.extensions.finetuning.datasets import (
     GenomicDataset,

@@ -53,7 +53,8 @@ class TestAggregationDivisor:
 
         # Replace _compute_head_loss with a stub that returns a known loss
         # per head, irrespective of input tensors.
-        def _stub(self, head, output, target, mask, organism_index):
+        def _stub(self, head, output, target, mask, organism_index,
+                  gene_mask=None):
             return torch.tensor(per_head_losses[head], dtype=torch.float32)
 
         loss_fn._compute_head_loss = _stub.__get__(loss_fn, AlphaGenomeLoss)

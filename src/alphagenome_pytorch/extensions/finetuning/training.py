@@ -273,12 +273,23 @@ def compute_finetuning_loss(
 
         # Add gene LFC term at 1bp resolution when enabled. Mirrors upstream
         # which only threads gene_mask through the resolution=1 head path.
-        if (
-            res == 1
-            and gene_loss_weight > 0
-            and gene_mask is not None
-            and strand_channel_mask is not None
-        ):
+        if res == 1 and gene_loss_weight > 0:
+            # Fail loud on a wiring error: when the gene term is enabled, the
+            # dataset always yields a (possibly all-zero) gene_mask tensor and
+            # strand_channel_mask is required. A None here means a dependency
+            # was never threaded through, so silently skipping would train
+            # without the intended term.
+            missing_args = []
+            if gene_mask is None:
+                missing_args.append("gene_mask")
+            if strand_channel_mask is None:
+                missing_args.append("strand_channel_mask")
+            if missing_args:
+                raise ValueError(
+                    "gene_loss_weight > 0 requires "
+                    f"{', '.join(missing_args)} to be provided for the gene "
+                    "LFC loss at 1bp resolution."
+                )
             # gene_lfc_loss expects channels-last; transpose if needed.
             if channels_last:
                 pred_nlc, target_nlc, mask_nlc = pred, target, mask
