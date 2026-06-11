@@ -347,6 +347,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Max threads for parallel BigWig I/O (default: 16)",
     )
     data.add_argument(
+        "--gtf",
+        type=str,
+        default=None,
+        help=(
+            "Path to a GTF annotation file (Gencode-compatible). Required when "
+            "--gene-loss-weight > 0. The GTF is parsed via pyranges and the "
+            "protein_coding gene rows are used to build per-window gene masks."
+        ),
+    )
+    data.add_argument(
+        "--track-strands",
+        type=str,
+        default=None,
+        help=(
+            "Per-track strand string for the rna_seq modality, one char per "
+            "BigWig in order. Each char must be '+', '-', or '.'. "
+            "Compact ('+-+-') or separated ('+,-,+,-' / '+ - + -') forms "
+            "are both accepted; commas and whitespace are stripped. "
+            "Required when --gene-loss-weight > 0. Can also be supplied via "
+            "the YAML config under modalities.<head>.strand."
+        ),
+    )
+    data.add_argument(
         "--strand-pairs",
         type=str,
         default=None,
@@ -359,6 +382,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "or --strand-pairs 'rna_seq:0,1;2,3 cage:0,1'. Indices are 0-based "
             "into that modality's --bigwig list. Overrides per-modality "
             "'strand_pairs' from --config."
+        ),
+    )
+
+    # Gene LFC loss arguments (Decima-style cross-track loss for RNA-seq).
+    gene_lfc = parser.add_argument_group("Gene LFC loss")
+    gene_lfc.add_argument(
+        "--gene-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Outer weight on the cross-track gene LFC loss for the rna_seq "
+            "head (paper value: 0.1). Default 0.0 disables the term entirely "
+            "and keeps loss values bit-identical to pre-B3.2 behavior. "
+            "When > 0, requires --gtf, rna_seq in --modality, and "
+            "--track-strands (or modalities.rna_seq.strand in YAML)."
+        ),
+    )
+    gene_lfc.add_argument(
+        "--gene-cross-track-weight",
+        type=float,
+        default=5.0,
+        help=(
+            "Inner multinomial weight inside the gene LFC term (paper "
+            "default: 5.0). Only used when --gene-loss-weight > 0."
         ),
     )
 
@@ -627,6 +674,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "save_every",
         "resume",
         "modality_weights",
+        "gtf",
+        "track_strands",
+        "gene_loss_weight",
+        "gene_cross_track_weight",
     ):
         _apply_config_scalar(attr, config_data)
 
@@ -669,6 +720,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             )
         if "task_weight" in mod_cfg and mod_cfg["task_weight"] is not None:
             spec["task_weight"] = float(mod_cfg["task_weight"])
+        if "strand" in mod_cfg and mod_cfg["strand"] is not None:
+            strand_val = mod_cfg["strand"]
+            if isinstance(strand_val, list):
+                strand_val = "".join(str(s) for s in strand_val)
+            elif not isinstance(strand_val, str):
+                parser.error(
+                    f"modalities.{modality}.strand must be a string of "
+                    f"+/-/. characters or a list, got {type(strand_val).__name__}"
+                )
+            spec["strand"] = strand_val
         if "strand_pairs" in mod_cfg and mod_cfg["strand_pairs"] is not None:
             spec["strand_pairs"] = mod_cfg["strand_pairs"]
         modality_specs[modality] = spec
@@ -716,6 +777,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.modality_to_bigwigs = {}
     args.modality_resolutions = {}
     args.modality_weight_dict = {}
+    args.modality_strands: dict[str, str] = {}
     args.modality_strand_pairs = {}
     for modality in args.modalities:
         spec = modality_specs.get(modality, {})
@@ -724,11 +786,61 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.modality_to_bigwigs[modality] = list(spec["bigwig"])
         args.modality_resolutions[modality] = spec.get("resolutions", args.global_resolutions)
         args.modality_weight_dict[modality] = float(spec.get("task_weight", 1.0))
+        if spec.get("strand"):
+            args.modality_strands[modality] = str(spec["strand"])
         # CLI --strand-pairs overrides per-modality config 'strand_pairs'.
         raw_pairs = cli_strand_pairs.get(modality, spec.get("strand_pairs"))
         args.modality_strand_pairs[modality] = _normalize_strand_pairs(
             raw_pairs, len(args.modality_to_bigwigs[modality]), modality, parser
         )
+
+    # `--track-strands` CLI flag overrides any YAML strand for rna_seq.
+    if args.track_strands:
+        if "rna_seq" not in args.modality_to_bigwigs:
+            parser.error(
+                "--track-strands is only meaningful with --modality rna_seq, "
+                f"but modalities are: {sorted(args.modality_to_bigwigs)}"
+            )
+        args.modality_strands["rna_seq"] = args.track_strands
+
+    # Normalize and validate strand strings: accept both compact form
+    # ('+-+-.-') and comma/whitespace-separated form ('+,-,+,-,.,-' or
+    # '+ - + - . -'). After stripping separators, exactly one char per
+    # bigwig, each in {+, -, .}.
+    def _normalize_strand_string(s: str) -> str:
+        return "".join(c for c in s if c not in ", \t")
+
+    for modality, strands in list(args.modality_strands.items()):
+        strands = _normalize_strand_string(strands)
+        args.modality_strands[modality] = strands
+        n_bw = len(args.modality_to_bigwigs[modality])
+        if len(strands) != n_bw:
+            parser.error(
+                f"strand string for modality '{modality}' has {len(strands)} "
+                f"strand chars but there are {n_bw} bigwigs"
+            )
+        invalid = sorted({c for c in strands if c not in "+-."})
+        if invalid:
+            parser.error(
+                f"strand string for '{modality}' contains invalid chars "
+                f"{invalid}; allowed: '+', '-', '.'"
+            )
+
+    # Validate gene-LFC config consistency.
+    if args.gene_loss_weight > 0:
+        if not args.gtf:
+            parser.error("--gene-loss-weight > 0 requires --gtf")
+        if "rna_seq" not in args.modality_to_bigwigs:
+            parser.error(
+                "--gene-loss-weight > 0 requires rna_seq in --modality / config; "
+                f"got modalities: {sorted(args.modality_to_bigwigs)}"
+            )
+        if "rna_seq" not in args.modality_strands:
+            parser.error(
+                "--gene-loss-weight > 0 requires per-track strand info for "
+                "rna_seq. Pass --track-strands or set "
+                "modalities.rna_seq.strand in the config."
+            )
 
     if "--modality-weights" not in cli_flags:
         for mod, weight in _parse_weight_overrides(
@@ -795,6 +907,41 @@ def create_datasets(
             rank,
         )
 
+    # Optional gene-mask extractor for the gene LFC training loss (B3.2).
+    # Only attached to the rna_seq dataset; gene_mask is sample-level so
+    # MultimodalDataset will propagate it to the batch.
+    gene_mask_extractor = None
+    g_max = None
+    if args.gene_loss_weight > 0:
+        from alphagenome_pytorch.extensions.finetuning.gene_annotation import (
+            GeneMaskExtractor,
+            cached_load_gene_table,
+            derive_g_max,
+        )
+        from alphagenome_pytorch.extensions.finetuning.datasets import (
+            _load_intervals_from_bed,
+        )
+
+        print_rank0(f"Loading GTF for gene LFC loss: {args.gtf}", rank)
+        gene_table = cached_load_gene_table(args.gtf, filter_protein_coding=True)
+        gene_mask_extractor = GeneMaskExtractor(gene_table)
+
+        # Project the BED windows used by the dataset (after centering/expansion
+        # to args.sequence_length) so derive_g_max sees the same intervals
+        # GenomicDataset will request at __getitem__.
+        all_intervals: list[tuple[str, int, int]] = []
+        for bed in (args.train_bed, args.val_bed):
+            raw_intervals, _ = _load_intervals_from_bed(bed)
+            half_len = args.sequence_length // 2
+            for chrom, s, e in raw_intervals:
+                center = (s + e) // 2
+                all_intervals.append((chrom, center - half_len, center + half_len))
+        g_max = derive_g_max(gene_mask_extractor, all_intervals)
+        print_rank0(
+            f"Gene LFC: scanned {len(all_intervals)} intervals, g_max={g_max}",
+            rank,
+        )
+
     # Always create MultimodalDataset (even for single modality) to have a unified interface
     # This is required by train_epoch_sequence_parallel
     print_rank0("Creating datasets...", rank)
@@ -803,6 +950,15 @@ def create_datasets(
 
     for modality, bigwigs in args.modality_to_bigwigs.items():
         resolutions = args.modality_resolutions[modality]
+        # Attach the gene-mask extractor only to the modality that consumes
+        # the gene LFC loss (rna_seq today).
+        attach_gene_mask = (
+            gene_mask_extractor is not None
+            and modality == "rna_seq"
+            and args.gene_loss_weight > 0
+        )
+        gme = gene_mask_extractor if attach_gene_mask else None
+        gme_g_max = g_max if attach_gene_mask else None
         train_datasets[modality] = GenomicDataset(
             genome_fasta=genome,
             bigwig_files=bigwigs,
@@ -812,6 +968,8 @@ def create_datasets(
             cache_genome=cache_genome,
             cache_signals=cache_signals,
             max_io_workers=max_io_workers,
+            gene_mask_extractor=gme,
+            g_max=gme_g_max,
         )
         val_datasets[modality] = GenomicDataset(
             genome_fasta=genome,
@@ -822,6 +980,8 @@ def create_datasets(
             cache_genome=cache_genome,
             cache_signals=cache_signals,
             max_io_workers=max_io_workers,
+            gene_mask_extractor=gme,
+            g_max=gme_g_max,
         )
 
     train_dataset = MultimodalDataset(train_datasets)
@@ -1196,6 +1356,25 @@ def main(args: argparse.Namespace | None = None) -> None:
     )
     model_module = unwrap_training_model(model)
 
+    # Build per-modality strand-channel masks for the gene LFC loss (B3.2).
+    # Empty dict when gene_loss_weight is 0; populated only for modalities
+    # whose strand info was supplied (today: rna_seq via --track-strands or
+    # the YAML strand field). Each mask is `[2, 1, C]` and lives on `device`.
+    gene_strand_channel_masks: dict[str, torch.Tensor] = {}
+    if args.gene_loss_weight > 0:
+        from alphagenome_pytorch.training import _build_strand_channel_mask
+        for modality, strands in args.modality_strands.items():
+            gene_strand_channel_masks[modality] = (
+                _build_strand_channel_mask(strands).to(device)
+            )
+
+    # Per-modality gene_loss_weights dict. Today only rna_seq receives a
+    # non-zero entry; other modalities are absent from the dict and the
+    # training loop's `gene_loss_weights.get(modality, 0.0)` returns 0.0.
+    gene_loss_weights: dict[str, float] = {}
+    if args.gene_loss_weight > 0:
+        gene_loss_weights["rna_seq"] = args.gene_loss_weight
+
     # Sequence parallelism setup
     sequence_parallel = None
     if args.sequence_parallel:
@@ -1440,6 +1619,9 @@ def main(args: argparse.Namespace | None = None) -> None:
                     profile_batches=args.profile_batches if epoch == start_epoch else 0,
                     log_fn=logger.log_step if is_main_process(rank) else None,
                     encoder_only=encoder_only,
+                    gene_loss_weights=gene_loss_weights,
+                    gene_cross_track_weight=args.gene_cross_track_weight,
+                    strand_channel_masks=gene_strand_channel_masks,
                 )
             else:
                 # Standard multimodal training (uses multihead functions)
@@ -1468,6 +1650,9 @@ def main(args: argparse.Namespace | None = None) -> None:
                     profile_batches=args.profile_batches if epoch == start_epoch else 0,
                     log_fn=logger.log_step if is_main_process(rank) else None,
                     encoder_only=encoder_only,
+                    gene_loss_weights=gene_loss_weights,
+                    gene_cross_track_weight=args.gene_cross_track_weight,
+                    strand_channel_masks=gene_strand_channel_masks,
                 )
 
             if handler.preempted:
