@@ -174,6 +174,69 @@ class AlphaGenomeLoss(nn.Module):
         Uses multinomial loss for profile heads (ATAC, DNase, etc.)
         and MSE for aggregate/contact map heads.
         """
+        if head == 'splice_sites':
+            logits = output['logits']
+            classification_mask = torch.any(target > 0, dim=-1, keepdim=True)
+            num_tracks = target.shape[-1]
+            return losses.cross_entropy_loss_from_logits(
+                y_pred_logits=logits,
+                y_true=(1.0 - 1e-7) * target.float() + 1e-7 / num_tracks,
+                mask=classification_mask,
+                axis=-1,
+            )
+
+        if head == 'splice_site_usage':
+            logits = output['logits']
+            if mask is None:
+                mask = torch.ones_like(target, dtype=torch.bool)
+            return losses.binary_crossentropy_from_logits(
+                y_pred=logits,
+                y_true=torch.clamp(target.float(), 1e-7, 1.0 - 1e-7),
+                mask=mask,
+            )
+
+        if head == 'splice_junctions':
+            pred_pair = output['pred_counts']
+            pairs_mask = output['splice_junction_mask']
+            
+            def _scale_junction_counts(counts):
+                return torch.where(
+                    counts > 10.0,
+                    2.0 * torch.sqrt(counts * 10.0) - 10.0,
+                    counts,
+                )
+                
+            sum_acceptors_tgt = torch.sum(torch.where(pairs_mask, target.float(), 0.0), dim=-2)
+            sum_acceptors_pred = torch.sum(torch.where(pairs_mask, pred_pair.float(), 0.0), dim=-2)
+            accept_total_loss = losses.poisson_loss(
+                y_true=_scale_junction_counts(sum_acceptors_tgt),
+                y_pred=sum_acceptors_pred,
+                mask=torch.any(pairs_mask, dim=-2)
+            )
+            
+            sum_donors_tgt = torch.sum(torch.where(pairs_mask, target.float(), 0.0), dim=-3)
+            sum_donors_pred = torch.sum(torch.where(pairs_mask, pred_pair.float(), 0.0), dim=-3)
+            donor_total_loss = losses.poisson_loss(
+                y_true=_scale_junction_counts(sum_donors_tgt),
+                y_pred=sum_donors_pred,
+                mask=torch.any(pairs_mask, dim=-3)
+            )
+            
+            donor_ratios_loss = losses.cross_entropy_loss(
+                y_true=target,
+                y_pred=pred_pair,
+                mask=pairs_mask,
+                axis=-3,
+            )
+            acceptor_ratios_loss = losses.cross_entropy_loss(
+                y_true=target,
+                y_pred=pred_pair,
+                mask=pairs_mask,
+                axis=-2,
+            )
+            
+            return donor_ratios_loss + acceptor_ratios_loss + 0.2 * (accept_total_loss + donor_total_loss)
+
         # Handle resolution dict outputs (e.g., {1: tensor, 128: tensor})
         resolution = None
         if isinstance(output, dict):
