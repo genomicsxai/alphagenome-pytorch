@@ -426,6 +426,26 @@ class TrackMetadataCatalog:
         """List organism indices present in this catalog."""
         return sorted(self._tracks_by_organism.keys())
 
+    def is_empty(self) -> bool:
+        """True if no tracks are registered for any organism/output."""
+        return not any(self._tracks_by_organism.values())
+
+    def to_rows(self) -> list[dict[str, Any]]:
+        """Serialize to a list-of-rows representation suitable for round-tripping via ``from_rows``.
+
+        Each row contains the core fields (``track_index``, ``output_name``,
+        ``organism``, ``track_name``) flattened with any ``extras``. Used for
+        embedding the catalog inside fine-tuning checkpoints so the served
+        model is self-describing.
+        """
+        rows: list[dict[str, Any]] = []
+        for org_idx in sorted(self._tracks_by_organism.keys()):
+            per_output = self._tracks_by_organism[org_idx]
+            for output_name in sorted(per_output.keys()):
+                for track in per_output[output_name]:
+                    rows.append(track.to_dict())
+        return rows
+
     @classmethod
     def from_dataframe(
         cls,

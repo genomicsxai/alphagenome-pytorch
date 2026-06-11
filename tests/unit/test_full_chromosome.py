@@ -258,6 +258,40 @@ class TestStitchingWithMockModel:
         onehot[:, 0] = 1.0  # All A's for simplicity
         return onehot
 
+    def _build_in_memory_provider(self, GenomeSequenceProvider, chrom_len):
+        """Construct a ``GenomeSequenceProvider`` backed by an in-memory genome.
+
+        Bypasses ``__init__`` (which requires a real FASTA) by injecting a
+        fake source object that mirrors the
+        :class:`~alphagenome_pytorch.genome.GenomeSequenceSource` API the
+        provider delegates to: ``fetch_onehot(chrom, start, end, ...)`` plus
+        a ``chrom_sizes`` dict.
+        """
+        genome_array = self._make_genome_array(chrom_len)
+
+        class _FakeSource:
+            chrom_sizes = {'chr1': chrom_len}
+
+            def fetch_onehot(self, chrom, start, end, *, pad=True, ambiguous='uniform'):
+                del ambiguous
+                length = end - start
+                if pad:
+                    result = np.full((length, 4), 0.25, dtype=np.float32)
+                    valid_start = max(0, start)
+                    valid_end = min(self.chrom_sizes.get(chrom, 0), end)
+                    if valid_start < valid_end:
+                        dest = valid_start - start
+                        result[dest:dest + (valid_end - valid_start)] = (
+                            genome_array[valid_start:valid_end]
+                        )
+                    return result
+                return genome_array[start:end].copy()
+
+        provider = object.__new__(GenomeSequenceProvider)
+        provider._source = _FakeSource()
+        provider.chrom_sizes = provider._source.chrom_sizes
+        return provider
+
     def test_stitching_no_crop_128bp(self):
         """Verify stitching without cropping recovers full chromosome predictions."""
         from alphagenome_pytorch.extensions.inference.full_chromosome import (
@@ -269,12 +303,7 @@ class TestStitchingWithMockModel:
         config = TilingConfig(crop_bp=0, resolution=128, batch_size=2)
         model = self._MockModel(resolution=128)
 
-        # Create a mock GenomeSequenceProvider
-        provider = object.__new__(GenomeSequenceProvider)
-        provider.chrom_sizes = {'chr1': chrom_len}
-        provider._cache = {'chr1': self._make_genome_array(chrom_len)}
-        provider._fasta_path = '/dev/null'
-        provider._cache_enabled = True
+        provider = self._build_in_memory_provider(GenomeSequenceProvider, chrom_len)
 
         preds = predict_full_chromosome(
             model, provider, 'chr1', 'atac',
@@ -300,11 +329,7 @@ class TestStitchingWithMockModel:
         config = TilingConfig(crop_bp=32768, resolution=128, batch_size=1)
         model = self._MockModel(resolution=128)
 
-        provider = object.__new__(GenomeSequenceProvider)
-        provider.chrom_sizes = {'chr1': chrom_len}
-        provider._cache = {'chr1': self._make_genome_array(chrom_len)}
-        provider._fasta_path = '/dev/null'
-        provider._cache_enabled = True
+        provider = self._build_in_memory_provider(GenomeSequenceProvider, chrom_len)
 
         preds = predict_full_chromosome(
             model, provider, 'chr1', 'atac',

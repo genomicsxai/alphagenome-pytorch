@@ -36,6 +36,9 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from alphagenome_pytorch.genome import GenomeSequenceSource
+from alphagenome_pytorch.utils.sequence import sequence_to_onehot
+
 # Lazy imports
 pyBigWig = None
 pyfaidx = None
@@ -138,32 +141,16 @@ class GenomeSequenceProvider:
             chromosomes: Optional set of chromosomes to load. If None, loads all.
             cache: Whether to cache chromosomes in memory. Default: True.
         """
-        _ensure_deps()
-
         self.chrom_sizes: dict[str, int] = {}
-        self._cache: dict[str, np.ndarray] = {}
-        self._fasta_path = str(source)
-        self._cache_enabled = cache
-        self._fasta = None  # Lazy-loaded pyfaidx.Fasta instance
-
-        # Load chromosome sizes and optionally cache sequences
         print(f"Loading genome from {source}...")
-        fasta = pyfaidx.Fasta(self._fasta_path)
-        try:
-            for ref in fasta.keys():
-                self.chrom_sizes[ref] = len(fasta[ref])
-
-            if cache:
-                refs_to_load = chromosomes if chromosomes else set(fasta.keys())
-                for ref in refs_to_load:
-                    if ref in self.chrom_sizes:
-                        seq_str = str(fasta[ref][:])
-                        self._cache[ref] = _sequence_to_onehot(seq_str)
-
-                cached_mb = sum(arr.nbytes for arr in self._cache.values()) / 1e6
-                print(f"Cached {len(self._cache)} chromosomes ({cached_mb:.1f} MB)")
-        finally:
-            fasta.close()
+        self._source = GenomeSequenceSource(
+            source,
+            chromosomes=chromosomes,
+            cache=cache,
+            ambiguous="uniform",
+            verbose=True,
+        )
+        self.chrom_sizes = self._source.chrom_sizes
 
     def fetch(self, chrom: str, start: int, end: int) -> np.ndarray:
         """Fetch one-hot encoded sequence, padding out-of-bounds with N (0.25).
@@ -176,39 +163,12 @@ class GenomeSequenceProvider:
         Returns:
             One-hot encoded array of shape (end - start, 4).
         """
-        seq_len = end - start
-        chrom_len = self.chrom_sizes.get(chrom, 0)
-
-        # Fast path: fully within chromosome and cached
-        if start >= 0 and end <= chrom_len:
-            if chrom in self._cache:
-                return self._cache[chrom][start:end].copy()
-            else:
-                return self._fetch_from_fasta(chrom, start, end)
-
-        # Need padding for out-of-bounds regions
-        result = np.full((seq_len, 4), 0.25, dtype=np.float32)  # N = uniform
-
-        valid_start = max(0, start)
-        valid_end = min(chrom_len, end)
-
-        if valid_start < valid_end:
-            if chrom in self._cache:
-                seq = self._cache[chrom][valid_start:valid_end]
-            else:
-                seq = self._fetch_from_fasta(chrom, valid_start, valid_end)
-
-            dest_start = valid_start - start
-            dest_end = dest_start + (valid_end - valid_start)
-            result[dest_start:dest_end] = seq
-
-        return result
+        return self._source.fetch_onehot(chrom, start, end, pad=True, ambiguous="uniform")
 
     def close(self):
         """Close the FASTA file handle."""
-        if self._fasta is not None:
-            self._fasta.close()
-            self._fasta = None
+        if hasattr(self, "_source"):
+            self._source.close()
 
     def __enter__(self):
         return self
@@ -218,11 +178,7 @@ class GenomeSequenceProvider:
 
     def _fetch_from_fasta(self, chrom: str, start: int, end: int) -> np.ndarray:
         """Fetch and encode sequence directly from FASTA."""
-        # Lazy-load pyfaidx.Fasta for non-cached access
-        if self._fasta is None:
-            self._fasta = pyfaidx.Fasta(self._fasta_path)
-        seq_str = str(self._fasta[chrom][start:end])
-        return _sequence_to_onehot(seq_str)
+        return self._source.fetch_onehot(chrom, start, end, ambiguous="uniform")
 
 
 def _sequence_to_onehot(seq: str) -> np.ndarray:
@@ -235,18 +191,7 @@ def _sequence_to_onehot(seq: str) -> np.ndarray:
         One-hot encoded array of shape (len(seq), 4) with columns [A, C, G, T].
         Unknown bases (N, etc.) are encoded as [0.25, 0.25, 0.25, 0.25].
     """
-    seq = seq.upper()
-    n = len(seq)
-    onehot = np.full((n, 4), 0.25, dtype=np.float32)
-
-    seq_array = np.frombuffer(seq.encode('ascii'), dtype=np.uint8)
-
-    onehot[seq_array == ord('A')] = [1, 0, 0, 0]
-    onehot[seq_array == ord('C')] = [0, 1, 0, 0]
-    onehot[seq_array == ord('G')] = [0, 0, 1, 0]
-    onehot[seq_array == ord('T')] = [0, 0, 0, 1]
-
-    return onehot
+    return sequence_to_onehot(seq, ambiguous="uniform")
 
 
 def _generate_tiles(

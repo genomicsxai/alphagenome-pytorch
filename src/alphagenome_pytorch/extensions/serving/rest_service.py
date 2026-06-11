@@ -19,23 +19,26 @@ from alphagenome.data import junction_data as ag_junction_data
 from alphagenome.data import track_data as ag_track_data
 from alphagenome.models import dna_output
 
-from alphagenome_pytorch.variant_scoring.scorers import (
-    BaseVariantScorer as PTBaseVariantScorer,
-    CenterMaskScorer as PTCenterMaskScorer,
-    ContactMapScorer as PTContactMapScorer,
-    GeneMaskActiveScorer as PTGeneMaskActiveScorer,
-    GeneMaskLFCScorer as PTGeneMaskLFCScorer,
-    GeneMaskSplicingScorer as PTGeneMaskSplicingScorer,
-    PolyadenylationScorer as PTPolyadenylationScorer,
-    SpliceJunctionScorer as PTSpliceJunctionScorer,
-)
-from alphagenome_pytorch.variant_scoring.scorers.gene_mask import GeneMaskMode
-from alphagenome_pytorch.variant_scoring.types import (
-    AggregationType as PTAggregationType,
-    OutputType as PTOutputType,
-)
+from alphagenome_pytorch.variant_scoring.types import OutputType as PTOutputType
 
 from .adapter import LocalDnaModelAdapter, _OFFICIAL_TO_PT_OUTPUT, _normalize_output_type
+from alphagenome_pytorch.extensions.attribution import UnsupportedMethodError
+
+# NOTE: variant-scoring scorer classes (``CenterMaskScorer`` etc.) and
+# ``GeneMaskMode`` / ``AggregationType`` are deliberately *not* imported at
+# module load time. They live in ``alphagenome_pytorch.variant_scoring.scorers``
+# which is heavyweight (gene-mask, polyadenylation, splice-junction machinery).
+# The ``--checkpoint`` (fine-tuned) serving path doesn't need any of that, so
+# this module loads them on demand via :py:func:`_get_scorer_builders`.
+#
+# Caveat: ``alphagenome_pytorch.variant_scoring.__init__`` currently re-exports
+# the scorers eagerly, which means importing *any* ``variant_scoring`` submodule
+# (including ``variant_scoring.types`` below, used by the adapter) still pulls
+# the scorers into ``sys.modules`` today. Fully decoupling rest_service from
+# the scoring stack requires making that package init lazy too — out of scope
+# for this PR. The lazy import here is still worthwhile: it establishes the
+# boundary at this layer and benefits automatically once the package init is
+# refactored.
 
 LOGGER = logging.getLogger(__name__)
 
@@ -136,72 +139,95 @@ def _scorer_enum(
     raise ValueError(f'Field "{field}" must be a string naming a {enum_cls.__name__} member.')
 
 
-def _center_mask_from_json(payload: dict[str, Any]) -> PTCenterMaskScorer:
-    width = payload.get('width')
-    return PTCenterMaskScorer(
-        requested_output=_scorer_pt_output(payload),
-        width=int(width) if width is not None else None,
-        aggregation_type=_scorer_enum(payload, 'aggregation_type', PTAggregationType),
+_SCORER_BUILDERS_CACHE: dict[str, Callable[[dict[str, Any]], Any]] | None = None
+
+
+def _get_scorer_builders() -> dict[str, Callable[[dict[str, Any]], Any]]:
+    """Lazily import variant-scoring classes and return the JSON→scorer dispatch table.
+
+    Defers ``alphagenome_pytorch.variant_scoring.scorers`` (and the
+    gene-mask / polyadenylation / splice-junction sub-modules it transitively
+    pulls in) until a scoring request actually arrives. The fine-tuned
+    serving path (``--checkpoint``) never enters this code, so its process
+    avoids loading the scoring stack entirely.
+    """
+    global _SCORER_BUILDERS_CACHE
+    if _SCORER_BUILDERS_CACHE is not None:
+        return _SCORER_BUILDERS_CACHE
+
+    from alphagenome_pytorch.variant_scoring.scorers import (
+        CenterMaskScorer as PTCenterMaskScorer,
+        ContactMapScorer as PTContactMapScorer,
+        GeneMaskActiveScorer as PTGeneMaskActiveScorer,
+        GeneMaskLFCScorer as PTGeneMaskLFCScorer,
+        GeneMaskSplicingScorer as PTGeneMaskSplicingScorer,
+        PolyadenylationScorer as PTPolyadenylationScorer,
+        SpliceJunctionScorer as PTSpliceJunctionScorer,
     )
+    from alphagenome_pytorch.variant_scoring.scorers.gene_mask import GeneMaskMode
+    from alphagenome_pytorch.variant_scoring.types import AggregationType as PTAggregationType
+
+    def _center_mask_from_json(payload: dict[str, Any]):
+        width = payload.get('width')
+        return PTCenterMaskScorer(
+            requested_output=_scorer_pt_output(payload),
+            width=int(width) if width is not None else None,
+            aggregation_type=_scorer_enum(payload, 'aggregation_type', PTAggregationType),
+        )
+
+    def _contact_map_from_json(payload: dict[str, Any]):
+        del payload
+        return PTContactMapScorer()
+
+    def _gene_mask_lfc_from_json(payload: dict[str, Any]):
+        return PTGeneMaskLFCScorer(
+            requested_output=_scorer_pt_output(payload),
+            mask_mode=_scorer_enum(payload, 'mask_mode', GeneMaskMode, default=GeneMaskMode.EXONS),
+        )
+
+    def _gene_mask_active_from_json(payload: dict[str, Any]):
+        return PTGeneMaskActiveScorer(
+            requested_output=_scorer_pt_output(payload),
+            mask_mode=_scorer_enum(payload, 'mask_mode', GeneMaskMode, default=GeneMaskMode.EXONS),
+        )
+
+    def _gene_mask_splicing_from_json(payload: dict[str, Any]):
+        width = payload.get('width')
+        return PTGeneMaskSplicingScorer(
+            requested_output=_scorer_pt_output(payload),
+            width=int(width) if width is not None else None,
+        )
+
+    def _polyadenylation_from_json(payload: dict[str, Any]):
+        return PTPolyadenylationScorer(
+            min_pas_count=int(payload.get('min_pas_count', 2)),
+            min_pas_coverage=float(payload.get('min_pas_coverage', 0.8)),
+        )
+
+    def _splice_junction_from_json(payload: dict[str, Any]):
+        return PTSpliceJunctionScorer(
+            filter_protein_coding=bool(payload.get('filter_protein_coding', True)),
+        )
+
+    _SCORER_BUILDERS_CACHE = {
+        'center_mask': _center_mask_from_json,
+        'contact_map': _contact_map_from_json,
+        'gene_mask_lfc': _gene_mask_lfc_from_json,
+        'gene_mask_active': _gene_mask_active_from_json,
+        'gene_mask_splicing': _gene_mask_splicing_from_json,
+        'polyadenylation': _polyadenylation_from_json,
+        'splice_junction': _splice_junction_from_json,
+    }
+    return _SCORER_BUILDERS_CACHE
 
 
-def _contact_map_from_json(payload: dict[str, Any]) -> PTContactMapScorer:
-    del payload
-    return PTContactMapScorer()
-
-
-def _gene_mask_lfc_from_json(payload: dict[str, Any]) -> PTGeneMaskLFCScorer:
-    return PTGeneMaskLFCScorer(
-        requested_output=_scorer_pt_output(payload),
-        mask_mode=_scorer_enum(payload, 'mask_mode', GeneMaskMode, default=GeneMaskMode.EXONS),
-    )
-
-
-def _gene_mask_active_from_json(payload: dict[str, Any]) -> PTGeneMaskActiveScorer:
-    return PTGeneMaskActiveScorer(
-        requested_output=_scorer_pt_output(payload),
-        mask_mode=_scorer_enum(payload, 'mask_mode', GeneMaskMode, default=GeneMaskMode.EXONS),
-    )
-
-
-def _gene_mask_splicing_from_json(payload: dict[str, Any]) -> PTGeneMaskSplicingScorer:
-    width = payload.get('width')
-    return PTGeneMaskSplicingScorer(
-        requested_output=_scorer_pt_output(payload),
-        width=int(width) if width is not None else None,
-    )
-
-
-def _polyadenylation_from_json(payload: dict[str, Any]) -> PTPolyadenylationScorer:
-    return PTPolyadenylationScorer(
-        min_pas_count=int(payload.get('min_pas_count', 2)),
-        min_pas_coverage=float(payload.get('min_pas_coverage', 0.8)),
-    )
-
-
-def _splice_junction_from_json(payload: dict[str, Any]) -> PTSpliceJunctionScorer:
-    return PTSpliceJunctionScorer(
-        filter_protein_coding=bool(payload.get('filter_protein_coding', True)),
-    )
-
-
-_SCORER_BUILDERS: dict[str, Callable[[dict[str, Any]], PTBaseVariantScorer]] = {
-    'center_mask': _center_mask_from_json,
-    'contact_map': _contact_map_from_json,
-    'gene_mask_lfc': _gene_mask_lfc_from_json,
-    'gene_mask_active': _gene_mask_active_from_json,
-    'gene_mask_splicing': _gene_mask_splicing_from_json,
-    'polyadenylation': _polyadenylation_from_json,
-    'splice_junction': _splice_junction_from_json,
-}
-
-
-def _parse_variant_scorers(raw: Any) -> list[PTBaseVariantScorer]:
+def _parse_variant_scorers(raw: Any) -> list[Any]:
     if raw is None:
         return []
     if not isinstance(raw, list):
         raise ValueError('"variant_scorers" must be a JSON list of scorer objects.')
-    scorers: list[PTBaseVariantScorer] = []
+    builders = _get_scorer_builders()
+    scorers: list[Any] = []
     for index, item in enumerate(raw):
         if not isinstance(item, dict):
             raise ValueError(
@@ -211,13 +237,13 @@ def _parse_variant_scorers(raw: Any) -> list[PTBaseVariantScorer]:
         if not isinstance(scorer_type, str):
             raise ValueError(
                 f'variant_scorers[{index}] missing required string field "type". '
-                f'Supported types: {", ".join(sorted(_SCORER_BUILDERS))}.'
+                f'Supported types: {", ".join(sorted(builders))}.'
             )
-        builder = _SCORER_BUILDERS.get(scorer_type)
+        builder = builders.get(scorer_type)
         if builder is None:
             raise ValueError(
                 f'Unknown variant scorer type "{scorer_type}" at variant_scorers[{index}]. '
-                f'Supported: {", ".join(sorted(_SCORER_BUILDERS))}.'
+                f'Supported: {", ".join(sorted(builders))}.'
             )
         scorers.append(builder(item))
     return scorers
@@ -321,6 +347,49 @@ def _serialize_output_metadata(metadata: dna_output.OutputMetadata) -> dict[str,
         'outputs': outputs,
         'concatenated': concatenated.to_dict(orient='records'),
     }
+
+
+def _nan_to_none(arr: np.ndarray) -> list:
+    """Convert a numpy array to a nested list with NaN replaced by None.
+
+    ``ndarray.tolist()`` maps NaN to ``float('nan')``, which ``json.dumps``
+    serializes as the non-standard ``NaN`` token.  We want ``null`` instead,
+    so we replace NaN values with ``None`` in a Python object array first.
+    """
+    if not np.issubdtype(arr.dtype, np.floating):
+        return arr.tolist()
+    mask = np.isnan(arr)
+    if not mask.any():
+        return arr.tolist()
+    obj = arr.astype(object)
+    obj[mask] = None
+    return obj.tolist()
+
+
+def _serialize_attribution(result: 'AttributionResult') -> dict[str, Any]:
+    """Convert an :class:`AttributionResult` to a JSON-serializable dict.
+
+    NaN values in the numpy arrays are mapped to ``null`` via
+    :func:`_nan_to_none`.
+    """
+    payload: dict[str, Any] = {
+        'method': result.method,
+        'kind': result.kind,
+        'bases': list(result.bases),
+        'values': _nan_to_none(result.values),
+        'sequence': result.sequence,
+        'target_start': result.target_start,
+        'target_end': result.target_end,
+        'resolution': result.resolution,
+        'track_indices': list(result.track_indices),
+        'reduction': result.reduction,
+        'metadata': result.metadata,
+    }
+    if result.raw_gradient is not None:
+        payload['raw_gradient'] = _nan_to_none(result.raw_gradient)
+    else:
+        payload['raw_gradient'] = None
+    return payload
 
 
 class _ServingHandler(BaseHTTPRequestHandler):
@@ -437,7 +506,30 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            if path == '/v1/explain_interval':
+                try:
+                    result = self.adapter.explain_interval(
+                        interval=_interval_from_payload(body['interval']),
+                        target_interval=_interval_from_payload(body['target_interval']),
+                        organism=body.get('organism', 'HOMO_SAPIENS'),
+                        requested_output=body['requested_output'],
+                        resolution=int(body.get('resolution', 128)),
+                        track_indices=[int(i) for i in body['track_indices']],
+                        method=body['method'],
+                        reduction=body.get('reduction', 'sum'),
+                        include_raw_gradient=bool(body.get('include_raw_gradient', False)),
+                        strand_averaged=bool(body.get('strand_averaged', False)),
+                        batch_size=int(body.get('batch_size', 8)),
+                    )
+                except UnsupportedMethodError as exc:
+                    self._write_json({'error': str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                self._write_json({'attribution': _serialize_attribution(result)})
+                return
+
             self._write_json({'error': 'Not found'}, status=HTTPStatus.NOT_FOUND)
+        except NotImplementedError as exc:
+            self._write_json({'error': str(exc)}, status=HTTPStatus.NOT_IMPLEMENTED)
         except Exception as exc:  # pragma: no cover - exercised in integration.
             self._write_json({'error': str(exc)}, status=HTTPStatus.BAD_REQUEST)
 
