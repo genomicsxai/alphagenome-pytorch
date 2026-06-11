@@ -121,6 +121,10 @@ class GeneMaskLFCScorer(BaseVariantScorer):
     def is_signed(self) -> bool:
         return True
 
+    @property
+    def calibration_key(self) -> str | None:
+        return f"GeneMaskLFCScorer(requested_output={self._requested_output.name})"
+
     def score(
         self,
         ref_outputs: dict[str, Any],
@@ -327,6 +331,10 @@ class GeneMaskActiveScorer(BaseVariantScorer):
     @property
     def is_signed(self) -> bool:
         return False
+
+    @property
+    def calibration_key(self) -> str | None:
+        return f"GeneMaskActiveScorer(requested_output={self._requested_output.name})"
 
     def score(
         self,

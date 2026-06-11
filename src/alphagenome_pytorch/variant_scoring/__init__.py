@@ -51,6 +51,9 @@ from .types import (
     Width,
 )
 
+# Quantile calibration
+from .calibration import Calibration, ScorerCalibration
+
 # Aggregation functions
 from .aggregations import align_alternate, compute_aggregation, create_center_mask
 
@@ -105,6 +108,9 @@ __all__ = [
     'scores_to_dataframe',
     'tidy_scores',
     'Width',
+    # Calibration
+    'Calibration',
+    'ScorerCalibration',
     # Aggregations
     'align_alternate',
     'compute_aggregation',
