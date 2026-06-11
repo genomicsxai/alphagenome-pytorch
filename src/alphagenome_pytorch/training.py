@@ -42,7 +42,10 @@ class AlphaGenomeTrainingConfig:
     positional_weight: float = 5.0  # JAX production value (AG_MODEL.md line 321)
 
 
-# Default head weights (equal for all heads)
+# Default per-head loss weights matching upstream JAX `HeadConfig.loss_weight`
+# (google-deepmind/alphagenome_research, commit 7046b72). All heads weight 1.0
+# except splice junctions, which upstream weights at 0.2 to balance the very
+# different magnitude of the junction loss against the count-based heads.
 DEFAULT_HEAD_WEIGHTS = {
     'atac': 1.0,
     'dnase': 1.0,
@@ -52,6 +55,9 @@ DEFAULT_HEAD_WEIGHTS = {
     'chip_tf': 1.0,
     'chip_histone': 1.0,
     'contact_maps': 1.0,
+    'splice_sites': 1.0,
+    'splice_site_usage': 1.0,
+    'splice_junctions': 0.2,
 }
 
 
@@ -66,11 +72,21 @@ class AlphaGenomeLoss(nn.Module):
     2. Call model with `return_scaled_predictions=True` during training
     3. Pass `organism_index` to the forward method
 
+    Aggregation: the total loss is `sum(head_weight * head_loss) / num_heads`,
+    where the divisor is the *count* of heads that produced a loss this step
+    (not the sum of weights). A weight of 0.2 therefore down-weights that
+    head's contribution by exactly 0.2× relative to a weight-1.0 head with
+    the same residual, matching upstream JAX `HeadConfig.loss_weight` semantics.
+
     Args:
         model: AlphaGenome model instance. Required to access head modules for target scaling.
             Without this, targets will not be scaled to model space, resulting in incorrect gradients.
         heads: List of head names to compute loss for. If None, uses all heads.
-        head_weights: Dict mapping head names to loss weights. If None, equal weights.
+        head_weights: Dict mapping head names to loss weights. Merged *on top
+            of* `DEFAULT_HEAD_WEIGHTS`, so a partial dict only overrides the
+            heads it names and leaves the rest at their upstream defaults
+            (1.0 for count and splice-site heads, 0.2 for splice junctions).
+            Pass `None` to use the defaults unchanged.
         multinomial_resolution: Resolution for multinomial loss computation. This is the
             segment size used to divide the sequence for multinomial loss. For JAX parity,
             use `seq_len` (full sequence as 1 segment) or `seq_len // 8` for 8 segments
@@ -90,7 +106,11 @@ class AlphaGenomeLoss(nn.Module):
         super().__init__()
         self.model = model
         self.heads = heads or list(DEFAULT_HEAD_WEIGHTS.keys())
-        self.head_weights = head_weights or DEFAULT_HEAD_WEIGHTS
+        # Merge overrides onto a fresh copy of the defaults: a partial dict
+        # only changes the heads it names (so splice_junctions keeps its 0.2
+        # unless explicitly overridden), and we never alias/mutate the
+        # module-level constant.
+        self.head_weights = {**DEFAULT_HEAD_WEIGHTS, **(head_weights or {})}
         self.multinomial_resolution = multinomial_resolution
         self.positional_weight = positional_weight
     
@@ -160,6 +180,69 @@ class AlphaGenomeLoss(nn.Module):
         Uses multinomial loss for profile heads (ATAC, DNase, etc.)
         and MSE for aggregate/contact map heads.
         """
+        if head == 'splice_sites':
+            logits = output['logits']
+            classification_mask = torch.any(target > 0, dim=-1, keepdim=True)
+            num_tracks = target.shape[-1]
+            return losses.cross_entropy_loss_from_logits(
+                y_pred_logits=logits,
+                y_true=(1.0 - 1e-7) * target.float() + 1e-7 / num_tracks,
+                mask=classification_mask,
+                axis=-1,
+            )
+
+        if head == 'splice_site_usage':
+            logits = output['logits']
+            if mask is None:
+                mask = torch.ones_like(target, dtype=torch.bool)
+            return losses.binary_crossentropy_from_logits(
+                y_pred=logits,
+                y_true=torch.clamp(target.float(), 1e-7, 1.0 - 1e-7),
+                mask=mask,
+            )
+
+        if head == 'splice_junctions':
+            pred_pair = output['pred_counts']
+            pairs_mask = output['splice_junction_mask']
+            
+            def _scale_junction_counts(counts):
+                return torch.where(
+                    counts > 10.0,
+                    2.0 * torch.sqrt(counts * 10.0) - 10.0,
+                    counts,
+                )
+                
+            sum_acceptors_tgt = torch.sum(torch.where(pairs_mask, target.float(), 0.0), dim=-2)
+            sum_acceptors_pred = torch.sum(torch.where(pairs_mask, pred_pair.float(), 0.0), dim=-2)
+            accept_total_loss = losses.poisson_loss(
+                y_true=_scale_junction_counts(sum_acceptors_tgt),
+                y_pred=sum_acceptors_pred,
+                mask=torch.any(pairs_mask, dim=-2)
+            )
+            
+            sum_donors_tgt = torch.sum(torch.where(pairs_mask, target.float(), 0.0), dim=-3)
+            sum_donors_pred = torch.sum(torch.where(pairs_mask, pred_pair.float(), 0.0), dim=-3)
+            donor_total_loss = losses.poisson_loss(
+                y_true=_scale_junction_counts(sum_donors_tgt),
+                y_pred=sum_donors_pred,
+                mask=torch.any(pairs_mask, dim=-3)
+            )
+            
+            donor_ratios_loss = losses.cross_entropy_loss(
+                y_true=target,
+                y_pred=pred_pair,
+                mask=pairs_mask,
+                axis=-3,
+            )
+            acceptor_ratios_loss = losses.cross_entropy_loss(
+                y_true=target,
+                y_pred=pred_pair,
+                mask=pairs_mask,
+                axis=-2,
+            )
+            
+            return donor_ratios_loss + acceptor_ratios_loss + 0.2 * (accept_total_loss + donor_total_loss)
+
         # Handle resolution dict outputs (e.g., {1: tensor, 128: tensor})
         resolution = None
         if isinstance(output, dict):
