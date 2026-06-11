@@ -82,9 +82,11 @@ class AlphaGenomeLoss(nn.Module):
         model: AlphaGenome model instance. Required to access head modules for target scaling.
             Without this, targets will not be scaled to model space, resulting in incorrect gradients.
         heads: List of head names to compute loss for. If None, uses all heads.
-        head_weights: Dict mapping head names to loss weights. If None, uses
-            `DEFAULT_HEAD_WEIGHTS`, which mirrors upstream JAX defaults
+        head_weights: Dict mapping head names to loss weights. Merged *on top
+            of* `DEFAULT_HEAD_WEIGHTS`, so a partial dict only overrides the
+            heads it names and leaves the rest at their upstream defaults
             (1.0 for count and splice-site heads, 0.2 for splice junctions).
+            Pass `None` to use the defaults unchanged.
         multinomial_resolution: Resolution for multinomial loss computation. This is the
             segment size used to divide the sequence for multinomial loss. For JAX parity,
             use `seq_len` (full sequence as 1 segment) or `seq_len // 8` for 8 segments
@@ -104,7 +106,11 @@ class AlphaGenomeLoss(nn.Module):
         super().__init__()
         self.model = model
         self.heads = heads or list(DEFAULT_HEAD_WEIGHTS.keys())
-        self.head_weights = head_weights or DEFAULT_HEAD_WEIGHTS
+        # Merge overrides onto a fresh copy of the defaults: a partial dict
+        # only changes the heads it names (so splice_junctions keeps its 0.2
+        # unless explicitly overridden), and we never alias/mutate the
+        # module-level constant.
+        self.head_weights = {**DEFAULT_HEAD_WEIGHTS, **(head_weights or {})}
         self.multinomial_resolution = multinomial_resolution
         self.positional_weight = positional_weight
     
