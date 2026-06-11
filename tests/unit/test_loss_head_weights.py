@@ -113,3 +113,31 @@ class TestAggregationDivisor:
 
         expected = sum(DEFAULT_HEAD_WEIGHTS.values()) / len(head_names)
         assert torch.isclose(result['loss'], torch.tensor(expected))
+
+    def test_partial_override_preserves_other_defaults(self):
+        """A partial head_weights dict overrides only the named head; the rest
+        keep their defaults (splice_junctions stays at 0.2, not 1.0)."""
+        per_head = {'atac': 1.0, 'splice_junctions': 1.0}
+        loss_fn = self._make_loss_with_fixed_per_head(
+            per_head,
+            head_weights={'atac': 2.0},  # only atac specified
+        )
+        result = self._run(loss_fn, list(per_head.keys()))
+
+        # atac override applied, splice_junctions still at its 0.2 default.
+        assert loss_fn.head_weights['splice_junctions'] == 0.2
+        # total = (2.0 * 1.0 + 0.2 * 1.0) / 2 = 1.1
+        assert torch.isclose(result['loss'], torch.tensor(1.1))
+
+
+@pytest.mark.unit
+class TestNoConstantMutation:
+    """The module-level DEFAULT_HEAD_WEIGHTS must never be aliased or mutated."""
+
+    def test_instance_dict_is_a_copy(self):
+        before = dict(DEFAULT_HEAD_WEIGHTS)
+        loss_fn = AlphaGenomeLoss()  # head_weights=None path
+
+        assert loss_fn.head_weights is not DEFAULT_HEAD_WEIGHTS
+        loss_fn.head_weights['atac'] = 99.0  # mutate the instance copy
+        assert DEFAULT_HEAD_WEIGHTS == before  # constant untouched
