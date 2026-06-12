@@ -458,6 +458,8 @@ class GenomicDataset(Dataset):
         cache_signals: bool = False,
         max_io_workers: int = DEFAULT_MAX_IO_WORKERS,
         use_mmap: bool = False,
+        gene_mask_extractor: "Any | None" = None,
+        g_max: int | None = None,
     ):
         _ensure_genomic_deps()
 
@@ -467,6 +469,20 @@ class GenomicDataset(Dataset):
         self.cache_signals = cache_signals
         self.max_io_workers = max_io_workers
         self.use_mmap = use_mmap
+
+        # Optional gene-mask plumbing for the gene LFC training loss.
+        # When `gene_mask_extractor` is set, __getitem__ returns a 3-tuple
+        # (sequence, targets, gene_mask) instead of (sequence, targets);
+        # `g_max` then defines the fixed gene padding width.
+        self.gene_mask_extractor = gene_mask_extractor
+        if gene_mask_extractor is not None and g_max is None:
+            raise ValueError(
+                "gene_mask_extractor was provided but g_max is None. "
+                "Pass g_max explicitly, or call "
+                "alphagenome_pytorch.extensions.finetuning.gene_annotation.derive_g_max(...) "
+                "first to scan training intervals."
+            )
+        self.g_max = g_max
 
         # Normalise genome input: str path or pre-built CachedGenome
         if isinstance(genome_fasta, CachedGenome):
@@ -685,14 +701,19 @@ class GenomicDataset(Dataset):
 
     def __getitem__(
         self, idx: int
-    ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+    ) -> "tuple[torch.Tensor, dict[int, torch.Tensor]] | tuple[torch.Tensor, dict[int, torch.Tensor], torch.Tensor]":
         """Get a single sample.
 
         Returns:
-            Tuple of (sequence, targets_dict):
+            Tuple of (sequence, targets_dict) by default, or
+            (sequence, targets_dict, gene_mask) when this dataset was
+            constructed with a `gene_mask_extractor`:
                 - sequence: One-hot encoded DNA (seq_len, 4)
                 - targets_dict: Dict mapping resolution to signals
                     {res: tensor of shape (output_len, n_tracks)}
+                - gene_mask: Bool tensor of shape (seq_len, 2, g_max)
+                    where axis 1 is [plus_strand_genes, minus_strand_genes]
+                    and the gene axis is zero-padded to g_max.
         """
         self._ensure_handles()
         chrom, start, end = self._positions_list[idx]
@@ -730,10 +751,24 @@ class GenomicDataset(Dataset):
                 binned = raw_signals.reshape(output_len, res, self.n_tracks).sum(axis=1)
                 targets_dict[res] = torch.from_numpy(binned).float()
 
-        return (
-            torch.from_numpy(sequence).float(),
-            targets_dict,
-        )
+        seq_tensor = torch.from_numpy(sequence).float()
+
+        if self.gene_mask_extractor is None:
+            return (seq_tensor, targets_dict)
+
+        gene_mask_np, _ = self.gene_mask_extractor.extract(chrom, start, end)
+        # Pad to fixed g_max along the gene axis. Shape: (S, 2, g_max).
+        num_genes = gene_mask_np.shape[-1]
+        if num_genes > self.g_max:
+            raise ValueError(
+                f"Window {chrom}:{start}-{end} contains {num_genes} genes, "
+                f"exceeding g_max={self.g_max}. Increase g_max (e.g. via "
+                "derive_g_max with more headroom) or shrink the window."
+            )
+        padded = np.zeros((self.sequence_length, 2, self.g_max), dtype=bool)
+        if num_genes > 0:
+            padded[:, :, :num_genes] = gene_mask_np
+        return (seq_tensor, targets_dict, torch.from_numpy(padded))
 
     def __del__(self) -> None:
         """Clean up file handles and thread pool (only if we own them)."""
@@ -766,6 +801,7 @@ def compute_track_means(
     sequence_length: int = 1_048_576,
     resolution: int = 1,
     max_samples: int | None = None,
+    strand_pair_groups: list[tuple[int, int]] | None = None,
 ) -> torch.Tensor:
     """Compute nonzero_mean signal per track from training data.
 
@@ -782,6 +818,13 @@ def compute_track_means(
         max_samples: Maximum number of samples to use for computing means.
             If None, uses all samples. Using a subset (e.g., 1000) speeds
             up computation while giving a good estimate.
+        strand_pair_groups: Optional list of (plus_idx, minus_idx) track
+            index pairs. When provided, the per-track nonzero means within
+            each pair are averaged and broadcast back to both indices, so
+            paired strands share a scaling factor. Mirrors AlphaGenome's
+            official scaling semantics (upstream notebook averages plus/minus
+            strand means by track name). Default `None` keeps existing
+            per-track behavior bit-equal.
 
     Returns:
         Track means tensor of shape (1, n_tracks) suitable for passing
@@ -868,6 +911,31 @@ def compute_track_means(
         1.0,
     )
 
+    if strand_pair_groups is not None:
+        seen: set[int] = set()
+        for pair in strand_pair_groups:
+            plus_idx, minus_idx = (int(i) for i in pair)  # raises if not a 2-tuple
+            for idx in (plus_idx, minus_idx):
+                if not 0 <= idx < n_tracks:
+                    raise ValueError(
+                        f"strand_pair_groups index {idx} out of range "
+                        f"[0, {n_tracks})"
+                    )
+                if idx in seen:
+                    raise ValueError(
+                        f"strand_pair_groups index {idx} appears in more than "
+                        f"one pair; averaging would be order-dependent"
+                    )
+            if plus_idx == minus_idx:
+                raise ValueError(
+                    f"strand_pair_groups pair ({plus_idx}, {minus_idx}) must "
+                    f"reference two distinct tracks"
+                )
+            seen.update((plus_idx, minus_idx))
+            paired_mean = 0.5 * (track_means[plus_idx] + track_means[minus_idx])
+            track_means[plus_idx] = paired_mean
+            track_means[minus_idx] = paired_mean
+
     print(f"Computed nonzero_mean per track: {track_means}")
 
     # Return as (1, n_tracks) for num_organisms=1
@@ -918,24 +986,37 @@ class MultimodalDataset(Dataset):
 
     def __getitem__(
         self, idx: int
-    ) -> tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]]]:
+    ) -> "tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]]] | tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]], torch.Tensor]":
         """Get sequence and targets for all modalities.
 
         Returns:
-            Tuple of (sequence, modality_targets) where:
-                - sequence: One-hot encoded DNA (seq_len, 4)
-                - modality_targets: Dict mapping modality name to targets_dict
-                    {modality: {resolution: tensor}}
+            Tuple of (sequence, modality_targets) by default. When any
+            wrapped GenomicDataset has a `gene_mask_extractor`, the
+            tuple is extended to (sequence, modality_targets, gene_mask)
+            using the gene_mask from the first such dataset (gene_mask is
+            sample-level, not per-modality, so any one source suffices).
         """
-        # Get sequence from primary dataset
-        sequence, _ = self._primary_dataset[idx]
+        # Get sequence (and possibly gene_mask) from primary dataset.
+        primary_result = self._primary_dataset[idx]
+        if len(primary_result) == 3:
+            sequence, _, gene_mask = primary_result
+        else:
+            sequence, _ = primary_result
+            gene_mask = None
 
-        # Get targets from all datasets
-        modality_targets = {}
+        # Get targets from all datasets. If the primary didn't have a
+        # gene_mask but another dataset does, use the first one we find.
+        modality_targets: dict[str, dict[int, torch.Tensor]] = {}
         for modality, dataset in self.datasets.items():
-            _, targets_dict = dataset[idx]
+            result = dataset[idx]
+            if len(result) == 3 and gene_mask is None:
+                _, targets_dict, gene_mask = result
+            else:
+                targets_dict = result[1]
             modality_targets[modality] = targets_dict
 
+        if gene_mask is not None:
+            return sequence, modality_targets, gene_mask
         return sequence, modality_targets
 
 

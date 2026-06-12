@@ -36,6 +36,16 @@ class BaseVariantScorer(ABC):
         pass
 
     @property
+    def required_heads(self) -> frozenset[str]:
+        """Set of model head names this scorer needs from the forward pass.
+
+        Used by VariantScoringModel.score_variant() to skip unused heads.
+        Defaults to the scorer's requested_output head; subclasses with
+        compound requirements (e.g., SpliceJunctionScorer) override.
+        """
+        return frozenset({self.requested_output.value})
+
+    @property
     @abstractmethod
     def is_signed(self) -> bool:
         """Whether scores are directional (can be negative)."""
