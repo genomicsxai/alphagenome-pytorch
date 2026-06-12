@@ -485,6 +485,7 @@ class VariantScoringModel:
             for out in [ref_outputs, alt_outputs]:
                 out.pop('embeddings_1bp', None)
                 out.pop('embeddings_128bp', None)
+                out.pop('embeddings_pair', None)
 
         # Move ref to CPU before alt prediction to free GPU memory
         # logic for to_cpu handled at end or between
