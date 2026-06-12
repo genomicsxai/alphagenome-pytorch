@@ -650,8 +650,14 @@ class AlphaGenome(nn.Module):
         """
         organism_index = self._normalize_organism_index(organism_index, dna_sequence)
 
-        embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = \
-            self._compute_embeddings_ncl(dna_sequence, organism_index, resolutions)
+        # Derive autocast device_type from the actual tensor device so non-CUDA
+        # accelerators (e.g. "mps") are passed through rather than collapsed to "cpu".
+        device_type = dna_sequence.device.type
+        use_amp = self.dtype_policy.compute_dtype != torch.float32
+
+        with torch.autocast(device_type=device_type, dtype=self.dtype_policy.compute_dtype, enabled=use_amp):
+            embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = \
+                self._compute_embeddings_ncl(dna_sequence, organism_index, resolutions)
 
         # Build output dict with requested format
         # Use contiguous() after transpose to ensure memory layout is optimal
@@ -925,7 +931,9 @@ class AlphaGenome(nn.Module):
             Dict of predictions with all floating-point tensors in float32, or
             ``NamedOutputs`` when ``named_outputs=True``.
         """
-        device_type = "cuda" if dna_sequence.is_cuda else "cpu"
+        # Derive autocast device_type from the actual tensor device so non-CUDA
+        # accelerators (e.g. "mps") are passed through rather than collapsed to "cpu".
+        device_type = dna_sequence.device.type
         use_amp = self.dtype_policy.compute_dtype != torch.float32
 
         organism_index = self._normalize_organism_index(organism_index, dna_sequence)

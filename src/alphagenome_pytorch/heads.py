@@ -554,9 +554,11 @@ class SpliceSitesJunctionHead(nn.Module):
         )
 
         def make_rope_params():
-            return nn.Parameter(torch.zeros(
+            tensor = torch.empty(
                 self._num_organisms, 2, self._num_tissues, self._hidden_dim
-            ))
+            )
+            nn.init.trunc_normal_(tensor, std=0.1)
+            return nn.Parameter(tensor)
 
         self.rope_params = nn.ParameterDict({
             "pos_donor": make_rope_params(),
