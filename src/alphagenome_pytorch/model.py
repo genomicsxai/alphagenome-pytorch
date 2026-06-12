@@ -643,8 +643,9 @@ class AlphaGenome(nn.Module):
             with torch.no_grad():
                 emb = model.encode(dna_seq, organism_idx, resolutions=(128,))
 
-            # Fine-tuning: omit no_grad so gradients reach the backbone
-            # (NCL format for Conv1d heads)
+            # Fine-tuning: switch to train mode and omit no_grad so gradients
+            # reach the backbone (NCL format for Conv1d heads)
+            model.train()
             emb = model.encode(dna_seq, organism_idx, channels_last=False)
             custom_output = my_conv_head(emb['embeddings_128bp'])
         """
