@@ -93,7 +93,6 @@ class CachedGenome:
             fasta_path,
             chromosomes=chromosomes,
             cache=True,
-            ambiguous="zero",
         )
         self.chrom_sizes = self._source.chrom_sizes
         self._cache = self._source._cache

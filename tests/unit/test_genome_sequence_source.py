@@ -38,7 +38,7 @@ def test_genome_sequence_source_reopens_stale_fasta_handle(tmp_path):
     assert source.fetch_sequence(Interval("chr1", 0, 1)) == "A"
 
 
-def test_genome_sequence_source_cached_fetch_and_uniform_padding(tmp_path):
+def test_genome_sequence_source_cached_fetch_and_zero_padding(tmp_path):
     fasta_path = tmp_path / "genome.fa"
     _write_fasta(fasta_path)
 
@@ -46,16 +46,35 @@ def test_genome_sequence_source_cached_fetch_and_uniform_padding(tmp_path):
         fasta_path,
         chromosomes={"chr1"},
         cache=True,
-        ambiguous="uniform",
     )
 
-    values = source.fetch_onehot("chr1", -2, 3, pad=True, ambiguous="uniform")
+    values = source.fetch_onehot("chr1", -2, 3, pad=True)
+    assert values.dtype == np.uint8
     assert values.shape == (5, 4)
-    assert np.allclose(values[0], [0.25, 0.25, 0.25, 0.25])
-    assert np.allclose(values[1], [0.25, 0.25, 0.25, 0.25])
-    assert np.allclose(values[2], [1, 0, 0, 0])
-    assert np.allclose(values[3], [0, 1, 0, 0])
-    assert np.allclose(values[4], [0, 0, 1, 0])
+    # Padding positions: all zeros.
+    np.testing.assert_array_equal(values[0], [0, 0, 0, 0])
+    np.testing.assert_array_equal(values[1], [0, 0, 0, 0])
+    # Valid region: standard one-hot.
+    np.testing.assert_array_equal(values[2], [1, 0, 0, 0])
+    np.testing.assert_array_equal(values[3], [0, 1, 0, 0])
+    np.testing.assert_array_equal(values[4], [0, 0, 1, 0])
+
+
+def test_genome_sequence_source_padding_without_cache(tmp_path):
+    """Padding works correctly even without a cache."""
+    fasta_path = tmp_path / "genome.fa"
+    _write_fasta(fasta_path)
+
+    source = GenomeSequenceSource(fasta_path)
+
+    values = source.fetch_onehot("chr1", -2, 3, pad=True)
+    assert values.dtype == np.uint8
+    assert values.shape == (5, 4)
+    np.testing.assert_array_equal(values[0], [0, 0, 0, 0])
+    np.testing.assert_array_equal(values[1], [0, 0, 0, 0])
+    np.testing.assert_array_equal(values[2], [1, 0, 0, 0])  # A
+    np.testing.assert_array_equal(values[3], [0, 1, 0, 0])  # C
+    np.testing.assert_array_equal(values[4], [0, 0, 1, 0])  # G
 
 
 def test_apply_variant_to_sequence_checks_reference():

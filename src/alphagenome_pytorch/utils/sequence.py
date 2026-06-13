@@ -32,38 +32,25 @@ for _i, _ch in enumerate(_BASES):
     _ENCODE_LOOKUP[ord(_ch.lower())] = _i
 
 
-def sequence_to_onehot(sequence: str, *, ambiguous: str = "zero") -> np.ndarray:
+def sequence_to_onehot(sequence: str) -> np.ndarray:
     """Convert a DNA sequence string to a one-hot encoded numpy array.
 
     Handles both upper- and lower-case nucleotides.
-    Ambiguous / unknown bases (e.g. ``N``) are encoded according to
-    ``ambiguous``.
+    Ambiguous / unknown bases (e.g. ``N``) are encoded as all-zeros,
+    matching the JAX reference.
 
     Args:
         sequence: DNA sequence string (``ACGTN``).
-        ambiguous: Encoding for ambiguous / unknown bases. ``"zero"`` uses
-            all-zeros, matching the JAX reference for model inputs. ``"uniform"``
-            uses ``[0.25, 0.25, 0.25, 0.25]``, matching the existing tiling
-            padding convention.
 
     Returns:
-        One-hot encoded array of shape ``(len(sequence), 4)``.
+        One-hot encoded ``uint8`` array of shape ``(len(sequence), 4)``.
     """
     seq_bytes = np.frombuffer(sequence.encode("ascii"), dtype=np.uint8)
-    if ambiguous == "zero":
-        onehot = np.zeros((len(seq_bytes), 4), dtype=np.uint8)
-    elif ambiguous == "uniform":
-        onehot = np.full((len(seq_bytes), 4), 0.25, dtype=np.float32)
-    else:
-        raise ValueError(
-            f"Unknown ambiguous policy {ambiguous!r}. Expected 'zero' or 'uniform'."
-        )
+    onehot = np.zeros((len(seq_bytes), 4), dtype=np.uint8)
     # clip(0, 127) prevents crash on non-ASCII if present
     indices = _ENCODE_LOOKUP[seq_bytes.clip(0, 127)]
     mask = indices >= 0
     valid_rows = np.where(mask)[0]
-    if ambiguous == "uniform":
-        onehot[valid_rows] = 0.0
     onehot[valid_rows, indices[mask]] = 1
     return onehot
 
@@ -99,8 +86,6 @@ def sequence_to_onehot_tensor(
     sequence: str,
     dtype: "torch.dtype | None" = None,
     device: "torch.device | str | None" = None,
-    *,
-    ambiguous: str = "zero",
 ) -> "torch.Tensor":
     """Convert DNA sequence string to a one-hot encoded torch tensor.
 
@@ -111,15 +96,13 @@ def sequence_to_onehot_tensor(
         sequence: DNA sequence string (``ACGTN``).
         dtype: Output tensor dtype. Defaults to ``torch.float32``.
         device: Output tensor device.
-        ambiguous: Encoding for ambiguous / unknown bases. See
-            :func:`sequence_to_onehot`.
 
     Returns:
         One-hot encoded tensor of shape ``(len(sequence), 4)``.
     """
     import torch as _torch
 
-    np_onehot = sequence_to_onehot(sequence, ambiguous=ambiguous)
+    np_onehot = sequence_to_onehot(sequence)
     tensor = _torch.from_numpy(np_onehot.astype(np.float32))
     if dtype is not None:
         tensor = tensor.to(dtype=dtype)

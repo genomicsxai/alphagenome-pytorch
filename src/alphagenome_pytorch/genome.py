@@ -275,7 +275,6 @@ class GenomeSequenceSource:
         *,
         chromosomes: set[str] | None = None,
         cache: bool = False,
-        ambiguous: str = "zero",
         verbose: bool = False,
     ):
         try:
@@ -286,7 +285,6 @@ class GenomeSequenceSource:
             ) from exc
 
         self.fasta_path = str(fasta_path)
-        self.ambiguous = ambiguous
         self._pyfaidx = pyfaidx
         self._fasta: pyfaidx.Fasta | None = None
         self._owner_pid: int | None = None
@@ -302,7 +300,7 @@ class GenomeSequenceSource:
                 for ref in refs_to_load:
                     if ref in self.chrom_sizes:
                         self._cache[ref] = sequence_to_onehot(
-                            str(fasta[ref][:]), ambiguous=ambiguous
+                            str(fasta[ref][:])
                         )
         finally:
             fasta.close()
@@ -346,37 +344,33 @@ class GenomeSequenceSource:
         start: int,
         end: int,
         *,
-        ambiguous: str | None = None,
         pad: bool = False,
         copy: bool = True,
     ) -> np.ndarray:
-        policy = ambiguous or self.ambiguous
         seq_len = end - start
         resolved = self._resolve_chrom(chrom)
         chrom_len = self.chrom_sizes[resolved]
 
+        cached = resolved in self._cache
+
+        def _encode(lo: int, hi: int) -> np.ndarray:
+            if cached:
+                return self._cache[resolved][lo:hi]
+            return sequence_to_onehot(str(self.fasta[resolved][lo:hi]))
+
         if start >= 0 and end <= chrom_len:
-            if resolved in self._cache:
-                view = self._cache[resolved][start:end]
-                return view.copy() if copy else view
-            return sequence_to_onehot(
-                str(self.fasta[resolved][start:end]), ambiguous=policy
-            )
+            seq = _encode(start, end)
+            return seq.copy() if (copy and cached) else seq
 
         if not pad:
             raise ValueError(f"Requested interval {chrom}:{start}-{end} is out of bounds")
 
-        result = np.full((seq_len, 4), 0.25, dtype=np.float32)
+        # Padding is zeros (same as unknown-base encoding).
+        result = np.zeros((seq_len, 4), dtype=np.uint8)
         valid_start = max(0, start)
         valid_end = min(chrom_len, end)
         if valid_start < valid_end:
-            if resolved in self._cache:
-                seq = self._cache[resolved][valid_start:valid_end]
-            else:
-                seq = sequence_to_onehot(
-                    str(self.fasta[resolved][valid_start:valid_end]),
-                    ambiguous=policy,
-                )
+            seq = _encode(valid_start, valid_end)
             dest_start = valid_start - start
             result[dest_start:dest_start + (valid_end - valid_start)] = seq
         return result

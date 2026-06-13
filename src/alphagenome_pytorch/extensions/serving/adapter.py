@@ -475,6 +475,19 @@ class LocalDnaModelAdapter:
         ).unsqueeze(0)  # (1, L, 4)
 
         # --- target window bookkeeping -----------------------------------
+        if resolution <= 0:
+            raise ValueError(
+                f"resolution must be a positive integer, got {resolution}."
+            )
+        start_offset = target_interval.start - interval.start
+        end_offset = target_interval.end - interval.start
+        if start_offset % resolution != 0 or end_offset % resolution != 0:
+            raise ValueError(
+                f"target_interval offsets relative to interval.start must be "
+                f"multiples of resolution ({resolution}); got start offset "
+                f"{start_offset}, end offset {end_offset}."
+            )
+
         target_slice = target_slice_for_resolution(
             interval.start, target_interval.start, target_interval.end, resolution,
         )
