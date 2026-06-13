@@ -113,7 +113,7 @@ def test_score_variant_forwards_union_of_required_heads(monkeypatch):
     seq_len = 256
 
     def fake_predict_variant(interval, variant, organism=None, to_cpu=False,
-                             unified_splicing=False, heads=None):
+                             unified_splicing=False, heads=None, ref_outputs=None):
         kwargs = {'return_embeddings': unified_splicing}
         if heads is not None:
             kwargs['heads'] = heads
@@ -152,7 +152,7 @@ def test_score_variant_subset_only_atac():
     seq_len = 256
 
     def fake_predict_variant(interval, variant, organism=None, to_cpu=False,
-                             unified_splicing=False, heads=None):
+                             unified_splicing=False, heads=None, ref_outputs=None):
         kwargs = {'return_embeddings': unified_splicing}
         if heads is not None:
             kwargs['heads'] = heads
@@ -177,7 +177,7 @@ def test_score_variant_empty_scorers_runs_all_heads():
     captured = {}
 
     def fake_predict_variant(interval, variant, organism=None, to_cpu=False,
-                             unified_splicing=False, heads=None):
+                             unified_splicing=False, heads=None, ref_outputs=None):
         captured['heads'] = heads
         # Return minimal outputs (won't be consumed since scorers list is empty)
         return {}, {}
