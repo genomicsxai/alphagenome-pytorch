@@ -36,7 +36,8 @@ def sequence_to_onehot(sequence: str) -> np.ndarray:
     """Convert a DNA sequence string to a one-hot encoded numpy array.
 
     Handles both upper- and lower-case nucleotides.
-    Ambiguous / unknown bases (e.g. ``N``) are encoded as all-zeros.
+    Ambiguous / unknown bases (e.g. ``N``) are encoded as all-zeros,
+    matching the JAX reference.
 
     Args:
         sequence: DNA sequence string (``ACGTN``).
@@ -49,7 +50,8 @@ def sequence_to_onehot(sequence: str) -> np.ndarray:
     # clip(0, 127) prevents crash on non-ASCII if present
     indices = _ENCODE_LOOKUP[seq_bytes.clip(0, 127)]
     mask = indices >= 0
-    onehot[np.where(mask)[0], indices[mask]] = 1
+    valid_rows = np.where(mask)[0]
+    onehot[valid_rows, indices[mask]] = 1
     return onehot
 
 

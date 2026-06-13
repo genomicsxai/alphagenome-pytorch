@@ -46,6 +46,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from alphagenome_pytorch.genome import GenomeSequenceSource
 from alphagenome_pytorch.utils.sequence import sequence_to_onehot
 
 # Lazy imports for pyfaidx/pyBigWig to avoid import errors when not needed
@@ -85,26 +86,16 @@ class CachedGenome:
     """
 
     def __init__(self, fasta_path: str, chromosomes: set[str] | None = None):
-        _ensure_genomic_deps()
         self.fasta_path = fasta_path
-        self._cache: dict[str, np.ndarray] = {}
-        self.chrom_sizes: dict[str, int] = {}
 
         print(f"CachedGenome: Loading genome from {fasta_path}...")
-        fasta = pyfaidx.Fasta(fasta_path)
-        try:
-            refs_to_load = chromosomes if chromosomes else set(fasta.keys())
-
-            for ref in fasta.keys():
-                length = len(fasta[ref])
-                self.chrom_sizes[ref] = length
-
-                if ref in refs_to_load:
-                    # Fetch and encode the entire chromosome
-                    seq_str = str(fasta[ref][:])
-                    self._cache[ref] = sequence_to_onehot(seq_str)
-        finally:
-            fasta.close()
+        self._source = GenomeSequenceSource(
+            fasta_path,
+            chromosomes=chromosomes,
+            cache=True,
+        )
+        self.chrom_sizes = self._source.chrom_sizes
+        self._cache = self._source._cache
 
         cached_size_mb = sum(arr.nbytes for arr in self._cache.values()) / 1e6
         print(f"CachedGenome: Loaded {len(self._cache)} chromosomes ({cached_size_mb:.1f} MB)")
