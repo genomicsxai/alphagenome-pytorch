@@ -24,6 +24,7 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from tqdm import tqdm
 
+from alphagenome_pytorch import losses
 from alphagenome_pytorch.losses import multinomial_loss
 
 # Number of segments for multinomial loss computation.
@@ -187,11 +188,24 @@ def compute_finetuning_loss(
     positional_weight: float,
     device: torch.device,
     channels_last: bool = True,
+    *,
+    gene_mask: Tensor | None = None,
+    gene_loss_weight: float = 0.0,
+    gene_cross_track_weight: float = 5.0,
+    strand_channel_mask: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Compute combined loss across resolutions.
 
     Uses dynamic multinomial_resolution = seq_len // 8 for consistent loss
     granularity across different sequence lengths.
+
+    Optionally adds the cross-track gene LFC term (Decima-style; see
+    `losses.gene_lfc_loss`) at 1bp resolution when:
+      - `gene_loss_weight > 0`
+      - `gene_mask` and `strand_channel_mask` are both provided
+      - `predictions` / `targets` contain key `1`
+    The gene LFC contribution is `resolution_weights[1] * gene_loss_weight *
+    gene_lfc_term` so it scales with the existing 1bp resolution weight.
 
     Args:
         predictions: Dict mapping resolution to prediction tensors.
@@ -200,6 +214,15 @@ def compute_finetuning_loss(
         positional_weight: Weight for positional component of multinomial loss.
         device: Torch device.
         channels_last: If True, assumes (B, S, C). If False, assumes (B, C, S).
+        gene_mask: Optional `[B, S, 2, G]` gene-body mask for the gene LFC
+            term. Ignored if `gene_loss_weight <= 0`.
+        gene_loss_weight: Outer weight on the gene LFC term (paper: 0.1).
+            Default 0.0 disables the term entirely (no behavioral change vs.
+            the pre-B3.2 loss path).
+        gene_cross_track_weight: Inner weight on the multinomial component
+            of the gene LFC term (paper default: 5.0).
+        strand_channel_mask: Optional `[2, 1, C]` track strand-compatibility
+            mask, required when `gene_loss_weight > 0`.
 
     Returns:
         Tuple of (total_loss, loss_dict) where loss_dict contains per-resolution
@@ -246,8 +269,49 @@ def compute_finetuning_loss(
             channels_last=channels_last,
         )
 
-        total_loss = total_loss + weight * res_loss_dict["loss"]
-        loss_dict[f"loss_{res}bp"] = res_loss_dict["loss"]
+        res_loss = res_loss_dict["loss"]
+
+        # Add gene LFC term at 1bp resolution when enabled. Mirrors upstream
+        # which only threads gene_mask through the resolution=1 head path.
+        if res == 1 and gene_loss_weight > 0:
+            # Fail loud on a wiring error: when the gene term is enabled, the
+            # dataset always yields a (possibly all-zero) gene_mask tensor and
+            # strand_channel_mask is required. A None here means a dependency
+            # was never threaded through, so silently skipping would train
+            # without the intended term.
+            missing_args = []
+            if gene_mask is None:
+                missing_args.append("gene_mask")
+            if strand_channel_mask is None:
+                missing_args.append("strand_channel_mask")
+            if missing_args:
+                raise ValueError(
+                    "gene_loss_weight > 0 requires "
+                    f"{', '.join(missing_args)} to be provided for the gene "
+                    "LFC loss at 1bp resolution."
+                )
+            # gene_lfc_loss expects channels-last; transpose if needed.
+            if channels_last:
+                pred_nlc, target_nlc, mask_nlc = pred, target, mask
+            else:
+                pred_nlc = pred.transpose(-1, -2).contiguous()
+                target_nlc = target.transpose(-1, -2).contiguous()
+                mask_nlc = mask.transpose(-1, -2).contiguous()
+            gene_loss, gene_aux = losses.gene_lfc_loss(
+                predictions=pred_nlc,
+                targets=target_nlc,
+                targets_mask=mask_nlc,
+                gene_mask=gene_mask,
+                strand_channel_mask=strand_channel_mask,
+                gene_cross_track_weight=gene_cross_track_weight,
+            )
+            res_loss = res_loss + gene_loss_weight * gene_loss
+            loss_dict["loss_gene_lfc"] = gene_loss
+            loss_dict["loss_gene_total_count"] = gene_aux["gene_loss_total_count"]
+            loss_dict["loss_gene_positional"] = gene_aux["gene_loss_positional"]
+
+        total_loss = total_loss + weight * res_loss
+        loss_dict[f"loss_{res}bp"] = res_loss
 
     loss_dict["loss"] = total_loss
     return total_loss, loss_dict
@@ -267,6 +331,10 @@ def train_epoch(
     use_amp: bool = True,
     accumulation_steps: int = 1,
     resolutions: tuple[int, ...] | None = None,
+    *,
+    gene_loss_weight: float = 0.0,
+    gene_cross_track_weight: float = 5.0,
+    strand_channel_mask: Tensor | None = None,
 ) -> float:
     """Train for one epoch.
 
@@ -288,6 +356,14 @@ def train_epoch(
         resolutions: Tuple of resolutions to train on (e.g., (1,), (128,), or (1, 128)).
             If None, inferred from resolution_weights keys. Training on 1bp resolution
             requires significantly more memory than 128bp.
+        gene_loss_weight: Outer weight on the gene LFC term (paper: 0.1 for
+            RNA-seq). Default 0.0 disables. Requires `train_loader` to yield
+            3-tuples (sequence, targets, gene_mask) and `strand_channel_mask`
+            to be set.
+        gene_cross_track_weight: Inner multinomial weight inside the gene LFC
+            term (paper default: 5.0).
+        strand_channel_mask: `[2, 1, C]` track strand-compatibility mask,
+            required when gene_loss_weight > 0.
 
     Returns:
         Average training loss for the epoch.
@@ -304,6 +380,11 @@ def train_epoch(
     if invalid := (set(resolutions) - {1, 128}):
         raise ValueError(f"Invalid resolutions {invalid}, must be 1 or 128")
 
+    if gene_loss_weight > 0 and strand_channel_mask is None:
+        raise ValueError(
+            "gene_loss_weight > 0 requires strand_channel_mask to be set."
+        )
+
     # Set up autocast context (bfloat16 on CUDA, no-op on CPU)
     if use_amp and device.type == "cuda":
         amp_context = autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -311,7 +392,14 @@ def train_epoch(
         amp_context = nullcontext()
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
-    for batch_idx, (sequences, targets_dict) in enumerate(pbar):
+    for batch_idx, batch_data in enumerate(pbar):
+        # Dataset returns a 3-tuple when gene_mask is configured, else 2-tuple.
+        if len(batch_data) == 3:
+            sequences, targets_dict, gene_mask = batch_data
+            gene_mask = gene_mask.to(device)
+        else:
+            sequences, targets_dict = batch_data
+            gene_mask = None
         sequences = sequences.to(device)
         targets_dict = {k: v.to(device) for k, v in targets_dict.items() if k in resolutions}
 
@@ -344,6 +432,10 @@ def train_epoch(
                 positional_weight=positional_weight,
                 device=device,
                 channels_last=True,
+                gene_mask=gene_mask,
+                gene_loss_weight=gene_loss_weight,
+                gene_cross_track_weight=gene_cross_track_weight,
+                strand_channel_mask=strand_channel_mask,
             )
 
         # Scale loss for gradient accumulation
@@ -1139,6 +1231,10 @@ def train_epoch_multihead(
     profile_batches: int = 0,
     log_fn: Any | None = None,
     encoder_only: bool = False,
+    *,
+    gene_loss_weights: dict[str, float] | None = None,
+    gene_cross_track_weight: float = 5.0,
+    strand_channel_masks: dict[str, Tensor] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with multiple modality heads.
 
@@ -1208,7 +1304,17 @@ def train_epoch_multihead(
     running_loss = 0.0
     accumulated_batches = 0
 
-    for batch_idx, (sequences, modality_targets) in enumerate(pbar):
+    gene_loss_weights = gene_loss_weights or {}
+
+    for batch_idx, batch_data in enumerate(pbar):
+        # Dataset returns 3-tuple when gene_mask is configured, else 2-tuple.
+        if len(batch_data) == 3:
+            sequences, modality_targets, gene_mask = batch_data
+            gene_mask = gene_mask.to(device)
+        else:
+            sequences, modality_targets = batch_data
+            gene_mask = None
+
         is_profiling = do_profile and batch_idx < profile_batches
 
         if is_profiling and batch_idx > 0:
@@ -1320,6 +1426,32 @@ def train_epoch_multihead(
                 )
 
                 res_loss = loss_dict["loss"] * weight
+
+                # Optional gene LFC term (Decima-style cross-track loss).
+                # Only applies at 1bp resolution to the head whose modality
+                # has a non-zero entry in `gene_loss_weights`. Mirrors
+                # upstream which threads gene_mask only through res=1.
+                gene_w = gene_loss_weights.get(modality, 0.0)
+                if (
+                    res == 1
+                    and gene_w > 0
+                    and gene_mask is not None
+                    and strand_channel_masks is not None
+                    and modality in strand_channel_masks
+                ):
+                    gene_loss, gene_aux = losses.gene_lfc_loss(
+                        predictions=pred,
+                        targets=targets,
+                        targets_mask=mask,
+                        gene_mask=gene_mask,
+                        strand_channel_mask=strand_channel_masks[modality],
+                        gene_cross_track_weight=gene_cross_track_weight,
+                    )
+                    res_loss = res_loss + weight * gene_w * gene_loss
+                    loss_components[f"{modality}_gene_lfc"] = gene_loss.item()
+                    loss_components[f"{modality}_gene_total_count"] = gene_aux["gene_loss_total_count"].item()
+                    loss_components[f"{modality}_gene_positional"] = gene_aux["gene_loss_positional"].item()
+
                 modality_loss = modality_loss + res_loss
                 loss_components[f"{modality}_loss_{res}bp"] = res_loss.item()
                 loss_components[f"{modality}_loss_{res}bp_count"] = loss_dict["loss_total"].item()
@@ -1668,6 +1800,10 @@ def train_epoch_sequence_parallel(
     profile_batches: int = 0,
     log_fn: Any | None = None,
     encoder_only: bool = False,
+    *,
+    gene_loss_weights: dict[str, float] | None = None,
+    gene_cross_track_weight: float = 5.0,
+    strand_channel_masks: dict[str, Tensor] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with sequence parallelism.
 
@@ -1741,7 +1877,16 @@ def train_epoch_sequence_parallel(
     else:
         pbar = train_loader
 
-    for batch_idx, (sequences, modality_targets) in enumerate(pbar):
+    gene_loss_weights = gene_loss_weights or {}
+
+    for batch_idx, batch_data in enumerate(pbar):
+        # Dataset returns 3-tuple when gene_mask is configured, else 2-tuple.
+        if len(batch_data) == 3:
+            sequences, modality_targets, gene_mask = batch_data
+            gene_mask = gene_mask.to(device)
+        else:
+            sequences, modality_targets = batch_data
+            gene_mask = None
         sequences = sequences.to(device)
         organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
 
@@ -1862,6 +2007,38 @@ def train_epoch_sequence_parallel(
                 )
 
                 res_loss = loss_dict["loss"] * weight
+
+                # Optional gene LFC term (Decima-style cross-track loss) for
+                # the rna_seq head at 1bp resolution. Slice gene_mask along
+                # S to match this rank's local shard, exactly as we sliced
+                # targets above.
+                gene_w = gene_loss_weights.get(modality, 0.0)
+                if (
+                    res == 1
+                    and gene_w > 0
+                    and gene_mask is not None
+                    and strand_channel_masks is not None
+                    and modality in strand_channel_masks
+                ):
+                    g_full_len = gene_mask.shape[1]
+                    g_local_len = g_full_len // world_size
+                    g_start = rank * g_local_len
+                    local_gene_mask = gene_mask[
+                        :, g_start:g_start + g_local_len, :, :
+                    ]
+                    gene_loss, gene_aux = losses.gene_lfc_loss(
+                        predictions=pred,
+                        targets=targets,
+                        targets_mask=mask,
+                        gene_mask=local_gene_mask,
+                        strand_channel_mask=strand_channel_masks[modality],
+                        gene_cross_track_weight=gene_cross_track_weight,
+                    )
+                    res_loss = res_loss + weight * gene_w * gene_loss
+                    loss_components[f"{modality}_gene_lfc"] = gene_loss.item()
+                    loss_components[f"{modality}_gene_total_count"] = gene_aux["gene_loss_total_count"].item()
+                    loss_components[f"{modality}_gene_positional"] = gene_aux["gene_loss_positional"].item()
+
                 modality_loss = modality_loss + res_loss
                 loss_components[f"{modality}_loss_{res}bp"] = res_loss.item()
 

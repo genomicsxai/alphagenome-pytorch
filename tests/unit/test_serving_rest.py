@@ -4,14 +4,13 @@ import http.client
 import json
 
 import numpy as np
-import pandas as pd
 import pytest
-import torch
 
 from alphagenome.models import dna_output
 
 from alphagenome_pytorch.extensions.serving.adapter import LocalDnaModelAdapter, SEQUENCE_LENGTH_16KB
 from alphagenome_pytorch.extensions.serving.rest_service import serve_rest
+from alphagenome_pytorch.extensions.serving.scorer import VariantScorer
 from alphagenome_pytorch.variant_scoring.scorers import (
     CenterMaskScorer as PTCenterMaskScorer,
     ContactMapScorer as PTContactMapScorer,
@@ -24,75 +23,13 @@ from alphagenome_pytorch.variant_scoring.scorers import (
 from alphagenome_pytorch.variant_scoring.scorers.gene_mask import GeneMaskMode
 from alphagenome_pytorch.variant_scoring.types import (
     AggregationType as PTAggregationType,
-    Interval as PTInterval,
     OutputType as PTOutputType,
-    TrackMetadata as PTTrackMetadata,
-    Variant as PTVariant,
-    VariantScore,
 )
 
-
-class _FakeAnndataModule:
-    class AnnData:
-        def __init__(self, X, obs=None, var=None, uns=None, layers=None):
-            self.X = X
-            self.obs = obs if obs is not None else pd.DataFrame()
-            self.var = var if var is not None else pd.DataFrame()
-            self.uns = uns if uns is not None else {}
-            self.layers = layers if layers is not None else {}
+from .serving_fakes import FakeAnndataModule, FakeRuntime, FakeScoringModel
 
 
-class _FakeScoringModel:
-    def __init__(self):
-        self._metadata = {
-            0: {
-                PTOutputType.DNASE: [
-                    PTTrackMetadata(0, 'track_a', '.', PTOutputType.DNASE, ontology_curie='CL:0001'),
-                    PTTrackMetadata(1, 'track_b', '.', PTOutputType.DNASE, ontology_curie='CL:0002'),
-                ]
-            }
-        }
-
-    def get_track_metadata(self, organism=None):
-        del organism
-        return self._metadata[0]
-
-    def predict(self, sequence, organism=None, **kwargs):
-        del organism, kwargs
-        seq_len = len(sequence)
-        values = np.ones((1, seq_len, 2), dtype=np.float32)
-        return {'dnase': {1: values}}
-
-    def get_sequence(self, interval, variant=None):
-        del variant
-        return 'A' * interval.width
-
-    def predict_variant(self, interval, variant, organism=None):
-        del variant, organism
-        ref = self.predict('A' * interval.width)
-        alt = self.predict('A' * interval.width)
-        alt['dnase'][1] = alt['dnase'][1] + 1.0
-        return ref, alt
-
-    def score_variant(self, interval, variant, scorers, organism=None):
-        del interval, variant, organism
-        result = []
-        for scorer in scorers:
-            result.append(
-                VariantScore(
-                    variant=PTVariant('chr1', 10, 'A', 'C'),
-                    interval=PTInterval('chr1', 0, SEQUENCE_LENGTH_16KB),
-                    scorer=scorer,
-                    scores=torch.tensor([1.0, 2.0]),
-                )
-            )
-        return result
-
-
-@pytest.fixture
-def rest_server(monkeypatch):
-    monkeypatch.setitem(__import__('sys').modules, 'anndata', _FakeAnndataModule)
-    adapter = LocalDnaModelAdapter(_FakeScoringModel())
+def _start_rest(adapter):
     server = serve_rest(adapter, host='127.0.0.1', port=0, wait=False)
     host, port = server.server_address
     try:
@@ -100,6 +37,23 @@ def rest_server(monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.fixture
+def rest_server(monkeypatch):
+    monkeypatch.setitem(__import__('sys').modules, 'anndata', FakeAnndataModule)
+    runtime = FakeRuntime()
+    adapter = LocalDnaModelAdapter(
+        runtime, scorer=VariantScorer(runtime, FakeScoringModel()),
+    )
+    yield from _start_rest(adapter)
+
+
+@pytest.fixture
+def prediction_only_rest_server(monkeypatch):
+    monkeypatch.setitem(__import__('sys').modules, 'anndata', FakeAnndataModule)
+    adapter = LocalDnaModelAdapter(FakeRuntime())
+    yield from _start_rest(adapter)
 
 
 def _post(host: str, port: int, path: str, body: bytes) -> tuple[int, dict]:
@@ -195,6 +149,21 @@ def test_score_variant_missing_required_field(rest_server):
     assert 'aggregation_type' in payload['error']
 
 
+def test_score_variant_prediction_only_adapter_returns_501(prediction_only_rest_server):
+    host, port = prediction_only_rest_server
+    body = json.dumps({
+        'interval': {'chromosome': 'chr1', 'start': 0, 'end': SEQUENCE_LENGTH_16KB},
+        'variant': {
+            'chromosome': 'chr1', 'position': 10,
+            'reference_bases': 'A', 'alternate_bases': 'C',
+        },
+        'variant_scorers': [],
+    }).encode('utf-8')
+    status, payload = _post(host, port, '/v1/score_variant', body)
+    assert status == 501
+    assert 'Variant scoring not available' in payload['error']
+
+
 def test_parse_variant_scorers_all_types():
     from alphagenome_pytorch.extensions.serving.rest_service import _parse_variant_scorers
 
@@ -242,3 +211,74 @@ def test_parse_variant_scorers_empty_returns_empty_list():
 
     assert _parse_variant_scorers(None) == []
     assert _parse_variant_scorers([]) == []
+
+
+# ---------------------------------------------------------------------------
+# /v1/explain_interval tests
+# ---------------------------------------------------------------------------
+
+
+def test_explain_interval_gradient_round_trip(rest_server):
+    host, port = rest_server
+    body = json.dumps({
+        'interval': {'chromosome': 'chr1', 'start': 0, 'end': SEQUENCE_LENGTH_16KB},
+        'target_interval': {'chromosome': 'chr1', 'start': 100, 'end': 200},
+        'organism': 'HOMO_SAPIENS',
+        'requested_output': 'dnase',
+        'resolution': 1,
+        'track_indices': [0],
+        'method': 'input_x_gradient',
+        'reduction': 'sum',
+    }).encode('utf-8')
+    status, payload = _post(host, port, '/v1/explain_interval', body)
+    assert status == 200
+    assert 'attribution' in payload
+    attr = payload['attribution']
+    assert attr['method'] == 'input_x_gradient'
+    assert attr['kind'] == 'base_matrix'
+    # values shape should be (100, 4, 1) encoded as nested lists
+    values = np.asarray(attr['values'])
+    assert values.shape == (100, 4, 1)
+    assert attr['target_start'] == 100
+    assert attr['target_end'] == 200
+    assert attr['raw_gradient'] is None
+
+
+def test_explain_interval_ism_round_trip(rest_server):
+    host, port = rest_server
+    body = json.dumps({
+        'interval': {'chromosome': 'chr1', 'start': 0, 'end': SEQUENCE_LENGTH_16KB},
+        'target_interval': {'chromosome': 'chr1', 'start': 100, 'end': 108},
+        'requested_output': 'dnase',
+        'resolution': 1,
+        'track_indices': [0],
+        'method': 'saturation_ism',
+        'batch_size': 4,
+    }).encode('utf-8')
+    status, payload = _post(host, port, '/v1/explain_interval', body)
+    assert status == 200
+    attr = payload['attribution']
+    assert attr['method'] == 'saturation_ism'
+    # ISM reference-base cells are NaN → serialized as null
+    values = attr['values']  # nested list
+    # Check that at least one cell is null (the reference base for each position)
+    flat = json.dumps(values)
+    assert 'null' in flat, 'Reference-base cells should serialize as null'
+
+
+def test_explain_interval_unknown_method_400(rest_server):
+    host, port = rest_server
+    body = json.dumps({
+        'interval': {'chromosome': 'chr1', 'start': 0, 'end': SEQUENCE_LENGTH_16KB},
+        'target_interval': {'chromosome': 'chr1', 'start': 100, 'end': 200},
+        'requested_output': 'dnase',
+        'resolution': 1,
+        'track_indices': [0],
+        'method': 'nonexistent_method',
+    }).encode('utf-8')
+    status, payload = _post(host, port, '/v1/explain_interval', body)
+    assert status == 400
+    assert 'nonexistent_method' in payload['error']
+    # Error should list known methods
+    assert 'input_x_gradient' in payload['error']
+    assert 'saturation_ism' in payload['error']
