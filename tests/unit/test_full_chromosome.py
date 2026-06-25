@@ -192,9 +192,9 @@ class TestSequenceToOnehot:
         np.testing.assert_array_equal(upper, lower)
 
     def test_n_encoding(self):
-        """N bases should be encoded as uniform [0.25, 0.25, 0.25, 0.25]."""
+        """N bases should be encoded as all-zeros (matching the JAX reference)."""
         onehot = _sequence_to_onehot("N")
-        expected = np.array([[0.25, 0.25, 0.25, 0.25]], dtype=np.float32)
+        expected = np.array([[0, 0, 0, 0]], dtype=np.uint8)
         np.testing.assert_array_equal(onehot, expected)
 
     def test_mixed_sequence(self):
@@ -203,13 +203,13 @@ class TestSequenceToOnehot:
         # A
         np.testing.assert_array_equal(onehot[0], [1, 0, 0, 0])
         # N
-        np.testing.assert_array_equal(onehot[2], [0.25, 0.25, 0.25, 0.25])
+        np.testing.assert_array_equal(onehot[2], [0, 0, 0, 0])
         # T
         np.testing.assert_array_equal(onehot[4], [0, 0, 0, 1])
 
     def test_output_dtype(self):
         onehot = _sequence_to_onehot("ACGT")
-        assert onehot.dtype == np.float32
+        assert onehot.dtype == np.uint8
 
     def test_empty_sequence(self):
         onehot = _sequence_to_onehot("")
@@ -272,11 +272,10 @@ class TestStitchingWithMockModel:
         class _FakeSource:
             chrom_sizes = {'chr1': chrom_len}
 
-            def fetch_onehot(self, chrom, start, end, *, pad=True, ambiguous='uniform'):
-                del ambiguous
+            def fetch_onehot(self, chrom, start, end, *, pad=True):
                 length = end - start
                 if pad:
-                    result = np.full((length, 4), 0.25, dtype=np.float32)
+                    result = np.zeros((length, 4), dtype=genome_array.dtype)
                     valid_start = max(0, start)
                     valid_end = min(self.chrom_sizes.get(chrom, 0), end)
                     if valid_start < valid_end:

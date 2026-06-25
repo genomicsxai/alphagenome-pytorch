@@ -55,10 +55,14 @@ class TestAlphaGenomeLoss:
     def test_initialization(self):
         """Test loss module initializes correctly."""
         loss_fn = AlphaGenomeLoss()
-        
-        assert len(loss_fn.heads) == 8
+
+        # 8 count/contact heads + 3 splice heads = 11
+        assert len(loss_fn.heads) == 11
         assert 'atac' in loss_fn.heads
         assert 'contact_maps' in loss_fn.heads
+        assert 'splice_sites' in loss_fn.heads
+        assert 'splice_site_usage' in loss_fn.heads
+        assert 'splice_junctions' in loss_fn.heads
     
     def test_custom_heads(self):
         """Test loss with subset of heads."""
@@ -108,6 +112,149 @@ class TestAlphaGenomeLoss:
         assert 'loss' in result
         assert 'atac_loss' in result
         assert 'dnase_loss' in result
+
+
+@pytest.mark.unit
+class TestSpliceLoss:
+    """Tests for the splice-head loss branches in `_compute_head_loss`.
+
+    Splice heads emit dicts with string keys ({'logits', ...} /
+    {'pred_counts', ...}) rather than the tensor / {int: tensor} layout the
+    count heads use. These tests pin that `AlphaGenomeLoss` consumes those
+    dicts (regression for the crash where `output.shape` was called on a dict)
+    and mirrors the upstream JAX loss math (alphagenome_research heads.py).
+    No model is needed: splice branches return before any target scaling.
+    """
+
+    def test_splice_sites_runs_on_dict_output(self):
+        """splice_sites consumes {'logits': ...} and returns a finite scalar."""
+        loss_fn = AlphaGenomeLoss(heads=['splice_sites'])
+
+        # 5 classes: Donor+, Acceptor+, Donor-, Acceptor-, Not-a-site.
+        target = torch.zeros(2, 8, 5)
+        target[..., 4] = 1.0  # every position labelled "not a splice site"
+        target[0, 3] = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0])  # one donor+
+
+        outputs = {'splice_sites': {'logits': torch.zeros(2, 8, 5)}}
+        result = loss_fn(outputs, {'splice_sites': target}, torch.tensor([0, 0]))
+
+        assert 'splice_sites_loss' in result
+        assert torch.isfinite(result['loss'])
+        assert result['loss'].item() >= 0
+
+    def test_splice_sites_directional(self):
+        """Logits aligned with the one-hot target beat anti-aligned logits."""
+        loss_fn = AlphaGenomeLoss(heads=['splice_sites'])
+        target = torch.zeros(1, 4, 5)
+        target[..., 0] = 1.0  # class 0 everywhere
+
+        good = {'splice_sites': {'logits': (target * 10.0 - 5.0)}}
+        bad = {'splice_sites': {'logits': (-target * 10.0)}}
+        oi = torch.tensor([0])
+
+        good_loss = loss_fn(good, {'splice_sites': target}, oi)['loss']
+        bad_loss = loss_fn(bad, {'splice_sites': target}, oi)['loss']
+        assert good_loss < bad_loss
+
+    def test_splice_site_usage_runs_and_directional(self):
+        """splice_site_usage consumes {'logits': ...}; aligned logits win."""
+        loss_fn = AlphaGenomeLoss(heads=['splice_site_usage'])
+        # Usage targets are proportions in [0, 1]; use a 0/1 pattern.
+        target = torch.tensor([[[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]])  # (1, 2, 3)
+
+        aligned = (target * 2.0 - 1.0) * 10.0  # +10 where 1, -10 where 0
+        good = {'splice_site_usage': {'logits': aligned}}
+        bad = {'splice_site_usage': {'logits': -aligned}}
+        oi = torch.tensor([0])
+
+        good_res = loss_fn(good, {'splice_site_usage': target}, oi)
+        assert torch.isfinite(good_res['loss'])
+        assert good_res['loss'].item() >= 0
+        bad_loss = loss_fn(bad, {'splice_site_usage': target}, oi)['loss']
+        assert good_res['loss'] < bad_loss
+
+    def test_splice_site_usage_respects_passed_mask(self):
+        """A mask that excludes every track yields zero loss."""
+        loss_fn = AlphaGenomeLoss(heads=['splice_site_usage'])
+        target = torch.rand(1, 2, 3)
+        outputs = {'splice_site_usage': {'logits': torch.randn(1, 2, 3)}}
+        masks = {'splice_site_usage': torch.zeros(1, 2, 3, dtype=torch.bool)}
+
+        result = loss_fn(outputs, {'splice_site_usage': target},
+                         torch.tensor([0]), masks)
+        # _safe_masked_mean clamps the denominator, so a fully-masked head
+        # contributes exactly 0.
+        assert result['splice_site_usage_loss'].item() == 0.0
+
+    def test_splice_junctions_runs_on_dict_output(self):
+        """splice_junctions consumes {'pred_counts', 'splice_junction_mask'}."""
+        loss_fn = AlphaGenomeLoss(heads=['splice_junctions'])
+
+        # Junctions: (B, donors, acceptors, 2 * num_tissues). Keep it small.
+        b, p, t2 = 1, 4, 2
+        target = torch.rand(b, p, p, t2) * 20.0  # spans the soft-clip threshold
+        pred = torch.rand(b, p, p, t2) + 0.1
+        mask = torch.zeros(b, p, p, t2, dtype=torch.bool)
+        mask[:, :3, :3, :] = True  # a connected block of valid donor/acceptor pairs
+
+        outputs = {'splice_junctions': {
+            'pred_counts': pred,
+            'splice_junction_mask': mask,
+        }}
+        result = loss_fn(outputs, {'splice_junctions': target}, torch.tensor([0]))
+
+        assert 'splice_junctions_loss' in result
+        assert torch.isfinite(result['loss'])
+        assert result['loss'].item() >= 0
+
+    def test_splice_junctions_perfect_prediction_beats_noise(self):
+        """Predicting the (soft-clipped) target beats a flat wrong prediction."""
+        loss_fn = AlphaGenomeLoss(heads=['splice_junctions'])
+        b, p, t2 = 1, 4, 2
+        target = torch.rand(b, p, p, t2) * 5.0 + 0.5  # below soft-clip, exact match
+        mask = torch.ones(b, p, p, t2, dtype=torch.bool)
+        oi = torch.tensor([0])
+
+        good = {'splice_junctions': {
+            'pred_counts': target.clone(),
+            'splice_junction_mask': mask,
+        }}
+        bad = {'splice_junctions': {
+            'pred_counts': torch.full_like(target, 0.01),
+            'splice_junction_mask': mask,
+        }}
+        good_loss = loss_fn(good, {'splice_junctions': target}, oi)['loss']
+        bad_loss = loss_fn(bad, {'splice_junctions': target}, oi)['loss']
+        assert good_loss < bad_loss
+
+    def test_all_splice_heads_aggregate(self):
+        """All three splice heads run together through forward()."""
+        loss_fn = AlphaGenomeLoss(
+            heads=['splice_sites', 'splice_site_usage', 'splice_junctions'],
+        )
+        b, p, t2 = 1, 4, 2
+        mask = torch.ones(b, p, p, t2, dtype=torch.bool)
+        outputs = {
+            'splice_sites': {'logits': torch.randn(1, 8, 5)},
+            'splice_site_usage': {'logits': torch.randn(1, 8, 3)},
+            'splice_junctions': {
+                'pred_counts': torch.rand(b, p, p, t2) + 0.1,
+                'splice_junction_mask': mask,
+            },
+        }
+        ss_target = torch.zeros(1, 8, 5)
+        ss_target[..., 4] = 1.0
+        targets = {
+            'splice_sites': ss_target,
+            'splice_site_usage': torch.rand(1, 8, 3),
+            'splice_junctions': torch.rand(b, p, p, t2) * 20.0,
+        }
+        result = loss_fn(outputs, targets, torch.tensor([0]))
+
+        for key in ('splice_sites_loss', 'splice_site_usage_loss',
+                    'splice_junctions_loss', 'loss'):
+            assert key in result
+            assert torch.isfinite(result[key])
 
 
 @pytest.mark.unit

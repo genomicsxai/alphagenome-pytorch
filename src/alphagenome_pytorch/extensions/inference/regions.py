@@ -142,7 +142,7 @@ def read_fasta_sequences(path: str | Path) -> list[tuple[str, np.ndarray]]:
     """Read a FASTA file as a list of (name, one_hot) pairs.
 
     Uses pyfaidx for indexed access. Each sequence is one-hot encoded with
-    the same scheme as :class:`GenomeSequenceProvider` (unknown bases → 0.25).
+    the same scheme as :class:`GenomeSequenceProvider` (unknown bases → zeros).
     """
     _ensure_deps()
     fasta = _fc.pyfaidx.Fasta(str(path))
@@ -158,7 +158,7 @@ def read_fasta_sequences(path: str | Path) -> list[tuple[str, np.ndarray]]:
 
 
 def pad_to_window(seq: np.ndarray, window_size: int) -> tuple[np.ndarray, int]:
-    """Center ``seq`` in a window of ``window_size`` bp, padding with N (0.25).
+    """Center ``seq`` in a window of ``window_size`` bp, padding with N (zeros).
 
     Returns (padded, left_pad) where ``left_pad`` is the bp offset at which
     the original sequence starts in the padded window.
@@ -170,7 +170,7 @@ def pad_to_window(seq: np.ndarray, window_size: int) -> tuple[np.ndarray, int]:
         raise ValueError(f"Sequence ({L}bp) longer than window ({window_size}bp)")
     if L == window_size:
         return seq.copy(), 0
-    padded = np.full((window_size, 4), 0.25, dtype=np.float32)
+    padded = np.zeros((window_size, 4), dtype=seq.dtype)
     left_pad = (window_size - L) // 2
     padded[left_pad:left_pad + L] = seq
     return padded, left_pad
@@ -571,7 +571,7 @@ def _predict_raw_sequence_tiled(
 
     Mirrors :func:`predict_region` but pulls sub-sequences from the in-memory
     array rather than a genome provider. Tiles that extend past the sequence
-    end are right-padded with N (0.25) — same convention as
+    end are right-padded with N (zeros) — same convention as
     GenomeSequenceProvider for out-of-bounds fetches.
     """
     L = seq.shape[0]
@@ -600,8 +600,8 @@ def _predict_raw_sequence_tiled(
         batch = tiles[bstart:bstart + config.batch_size]
         sequences = []
         for ws, we, _, _ in batch:
-            # Slice with N-padding for out-of-bounds ends
-            window = np.full((W, 4), 0.25, dtype=np.float32)
+            # Slice with N-padding (zeros) for out-of-bounds ends
+            window = np.zeros((W, 4), dtype=seq.dtype)
             valid_start = max(0, ws)
             valid_end = min(L, we)
             if valid_start < valid_end:

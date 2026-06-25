@@ -28,13 +28,6 @@ def test_n_encodes_as_zeros_and_decodes_back():
     assert onehot_to_sequence(oh) == "ANGT"
 
 
-def test_n_can_encode_as_uniform_for_padding():
-    oh = sequence_to_onehot("AN", ambiguous="uniform")
-    np.testing.assert_allclose(oh[0], [1, 0, 0, 0])
-    np.testing.assert_allclose(oh[1], [0.25, 0.25, 0.25, 0.25])
-    assert oh.dtype == np.float32
-
-
 def test_all_n():
     oh = sequence_to_onehot("NNN")
     assert oh.sum() == 0
@@ -51,6 +44,14 @@ def test_dtype_and_shape():
     oh = sequence_to_onehot("ACGT")
     assert oh.dtype == np.uint8
     assert oh.shape == (4, 4)
+
+
+def test_dtype_override():
+    """An explicit dtype is honored, with identical values to the default."""
+    oh_u8 = sequence_to_onehot("ACGTN")
+    oh_f32 = sequence_to_onehot("ACGTN", dtype=np.float32)
+    assert oh_f32.dtype == np.float32
+    np.testing.assert_array_equal(oh_f32, oh_u8.astype(np.float32))
 
 
 def test_each_row_sums_to_one_or_zero():
