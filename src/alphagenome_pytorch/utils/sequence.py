@@ -32,7 +32,9 @@ for _i, _ch in enumerate(_BASES):
     _ENCODE_LOOKUP[ord(_ch.lower())] = _i
 
 
-def sequence_to_onehot(sequence: str) -> np.ndarray:
+def sequence_to_onehot(
+    sequence: str, dtype: "np.dtype | type" = np.uint8
+) -> np.ndarray:
     """Convert a DNA sequence string to a one-hot encoded numpy array.
 
     Handles both upper- and lower-case nucleotides.
@@ -41,12 +43,17 @@ def sequence_to_onehot(sequence: str) -> np.ndarray:
 
     Args:
         sequence: DNA sequence string (``ACGTN``).
+        dtype: Output array dtype. Defaults to ``np.uint8`` (compact; the
+            model casts to its compute dtype at the forward boundary). Pass
+            ``np.float32`` if a downstream consumer needs float arithmetic on
+            the one-hot before it reaches the model.
 
     Returns:
-        One-hot encoded ``uint8`` array of shape ``(len(sequence), 4)``.
+        One-hot encoded array of shape ``(len(sequence), 4)`` and dtype
+        ``dtype``.
     """
     seq_bytes = np.frombuffer(sequence.encode("ascii"), dtype=np.uint8)
-    onehot = np.zeros((len(seq_bytes), 4), dtype=np.uint8)
+    onehot = np.zeros((len(seq_bytes), 4), dtype=dtype)
     # clip(0, 127) prevents crash on non-ASCII if present
     indices = _ENCODE_LOOKUP[seq_bytes.clip(0, 127)]
     mask = indices >= 0
