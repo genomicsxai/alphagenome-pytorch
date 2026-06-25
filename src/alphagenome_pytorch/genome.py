@@ -355,28 +355,33 @@ class GenomeSequenceSource:
         resolved = self._resolve_chrom(chrom)
         chrom_len = self.chrom_sizes[resolved]
 
-        if start >= 0 and end <= chrom_len:
-            if resolved in self._cache:
-                view = self._cache[resolved][start:end]
-                return view.copy() if copy else view
+        cached = resolved in self._cache
+
+        def _encode(lo: int, hi: int) -> np.ndarray:
+            if cached:
+                return self._cache[resolved][lo:hi]
             return sequence_to_onehot(
-                str(self.fasta[resolved][start:end]), ambiguous=policy
+                str(self.fasta[resolved][lo:hi]), ambiguous=policy
             )
+
+        if start >= 0 and end <= chrom_len:
+            seq = _encode(start, end)
+            return seq.copy() if (copy and cached) else seq
 
         if not pad:
             raise ValueError(f"Requested interval {chrom}:{start}-{end} is out of bounds")
 
-        result = np.full((seq_len, 4), 0.25, dtype=np.float32)
+        # Out-of-bounds positions are padded per the ``ambiguous`` policy:
+        # ``"uniform"`` fills 0.25 (float32), ``"zero"`` fills zeros (uint8),
+        # matching the encoding of in-bounds ambiguous bases.
+        if policy == "uniform":
+            result = np.full((seq_len, 4), 0.25, dtype=np.float32)
+        else:
+            result = np.zeros((seq_len, 4), dtype=np.uint8)
         valid_start = max(0, start)
         valid_end = min(chrom_len, end)
         if valid_start < valid_end:
-            if resolved in self._cache:
-                seq = self._cache[resolved][valid_start:valid_end]
-            else:
-                seq = sequence_to_onehot(
-                    str(self.fasta[resolved][valid_start:valid_end]),
-                    ambiguous=policy,
-                )
+            seq = _encode(valid_start, valid_end)
             dest_start = valid_start - start
             result[dest_start:dest_start + (valid_end - valid_start)] = seq
         return result

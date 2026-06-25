@@ -8,7 +8,8 @@ deliberately uses fp32".
 
 from __future__ import annotations
 
-from typing import Sequence
+import warnings
+from typing import Callable, Sequence
 
 import numpy as np
 import torch
@@ -40,6 +41,41 @@ def _align_rc_to_forward(values: np.ndarray) -> np.ndarray:
     return values[::-1, list(_RC_BASE_PERM), :].copy()
 
 
+def strand_average(
+    forward: np.ndarray,
+    run_pass: "Callable[[torch.Tensor, slice], np.ndarray]",
+    *,
+    onehot: torch.Tensor,
+    target_slice: slice,
+    resolution: int,
+) -> np.ndarray:
+    """Average a forward-strand attribution with its reverse-complement.
+
+    ``run_pass(input_onehot, slice_)`` runs a single-direction attribution pass
+    and returns a ``(W, 4, T)`` array. This helper runs it once more on the
+    reverse-complemented input over the RC-flipped target window, maps the
+    result back to forward coordinates, and combines it with ``forward`` via
+    elementwise ``nanmean`` — cells that are NaN on both strands (e.g. N
+    positions, or the non-reference cells of an ISM matrix) stay NaN.
+
+    Shared by gradient and ISM attribution so the RC-coordinate math lives in
+    one place.
+    """
+    rc_onehot = _reverse_complement_onehot(onehot)
+    L_bins = onehot.shape[1] // resolution
+    rc_slice = slice(L_bins - target_slice.stop, L_bins - target_slice.start)
+    rc = _align_rc_to_forward(run_pass(rc_onehot, rc_slice))
+
+    stacked = np.stack([forward, rc], axis=0)
+    both_nan = np.isnan(forward) & np.isnan(rc)
+    with warnings.catch_warnings():
+        # All-NaN cells warn ("Mean of empty slice"); we overwrite them below.
+        warnings.simplefilter("ignore", RuntimeWarning)
+        averaged = np.nanmean(stacked, axis=0).astype(np.float32)
+    averaged[both_nan] = np.nan
+    return averaged
+
+
 def _gradient_pass(
     model: nn.Module,
     onehot: torch.Tensor,
@@ -58,7 +94,6 @@ def _gradient_pass(
     target window, where W = ``target_slice.stop - target_slice.start`` in
     *input* positions.
     """
-    L = onehot.shape[1]
     T = len(track_indices)
     target_lo_bp = target_slice.start * resolution
     target_hi_bp = target_slice.stop * resolution
@@ -66,12 +101,18 @@ def _gradient_pass(
 
     raw_grad = np.zeros((W, 4, T), dtype=np.float32)
 
+    # The forward pass is identical for every track (same input, same model);
+    # only which track's window we reduce-and-backprop differs. Run it once and
+    # take one backward per track (a Jacobian row), retaining the graph between
+    # tracks and zeroing the input grad in between. Numerically identical to a
+    # per-track forward, but T forwards collapse to one.
+    x = onehot.clone().detach().float().requires_grad_(True)
+    pred = head_selector(
+        model, x, organism_index,
+        output_type=output_type, resolution=resolution,
+    )  # (1, T_bins, n_tracks)
+
     for t_i, track_idx in enumerate(track_indices):
-        x = onehot.clone().detach().float().requires_grad_(True)
-        pred = head_selector(
-            model, x, organism_index,
-            output_type=output_type, resolution=resolution,
-        )  # (1, T_bins, n_tracks)
         window_pred = pred[:, target_slice, track_idx]  # (1, W_bins)
         scalar = reduce_window(window_pred.unsqueeze(-1), reduction).squeeze()
         if scalar.dim() != 0:
@@ -79,7 +120,8 @@ def _gradient_pass(
                 f"Reduction returned non-scalar tensor of shape {tuple(scalar.shape)}; "
                 "gradient attribution expects a single scalar per track."
             )
-        scalar.backward()
+        x.grad = None  # discard the previous track's gradient before accumulating.
+        scalar.backward(retain_graph=t_i < T - 1)
         if x.grad is None:
             raise RuntimeError(
                 "Backward did not populate input gradients. The model may have "
@@ -87,9 +129,8 @@ def _gradient_pass(
             )
         g = x.grad.detach().float().cpu().numpy()[0]  # (L, 4)
         raw_grad[:, :, t_i] = g[target_lo_bp:target_hi_bp]
-        model.zero_grad(set_to_none=True)
 
-    _ = L  # silence unused-warning in tooling that flags it; L is implicit above.
+    model.zero_grad(set_to_none=True)
     return raw_grad
 
 
@@ -145,34 +186,27 @@ def gradient_x_input(
         raise ValueError(
             f"onehot must have shape (1, L, 4); got {tuple(onehot.shape)}."
         )
-    if reduction not in ("sum", "mean", "peak"):
+    if reduction not in ("sum", "mean", "max"):
         raise ValueError(f"Unknown reduction {reduction!r}.")
 
-    L = onehot.shape[1]
     device = onehot.device
     organism_t = torch.tensor([int(organism_index)], dtype=torch.long, device=device)
 
-    raw_fwd = _gradient_pass(
-        model, onehot.float(), organism_t,
-        head_selector=head_selector,
-        output_type=output_type, resolution=resolution,
-        target_slice=target_slice, track_indices=track_indices,
-        reduction=reduction,
-    )
-
-    if strand_averaged:
-        rc_onehot = _reverse_complement_onehot(onehot.float())
-        # Flip target window into RC coordinates (in resolution bins).
-        L_bins = L // resolution
-        rc_target_slice = slice(L_bins - target_slice.stop, L_bins - target_slice.start)
-        raw_rc = _gradient_pass(
-            model, rc_onehot, organism_t,
+    def run_pass(input_onehot: torch.Tensor, slice_: slice) -> np.ndarray:
+        return _gradient_pass(
+            model, input_onehot, organism_t,
             head_selector=head_selector,
             output_type=output_type, resolution=resolution,
-            target_slice=rc_target_slice, track_indices=track_indices,
+            target_slice=slice_, track_indices=track_indices,
             reduction=reduction,
         )
-        raw_grad = 0.5 * (raw_fwd + _align_rc_to_forward(raw_rc))
+
+    raw_fwd = run_pass(onehot.float(), target_slice)
+    if strand_averaged:
+        raw_grad = strand_average(
+            raw_fwd, run_pass,
+            onehot=onehot.float(), target_slice=target_slice, resolution=resolution,
+        )
     else:
         raw_grad = raw_fwd
 

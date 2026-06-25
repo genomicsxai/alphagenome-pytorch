@@ -339,6 +339,6 @@ class TestGradientXInput:
                 resolution=1,
                 target_slice=slice(0, 4),
                 track_indices=[0],
-                reduction="max",
+                reduction="bogus",
                 head_selector=_fake_head_selector,
             )

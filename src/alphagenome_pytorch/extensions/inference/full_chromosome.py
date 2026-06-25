@@ -153,7 +153,7 @@ class GenomeSequenceProvider:
         self.chrom_sizes = self._source.chrom_sizes
 
     def fetch(self, chrom: str, start: int, end: int) -> np.ndarray:
-        """Fetch one-hot encoded sequence, padding out-of-bounds with N (0.25).
+        """Fetch one-hot encoded sequence, padding out-of-bounds with zeros.
 
         Args:
             chrom: Chromosome name.
@@ -189,7 +189,7 @@ def _sequence_to_onehot(seq: str) -> np.ndarray:
 
     Returns:
         One-hot encoded array of shape (len(seq), 4) with columns [A, C, G, T].
-        Unknown bases (N, etc.) are encoded as [0.25, 0.25, 0.25, 0.25].
+        Unknown bases (N, etc.) are encoded as [0, 0, 0, 0].
     """
     return sequence_to_onehot(seq, ambiguous="uniform")
 

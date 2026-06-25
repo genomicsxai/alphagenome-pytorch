@@ -32,7 +32,12 @@ for _i, _ch in enumerate(_BASES):
     _ENCODE_LOOKUP[ord(_ch.lower())] = _i
 
 
-def sequence_to_onehot(sequence: str, *, ambiguous: str = "zero") -> np.ndarray:
+def sequence_to_onehot(
+    sequence: str,
+    dtype: "np.dtype | type" = np.uint8,
+    *,
+    ambiguous: str = "zero",
+) -> np.ndarray:
     """Convert a DNA sequence string to a one-hot encoded numpy array.
 
     Handles both upper- and lower-case nucleotides.
@@ -41,6 +46,12 @@ def sequence_to_onehot(sequence: str, *, ambiguous: str = "zero") -> np.ndarray:
 
     Args:
         sequence: DNA sequence string (``ACGTN``).
+        dtype: Output array dtype for the ``"zero"`` policy. Defaults to
+            ``np.uint8`` (compact; the model casts to its compute dtype at the
+            forward boundary). Pass ``np.float32`` if a downstream consumer
+            needs float arithmetic on the one-hot before it reaches the model.
+            Ignored for the ``"uniform"`` policy, which always produces
+            ``float32``.
         ambiguous: Encoding for ambiguous / unknown bases. ``"zero"`` uses
             all-zeros, matching the JAX reference for model inputs. ``"uniform"``
             uses ``[0.25, 0.25, 0.25, 0.25]``, matching the existing tiling
@@ -51,7 +62,7 @@ def sequence_to_onehot(sequence: str, *, ambiguous: str = "zero") -> np.ndarray:
     """
     seq_bytes = np.frombuffer(sequence.encode("ascii"), dtype=np.uint8)
     if ambiguous == "zero":
-        onehot = np.zeros((len(seq_bytes), 4), dtype=np.uint8)
+        onehot = np.zeros((len(seq_bytes), 4), dtype=dtype)
     elif ambiguous == "uniform":
         onehot = np.full((len(seq_bytes), 4), 0.25, dtype=np.float32)
     else:

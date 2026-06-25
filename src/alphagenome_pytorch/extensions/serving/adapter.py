@@ -419,11 +419,14 @@ class LocalDnaModelAdapter:
             target_interval: Sub-interval to attribute over — must be contained
                 in ``interval``.
             organism: Organism identifier (proto enum, string, or int).
-            requested_output: Head name, e.g. ``"dnase"``.
+            requested_output: Output/head identifier. Accepts the same forms as
+                the predict path: a head name (``"dnase"``), the upper-case or
+                ``OUTPUT_TYPE_``-prefixed enum name, the proto/PT ``OutputType``
+                enum, or its int value.
             resolution: Output resolution in bp (1 or 128).
             track_indices: Which tracks to attribute.
             method: ``"input_x_gradient"`` or ``"saturation_ism"``.
-            reduction: Window reduction (``"sum"``, ``"mean"``, ``"peak"``).
+            reduction: Window reduction (``"sum"``, ``"mean"``, ``"max"``).
             include_raw_gradient: Return full ``(W, 4, T)`` gradient tensor
                 (only valid for gradient-based methods).
             strand_averaged: Average forward and reverse-complement attributions.
@@ -463,6 +466,18 @@ class LocalDnaModelAdapter:
         if not track_indices:
             raise ValueError("track_indices must be non-empty.")
 
+        # Normalize the requested output to the model's head key, accepting the
+        # same forms as the predict path (``"dnase"``, ``"DNASE"``,
+        # ``"OUTPUT_TYPE_DNASE"``, the proto/PT enum, or its int value). The
+        # official enum maps to a PT output whose ``.value`` is the head key.
+        official_output = _normalize_output_type(requested_output)
+        pt_output = _OFFICIAL_TO_PT_OUTPUT.get(official_output)
+        if pt_output is None:
+            raise ValueError(
+                f"Output {requested_output!r} is not supported for attribution."
+            )
+        output_type = pt_output.value
+
         # --- sequence → one-hot -----------------------------------------
         organism_index = self.runtime.resolve_organism_index(organism)
         sequence = self.runtime.get_sequence(interval)
@@ -475,6 +490,19 @@ class LocalDnaModelAdapter:
         ).unsqueeze(0)  # (1, L, 4)
 
         # --- target window bookkeeping -----------------------------------
+        if resolution <= 0:
+            raise ValueError(
+                f"resolution must be a positive integer, got {resolution}."
+            )
+        start_offset = target_interval.start - interval.start
+        end_offset = target_interval.end - interval.start
+        if start_offset % resolution != 0 or end_offset % resolution != 0:
+            raise ValueError(
+                f"target_interval offsets relative to interval.start must be "
+                f"multiples of resolution ({resolution}); got start offset "
+                f"{start_offset}, end offset {end_offset}."
+            )
+
         target_slice = target_slice_for_resolution(
             interval.start, target_interval.start, target_interval.end, resolution,
         )
@@ -485,7 +513,7 @@ class LocalDnaModelAdapter:
         kwargs: dict[str, Any] = dict(
             onehot=onehot,
             organism_index=organism_index,
-            output_type=requested_output,
+            output_type=output_type,
             resolution=resolution,
             target_slice=target_slice,
             track_indices=track_indices,

@@ -334,6 +334,17 @@ Available embeddings:
 - ``embeddings_128bp``: (B, L//128, 3072) — always computed
 - ``embeddings_pair``: (B, L//2048, L//2048, 128) — for contact maps
 
+Unlike ``predict()`` (which is wrapped in ``torch.no_grad()``), ``encode()`` honors
+the ambient autograd context so gradients can flow into the backbone for end-to-end
+fine-tuning. The trade-off is extra memory from the retained activation graph, so
+wrap the call in ``torch.no_grad()`` for pure inference or analysis:
+
+.. code-block:: python
+
+   # Inference / analysis: no gradients, lower memory
+   with torch.no_grad():
+       emb = model.encode(sequences, organism_idx, resolutions=(128,))
+
 Memory Optimization
 -------------------
 

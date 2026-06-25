@@ -356,6 +356,9 @@ class VariantScoringModel:
         organism: str | int | None = None,
         to_cpu: bool = False,
         unified_splicing: bool = False,
+        heads: tuple[str, ...] | None = None,
+        ref_outputs: dict[str, Any] | None = None,
+        interval_variant: Variant | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Get reference and alternate predictions for a variant.
 
@@ -367,10 +370,37 @@ class VariantScoringModel:
                 Recommended for visualization or when processing many variants.
             unified_splicing: If True, performs a second pass to align splice
                 sites between Ref and Alt predictions. Required for SpliceJunctionScorer.
+            heads: Optional tuple of head names to compute. If None, all heads
+                run. Forwarded to the model forward pass to skip unused heads.
+            interval_variant: Optional background variant applied to the context
+                sequence before ``variant``. When given, the reference forward
+                pass runs on the background-modified sequence and ``variant`` is
+                applied on top of it (used by ISM to score SNVs against a variant
+                background). Must be length-preserving so genomic coordinates are
+                unchanged.
+            ref_outputs: Optional precomputed first-pass reference outputs. When
+                supplied (e.g. by ISM scoring over a shared reference), the
+                reference forward pass is skipped and this cache is reused. It
+                must have been computed with the same ``heads``/``unified_splicing``
+                settings. The cache is shallow-copied before any per-variant
+                mutation (junction second pass, embedding cleanup) so it stays
+                valid across variants.
 
         Returns:
             Tuple of (ref_outputs, alt_outputs) dictionaries.
         """
+        # The unified-splicing second pass reads splice_sites['probs'] (and
+        # aligns it for indels) to derive unified positions, so a head filter
+        # that omits splice_sites would otherwise fail with an opaque KeyError.
+        # The junction head itself is recomputed from embeddings and need not be
+        # in `heads`. Embeddings come from return_embeddings, not the filter.
+        if unified_splicing and heads is not None and 'splice_sites' not in heads:
+            raise ValueError(
+                "unified_splicing=True requires 'splice_sites' in heads "
+                f"(got {heads}); it is needed to derive unified splice-site "
+                "positions for the junction head's second pass."
+            )
+
         # Handle indels: for deletions, extend extraction to compensate for
         # sequence shrinkage. For insertions, the alt is longer and gets
         # truncated. Both ref and alt are truncated to the original interval
@@ -389,7 +419,9 @@ class VariantScoringModel:
         else:
             extraction_interval = interval
 
-        base_seq = self.fasta.extract(extraction_interval)
+        # When a background variant is supplied, the reference is the
+        # background-modified sequence and ``variant`` is applied on top of it.
+        base_seq = self.get_sequence(extraction_interval, variant=interval_variant)
         ref_seq = base_seq[:interval_length]
         alt_seq = apply_variant_to_sequence(
             base_seq, variant, extraction_interval
@@ -397,13 +429,39 @@ class VariantScoringModel:
 
         # First pass: Get standard predictions with embeddings if needed
         return_embeddings = unified_splicing
-        ref_outputs = self.predict(ref_seq, organism, return_embeddings=return_embeddings)
-        alt_outputs = self.predict(alt_seq, organism, return_embeddings=return_embeddings)
+        predict_kwargs: dict[str, Any] = {'return_embeddings': return_embeddings}
+        if heads is not None:
+            predict_kwargs['heads'] = heads
+        if ref_outputs is None:
+            ref_outputs = self.predict(ref_seq, organism, **predict_kwargs)
+        else:
+            # Reuse a shared reference cache (ISM). Shallow-copy so the
+            # unified-splicing second pass (which sets 'splice_junctions' and
+            # pops embeddings) mutates only this variant's view, leaving the
+            # cache intact for subsequent variants.
+            ref_outputs = dict(ref_outputs)
+        alt_outputs = self.predict(alt_seq, organism, **predict_kwargs)
 
         if unified_splicing:
             # Calculate unified splice site positions (max of Ref and Alt)
             from ..utils.splicing import generate_splice_site_positions
-            
+            from .aggregations import align_alternate
+
+            # Align ALT embeddings + splice-site probs into REF coordinate
+            # space before generating unified positions and re-running the
+            # junction head. Identity for SNVs (ref_len == alt_len).
+            if variant.is_indel:
+                ref_len = len(variant.reference_bases)
+                alt_len = len(variant.alternate_bases)
+                alt_outputs['embeddings_1bp'] = align_alternate(
+                    alt_outputs['embeddings_1bp'],
+                    variant.start, ref_len, alt_len, interval.start,
+                )
+                alt_outputs['splice_sites']['probs'] = align_alternate(
+                    alt_outputs['splice_sites']['probs'],
+                    variant.start, ref_len, alt_len, interval.start,
+                )
+
             ref_probs = ref_outputs['splice_sites']['probs']
             alt_probs = alt_outputs['splice_sites']['probs']
             
@@ -451,6 +509,7 @@ class VariantScoringModel:
             for out in [ref_outputs, alt_outputs]:
                 out.pop('embeddings_1bp', None)
                 out.pop('embeddings_128bp', None)
+                out.pop('embeddings_pair', None)
 
         # Move ref to CPU before alt prediction to free GPU memory
         # logic for to_cpu handled at end or between
@@ -475,6 +534,27 @@ class VariantScoringModel:
             return tuple(self._outputs_to_cpu(v) for v in outputs)
         return outputs
 
+    def _resolve_scorer_passes(
+        self, scorers: list[BaseVariantScorer]
+    ) -> tuple[bool, tuple[str, ...] | None]:
+        """Resolve forward-pass settings shared by a set of scorers.
+
+        Returns ``(unified_splicing, heads_arg)``:
+
+        - ``unified_splicing``: whether any scorer needs the splice-junction
+          alignment second pass. Checked by class-name string to avoid a
+          circular import of ``SpliceJunctionScorer``.
+        - ``heads_arg``: the union of heads the scorers require, so the model
+          forward pass can skip unused heads. ``None`` (run all heads) when no
+          scorer declares requirements.
+        """
+        unified_splicing = any(s.name == "SpliceJunctionScorer()" for s in scorers)
+        required_heads: set[str] = set()
+        for s in scorers:
+            required_heads.update(s.required_heads)
+        heads_arg = tuple(sorted(required_heads)) if required_heads else None
+        return unified_splicing, heads_arg
+
     def score_variant(
         self,
         interval: Interval,
@@ -483,6 +563,8 @@ class VariantScoringModel:
         organism: str | int | None = None,
         gene_annotation: GeneAnnotation | None = None,
         to_cpu: bool = False,
+        ref_outputs: dict[str, Any] | None = None,
+        interval_variant: Variant | None = None,
     ) -> list[VariantScore | list[VariantScore]]:
         """Score a single variant with multiple scorers.
 
@@ -493,21 +575,29 @@ class VariantScoringModel:
             organism: 'human', 'mouse', or index. Uses default_organism if None.
             gene_annotation: Optional GeneAnnotation.
             to_cpu: If True, move scores to CPU and clear GPU cache.
+            interval_variant: Optional length-preserving background variant
+                applied to the context before ``variant`` (see
+                ``predict_variant``). When supplied with ``ref_outputs``, the
+                cache must have been produced for the same background.
+            ref_outputs: Optional precomputed first-pass reference outputs to
+                reuse instead of recomputing the reference forward pass. Must
+                have been produced for the same ``interval``/``organism`` with
+                the same scorer set (see ``_predict_reference_outputs``).
 
         Returns:
             List of VariantScore objects
         """
         organism_index = self._resolve_organism_index(organism)
 
-        # Check if we need unified splicing pass
-        unified_splicing = any(s.name == "SpliceJunctionScorer()" for s in scorers)
-        # Note: checking by class name string is fragile but avoids circular imports
-        # Alternative: isinstance(s, SpliceJunctionScorer) if imported
-        # Let's check typical string representation
+        unified_splicing, heads_arg = self._resolve_scorer_passes(scorers)
 
         # Get predictions
         ref_outputs, alt_outputs = self.predict_variant(
-            interval, variant, organism, unified_splicing=unified_splicing
+            interval, variant, organism,
+            unified_splicing=unified_splicing,
+            heads=heads_arg,
+            ref_outputs=ref_outputs,
+            interval_variant=interval_variant,
         )
 
         # Use instance gene annotation if not provided
@@ -616,77 +706,146 @@ class VariantScoringModel:
     def score_ism_variants(
         self,
         interval: Interval,
-        center_position: int,
         scorers: list[BaseVariantScorer],
+        *,
+        ism_interval: Interval | None = None,
+        center_position: int | None = None,
         window_size: int = 21,
+        interval_variant: Variant | None = None,
         organism: str | int | None = None,
         gene_annotation: GeneAnnotation | None = None,
         nucleotides: str = 'ACGT',
         to_cpu: bool = True,
         progress: bool = True,
     ) -> list[list[VariantScore | list[VariantScore]]]:
-        """Score all possible single-nucleotide mutations in a window.
+        """Score all possible single-nucleotide mutations across a region.
 
         In-silico mutagenesis (ISM) systematically evaluates all possible
-        SNVs within a window centered on a position of interest. This is
-        useful for identifying which positions are most sensitive to mutation.
+        SNVs within a region of interest. The region can be specified either
+        explicitly (``ism_interval``) or as a window centered on a position
+        (``center_position``/``window_size``) — supply exactly one.
 
         Args:
-            interval: Genomic interval for prediction context (must be 131072bp)
-            center_position: 1-based center position for the ISM window
-            scorers: List of scorer configurations
-            window_size: Size of the window to mutate (default 21bp, centered)
+            interval: Genomic interval for prediction context (must be 131072bp).
+            scorers: List of scorer configurations.
+            ism_interval: Genomic interval to mutate. Must be contained in
+                ``interval`` and on the same chromosome. Mutually exclusive
+                with ``center_position``.
+            center_position: 1-based center position for the ISM window.
+                Mutually exclusive with ``ism_interval``.
+            window_size: Size of the window to mutate when using
+                ``center_position`` (default 21bp, centered).
+            interval_variant: Optional background variant applied to the whole
+                interval before ISM runs. The reference and every per-position
+                SNV are scored against this modified background (not the raw
+                reference), so it's the variant context the ISM is performed in
+                — as distinct from the per-position SNVs being mutagenized. Must
+                be length-preserving (a substitution); indels are rejected.
             organism: 'human', 'mouse', or index. Uses default_organism if None.
-            gene_annotation: Optional GeneAnnotation for gene-centric scorers
-            nucleotides: Nucleotides to mutate to (default 'ACGT' = all 4 bases)
+            gene_annotation: Optional GeneAnnotation for gene-centric scorers.
+            nucleotides: Nucleotides to mutate to (default 'ACGT' = all 4 bases).
+                Reference bases not in this set are skipped.
             to_cpu: If True, move scores to CPU and clear GPU cache after each variant.
-            progress: Whether to show progress bar
+            progress: Whether to show progress bar.
 
         Returns:
             Nested list: [variant_idx][scorer_idx] of VariantScore.
-            Each variant is a possible SNV in the window.
+            Each variant is a possible SNV in the ISM region.
 
         Example:
-            >>> # Score all SNVs in a 21bp window
+            >>> # Score all SNVs in a 21bp window centered on a position
             >>> ism_scores = scoring_model.score_ism_variants(
             ...     interval=interval,
-            ...     center_position=36201698,
             ...     scorers=[CenterMaskScorer(OutputType.ATAC, 501, AggregationType.DIFF_LOG2_SUM)],
+            ...     center_position=36201698,
             ...     window_size=21,
             ... )
+
+            >>> # Or supply an explicit ISM interval
+            >>> ism_scores = scoring_model.score_ism_variants(
+            ...     interval=interval,
+            ...     scorers=[...],
+            ...     ism_interval=Interval('chr22', 36201688, 36201709),
+            ... )
         """
-        # Get reference sequence
-        ref_seq = self.get_sequence(interval)
-
-        # Generate all SNVs in window
-        variants = []
-        half_window = window_size // 2
-
-        for offset in range(-half_window, half_window + 1):
-            pos = center_position + offset
-            rel_pos = pos - 1 - interval.start  # 0-based relative position
-
-            if 0 <= rel_pos < len(ref_seq):
-                ref_base = ref_seq[rel_pos].upper()
-                for alt_base in nucleotides:
-                    if alt_base.upper() != ref_base:
-                        variants.append(Variant(
-                            chromosome=interval.chromosome,
-                            position=pos,
-                            reference_bases=ref_base,
-                            alternate_bases=alt_base.upper(),
-                        ))
-
-        # Score all variants
-        return self.score_variants(
-            intervals=interval,
-            variants=variants,
-            scorers=scorers,
-            organism=organism,
-            gene_annotation=gene_annotation,
-            to_cpu=to_cpu,
-            progress=progress,
+        _require_length_preserving_background(interval_variant)
+        ism_interval = _resolve_ism_interval(
+            interval=interval,
+            ism_interval=ism_interval,
+            center_position=center_position,
+            window_size=window_size,
         )
+
+        sequence = self.get_sequence(interval, variant=interval_variant)
+        variants = _build_ism_variants(
+            sequence=sequence,
+            interval=interval,
+            ism_interval=ism_interval,
+            nucleotides=nucleotides,
+        )
+
+        if not variants:
+            return []
+
+        # All SNVs in the window share the same reference sequence (the
+        # background-modified context when interval_variant is given), so the
+        # reference forward pass is computed once and reused across variants.
+        ref_outputs = self._predict_reference_outputs(
+            interval, scorers, organism, interval_variant=interval_variant
+        )
+
+        if gene_annotation is None:
+            gene_annotation = self._gene_annotation
+
+        # Set up progress bar
+        if progress:
+            try:
+                from tqdm import tqdm
+                iterator = tqdm(variants, desc="Scoring ISM variants")
+            except ImportError:
+                iterator = variants
+        else:
+            iterator = variants
+
+        results = []
+        for variant in iterator:
+            results.append(self.score_variant(
+                interval=interval,
+                variant=variant,
+                scorers=scorers,
+                organism=organism,
+                gene_annotation=gene_annotation,
+                to_cpu=to_cpu,
+                ref_outputs=ref_outputs,
+                interval_variant=interval_variant,
+            ))
+
+        return results
+
+    def _predict_reference_outputs(
+        self,
+        interval: Interval,
+        scorers: list[BaseVariantScorer],
+        organism: str | int | None = None,
+        interval_variant: Variant | None = None,
+    ) -> dict[str, Any]:
+        """Compute first-pass reference outputs once for a shared interval.
+
+        Used by ISM scoring so the reference forward pass is not repeated for
+        every SNV in the window. Returns the un-mutated first-pass outputs
+        (including ``embeddings_1bp`` when splice-junction scoring is active);
+        the per-variant junction second pass operates on shallow copies of this
+        cache (see ``predict_variant``).
+
+        When ``interval_variant`` is supplied the reference is the
+        background-modified sequence, matching the per-variant reference pass.
+        """
+        unified_splicing, heads_arg = self._resolve_scorer_passes(scorers)
+        ref_seq = self.get_sequence(interval, variant=interval_variant)[:interval.width]
+        predict_kwargs: dict[str, Any] = {'return_embeddings': unified_splicing}
+        if heads_arg is not None:
+            predict_kwargs['heads'] = heads_arg
+        return self.predict(ref_seq, organism, **predict_kwargs)
 
     def tidy_scores(
         self,
@@ -733,19 +892,28 @@ class VariantScoringModel:
 
         Creates a (sequence_length, 4) matrix where each position contains
         the contribution score for mutating the reference base to each
-        possible alternate base.
+        possible alternate base, mean-centered across alternatives.
 
         Args:
             variant_scores: List of scores for each variant (from ISM scoring).
             variants: List of Variant objects corresponding to scores.
             interval: Genomic interval that was scored.
-            multiply_by_sequence: If True, zero out the reference base positions
-                (since we only have alt scores). Default True.
+            multiply_by_sequence: If True, zero every scored ALT column, leaving
+                non-zero values only at unscored columns. For a normal ACGT position
+                (all 3 ALT bases scored) that is exactly the reference-base column;
+                for an ``N`` reference (all 4 ALT bases scored) the whole row is
+                zeroed. Default True. 
+                Positions with only 1 or 2 scored ALT bases are rejected.
             vocabulary: Nucleotide vocabulary order. Default 'ACGT'.
 
         Returns:
             Tensor of shape (interval.width, 4) with mean-centered ISM scores.
-            
+
+        Raises:
+            ValueError: If any position has only 1 or 2 scored ALT bases. A real
+                ACGT reference must contribute all 3 alternates (an ``N`` reference
+                contributes 4); a partially scored position would be mis-centered.
+
         Example:
             >>> ism_scores = scorer.score_ism_variants(interval, center, scorers)
             >>> # Flatten to get score per variant
@@ -753,35 +921,13 @@ class VariantScoringModel:
             >>> variants = [...]  # Same order as ism_scores
             >>> matrix = scorer.ism_matrix(flat_scores, variants, interval)
         """
-        import numpy as np
-
-        scores = np.zeros((interval.width, len(vocabulary)), dtype=np.float32)
-        filled = np.zeros((interval.width, len(vocabulary)), dtype=bool)
-        base_index = {base: i for i, base in enumerate(vocabulary)}
-
-        for variant, score in zip(variants, variant_scores):
-            if not variant.is_snv:
-                continue
-            position = variant.start - interval.start
-            if 0 <= position < interval.width:
-                alt_base = variant.alternate_bases.upper()
-                if alt_base in base_index:
-                    scores[position, base_index[alt_base]] = score
-                    filled[position, base_index[alt_base]] = True
-
-        # Mean-center across alternatives (excluding reference)
-        # For each position, subtract mean of filled values
-        for pos in range(interval.width):
-            n_filled = filled[pos].sum()
-            if n_filled > 0:
-                mean_score = scores[pos, filled[pos]].mean()
-                scores[pos] -= mean_score / (len(vocabulary) - 1)
-
-        if multiply_by_sequence:
-            # Zero out positions where we don't have data
-            scores = scores * (~filled).astype(np.float32)
-
-        return torch.from_numpy(scores)
+        return _ism_matrix(
+            variant_scores=variant_scores,
+            variants=variants,
+            interval=interval,
+            multiply_by_sequence=multiply_by_sequence,
+            vocabulary=vocabulary,
+        )
 
     def close(self):
         """Close any open file handles."""
@@ -793,6 +939,184 @@ class VariantScoringModel:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+
+def _require_length_preserving_background(interval_variant: Any) -> None:
+    """Reject ISM background variants that shift genomic coordinates.
+
+    ISM generation and scoring index the context sequence by genomic position,
+    which only stays aligned if the background variant is a substitution
+    (``len(ref) == len(alt)``). An indel background would silently misalign
+    every downstream SNV, so it is rejected up front with a clear error.
+    """
+    if interval_variant is None:
+        return
+    ref = interval_variant.reference_bases
+    alt = interval_variant.alternate_bases
+    if len(ref) != len(alt):
+        raise ValueError(
+            "interval_variant for ISM must be length-preserving (a substitution); "
+            f"got reference_bases={ref!r}, alternate_bases={alt!r}. A length-changing "
+            "background (indel) would shift the ISM coordinates."
+        )
+
+
+def _resolve_ism_interval(
+    *,
+    interval: Interval,
+    ism_interval: Interval | None,
+    center_position: int | None,
+    window_size: int,
+) -> Interval:
+    """Validate and normalize the ISM region.
+
+    Returns the supplied ``ism_interval`` (after validation), or constructs one
+    from ``center_position`` + ``window_size`` (1-based VCF center, centered
+    window; for an even ``window_size`` the extra base falls on the left).
+    Exactly one of the two must be provided.
+    """
+    if ism_interval is None and center_position is None:
+        raise ValueError(
+            "score_ism_variants requires either ism_interval or center_position."
+        )
+    if ism_interval is not None and center_position is not None:
+        raise ValueError(
+            "score_ism_variants accepts only one of ism_interval or center_position."
+        )
+
+    if ism_interval is None:
+        half = window_size // 2
+        start_0b = (center_position - 1) - half
+        ism_interval = Interval(
+            chromosome=interval.chromosome,
+            start=start_0b,
+            end=start_0b + window_size,
+        )
+
+    if ism_interval.chromosome != interval.chromosome:
+        raise ValueError(
+            f"ISM interval chromosome {ism_interval.chromosome!r} does not match "
+            f"context interval chromosome {interval.chromosome!r}."
+        )
+    if ism_interval.strand == '-':
+        raise ValueError("ISM interval must be on the positive strand.")
+    if ism_interval.start < interval.start or ism_interval.end > interval.end:
+        raise ValueError(
+            f"ISM interval [{ism_interval.start}, {ism_interval.end}) must be "
+            f"contained within context interval "
+            f"[{interval.start}, {interval.end})."
+        )
+    return ism_interval
+
+
+def _build_ism_variants(
+    sequence: str,
+    interval: Any,
+    ism_interval: Any,
+    nucleotides: str = 'ACGT',
+    *,
+    variant_cls: type = Variant,
+) -> list:
+    """Generate all SNVs covering ``ism_interval`` from ``sequence``.
+
+    ``sequence`` is the reference (or variant-modified) sequence at positions
+    ``[interval.start, interval.end)``. For each position in
+    ``[ism_interval.start, ism_interval.end)`` whose reference base is in
+    ``nucleotides``, one variant is emitted per alternate base in
+    ``nucleotides`` other than the reference. Positions whose reference base
+    falls outside ``nucleotides`` (e.g. ``N``) are skipped.
+
+    ``interval`` and ``ism_interval`` need only expose ``chromosome``,
+    ``start``, and ``end`` (PT ``Interval`` or ``genome.Interval`` both work).
+    ``variant_cls`` lets callers select the constructor — defaults to PT
+    ``Variant``; serving passes ``genome.Variant`` to avoid a back-conversion.
+
+    Variant positions are 1-based (VCF convention).
+    """
+    nuc_upper = {b.upper() for b in nucleotides}
+    variants: list = []
+    for pos_0b in range(ism_interval.start, ism_interval.end):
+        rel = pos_0b - interval.start
+        if rel < 0 or rel >= len(sequence):
+            continue
+        ref_base = sequence[rel].upper()
+        if ref_base not in nuc_upper:
+            continue
+        for alt_base in nucleotides:
+            alt_upper = alt_base.upper()
+            if alt_upper == ref_base:
+                continue
+            variants.append(variant_cls(
+                chromosome=interval.chromosome,
+                position=pos_0b + 1,
+                reference_bases=ref_base,
+                alternate_bases=alt_upper,
+            ))
+    return variants
+
+
+def _ism_matrix(
+    variant_scores: list[float],
+    variants: list[Variant],
+    interval: Interval,
+    multiply_by_sequence: bool = True,
+    vocabulary: str = 'ACGT',
+) -> torch.Tensor:
+    """Construct mean-centered ISM contribution matrix.
+
+    Module-level helper underlying ``VariantScoringModel.ism_matrix``. Mirrors
+    ``alphagenome.interpretation.ism.ism_matrix``: per row, subtracts
+    ``sum(scores) / (V - 1)``. For a normal ACGT position all 3 ALT columns are
+    scored and the REF column starts at 0, so the divisor ``V - 1`` is the ALT
+    count and the REF column holds ``-mean(ALT scores)`` while each ALT column
+    holds ``score - mean(ALT scores)``.
+
+    Positions with only 1 or 2 scored ALT bases are rejected with ``ValueError``:
+    the incomplete sum would still be divided by ``V - 1``, yielding a
+    wrong-magnitude row. A position with 4 scored ALTs (an ``N`` reference) is
+    allowed; under ``multiply_by_sequence`` its row zeros out entirely.
+    """
+    import numpy as np
+
+    scores = np.zeros((interval.width, len(vocabulary)), dtype=np.float32)
+    filled = np.zeros((interval.width, len(vocabulary)), dtype=bool)
+    base_index = {base: i for i, base in enumerate(vocabulary)}
+
+    for variant, score in zip(variants, variant_scores):
+        if not variant.is_snv:
+            continue
+        position = variant.start - interval.start
+        if 0 <= position < interval.width:
+            alt_base = variant.alternate_bases.upper()
+            if alt_base in base_index:
+                scores[position, base_index[alt_base]] = score
+                filled[position, base_index[alt_base]] = True
+
+    # Per-position coverage guard. A real ACGT reference has exactly 3 possible
+    # ALT bases, so a scored row holds 3 (normal) or 4 (non-ACGT/N reference, which
+    # yields all four ACGT as alts). 0 means the position fell outside the scored
+    # window (edge) and is intentionally left as zeros. 1 or 2 means a real base is
+    # missing some alternates: centering would then divide an incomplete sum by
+    # (V-1), silently producing a wrong-magnitude row, so we reject it rather than
+    # emit a misleading matrix.
+    per_pos = filled.sum(axis=-1)
+    partial = np.where((per_pos == 1) | (per_pos == 2))[0]
+    if partial.size:
+        positions_1based = (partial + interval.start + 1).tolist()
+        raise ValueError(
+            'ism_matrix: positions have only 1 or 2 alternate bases (expected 3 '
+            'for an ACGT reference, or 4 for N). 1-based positions: '
+            f'{positions_1based}'
+        )
+
+    # Mean-center: subtract sum/(V-1) per position. Because the REF column is 0,
+    # this equals the mean of the (V-1) ALT scores.
+    scores -= scores.sum(axis=-1, keepdims=True) / (len(vocabulary) - 1)
+
+    if multiply_by_sequence:
+        scores = scores * (~filled).astype(np.float32)
+
+    return torch.from_numpy(scores)
 
 
 # Recommended scorer presets matching JAX reference

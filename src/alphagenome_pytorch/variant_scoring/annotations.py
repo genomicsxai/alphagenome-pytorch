@@ -17,7 +17,7 @@ import pandas as pd
 import torch
 
 if TYPE_CHECKING:
-    from .types import Interval
+    from .types import Interval, Variant
 
 
 @dataclass
@@ -243,6 +243,51 @@ class GeneAnnotation:
             if gene_types is not None:
                 if info.gene_type not in gene_types:
                     continue
+
+            genes.append(gene_id)
+
+        return genes
+
+    def get_genes_overlapping_variant(
+        self,
+        variant: 'Variant',
+        gene_types: list[str] | None = None,
+    ) -> list[str]:
+        """Get gene IDs whose body overlaps the variant position.
+
+        Mirrors the upstream JAX behavior: only genes whose body contains
+        the variant's 0-based start position are returned. Used by splicing
+        scorers to restrict scoring to variant-overlapping genes.
+
+        Args:
+            variant: Variant whose 0-based start defines the overlap query
+            gene_types: Optional list of gene types to include
+                (e.g., ['protein_coding', 'lncRNA'])
+
+        Returns:
+            List of gene IDs (without version)
+        """
+        # Ensure index is built by accessing df
+        _ = self.df
+
+        chrom = variant.chromosome
+        pos = variant.start  # 0-based
+        genes = []
+
+        for gene_id, info in self._gene_index.items():
+            # Check chromosome match (handle chr prefix differences)
+            if info.chromosome != chrom:
+                if info.chromosome == 'chr' + chrom or chrom == 'chr' + info.chromosome:
+                    pass
+                else:
+                    continue
+
+            # Variant 0-based position must lie within [start, end)
+            if not (info.start <= pos < info.end):
+                continue
+
+            if gene_types is not None and info.gene_type not in gene_types:
+                continue
 
             genes.append(gene_id)
 

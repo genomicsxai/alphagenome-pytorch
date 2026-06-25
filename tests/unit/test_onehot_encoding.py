@@ -53,6 +53,14 @@ def test_dtype_and_shape():
     assert oh.shape == (4, 4)
 
 
+def test_dtype_override():
+    """An explicit dtype is honored, with identical values to the default."""
+    oh_u8 = sequence_to_onehot("ACGTN")
+    oh_f32 = sequence_to_onehot("ACGTN", dtype=np.float32)
+    assert oh_f32.dtype == np.float32
+    np.testing.assert_array_equal(oh_f32, oh_u8.astype(np.float32))
+
+
 def test_each_row_sums_to_one_or_zero():
     oh = sequence_to_onehot("ACNGTNA")
     row_sums = oh.sum(axis=1)
