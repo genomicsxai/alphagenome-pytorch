@@ -921,8 +921,9 @@ def _resolve_ism_interval(
     """Validate and normalize the ISM region.
 
     Returns the supplied ``ism_interval`` (after validation), or constructs one
-    from ``center_position`` + ``window_size`` (1-based VCF center, symmetric
-    window). Exactly one of the two must be provided.
+    from ``center_position`` + ``window_size`` (1-based VCF center, centered
+    window; for an even ``window_size`` the extra base falls on the left).
+    Exactly one of the two must be provided.
     """
     if ism_interval is None and center_position is None:
         raise ValueError(
