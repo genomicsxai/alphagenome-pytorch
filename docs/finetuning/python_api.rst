@@ -197,6 +197,10 @@ recipients only need the delta file plus the base pretrained weights:
    # After training, export for sharing
    export_delta_weights(model, config, "my_lora.safetensors")
 
+For a self-describing artifact ready to publish (manifest, model card,
+optional metrics) wrap the delta export into a bundle with
+``agt adapters export`` — see :doc:`/serving/adapters`.
+
 Loading Delta Weights (High-level)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

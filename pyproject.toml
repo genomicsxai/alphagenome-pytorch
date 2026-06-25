@@ -63,6 +63,10 @@ serving = [
     "pandas",
     "pyfaidx",
     "alphagenome",
+    "PyYAML",
+]
+hf = [
+    "huggingface_hub>=0.24",
 ]
 docs = [
     "sphinx>=7.0.0",
