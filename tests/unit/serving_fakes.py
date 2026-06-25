@@ -106,8 +106,9 @@ class FakeScoringModel:
         variant: PTVariant,
         scorers,
         organism: int | None = None,
+        interval_variant: PTVariant | None = None,
     ):
-        del interval, variant, organism
+        del interval, variant, organism, interval_variant
         outputs = []
         for scorer in scorers:
             outputs.append(

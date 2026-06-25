@@ -26,6 +26,7 @@ from alphagenome_pytorch.prediction import AlphaGenomePredictionRuntime
 from alphagenome_pytorch.variant_scoring.inference import (
     VariantScoringModel,
     _build_ism_variants,
+    _require_length_preserving_background,
     get_recommended_scorers,
 )
 from alphagenome_pytorch.variant_scoring.scorers import (
@@ -90,6 +91,7 @@ class VariantScorer:
         variant_scorers: Sequence[Any] = (),
         *,
         organism: Any = dna_model_pb2.ORGANISM_HOMO_SAPIENS,
+        interval_variant: genome.Variant | None = None,
     ) -> list[Any]:
         _validate_sequence_length(interval.width)
         organism_index = self.runtime.resolve_organism_index(organism)
@@ -112,6 +114,11 @@ class VariantScorer:
             variant=_variant_to_pt(variant),
             scorers=local_scorers,
             organism=organism_index,
+            interval_variant=(
+                _variant_to_pt(interval_variant)
+                if interval_variant is not None
+                else None
+            ),
         )
 
         return [
@@ -134,6 +141,7 @@ class VariantScorer:
         variant_scorers: Sequence[Any] = (),
         *,
         organism: Any = dna_model_pb2.ORGANISM_HOMO_SAPIENS,
+        interval_variant: genome.Variant | None = None,
         progress_bar: bool = True,
         max_workers: int = DEFAULT_MAX_WORKERS,
     ) -> list[list[Any]]:
@@ -153,6 +161,7 @@ class VariantScorer:
                     variant=variant,
                     variant_scorers=variant_scorers,
                     organism=organism,
+                    interval_variant=interval_variant,
                 )
                 for interval, variant in zip(intervals, variants, strict=True)
             ]
@@ -191,6 +200,7 @@ class VariantScorer:
         max_workers: int = DEFAULT_MAX_WORKERS,
     ) -> list[list[Any]]:
         _validate_sequence_length(interval.width)
+        _require_length_preserving_background(interval_variant)
         if ism_interval.negative_strand:
             raise ValueError("ISM interval must be on the positive strand.")
         if ism_interval.chromosome != interval.chromosome:
@@ -216,6 +226,7 @@ class VariantScorer:
             variants=variants,
             variant_scorers=variant_scorers,
             organism=organism,
+            interval_variant=interval_variant,
             progress_bar=progress_bar,
             max_workers=max_workers,
         )

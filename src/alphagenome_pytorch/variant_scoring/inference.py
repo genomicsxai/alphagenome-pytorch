@@ -358,6 +358,7 @@ class VariantScoringModel:
         unified_splicing: bool = False,
         heads: tuple[str, ...] | None = None,
         ref_outputs: dict[str, Any] | None = None,
+        interval_variant: Variant | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Get reference and alternate predictions for a variant.
 
@@ -371,6 +372,12 @@ class VariantScoringModel:
                 sites between Ref and Alt predictions. Required for SpliceJunctionScorer.
             heads: Optional tuple of head names to compute. If None, all heads
                 run. Forwarded to the model forward pass to skip unused heads.
+            interval_variant: Optional background variant applied to the context
+                sequence before ``variant``. When given, the reference forward
+                pass runs on the background-modified sequence and ``variant`` is
+                applied on top of it (used by ISM to score SNVs against a variant
+                background). Must be length-preserving so genomic coordinates are
+                unchanged.
             ref_outputs: Optional precomputed first-pass reference outputs. When
                 supplied (e.g. by ISM scoring over a shared reference), the
                 reference forward pass is skipped and this cache is reused. It
@@ -412,7 +419,9 @@ class VariantScoringModel:
         else:
             extraction_interval = interval
 
-        base_seq = self.fasta.extract(extraction_interval)
+        # When a background variant is supplied, the reference is the
+        # background-modified sequence and ``variant`` is applied on top of it.
+        base_seq = self.get_sequence(extraction_interval, variant=interval_variant)
         ref_seq = base_seq[:interval_length]
         alt_seq = apply_variant_to_sequence(
             base_seq, variant, extraction_interval
@@ -555,6 +564,7 @@ class VariantScoringModel:
         gene_annotation: GeneAnnotation | None = None,
         to_cpu: bool = False,
         ref_outputs: dict[str, Any] | None = None,
+        interval_variant: Variant | None = None,
     ) -> list[VariantScore | list[VariantScore]]:
         """Score a single variant with multiple scorers.
 
@@ -565,6 +575,10 @@ class VariantScoringModel:
             organism: 'human', 'mouse', or index. Uses default_organism if None.
             gene_annotation: Optional GeneAnnotation.
             to_cpu: If True, move scores to CPU and clear GPU cache.
+            interval_variant: Optional length-preserving background variant
+                applied to the context before ``variant`` (see
+                ``predict_variant``). When supplied with ``ref_outputs``, the
+                cache must have been produced for the same background.
             ref_outputs: Optional precomputed first-pass reference outputs to
                 reuse instead of recomputing the reference forward pass. Must
                 have been produced for the same ``interval``/``organism`` with
@@ -583,6 +597,7 @@ class VariantScoringModel:
             unified_splicing=unified_splicing,
             heads=heads_arg,
             ref_outputs=ref_outputs,
+            interval_variant=interval_variant,
         )
 
         # Use instance gene annotation if not provided
@@ -720,9 +735,12 @@ class VariantScoringModel:
                 Mutually exclusive with ``ism_interval``.
             window_size: Size of the window to mutate when using
                 ``center_position`` (default 21bp, centered).
-            interval_variant: Optional variant to apply to the context
-                sequence before generating SNVs. SNV reference bases are
-                read from the variant-modified sequence.
+            interval_variant: Optional background variant applied to the whole
+                interval before ISM runs. The reference and every per-position
+                SNV are scored against this modified background (not the raw
+                reference), so it's the variant context the ISM is performed in
+                — as distinct from the per-position SNVs being mutagenized. Must
+                be length-preserving (a substitution); indels are rejected.
             organism: 'human', 'mouse', or index. Uses default_organism if None.
             gene_annotation: Optional GeneAnnotation for gene-centric scorers.
             nucleotides: Nucleotides to mutate to (default 'ACGT' = all 4 bases).
@@ -750,6 +768,7 @@ class VariantScoringModel:
             ...     ism_interval=Interval('chr22', 36201688, 36201709),
             ... )
         """
+        _require_length_preserving_background(interval_variant)
         ism_interval = _resolve_ism_interval(
             interval=interval,
             ism_interval=ism_interval,
@@ -765,9 +784,15 @@ class VariantScoringModel:
             nucleotides=nucleotides,
         )
 
-        # All SNVs in the window share the same reference sequence, so the
+        if not variants:
+            return []
+
+        # All SNVs in the window share the same reference sequence (the
+        # background-modified context when interval_variant is given), so the
         # reference forward pass is computed once and reused across variants.
-        ref_outputs = self._predict_reference_outputs(interval, scorers, organism)
+        ref_outputs = self._predict_reference_outputs(
+            interval, scorers, organism, interval_variant=interval_variant
+        )
 
         if gene_annotation is None:
             gene_annotation = self._gene_annotation
@@ -792,6 +817,7 @@ class VariantScoringModel:
                 gene_annotation=gene_annotation,
                 to_cpu=to_cpu,
                 ref_outputs=ref_outputs,
+                interval_variant=interval_variant,
             ))
 
         return results
@@ -801,6 +827,7 @@ class VariantScoringModel:
         interval: Interval,
         scorers: list[BaseVariantScorer],
         organism: str | int | None = None,
+        interval_variant: Variant | None = None,
     ) -> dict[str, Any]:
         """Compute first-pass reference outputs once for a shared interval.
 
@@ -809,9 +836,12 @@ class VariantScoringModel:
         (including ``embeddings_1bp`` when splice-junction scoring is active);
         the per-variant junction second pass operates on shallow copies of this
         cache (see ``predict_variant``).
+
+        When ``interval_variant`` is supplied the reference is the
+        background-modified sequence, matching the per-variant reference pass.
         """
         unified_splicing, heads_arg = self._resolve_scorer_passes(scorers)
-        ref_seq = self.fasta.extract(interval)[:interval.width]
+        ref_seq = self.get_sequence(interval, variant=interval_variant)[:interval.width]
         predict_kwargs: dict[str, Any] = {'return_embeddings': unified_splicing}
         if heads_arg is not None:
             predict_kwargs['heads'] = heads_arg
@@ -909,6 +939,26 @@ class VariantScoringModel:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+
+def _require_length_preserving_background(interval_variant: Any) -> None:
+    """Reject ISM background variants that shift genomic coordinates.
+
+    ISM generation and scoring index the context sequence by genomic position,
+    which only stays aligned if the background variant is a substitution
+    (``len(ref) == len(alt)``). An indel background would silently misalign
+    every downstream SNV, so it is rejected up front with a clear error.
+    """
+    if interval_variant is None:
+        return
+    ref = interval_variant.reference_bases
+    alt = interval_variant.alternate_bases
+    if len(ref) != len(alt):
+        raise ValueError(
+            "interval_variant for ISM must be length-preserving (a substitution); "
+            f"got reference_bases={ref!r}, alternate_bases={alt!r}. A length-changing "
+            "background (indel) would shift the ISM coordinates."
+        )
 
 
 def _resolve_ism_interval(
