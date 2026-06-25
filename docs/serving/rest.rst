@@ -82,6 +82,64 @@ Example ``GET`` Request
 
    curl -s "http://127.0.0.1:8080/v1/output_metadata?organism=HOMO_SAPIENS"
 
+``/v1/score_ism_variants`` — In-Silico Mutagenesis Scoring
+----------------------------------------------------------
+
+Scores every possible single-nucleotide variant (SNV) across an ``ism_interval``
+using the same variant scorers as ``/v1/score_variant``. For each position in the
+window, each alternate base is mutated in turn and scored against the reference.
+
+.. note::
+
+   This is distinct from ``/v1/explain_interval`` with
+   ``method: "saturation_ism"``. That endpoint returns a per-nucleotide
+   *attribution map* for a single track; this endpoint returns full
+   *variant scores* (one per SNV) from the variant scorers, and is the
+   serving equivalent of ``VariantScoringModel.score_ism_variants``.
+
+Request fields
+~~~~~~~~~~~~~~
+
+.. list-table::
+   :widths: 25 10 65
+   :header-rows: 1
+
+   * - Field
+     - Required
+     - Description
+   * - ``interval``
+     - ✓
+     - Full input interval (a supported sequence length). Object with
+       ``chromosome``, ``start``, ``end``.
+   * - ``ism_interval``
+     - ✓
+     - Sub-interval to mutagenize — must be contained within ``interval`` and on
+       the same chromosome. Every position in this window is mutated to every
+       alternate base. Same object shape.
+   * - ``variant_scorers``
+     -
+     - List of scorer specifications (same tagged-union schema as
+       ``/v1/score_variant``). Empty or omitted falls back to the recommended
+       scorers for the organism.
+   * - ``organism``
+     -
+     - Organism identifier (default ``"HOMO_SAPIENS"``).
+   * - ``interval_variant``
+     -
+     - Optional **background variant** applied to the whole interval before ISM
+       runs. The reference and every per-position SNV are scored against this
+       modified background (not the raw reference), so it is the *variant
+       context* the ISM is performed in — as distinct from the per-position SNVs
+       being mutagenized. Must be length-preserving (a substitution); indels are
+       rejected. Object with ``chromosome``, ``position`` (1-based),
+       ``reference_bases``, ``alternate_bases``.
+   * - ``max_workers``
+     -
+     - Thread-pool size for scoring the generated SNVs (default ``5``).
+
+The response mirrors ``/v1/score_variants``: ``{"scores": [[...], ...]}``, a list
+per generated SNV of serialized AnnData score objects (one per scorer).
+
 ``/v1/explain_interval`` — Nucleotide Attribution
 --------------------------------------------------
 
