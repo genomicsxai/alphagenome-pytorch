@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from .gradient import _align_rc_to_forward, _reverse_complement_onehot
+from .gradient import strand_average
 from .heads import HeadSelector, default_head_selector
 from .types import BASES, AttributionResult
 from .window import reduce_window
@@ -37,7 +37,6 @@ def _ism_pass(
     """Single-direction saturation ISM. Returns ``(W, 4, T)`` with NaN at
     reference-base cells and at N positions.
     """
-    L = onehot.shape[1]
     target_lo_bp = target_slice.start * resolution
     target_hi_bp = target_slice.stop * resolution
     W = target_hi_bp - target_lo_bp
@@ -111,7 +110,6 @@ def _ism_pass(
         for i, (p, alt_b) in enumerate(chunk):
             values[p, alt_b, :] = alt_scalar[i] - ref_scalar
 
-    _ = L  # variable referenced for clarity; not used downstream.
     return values
 
 
@@ -138,44 +136,30 @@ def saturation_ism(
         raise ValueError(
             f"onehot must have shape (1, L, 4); got {tuple(onehot.shape)}."
         )
-    if reduction not in ("sum", "mean", "peak"):
+    if reduction not in ("sum", "mean", "max"):
         raise ValueError(f"Unknown reduction {reduction!r}.")
     if batch_size < 1:
         raise ValueError("batch_size must be >= 1.")
 
-    L = onehot.shape[1]
     device = onehot.device
     organism_t = torch.tensor([int(organism_index)], dtype=torch.long, device=device)
 
-    fwd = _ism_pass(
-        model, onehot, organism_t,
-        head_selector=head_selector,
-        output_type=output_type, resolution=resolution,
-        target_slice=target_slice, track_indices=track_indices,
-        reduction=reduction, batch_size=batch_size,
-        autocast_dtype=autocast_dtype,
-    )
-
-    if strand_averaged:
-        rc_onehot = _reverse_complement_onehot(onehot)
-        L_bins = L // resolution
-        rc_target_slice = slice(L_bins - target_slice.stop, L_bins - target_slice.start)
-        rc = _ism_pass(
-            model, rc_onehot, organism_t,
+    def run_pass(input_onehot: torch.Tensor, slice_: slice) -> np.ndarray:
+        return _ism_pass(
+            model, input_onehot, organism_t,
             head_selector=head_selector,
             output_type=output_type, resolution=resolution,
-            target_slice=rc_target_slice, track_indices=track_indices,
+            target_slice=slice_, track_indices=track_indices,
             reduction=reduction, batch_size=batch_size,
             autocast_dtype=autocast_dtype,
         )
-        rc_aligned = _align_rc_to_forward(rc)
-        # nanmean elementwise: where one side is NaN (ref or N), keep the other.
-        stacked = np.stack([fwd, rc_aligned], axis=0)
-        with np.errstate(invalid="ignore"):
-            values = np.nanmean(stacked, axis=0).astype(np.float32)
-        # Restore NaN rows where BOTH inputs were NaN (e.g. N positions).
-        all_nan = np.isnan(fwd) & np.isnan(rc_aligned)
-        values[all_nan] = np.nan
+
+    fwd = run_pass(onehot, target_slice)
+    if strand_averaged:
+        values = strand_average(
+            fwd, run_pass,
+            onehot=onehot, target_slice=target_slice, resolution=resolution,
+        )
     else:
         values = fwd
 
