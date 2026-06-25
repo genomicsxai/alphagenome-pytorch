@@ -195,3 +195,35 @@ class TestExplainIntervalValidation:
         )
         assert result.method == 'saturation_ism'
         assert result.values.shape == (8, 4, 1)
+
+    def test_requested_output_normalization(self, adapter):
+        """Display-name / enum / prefixed forms resolve like the head key."""
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr1', 100, 200)
+
+        def run(req):
+            return adapter.explain_interval(
+                interval=interval,
+                target_interval=target,
+                requested_output=req,
+                resolution=1,
+                track_indices=[0],
+                method='input_x_gradient',
+            ).values
+
+        baseline = run('dnase')
+        for alias in ('DNASE', 'OUTPUT_TYPE_DNASE', dna_output.OutputType.DNASE):
+            np.testing.assert_array_equal(run(alias), baseline)
+
+    def test_unknown_requested_output_raises(self, adapter):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr1', 100, 200)
+        with pytest.raises(ValueError, match='output type'):
+            adapter.explain_interval(
+                interval=interval,
+                target_interval=target,
+                requested_output='not_a_head',
+                resolution=1,
+                track_indices=[0],
+                method='input_x_gradient',
+            )

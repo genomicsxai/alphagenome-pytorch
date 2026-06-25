@@ -129,7 +129,8 @@ Request fields
      - Organism identifier (default ``"HOMO_SAPIENS"``).
    * - ``reduction``
      -
-     - Window reduction: ``"sum"`` (default), ``"mean"``, or ``"peak"``.
+     - Window reduction: ``"sum"`` (default), ``"mean"``, or ``"max"``.
+       (``"max"`` suits gradient saliency; ``"sum"``/``"mean"`` suit ISM.)
    * - ``include_raw_gradient``
      -
      - If ``true``, include the full ``(W, 4, T)`` gradient tensor. Only
