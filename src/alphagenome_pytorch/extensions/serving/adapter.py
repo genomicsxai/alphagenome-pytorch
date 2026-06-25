@@ -1,16 +1,14 @@
 """Local serving adapter for AlphaGenome notebook-compatible APIs.
 
 This module provides a local implementation of the notebook-facing AlphaGenome
-surface (`predict_*`, `score_*`, `output_metadata`) by wrapping
-`VariantScoringModel` and converting outputs to upstream-compatible containers.
+prediction surface (`predict_*`, `output_metadata`) by wrapping the shared
+``AlphaGenomePredictionRuntime`` and converting outputs to upstream-compatible
+containers. Variant scoring lives in ``scorer.py``.
 """
 
 from __future__ import annotations
 
-import concurrent.futures
 import dataclasses
-import importlib
-import itertools
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -24,24 +22,19 @@ from alphagenome.data import track_data as ag_track_data
 from alphagenome.models import dna_output
 from alphagenome.protos import dna_model_pb2
 
-from alphagenome_pytorch.variant_scoring.inference import VariantScoringModel, get_recommended_scorers
-from alphagenome_pytorch.variant_scoring.scorers import (
-    BaseVariantScorer as PTBaseVariantScorer,
-    CenterMaskScorer as PTCenterMaskScorer,
-    ContactMapScorer as PTContactMapScorer,
-    GeneMaskActiveScorer as PTGeneMaskActiveScorer,
-    GeneMaskLFCScorer as PTGeneMaskLFCScorer,
-    GeneMaskSplicingScorer as PTGeneMaskSplicingScorer,
-    PolyadenylationScorer as PTPolyadenylationScorer,
-    SpliceJunctionScorer as PTSpliceJunctionScorer,
+from alphagenome_pytorch.prediction import AlphaGenomePredictionRuntime
+from alphagenome_pytorch.extensions.attribution import (
+    AttributionResult,
+    get_method,
+    UnsupportedMethodError,
 )
+from alphagenome_pytorch.extensions.attribution.heads import default_head_selector
+from alphagenome_pytorch.extensions.attribution.window import target_slice_for_resolution
 from alphagenome_pytorch.variant_scoring.types import (
-    AggregationType as PTAggregationType,
     Interval as PTInterval,
     OutputType as PTOutputType,
     TrackMetadata as PTTrackMetadata,
     Variant as PTVariant,
-    VariantScore,
 )
 from alphagenome_pytorch.utils.splicing import unstack_junction_predictions
 
@@ -58,21 +51,9 @@ SUPPORTED_SEQUENCE_LENGTHS: Mapping[str, int] = {
     'SEQUENCE_LENGTH_1MB': SEQUENCE_LENGTH_1MB,
 }
 
-MAX_VARIANT_SCORERS_PER_REQUEST = 20
 DEFAULT_MAX_WORKERS = 5
+MAX_VARIANT_SCORERS_PER_REQUEST = 20
 VALID_SEQUENCE_CHARACTERS = frozenset('ACGTN')
-ISM_NUCLEOTIDES = 'ACGT'
-
-_ORGANISM_TO_INDEX = {
-    dna_model_pb2.ORGANISM_HOMO_SAPIENS: 0,
-    dna_model_pb2.ORGANISM_MUS_MUSCULUS: 1,
-    'HOMO_SAPIENS': 0,
-    'MUS_MUSCULUS': 1,
-    'human': 0,
-    'mouse': 1,
-    0: 0,
-    1: 1,
-}
 
 _PT_OUTPUT_TO_OFFICIAL = {
     PTOutputType.ATAC: dna_output.OutputType.ATAC,
@@ -117,44 +98,12 @@ _PRODUCED_PT_OUTPUTS = {
     PTOutputType.PROCAP,
 }
 
-_PT_AGGREGATION_BY_NAME = {a.name: a for a in PTAggregationType}
-
-
 def _validate_sequence_length(length: int) -> None:
     if length not in SUPPORTED_SEQUENCE_LENGTHS.values():
         raise ValueError(
             f'Sequence length {length} not supported. '
             f'Supported lengths: {list(SUPPORTED_SEQUENCE_LENGTHS.values())}'
         )
-
-
-def _resolve_organism_index(organism: Any) -> int:
-    if organism is None:
-        return 0
-    if hasattr(organism, 'value'):
-        candidate = getattr(organism, 'value')
-        if candidate in _ORGANISM_TO_INDEX:
-            return _ORGANISM_TO_INDEX[candidate]
-    if hasattr(organism, 'name'):
-        candidate = getattr(organism, 'name')
-        if candidate in _ORGANISM_TO_INDEX:
-            return _ORGANISM_TO_INDEX[candidate]
-        if isinstance(candidate, str) and candidate.startswith('ORGANISM_'):
-            stripped = candidate.removeprefix('ORGANISM_')
-            if stripped in _ORGANISM_TO_INDEX:
-                return _ORGANISM_TO_INDEX[stripped]
-    if organism in _ORGANISM_TO_INDEX:
-        return _ORGANISM_TO_INDEX[organism]
-    if isinstance(organism, str):
-        normalized = organism.upper().removeprefix('ORGANISM_')
-        if normalized in _ORGANISM_TO_INDEX:
-            return _ORGANISM_TO_INDEX[normalized]
-        lower = organism.lower()
-        if lower in _ORGANISM_TO_INDEX:
-            return _ORGANISM_TO_INDEX[lower]
-    raise ValueError(
-        f'Unsupported organism "{organism}". Expected Homo sapiens or Mus musculus.'
-    )
 
 
 def _organism_proto_from_index(idx: int) -> int:
@@ -171,11 +120,6 @@ def _as_numpy(value: Any) -> np.ndarray:
     if torch.is_tensor(value):
         return value.detach().cpu().numpy()
     return np.asarray(value)
-
-
-def _import_anndata_module():
-    # Import lazily to keep serving optional and avoid importing at module load.
-    return importlib.import_module('anndata')
 
 
 def _interval_to_pt(interval: genome.Interval) -> PTInterval:
@@ -253,16 +197,97 @@ def _normalize_ontology_terms(ontology_terms: Iterable[Any] | None) -> list[str]
     return list(dict.fromkeys(normalized))
 
 
+def _pt_metadata_to_track_df(
+    metadata: Sequence[PTTrackMetadata],
+    num_tracks: int | None = None,
+) -> pd.DataFrame:
+    rows = []
+    for i, meta in enumerate(metadata):
+        extras_get = getattr(meta, 'get', None)
+        get = extras_get if callable(extras_get) else lambda name, default=None: getattr(meta, name, default)
+        track_name = getattr(meta, 'track_name', None) or get('name', None)
+        track_strand = getattr(meta, 'track_strand', None) or get('strand', '.')
+        rows.append(
+            {
+                'name': track_name or f'track_{i}',
+                'strand': track_strand or '.',
+                'ontology_curie': get('ontology_curie', None),
+                'gtex_tissue': get('gtex_tissue', None),
+                'Assay title': get('assay_title', None) or get('Assay title', None),
+                'biosample_name': get('biosample_name', None),
+                'biosample_type': get('biosample_type', None),
+                'transcription_factor': get('transcription_factor', None),
+                'histone_mark': get('histone_mark', None),
+            }
+        )
+    if not rows and num_tracks is not None:
+        rows = [{'name': f'track_{i}', 'strand': '.'} for i in range(num_tracks)]
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame(columns=['name', 'strand'])
+    if num_tracks is not None:
+        if len(df) < num_tracks:
+            for i in range(len(df), num_tracks):
+                df.loc[i] = {'name': f'track_{i}', 'strand': '.'}
+        elif len(df) > num_tracks:
+            df = df.iloc[:num_tracks].copy()
+    df = df.reset_index(drop=True)
+    if 'name' not in df.columns:
+        df['name'] = [f'track_{i}' for i in range(len(df))]
+    if 'strand' not in df.columns:
+        df['strand'] = '.'
+    return df
+
+
+def _pt_metadata_to_junction_df(
+    metadata: Sequence[PTTrackMetadata],
+    num_tracks: int | None = None,
+) -> pd.DataFrame:
+    rows = []
+    for i, meta in enumerate(metadata):
+        extras_get = getattr(meta, 'get', None)
+        get = extras_get if callable(extras_get) else lambda name, default=None: getattr(meta, name, default)
+        track_name = getattr(meta, 'track_name', None) or get('name', None)
+        rows.append(
+            {
+                'name': track_name or f'track_{i}',
+                'ontology_curie': get('ontology_curie', None),
+                'gtex_tissue': get('gtex_tissue', None),
+                'Assay title': get('assay_title', None) or get('Assay title', None),
+                'biosample_name': get('biosample_name', None),
+                'biosample_type': get('biosample_type', None),
+            }
+        )
+    if not rows and num_tracks is not None:
+        rows = [{'name': f'track_{i}'} for i in range(num_tracks)]
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame(columns=['name'])
+    if num_tracks is not None:
+        if len(df) < num_tracks:
+            for i in range(len(df), num_tracks):
+                df.loc[i] = {'name': f'track_{i}'}
+        elif len(df) > num_tracks:
+            df = df.iloc[:num_tracks].copy()
+    return df.reset_index(drop=True)
+
+
 class LocalDnaModelAdapter:
     """Notebook-compatible local model adapter.
 
     This class mirrors the notebook-critical subset of the AlphaGenome API:
-    `predict_sequence`, `predict_interval`, `predict_variant`, `score_variant`,
-    `score_variants`, `score_ism_variants`, and `output_metadata`.
+    `predict_sequence`, `predict_interval`, `predict_variant`, and
+    `output_metadata`.
     """
 
-    def __init__(self, scoring_model: VariantScoringModel):
-        self.scoring_model = scoring_model
+    def __init__(
+        self,
+        runtime: AlphaGenomePredictionRuntime,
+        *,
+        scorer: 'VariantScorer | None' = None,
+    ):
+        self.runtime = runtime
+        self.scorer = scorer
 
     def predict_sequence(
         self,
@@ -280,8 +305,8 @@ class LocalDnaModelAdapter:
                 f'Invalid DNA sequence. Allowed characters are A/C/G/T/N. Found: {bad}'
             )
         _validate_sequence_length(len(sequence))
-        organism_index = _resolve_organism_index(organism)
-        outputs = self.scoring_model.predict(sequence, organism=organism_index)
+        organism_index = self.runtime.resolve_organism_index(organism)
+        outputs = self.runtime.predict(sequence, organism=organism_index)
         requested = _normalize_requested_outputs(requested_outputs)
         ontology = _normalize_ontology_terms(ontology_terms)
         return self._convert_output(
@@ -301,8 +326,7 @@ class LocalDnaModelAdapter:
         ontology_terms: Iterable[Any] | None = None,
     ) -> dna_output.Output:
         _validate_sequence_length(interval.width)
-        pt_interval = _interval_to_pt(interval)
-        sequence = self.scoring_model.get_sequence(pt_interval)
+        sequence = self.runtime.get_sequence(interval)
         return self.predict_sequence(
             sequence=sequence,
             organism=organism,
@@ -321,13 +345,11 @@ class LocalDnaModelAdapter:
         ontology_terms: Iterable[Any] | None = None,
     ) -> dna_output.VariantOutput:
         _validate_sequence_length(interval.width)
-        organism_index = _resolve_organism_index(organism)
-        pt_interval = _interval_to_pt(interval)
-        pt_variant = _variant_to_pt(variant)
+        organism_index = self.runtime.resolve_organism_index(organism)
 
-        ref_outputs, alt_outputs = self.scoring_model.predict_variant(
-            interval=pt_interval,
-            variant=pt_variant,
+        ref_outputs, alt_outputs = self.runtime.predict_variant(
+            interval=interval,
+            variant=variant,
             organism=organism_index,
         )
 
@@ -352,176 +374,178 @@ class LocalDnaModelAdapter:
 
     def score_interval(self, *args, **kwargs):
         del args, kwargs  # Unused for the local serving MVP.
-        raise NotImplementedError('score_interval is not implemented in LocalDnaModelAdapter.')
+        raise NotImplementedError('score_interval is not implemented.')
 
-    def score_variant(
+    def score_variant(self, *args, **kwargs):
+        if self.scorer is None:
+            raise NotImplementedError('Variant scoring not available for this model.')
+        return self.scorer.score_variant(*args, **kwargs)
+
+    def score_variants(self, *args, **kwargs):
+        if self.scorer is None:
+            raise NotImplementedError('Variant scoring not available for this model.')
+        return self.scorer.score_variants(*args, **kwargs)
+
+    def score_ism_variants(self, *args, **kwargs):
+        if self.scorer is None:
+            raise NotImplementedError('Variant scoring not available for this model.')
+        return self.scorer.score_ism_variants(*args, **kwargs)
+
+    def explain_interval(
         self,
-        interval: genome.Interval,
-        variant: genome.Variant,
-        variant_scorers: Sequence[Any] = (),
         *,
+        interval: genome.Interval,
+        target_interval: genome.Interval,
         organism: Any = dna_model_pb2.ORGANISM_HOMO_SAPIENS,
-    ) -> list[Any]:
+        requested_output: str,
+        resolution: int,
+        track_indices: Sequence[int],
+        method: str,
+        reduction: str = "sum",
+        include_raw_gradient: bool = False,
+        strand_averaged: bool = False,
+        batch_size: int = 8,
+    ) -> 'AttributionResult':
+        """Nucleotide attribution over a target window inside an interval.
+
+        This is the serving surface for per-base attribution (gradient × input
+        and saturation ISM).  It calls into
+        :mod:`alphagenome_pytorch.extensions.attribution` — **not** through
+        ``VariantScoringModel.predict()`` — because gradient methods require an
+        active autograd graph.
+
+        Args:
+            interval: Full input interval (must be a supported sequence length).
+            target_interval: Sub-interval to attribute over — must be contained
+                in ``interval``.
+            organism: Organism identifier (proto enum, string, or int).
+            requested_output: Output/head identifier. Accepts the same forms as
+                the predict path: a head name (``"dnase"``), the upper-case or
+                ``OUTPUT_TYPE_``-prefixed enum name, the proto/PT ``OutputType``
+                enum, or its int value.
+            resolution: Output resolution in bp (1 or 128).
+            track_indices: Which tracks to attribute.
+            method: ``"input_x_gradient"`` or ``"saturation_ism"``.
+            reduction: Window reduction (``"sum"``, ``"mean"``, ``"max"``).
+            include_raw_gradient: Return full ``(W, 4, T)`` gradient tensor
+                (only valid for gradient-based methods).
+            strand_averaged: Average forward and reverse-complement attributions.
+            batch_size: Batch size for ISM mutation loop.
+
+        Returns:
+            :class:`~alphagenome_pytorch.extensions.attribution.types.AttributionResult`.
+
+        Raises:
+            ValueError: On invalid inputs (containment, unknown head, bad indices, …).
+            UnsupportedMethodError: If ``method`` is not in the registry.
+        """
+        # --- validation -------------------------------------------------
         _validate_sequence_length(interval.width)
-        organism_index = _resolve_organism_index(organism)
 
-        if not variant_scorers:
-            organism_name = 'human' if organism_index == 0 else 'mouse'
-            variant_scorers = list(get_recommended_scorers(organism_name))
-
-        if len(variant_scorers) > MAX_VARIANT_SCORERS_PER_REQUEST:
+        if target_interval.chromosome != interval.chromosome:
             raise ValueError(
-                f'Too many variant scorers requested: {len(variant_scorers)} '
-                f'(max {MAX_VARIANT_SCORERS_PER_REQUEST}).'
+                f"target_interval chromosome ({target_interval.chromosome}) "
+                f"must match interval chromosome ({interval.chromosome})."
             )
-        if len(variant_scorers) != len(set(map(str, variant_scorers))):
-            raise ValueError(f'Duplicate variant scorers requested: {variant_scorers}.')
+        if target_interval.start < interval.start or target_interval.end > interval.end:
+            raise ValueError(
+                f"target_interval {target_interval.chromosome}:"
+                f"{target_interval.start}-{target_interval.end} is not "
+                f"contained within interval {interval.chromosome}:"
+                f"{interval.start}-{interval.end}."
+            )
 
-        local_scorers = [self._to_local_variant_scorer(vs) for vs in variant_scorers]
-        pt_interval = _interval_to_pt(interval)
-        pt_variant = _variant_to_pt(variant)
+        # Method lookup (raises UnsupportedMethodError on unknown method).
+        method_spec = get_method(method)
 
-        scorer_results = self.scoring_model.score_variant(
-            interval=pt_interval,
-            variant=pt_variant,
-            scorers=local_scorers,
-            organism=organism_index,
+        if include_raw_gradient and not method_spec.supports_raw_gradient:
+            raise ValueError(
+                f"include_raw_gradient is not supported for method {method!r}."
+            )
+
+        if not track_indices:
+            raise ValueError("track_indices must be non-empty.")
+
+        # Normalize the requested output to the model's head key, accepting the
+        # same forms as the predict path (``"dnase"``, ``"DNASE"``,
+        # ``"OUTPUT_TYPE_DNASE"``, the proto/PT enum, or its int value). The
+        # official enum maps to a PT output whose ``.value`` is the head key.
+        official_output = _normalize_output_type(requested_output)
+        pt_output = _OFFICIAL_TO_PT_OUTPUT.get(official_output)
+        if pt_output is None:
+            raise ValueError(
+                f"Output {requested_output!r} is not supported for attribution."
+            )
+        output_type = pt_output.value
+
+        # --- sequence → one-hot -----------------------------------------
+        organism_index = self.runtime.resolve_organism_index(organism)
+        sequence = self.runtime.get_sequence(interval)
+
+        from alphagenome_pytorch.utils.sequence import sequence_to_onehot_tensor
+
+        device = self.runtime.device
+        onehot = sequence_to_onehot_tensor(
+            sequence, dtype=torch.float32, device=device,
+        ).unsqueeze(0)  # (1, L, 4)
+
+        # --- target window bookkeeping -----------------------------------
+        if resolution <= 0:
+            raise ValueError(
+                f"resolution must be a positive integer, got {resolution}."
+            )
+        start_offset = target_interval.start - interval.start
+        end_offset = target_interval.end - interval.start
+        if start_offset % resolution != 0 or end_offset % resolution != 0:
+            raise ValueError(
+                f"target_interval offsets relative to interval.start must be "
+                f"multiples of resolution ({resolution}); got start offset "
+                f"{start_offset}, end offset {end_offset}."
+            )
+
+        target_slice = target_slice_for_resolution(
+            interval.start, target_interval.start, target_interval.end, resolution,
         )
 
-        outputs = []
-        for original_scorer, local_result in zip(
-            variant_scorers, scorer_results, strict=True
-        ):
-            adata = self._scores_to_anndata(
-                scores=local_result,
-                organism_index=organism_index,
-                fallback_variant_scorer=original_scorer,
-                interval=interval,
-                variant=variant,
-            )
-            outputs.append(adata)
-        return outputs
+        # --- dispatch ----------------------------------------------------
+        model = self.runtime.model
 
-    def score_variants(
-        self,
-        intervals: genome.Interval | Sequence[genome.Interval],
-        variants: Sequence[genome.Variant],
-        variant_scorers: Sequence[Any] = (),
-        *,
-        organism: Any = dna_model_pb2.ORGANISM_HOMO_SAPIENS,
-        progress_bar: bool = True,
-        max_workers: int = DEFAULT_MAX_WORKERS,
-    ) -> list[list[Any]]:
-        if not isinstance(intervals, Sequence):
-            intervals = [intervals] * len(variants)
-        if len(intervals) != len(variants):
-            raise ValueError(
-                'Intervals and variants must have the same length. '
-                f'Got {len(intervals)} intervals and {len(variants)} variants.'
-            )
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(
-                    self.score_variant,
-                    interval=interval,
-                    variant=variant,
-                    variant_scorers=variant_scorers,
-                    organism=organism,
-                )
-                for interval, variant in zip(intervals, variants, strict=True)
-            ]
-
-            iterator: Iterable[Any]
-            if progress_bar:
-                try:
-                    import tqdm.auto
-
-                    iterator = tqdm.auto.tqdm(
-                        concurrent.futures.as_completed(futures),
-                        total=len(futures),
-                        desc='Scoring variants',
-                    )
-                except ImportError:
-                    iterator = concurrent.futures.as_completed(futures)
-            else:
-                iterator = concurrent.futures.as_completed(futures)
-
-            for future in iterator:
-                if (exc := future.exception()) is not None:
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    raise exc
-
-            return [future.result() for future in futures]
-
-    def score_ism_variants(
-        self,
-        interval: genome.Interval,
-        ism_interval: genome.Interval,
-        variant_scorers: Sequence[Any] = (),
-        *,
-        organism: Any = dna_model_pb2.ORGANISM_HOMO_SAPIENS,
-        interval_variant: genome.Variant | None = None,
-        progress_bar: bool = True,
-        max_workers: int = DEFAULT_MAX_WORKERS,
-    ) -> list[list[Any]]:
-        _validate_sequence_length(interval.width)
-        if ism_interval.negative_strand:
-            raise ValueError('ISM interval must be on the positive strand.')
-        if ism_interval.chromosome != interval.chromosome:
-            raise ValueError('ISM interval chromosome must match interval chromosome.')
-        if ism_interval.start < interval.start or ism_interval.end > interval.end:
-            raise ValueError('ISM interval must be contained within interval.')
-
-        pt_interval = _interval_to_pt(interval)
-        pt_interval_variant = _variant_to_pt(interval_variant) if interval_variant else None
-        sequence = self.scoring_model.get_sequence(pt_interval, variant=pt_interval_variant)
-
-        variants: list[genome.Variant] = []
-        for genomic_pos_0b in range(ism_interval.start, ism_interval.end):
-            rel = genomic_pos_0b - interval.start
-            if rel < 0 or rel >= len(sequence):
-                continue
-            ref_base = sequence[rel].upper()
-            if ref_base not in ISM_NUCLEOTIDES:
-                continue
-            for alt_base in ISM_NUCLEOTIDES:
-                if alt_base == ref_base:
-                    continue
-                variants.append(
-                    genome.Variant(
-                        chromosome=interval.chromosome,
-                        position=genomic_pos_0b + 1,
-                        reference_bases=ref_base,
-                        alternate_bases=alt_base,
-                    )
-                )
-
-        if not variants:
-            return []
-
-        return self.score_variants(
-            intervals=interval,
-            variants=variants,
-            variant_scorers=variant_scorers,
-            organism=organism,
-            progress_bar=progress_bar,
-            max_workers=max_workers,
+        kwargs: dict[str, Any] = dict(
+            onehot=onehot,
+            organism_index=organism_index,
+            output_type=output_type,
+            resolution=resolution,
+            target_slice=target_slice,
+            track_indices=track_indices,
+            reduction=reduction,
+            strand_averaged=strand_averaged,
+            head_selector=default_head_selector,
+            sequence=sequence,
+            target_start=target_interval.start,
+            target_end=target_interval.end,
         )
+        if method_spec.supports_raw_gradient:
+            kwargs["include_raw_gradient"] = include_raw_gradient
+        if method == "saturation_ism":
+            kwargs["batch_size"] = batch_size
+
+        return method_spec.func(model, **kwargs)
 
     def output_metadata(
         self,
         organism: Any = dna_model_pb2.ORGANISM_HOMO_SAPIENS,
     ) -> dna_output.OutputMetadata:
-        organism_index = _resolve_organism_index(organism)
-        track_metadata = self.scoring_model.get_track_metadata(organism_index)
+        organism_index = self.runtime.resolve_organism_index(organism)
 
         metadata_kwargs: dict[str, pd.DataFrame | None] = {
             field.name: None for field in dataclasses.fields(dna_output.OutputMetadata)
         }
         for official_output_type, field_name in _OFFICIAL_OUTPUT_FIELD.items():
             pt_output_type = _OFFICIAL_TO_PT_OUTPUT[official_output_type]
-            entries = track_metadata.get(pt_output_type, [])
+            entries = self.runtime.get_track_metadata(
+                organism_index,
+                output_name=pt_output_type.value,
+            )
             if not entries:
                 continue
             if official_output_type == dna_output.OutputType.SPLICE_JUNCTIONS:
@@ -696,7 +720,10 @@ class LocalDnaModelAdapter:
         organism_index: int,
         num_tracks: int,
     ) -> pd.DataFrame:
-        metadata = self.scoring_model.get_track_metadata(organism_index).get(pt_output_type, [])
+        metadata = self.runtime.get_track_metadata(
+            organism_index,
+            output_name=pt_output_type.value,
+        )
         return self._pt_metadata_to_track_df(metadata, num_tracks=num_tracks)
 
     def _build_junction_metadata_df(
@@ -705,8 +732,9 @@ class LocalDnaModelAdapter:
         organism_index: int,
         num_tracks: int,
     ) -> pd.DataFrame:
-        metadata = self.scoring_model.get_track_metadata(organism_index).get(
-            PTOutputType.SPLICE_JUNCTIONS, []
+        metadata = self.runtime.get_track_metadata(
+            organism_index,
+            output_name=PTOutputType.SPLICE_JUNCTIONS.value,
         )
         return self._pt_metadata_to_junction_df(metadata, num_tracks=num_tracks)
 
@@ -715,233 +743,14 @@ class LocalDnaModelAdapter:
         metadata: Sequence[PTTrackMetadata],
         num_tracks: int | None = None,
     ) -> pd.DataFrame:
-        rows = []
-        for i, meta in enumerate(metadata):
-            rows.append(
-                {
-                    'name': meta.track_name or f'track_{i}',
-                    'strand': meta.track_strand or '.',
-                    'ontology_curie': meta.ontology_curie,
-                    'gtex_tissue': meta.gtex_tissue,
-                    'Assay title': meta.assay_title,
-                    'biosample_name': meta.biosample_name,
-                    'biosample_type': meta.biosample_type,
-                    'transcription_factor': meta.transcription_factor,
-                    'histone_mark': meta.histone_mark,
-                }
-            )
-        if not rows and num_tracks is not None:
-            rows = [{'name': f'track_{i}', 'strand': '.'} for i in range(num_tracks)]
-        df = pd.DataFrame(rows)
-        if df.empty:
-            df = pd.DataFrame(columns=['name', 'strand'])
-        if num_tracks is not None:
-            if len(df) < num_tracks:
-                for i in range(len(df), num_tracks):
-                    df.loc[i] = {'name': f'track_{i}', 'strand': '.'}
-            elif len(df) > num_tracks:
-                df = df.iloc[:num_tracks].copy()
-        df = df.reset_index(drop=True)
-        if 'name' not in df.columns:
-            df['name'] = [f'track_{i}' for i in range(len(df))]
-        if 'strand' not in df.columns:
-            df['strand'] = '.'
-        return df
+        return _pt_metadata_to_track_df(metadata, num_tracks=num_tracks)
 
     def _pt_metadata_to_junction_df(
         self,
         metadata: Sequence[PTTrackMetadata],
         num_tracks: int | None = None,
     ) -> pd.DataFrame:
-        rows = []
-        for i, meta in enumerate(metadata):
-            rows.append(
-                {
-                    'name': meta.track_name or f'track_{i}',
-                    'ontology_curie': meta.ontology_curie,
-                    'gtex_tissue': meta.gtex_tissue,
-                    'Assay title': meta.assay_title,
-                    'biosample_name': meta.biosample_name,
-                    'biosample_type': meta.biosample_type,
-                }
-            )
-        if not rows and num_tracks is not None:
-            rows = [{'name': f'track_{i}'} for i in range(num_tracks)]
-        df = pd.DataFrame(rows)
-        if df.empty:
-            df = pd.DataFrame(columns=['name'])
-        if num_tracks is not None:
-            if len(df) < num_tracks:
-                for i in range(len(df), num_tracks):
-                    df.loc[i] = {'name': f'track_{i}'}
-            elif len(df) > num_tracks:
-                df = df.iloc[:num_tracks].copy()
-        return df.reset_index(drop=True)
-
-    def _to_local_variant_scorer(self, scorer: Any) -> PTBaseVariantScorer:
-        if isinstance(scorer, PTBaseVariantScorer):
-            return scorer
-
-        base = getattr(scorer, 'base_variant_scorer', None)
-        base_name = getattr(base, 'name', None)
-        class_name = scorer.__class__.__name__
-        scorer_kind = (base_name or class_name or '').upper()
-        requested_output = getattr(scorer, 'requested_output', None)
-
-        if scorer_kind in {'CENTER_MASK', 'CENTERMASKSCORER'}:
-            aggregation = getattr(scorer, 'aggregation_type', None)
-            aggregation_name = getattr(aggregation, 'name', None)
-            if aggregation_name is None:
-                raise ValueError(f'Unsupported center-mask scorer: {scorer}')
-            return PTCenterMaskScorer(
-                requested_output=_OFFICIAL_TO_PT_OUTPUT[_normalize_output_type(requested_output)],
-                width=getattr(scorer, 'width', None),
-                aggregation_type=_PT_AGGREGATION_BY_NAME[aggregation_name],
-            )
-        if scorer_kind in {'CONTACT_MAP', 'CONTACTMAPSCORER'}:
-            return PTContactMapScorer()
-        if scorer_kind in {'GENE_MASK_LFC', 'GENEMASKLFCSCORER'}:
-            return PTGeneMaskLFCScorer(
-                requested_output=_OFFICIAL_TO_PT_OUTPUT[_normalize_output_type(requested_output)],
-                resolution=1,
-            )
-        if scorer_kind in {'GENE_MASK_ACTIVE', 'GENEMASKACTIVESCORER'}:
-            return PTGeneMaskActiveScorer(
-                requested_output=_OFFICIAL_TO_PT_OUTPUT[_normalize_output_type(requested_output)],
-                resolution=1,
-            )
-        if scorer_kind in {'GENE_MASK_SPLICING', 'GENEMASKSPLICINGSCORER'}:
-            return PTGeneMaskSplicingScorer(
-                requested_output=_OFFICIAL_TO_PT_OUTPUT[_normalize_output_type(requested_output)],
-                width=getattr(scorer, 'width', None),
-            )
-        if scorer_kind in {'PA_QTL', 'POLYADENYLATIONSCORER'}:
-            return PTPolyadenylationScorer()
-        if scorer_kind in {'SPLICE_JUNCTION', 'SPLICEJUNCTIONSCORER'}:
-            return PTSpliceJunctionScorer()
-
-        # Proto-style scorer descriptor support.
-        which = getattr(scorer, 'WhichOneof', None)
-        if callable(which):
-            field = scorer.WhichOneof('scorer')
-            if field == 'center_mask':
-                center = scorer.center_mask
-                return PTCenterMaskScorer(
-                    requested_output=_OFFICIAL_TO_PT_OUTPUT[dna_output.OutputType(center.requested_output)],
-                    width=center.width if center.HasField('width') else None,
-                    aggregation_type=_PT_AGGREGATION_BY_NAME[
-                        dna_model_pb2.AggregationType.Name(center.aggregation_type)
-                        .removeprefix('AGGREGATION_TYPE_')
-                    ],
-                )
-            if field == 'contact_map':
-                return PTContactMapScorer()
-            if field == 'gene_mask':
-                return PTGeneMaskLFCScorer(
-                    requested_output=_OFFICIAL_TO_PT_OUTPUT[dna_output.OutputType(scorer.gene_mask.requested_output)],
-                    resolution=1,
-                )
-            if field == 'gene_mask_active':
-                return PTGeneMaskActiveScorer(
-                    requested_output=_OFFICIAL_TO_PT_OUTPUT[
-                        dna_output.OutputType(scorer.gene_mask_active.requested_output)
-                    ],
-                    resolution=1,
-                )
-            if field == 'gene_mask_splicing':
-                return PTGeneMaskSplicingScorer(
-                    requested_output=_OFFICIAL_TO_PT_OUTPUT[
-                        dna_output.OutputType(scorer.gene_mask_splicing.requested_output)
-                    ],
-                    width=scorer.gene_mask_splicing.width
-                    if scorer.gene_mask_splicing.HasField('width')
-                    else None,
-                )
-            if field == 'pa_qtl':
-                return PTPolyadenylationScorer()
-            if field == 'splice_junction':
-                return PTSpliceJunctionScorer()
-
-        raise ValueError(f'Unsupported variant scorer type: {scorer!r}')
-
-    def _scores_to_anndata(
-        self,
-        *,
-        scores: VariantScore | list[VariantScore],
-        organism_index: int,
-        fallback_variant_scorer: Any,
-        interval: genome.Interval,
-        variant: genome.Variant,
-    ):
-        anndata = _import_anndata_module()
-
-        score_list = scores if isinstance(scores, list) else [scores]
-        if not score_list:
-            return anndata.AnnData(
-                X=np.zeros((0, 0), dtype=np.float32),
-                obs=pd.DataFrame(),
-                var=pd.DataFrame(columns=['name', 'strand']),
-                uns={'interval': interval, 'variant': variant, 'variant_scorer': fallback_variant_scorer},
-            )
-
-        x_rows = []
-        obs_rows = []
-        has_gene_metadata = False
-        for i, score in enumerate(score_list):
-            values = _as_numpy(score.scores).astype(np.float32, copy=False)
-            if values.ndim != 1:
-                values = values.reshape(-1)
-            x_rows.append(values)
-
-            row = {
-                'gene_id': score.gene_id,
-                'gene_name': score.gene_name,
-                'gene_type': score.gene_type,
-                'strand': score.gene_strand,
-                'junction_Start': score.junction_start,
-                'junction_End': score.junction_end,
-            }
-            if any(v is not None for v in row.values()):
-                has_gene_metadata = True
-            obs_rows.append(row)
-
-        X = np.stack(x_rows, axis=0).astype(np.float32, copy=False)
-        n_tracks = X.shape[1] if X.ndim == 2 else 0
-
-        scorer_for_output = score_list[0].scorer if score_list else None
-        requested_output = getattr(scorer_for_output, 'requested_output', None)
-        if isinstance(requested_output, PTOutputType):
-            pt_output = requested_output
-        else:
-            pt_output = _OFFICIAL_TO_PT_OUTPUT.get(
-                _normalize_output_type(getattr(fallback_variant_scorer, 'requested_output', dna_output.OutputType.RNA_SEQ)),
-                PTOutputType.RNA_SEQ,
-            )
-        var_df = self._build_track_metadata_df(
-            pt_output_type=pt_output,
-            organism_index=organism_index,
-            num_tracks=n_tracks,
-        )
-
-        if has_gene_metadata:
-            obs_df = pd.DataFrame(obs_rows)
-            obs_df.index = obs_df.index.map(str)
-        else:
-            obs_df = pd.DataFrame(index=[str(i) for i in range(X.shape[0])])
-
-        var_df = var_df.reset_index(drop=True)
-        var_df.index = var_df.index.map(str)
-
-        return anndata.AnnData(
-            X=X,
-            obs=obs_df,
-            var=var_df,
-            uns={
-                'interval': interval,
-                'variant': variant,
-                'variant_scorer': fallback_variant_scorer,
-            },
-        )
+        return _pt_metadata_to_junction_df(metadata, num_tracks=num_tracks)
 
     @staticmethod
     def _squeeze_batch(values: np.ndarray) -> np.ndarray:
@@ -951,9 +760,12 @@ class LocalDnaModelAdapter:
 
     @staticmethod
     def _ensure_batch(values: np.ndarray) -> np.ndarray:
-        if values.ndim > 0 and values.shape[0] != 1:
-            return values
-        if values.ndim == 0:
-            return values[None]
-        return values if values.shape[0] == 1 else values[None]
+        """Promote a 0-d scalar to a length-1 array; pass arrays through unchanged.
 
+        This intentionally does **not** wrap arrays whose leading dim is not 1.
+        Callers in :py:meth:`_build_junction_data` rely on existing batch
+        dimensions being preserved as-is. If you need "wrap any non-1 leading
+        dim with a fresh batch axis" semantics, that is a different contract —
+        introduce a new helper rather than changing this one.
+        """
+        return values[None] if values.ndim == 0 else values

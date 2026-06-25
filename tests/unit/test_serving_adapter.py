@@ -1,109 +1,33 @@
 from __future__ import annotations
 
-import types
-
 import numpy as np
-import pandas as pd
 import pytest
-import torch
 
 from alphagenome.data import genome
 from alphagenome.models import dna_output
 from alphagenome.protos import dna_model_pb2
 
+from alphagenome_pytorch.extensions.attribution import UnsupportedMethodError
 from alphagenome_pytorch.extensions.serving.adapter import LocalDnaModelAdapter, SEQUENCE_LENGTH_16KB
+from alphagenome_pytorch.extensions.serving.scorer import VariantScorer
 from alphagenome_pytorch.variant_scoring.scorers import CenterMaskScorer
 from alphagenome_pytorch.variant_scoring.types import (
     AggregationType as PTAggregationType,
-    Interval as PTInterval,
     OutputType as PTOutputType,
-    TrackMetadata as PTTrackMetadata,
-    Variant as PTVariant,
-    VariantScore,
 )
 
-
-class _FakeAnndataModule:
-    class AnnData:
-        def __init__(self, X, obs=None, var=None, uns=None, layers=None):
-            self.X = X
-            self.obs = obs if obs is not None else pd.DataFrame()
-            self.var = var if var is not None else pd.DataFrame()
-            self.uns = uns if uns is not None else {}
-            self.layers = layers if layers is not None else {}
-
-
-class _FakeScoringModel:
-    def __init__(self):
-        self._metadata = {
-            0: {
-                PTOutputType.DNASE: [
-                    PTTrackMetadata(
-                        track_index=0,
-                        track_name='track_a',
-                        track_strand='.',
-                        output_type=PTOutputType.DNASE,
-                        ontology_curie='CL:0001',
-                    ),
-                    PTTrackMetadata(
-                        track_index=1,
-                        track_name='track_b',
-                        track_strand='-',
-                        output_type=PTOutputType.DNASE,
-                        ontology_curie='CL:0002',
-                    ),
-                ]
-            }
-        }
-
-    def get_track_metadata(self, organism: int | None = None):
-        idx = 0 if organism is None else int(organism)
-        return self._metadata.get(idx, {})
-
-    def predict(self, sequence: str, organism: int | None = None, **kwargs):
-        del organism, kwargs
-        seq_len = len(sequence)
-        values = np.zeros((1, seq_len, 2), dtype=np.float32)
-        values[0, :, 0] = 1.0
-        values[0, :, 1] = 2.0
-        return {'dnase': {1: values}}
-
-    def get_sequence(self, interval: PTInterval, variant: PTVariant | None = None) -> str:
-        seq = list('A' * interval.width)
-        if variant is not None:
-            rel = variant.start - interval.start
-            if 0 <= rel < len(seq):
-                seq[rel] = variant.alternate_bases
-        return ''.join(seq)
-
-    def predict_variant(self, interval: PTInterval, variant: PTVariant, organism: int | None = None):
-        del variant, organism
-        ref = self.predict('A' * interval.width)
-        alt = self.predict('A' * interval.width)
-        alt['dnase'][1] = alt['dnase'][1] + 1.0
-        return ref, alt
-
-    def score_variant(self, interval: PTInterval, variant: PTVariant, scorers, organism: int | None = None):
-        del interval, variant, organism
-        outputs = []
-        for scorer in scorers:
-            outputs.append(
-                VariantScore(
-                    variant=PTVariant('chr1', 10, 'A', 'C'),
-                    interval=PTInterval('chr1', 0, SEQUENCE_LENGTH_16KB),
-                    scorer=scorer,
-                    scores=torch.tensor([0.25, -0.5]),
-                    gene_id='ENSG000001',
-                    gene_name='GENE1',
-                    gene_strand='+',
-                )
-            )
-        return outputs
+from .serving_fakes import FakeAnndataModule, FakeRuntime, FakeScoringModel
 
 
 @pytest.fixture
 def adapter():
-    return LocalDnaModelAdapter(_FakeScoringModel())
+    return LocalDnaModelAdapter(FakeRuntime())
+
+
+@pytest.fixture
+def scoring_adapter():
+    runtime = FakeRuntime()
+    return LocalDnaModelAdapter(runtime, scorer=VariantScorer(runtime, FakeScoringModel()))
 
 
 def test_predict_sequence_filters_ontology_and_preserves_track_ops(adapter):
@@ -144,8 +68,8 @@ def test_output_metadata_concatenate_has_output_type(adapter):
     assert any(concatenated['output_type'] == dna_output.OutputType.DNASE)
 
 
-def test_score_variant_returns_anndata_compatible_shape(adapter, monkeypatch):
-    monkeypatch.setitem(__import__('sys').modules, 'anndata', _FakeAnndataModule)
+def test_score_variant_returns_anndata_compatible_shape(scoring_adapter, monkeypatch):
+    monkeypatch.setitem(__import__('sys').modules, 'anndata', FakeAnndataModule)
 
     interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
     variant = genome.Variant('chr1', 10, 'A', 'C')
@@ -155,7 +79,7 @@ def test_score_variant_returns_anndata_compatible_shape(adapter, monkeypatch):
         aggregation_type=PTAggregationType.DIFF_SUM,
     )
 
-    scores = adapter.score_variant(
+    scores = scoring_adapter.score_variant(
         interval=interval,
         variant=variant,
         variant_scorers=[scorer],
@@ -168,3 +92,138 @@ def test_score_variant_returns_anndata_compatible_shape(adapter, monkeypatch):
     assert adata.uns['variant'] == variant
     assert adata.uns['interval'] == interval
 
+
+# ---------------------------------------------------------------------------
+# explain_interval tests
+# ---------------------------------------------------------------------------
+
+
+class TestExplainIntervalValidation:
+    """explain_interval request-validation tests."""
+
+    def test_target_interval_not_contained_raises(self, adapter):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr1', SEQUENCE_LENGTH_16KB - 10, SEQUENCE_LENGTH_16KB + 10)
+        with pytest.raises(ValueError, match='not contained'):
+            adapter.explain_interval(
+                interval=interval,
+                target_interval=target,
+                requested_output='dnase',
+                resolution=1,
+                track_indices=[0],
+                method='input_x_gradient',
+            )
+
+    def test_chromosome_mismatch_raises(self, adapter):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr2', 100, 200)
+        with pytest.raises(ValueError, match='chromosome'):
+            adapter.explain_interval(
+                interval=interval,
+                target_interval=target,
+                requested_output='dnase',
+                resolution=1,
+                track_indices=[0],
+                method='input_x_gradient',
+            )
+
+    def test_unknown_method_raises(self, adapter):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr1', 100, 200)
+        with pytest.raises(UnsupportedMethodError, match='bogus_method'):
+            adapter.explain_interval(
+                interval=interval,
+                target_interval=target,
+                requested_output='dnase',
+                resolution=1,
+                track_indices=[0],
+                method='bogus_method',
+            )
+
+    def test_include_raw_gradient_rejected_for_ism(self, adapter):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr1', 100, 200)
+        with pytest.raises(ValueError, match='include_raw_gradient'):
+            adapter.explain_interval(
+                interval=interval,
+                target_interval=target,
+                requested_output='dnase',
+                resolution=1,
+                track_indices=[0],
+                method='saturation_ism',
+                include_raw_gradient=True,
+            )
+
+    def test_empty_track_indices_raises(self, adapter):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr1', 100, 200)
+        with pytest.raises(ValueError, match='track_indices'):
+            adapter.explain_interval(
+                interval=interval,
+                target_interval=target,
+                requested_output='dnase',
+                resolution=1,
+                track_indices=[],
+                method='input_x_gradient',
+            )
+
+    def test_gradient_happy_path(self, adapter):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr1', 100, 200)
+        result = adapter.explain_interval(
+            interval=interval,
+            target_interval=target,
+            requested_output='dnase',
+            resolution=1,
+            track_indices=[0],
+            method='input_x_gradient',
+        )
+        assert result.method == 'input_x_gradient'
+        assert result.values.shape == (100, 4, 1)
+
+    def test_ism_happy_path(self, adapter):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr1', 100, 108)
+        result = adapter.explain_interval(
+            interval=interval,
+            target_interval=target,
+            requested_output='dnase',
+            resolution=1,
+            track_indices=[0],
+            method='saturation_ism',
+            batch_size=4,
+        )
+        assert result.method == 'saturation_ism'
+        assert result.values.shape == (8, 4, 1)
+
+    def test_requested_output_normalization(self, adapter):
+        """Display-name / enum / prefixed forms resolve like the head key."""
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr1', 100, 200)
+
+        def run(req):
+            return adapter.explain_interval(
+                interval=interval,
+                target_interval=target,
+                requested_output=req,
+                resolution=1,
+                track_indices=[0],
+                method='input_x_gradient',
+            ).values
+
+        baseline = run('dnase')
+        for alias in ('DNASE', 'OUTPUT_TYPE_DNASE', dna_output.OutputType.DNASE):
+            np.testing.assert_array_equal(run(alias), baseline)
+
+    def test_unknown_requested_output_raises(self, adapter):
+        interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+        target = genome.Interval('chr1', 100, 200)
+        with pytest.raises(ValueError, match='output type'):
+            adapter.explain_interval(
+                interval=interval,
+                target_interval=target,
+                requested_output='not_a_head',
+                resolution=1,
+                track_indices=[0],
+                method='input_x_gradient',
+            )
