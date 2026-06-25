@@ -95,6 +95,11 @@ markers = [
 [tool.hatch.version]
 source = "vcs"
 
+[tool.hatch.build]
+artifacts = [
+    "src/alphagenome_pytorch/data/*.parquet",
+]
+
 [tool.hatch.build.hooks.vcs]
 version-file = "src/alphagenome_pytorch/_version.py"
 
