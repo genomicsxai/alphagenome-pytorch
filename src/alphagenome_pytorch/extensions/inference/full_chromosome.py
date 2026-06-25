@@ -147,7 +147,6 @@ class GenomeSequenceProvider:
             source,
             chromosomes=chromosomes,
             cache=cache,
-            ambiguous="uniform",
             verbose=True,
         )
         self.chrom_sizes = self._source.chrom_sizes
@@ -163,7 +162,7 @@ class GenomeSequenceProvider:
         Returns:
             One-hot encoded array of shape (end - start, 4).
         """
-        return self._source.fetch_onehot(chrom, start, end, pad=True, ambiguous="uniform")
+        return self._source.fetch_onehot(chrom, start, end, pad=True)
 
     def close(self):
         """Close the FASTA file handle."""
@@ -178,7 +177,7 @@ class GenomeSequenceProvider:
 
     def _fetch_from_fasta(self, chrom: str, start: int, end: int) -> np.ndarray:
         """Fetch and encode sequence directly from FASTA."""
-        return self._source.fetch_onehot(chrom, start, end, ambiguous="uniform")
+        return self._source.fetch_onehot(chrom, start, end)
 
 
 def _sequence_to_onehot(seq: str) -> np.ndarray:
@@ -191,7 +190,7 @@ def _sequence_to_onehot(seq: str) -> np.ndarray:
         One-hot encoded array of shape (len(seq), 4) with columns [A, C, G, T].
         Unknown bases (N, etc.) are encoded as [0, 0, 0, 0].
     """
-    return sequence_to_onehot(seq, ambiguous="uniform")
+    return sequence_to_onehot(seq)
 
 
 def _generate_tiles(

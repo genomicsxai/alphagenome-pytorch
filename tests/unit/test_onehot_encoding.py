@@ -28,13 +28,6 @@ def test_n_encodes_as_zeros_and_decodes_back():
     assert onehot_to_sequence(oh) == "ANGT"
 
 
-def test_n_can_encode_as_uniform_for_padding():
-    oh = sequence_to_onehot("AN", ambiguous="uniform")
-    np.testing.assert_allclose(oh[0], [1, 0, 0, 0])
-    np.testing.assert_allclose(oh[1], [0.25, 0.25, 0.25, 0.25])
-    assert oh.dtype == np.float32
-
-
 def test_all_n():
     oh = sequence_to_onehot("NNN")
     assert oh.sum() == 0

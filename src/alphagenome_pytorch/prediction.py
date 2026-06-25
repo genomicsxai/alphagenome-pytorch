@@ -145,7 +145,6 @@ class AlphaGenomePredictionRuntime:
                 sequence,
                 dtype=dtype,
                 device=self.device,
-                ambiguous="zero",
             )
         else:
             dtype = getattr(self.model, "dtype_policy", None)

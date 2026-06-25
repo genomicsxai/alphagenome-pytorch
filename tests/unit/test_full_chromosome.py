@@ -272,11 +272,10 @@ class TestStitchingWithMockModel:
         class _FakeSource:
             chrom_sizes = {'chr1': chrom_len}
 
-            def fetch_onehot(self, chrom, start, end, *, pad=True, ambiguous='uniform'):
-                del ambiguous
+            def fetch_onehot(self, chrom, start, end, *, pad=True):
                 length = end - start
                 if pad:
-                    result = np.full((length, 4), 0.25, dtype=np.float32)
+                    result = np.zeros((length, 4), dtype=genome_array.dtype)
                     valid_start = max(0, start)
                     valid_end = min(self.chrom_sizes.get(chrom, 0), end)
                     if valid_start < valid_end:

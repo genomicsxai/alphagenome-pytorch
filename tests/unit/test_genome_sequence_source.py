@@ -38,26 +38,6 @@ def test_genome_sequence_source_reopens_stale_fasta_handle(tmp_path):
     assert source.fetch_sequence(Interval("chr1", 0, 1)) == "A"
 
 
-def test_genome_sequence_source_cached_fetch_and_uniform_padding(tmp_path):
-    fasta_path = tmp_path / "genome.fa"
-    _write_fasta(fasta_path)
-
-    source = GenomeSequenceSource(
-        fasta_path,
-        chromosomes={"chr1"},
-        cache=True,
-        ambiguous="uniform",
-    )
-
-    values = source.fetch_onehot("chr1", -2, 3, pad=True, ambiguous="uniform")
-    assert values.shape == (5, 4)
-    assert np.allclose(values[0], [0.25, 0.25, 0.25, 0.25])
-    assert np.allclose(values[1], [0.25, 0.25, 0.25, 0.25])
-    assert np.allclose(values[2], [1, 0, 0, 0])
-    assert np.allclose(values[3], [0, 1, 0, 0])
-    assert np.allclose(values[4], [0, 0, 1, 0])
-
-
 def test_genome_sequence_source_cached_fetch_and_zero_padding(tmp_path):
     fasta_path = tmp_path / "genome.fa"
     _write_fasta(fasta_path)

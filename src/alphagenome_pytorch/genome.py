@@ -275,7 +275,6 @@ class GenomeSequenceSource:
         *,
         chromosomes: set[str] | None = None,
         cache: bool = False,
-        ambiguous: str = "zero",
         verbose: bool = False,
     ):
         try:
@@ -286,7 +285,6 @@ class GenomeSequenceSource:
             ) from exc
 
         self.fasta_path = str(fasta_path)
-        self.ambiguous = ambiguous
         self._pyfaidx = pyfaidx
         self._fasta: pyfaidx.Fasta | None = None
         self._owner_pid: int | None = None
@@ -302,7 +300,7 @@ class GenomeSequenceSource:
                 for ref in refs_to_load:
                     if ref in self.chrom_sizes:
                         self._cache[ref] = sequence_to_onehot(
-                            str(fasta[ref][:]), ambiguous=ambiguous
+                            str(fasta[ref][:])
                         )
         finally:
             fasta.close()
@@ -346,11 +344,9 @@ class GenomeSequenceSource:
         start: int,
         end: int,
         *,
-        ambiguous: str | None = None,
         pad: bool = False,
         copy: bool = True,
     ) -> np.ndarray:
-        policy = ambiguous or self.ambiguous
         seq_len = end - start
         resolved = self._resolve_chrom(chrom)
         chrom_len = self.chrom_sizes[resolved]
@@ -360,9 +356,7 @@ class GenomeSequenceSource:
         def _encode(lo: int, hi: int) -> np.ndarray:
             if cached:
                 return self._cache[resolved][lo:hi]
-            return sequence_to_onehot(
-                str(self.fasta[resolved][lo:hi]), ambiguous=policy
-            )
+            return sequence_to_onehot(str(self.fasta[resolved][lo:hi]))
 
         if start >= 0 and end <= chrom_len:
             seq = _encode(start, end)
@@ -371,13 +365,8 @@ class GenomeSequenceSource:
         if not pad:
             raise ValueError(f"Requested interval {chrom}:{start}-{end} is out of bounds")
 
-        # Out-of-bounds positions are padded per the ``ambiguous`` policy:
-        # ``"uniform"`` fills 0.25 (float32), ``"zero"`` fills zeros (uint8),
-        # matching the encoding of in-bounds ambiguous bases.
-        if policy == "uniform":
-            result = np.full((seq_len, 4), 0.25, dtype=np.float32)
-        else:
-            result = np.zeros((seq_len, 4), dtype=np.uint8)
+        # Padding is zeros (same as unknown-base encoding).
+        result = np.zeros((seq_len, 4), dtype=np.uint8)
         valid_start = max(0, start)
         valid_end = min(chrom_len, end)
         if valid_start < valid_end:
