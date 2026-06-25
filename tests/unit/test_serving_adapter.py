@@ -93,6 +93,38 @@ def test_score_variant_returns_anndata_compatible_shape(scoring_adapter, monkeyp
     assert adata.uns['interval'] == interval
 
 
+def test_score_ism_variants_delegates_to_cached_native_path(scoring_adapter, monkeypatch):
+    """Serving ISM must route through ``scoring_model.score_ism_variants`` (one
+    call, which caches the reference) instead of fanning out per-SNV through the
+    generic ``score_variants`` path, which recomputed the reference each time."""
+    monkeypatch.setitem(__import__('sys').modules, 'anndata', FakeAnndataModule)
+
+    interval = genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB)
+    ism_interval = genome.Interval('chr1', 100, 103)  # 3 positions
+    scorer = CenterMaskScorer(
+        requested_output=PTOutputType.DNASE,
+        width=501,
+        aggregation_type=PTAggregationType.DIFF_SUM,
+    )
+
+    scores = scoring_adapter.score_ism_variants(
+        interval=interval,
+        ism_interval=ism_interval,
+        variant_scorers=[scorer],
+        organism=dna_model_pb2.ORGANISM_HOMO_SAPIENS,
+        progress_bar=False,
+    )
+
+    # 3 positions x 3 alternate bases = 9 variants, each with one scorer AnnData.
+    assert len(scores) == 9
+    assert all(len(group) == 1 for group in scores)
+    assert all(group[0].X.shape == (1, 2) for group in scores)
+    # The official variant from the serving-built SNV list rides along in uns.
+    assert {str(group[0].uns['variant']) for group in scores}
+    # Delegated to the native cached ISM path exactly once.
+    assert scoring_adapter.scorer.scoring_model.ism_call_count == 1
+
+
 # ---------------------------------------------------------------------------
 # explain_interval tests
 # ---------------------------------------------------------------------------

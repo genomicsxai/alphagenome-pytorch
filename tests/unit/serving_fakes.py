@@ -17,6 +17,7 @@ import torch
 from torch import nn
 
 from alphagenome_pytorch.extensions.serving.adapter import SEQUENCE_LENGTH_16KB
+from alphagenome_pytorch.variant_scoring.inference import _build_ism_variants
 from alphagenome_pytorch.variant_scoring.types import (
     Interval as PTInterval,
     OutputType as PTOutputType,
@@ -123,6 +124,55 @@ class FakeScoringModel:
                 )
             )
         return outputs
+
+    def score_ism_variants(
+        self,
+        interval: PTInterval,
+        scorers,
+        *,
+        ism_interval: PTInterval | None = None,
+        center_position: int | None = None,
+        window_size: int = 21,
+        interval_variant: PTVariant | None = None,
+        organism: int | None = None,
+        gene_annotation=None,
+        nucleotides: str = 'ACGT',
+        to_cpu: bool = True,
+        progress: bool = True,
+    ):
+        """Faithful stand-in for the native cached ISM path.
+
+        Builds the same SNV list the serving layer builds (shared
+        ``_build_ism_variants``) and returns one inner list of per-scorer scores
+        per variant. ``ism_call_count`` lets tests assert the serving wrapper
+        delegates here once instead of fanning out per-SNV through
+        ``score_variant``.
+        """
+        del center_position, window_size, organism, gene_annotation, to_cpu, progress
+        self.ism_call_count = getattr(self, 'ism_call_count', 0) + 1
+        sequence = self.get_sequence(interval, variant=interval_variant)
+        variants = _build_ism_variants(
+            sequence=sequence,
+            interval=interval,
+            ism_interval=ism_interval,
+            nucleotides=nucleotides,
+            variant_cls=PTVariant,
+        )
+        return [
+            [
+                VariantScore(
+                    variant=variant,
+                    interval=interval,
+                    scorer=scorer,
+                    scores=torch.tensor([0.25, -0.5]),
+                    gene_id='ENSG000001',
+                    gene_name='GENE1',
+                    gene_strand='+',
+                )
+                for scorer in scorers
+            ]
+            for variant in variants
+        ]
 
 
 class TinyAttributionModel(nn.Module):

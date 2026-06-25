@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import importlib
-import itertools
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -95,20 +94,9 @@ class VariantScorer:
     ) -> list[Any]:
         _validate_sequence_length(interval.width)
         organism_index = self.runtime.resolve_organism_index(organism)
-
-        if not variant_scorers:
-            organism_name = "human" if organism_index == 0 else "mouse"
-            variant_scorers = list(get_recommended_scorers(organism_name))
-
-        if len(variant_scorers) > MAX_VARIANT_SCORERS_PER_REQUEST:
-            raise ValueError(
-                f"Too many variant scorers requested: {len(variant_scorers)} "
-                f"(max {MAX_VARIANT_SCORERS_PER_REQUEST})."
-            )
-        if len(variant_scorers) != len(set(map(str, variant_scorers))):
-            raise ValueError(f"Duplicate variant scorers requested: {variant_scorers}.")
-
-        local_scorers = [self._to_local_variant_scorer(vs) for vs in variant_scorers]
+        variant_scorers, local_scorers = self._resolve_scorers(
+            variant_scorers, organism_index
+        )
         scorer_results = self.scoring_model.score_variant(
             interval=_interval_to_pt(interval),
             variant=_variant_to_pt(variant),
@@ -199,6 +187,11 @@ class VariantScorer:
         progress_bar: bool = True,
         max_workers: int = DEFAULT_MAX_WORKERS,
     ) -> list[list[Any]]:
+        # ``max_workers`` is accepted for API compatibility but unused: the cached
+        # ISM path runs sequentially, sharing one reference forward pass across
+        # the window (see below). That cache — not thread fan-out — is the win,
+        # and on a single model/device the forward passes serialize anyway.
+        del max_workers
         _validate_sequence_length(interval.width)
         _require_length_preserving_background(interval_variant)
         if ism_interval.negative_strand:
@@ -208,8 +201,16 @@ class VariantScorer:
         if ism_interval.start < interval.start or ism_interval.end > interval.end:
             raise ValueError("ISM interval must be contained within interval.")
 
-        sequence = self.runtime.get_sequence(interval, variant=interval_variant)
+        organism_index = self.runtime.resolve_organism_index(organism)
+        variant_scorers, local_scorers = self._resolve_scorers(
+            variant_scorers, organism_index
+        )
 
+        # Build the SNV list here as official ``genome.Variant`` objects so each
+        # AnnData result carries the official variant. The native ISM path builds
+        # the identical list internally (shared ``_build_ism_variants`` with the
+        # same nucleotides/ordering), so the two align 1:1.
+        sequence = self.runtime.get_sequence(interval, variant=interval_variant)
         variants = _build_ism_variants(
             sequence=sequence,
             interval=interval,
@@ -221,15 +222,68 @@ class VariantScorer:
         if not variants:
             return []
 
-        return self.score_variants(
-            intervals=interval,
-            variants=variants,
-            variant_scorers=variant_scorers,
-            organism=organism,
-            interval_variant=interval_variant,
-            progress_bar=progress_bar,
-            max_workers=max_workers,
+        # Delegate to the native ISM path, which computes the reference forward
+        # pass ONCE for the whole window and reuses it across every SNV (via
+        # ``ref_outputs``). The previous generic ``score_variants`` fan-out passed
+        # no cache, recomputing the full reference for each of the ~3*W SNVs.
+        per_variant_results = self.scoring_model.score_ism_variants(
+            interval=_interval_to_pt(interval),
+            scorers=local_scorers,
+            ism_interval=_interval_to_pt(ism_interval),
+            organism=organism_index,
+            interval_variant=(
+                _variant_to_pt(interval_variant)
+                if interval_variant is not None
+                else None
+            ),
+            nucleotides=ISM_NUCLEOTIDES,
+            progress=progress_bar,
         )
+
+        return [
+            [
+                self._scores_to_anndata(
+                    scores=scorer_result,
+                    organism_index=organism_index,
+                    fallback_variant_scorer=original_scorer,
+                    interval=interval,
+                    variant=variant,
+                )
+                for original_scorer, scorer_result in zip(
+                    variant_scorers, results_for_variant, strict=True
+                )
+            ]
+            for variant, results_for_variant in zip(
+                variants, per_variant_results, strict=True
+            )
+        ]
+
+    def _resolve_scorers(
+        self, variant_scorers: Sequence[Any], organism_index: int
+    ) -> tuple[list[Any], list[PTBaseVariantScorer]]:
+        """Validate requested scorers and convert them to local PT scorers.
+
+        Returns ``(variant_scorers, local_scorers)``: the (possibly defaulted)
+        original scorer objects — kept so each result can be paired back to the
+        scorer the caller asked for — and the converted PT scorers passed to the
+        model. Shared by ``score_variant`` and ``score_ism_variants``.
+        """
+        if not variant_scorers:
+            organism_name = "human" if organism_index == 0 else "mouse"
+            variant_scorers = list(get_recommended_scorers(organism_name))
+        else:
+            variant_scorers = list(variant_scorers)
+
+        if len(variant_scorers) > MAX_VARIANT_SCORERS_PER_REQUEST:
+            raise ValueError(
+                f"Too many variant scorers requested: {len(variant_scorers)} "
+                f"(max {MAX_VARIANT_SCORERS_PER_REQUEST})."
+            )
+        if len(variant_scorers) != len(set(map(str, variant_scorers))):
+            raise ValueError(f"Duplicate variant scorers requested: {variant_scorers}.")
+
+        local_scorers = [self._to_local_variant_scorer(vs) for vs in variant_scorers]
+        return variant_scorers, local_scorers
 
     def _to_local_variant_scorer(self, scorer: Any) -> PTBaseVariantScorer:
         if isinstance(scorer, PTBaseVariantScorer):
