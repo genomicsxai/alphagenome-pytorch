@@ -1,4 +1,4 @@
-"""Integration tests for scripts/evaluate_finetuned.py.
+"""Integration tests for scripts/evaluate_checkpoint.py.
 
 Tests the two inference entry points (`evaluate_split` and
 `evaluate_native_split`) against a real AlphaGenome model with random weights
@@ -15,6 +15,7 @@ and mock BigWig data. These tests guard against two historical bugs:
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -35,12 +36,12 @@ MODALITY = "atac"
 
 
 def _load_script_module():
-    """Load scripts/evaluate_finetuned.py as a module (it's not a package)."""
+    """Load scripts/evaluate_checkpoint.py as a module (it's not a package)."""
     script_path = (
-        Path(__file__).parent.parent.parent / "scripts" / "evaluate_finetuned.py"
+        Path(__file__).parent.parent.parent / "scripts" / "evaluate_checkpoint.py"
     )
     spec = importlib.util.spec_from_file_location(
-        "evaluate_finetuned_script", script_path
+        "evaluate_checkpoint_script", script_path
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -181,3 +182,78 @@ def test_evaluate_native_split_skips_missing_resolution(
     )
     assert 1 in preds
     assert 64 not in preds
+
+
+def test_parse_resolutions_defaults_to_128(script_module):
+    assert script_module.parse_resolutions(None) == (128,)
+    assert script_module.parse_resolutions("1,128") == (1, 128)
+
+
+def test_format_summary_table_supports_native_only(script_module):
+    native_metrics = {
+        128: {
+            "profile_pearson_r_mean": 0.25,
+            "profile_pearson_r_median": 0.20,
+            "count_pearson_r": 0.50,
+            "jsd_mean": 0.10,
+            "jsd_median": 0.08,
+            "mse": 1.25,
+            "spearman_global": 0.40,
+            "n_regions": 3,
+        }
+    }
+
+    summary = script_module.format_summary_table(
+        ft_metrics=None,
+        native_metrics=native_metrics,
+        native_display_name="K562",
+        resolutions=(128,),
+    )
+
+    assert "Native(K562)" in summary
+    assert "Finetuned" not in summary
+    assert "Profile r (mean)" in summary
+    assert "0.2500" in summary
+
+
+def test_native_only_requires_explicit_metrics(script_module, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_checkpoint.py",
+            "--native-only",
+            "--pretrained-weights",
+            "model.safetensors",
+            "--output-dir",
+            str(tmp_path),
+            "--modality",
+            "atac",
+            "--native-biosample",
+            "K562",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="--native-only currently supports metrics"):
+        script_module.main()
+
+
+def test_native_only_requires_native_track_selector(script_module, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_checkpoint.py",
+            "--native-only",
+            "--metrics",
+            "--pretrained-weights",
+            "model.safetensors",
+            "--output-dir",
+            str(tmp_path),
+            "--modality",
+            "atac",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="--native-biosample or --native-track-index"):
+        script_module.main()
