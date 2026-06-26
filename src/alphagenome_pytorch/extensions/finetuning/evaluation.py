@@ -1,6 +1,6 @@
 """Shared evaluation primitives for fine-tuned AlphaGenome models.
 
-Consumed by scripts/evaluate_finetuned.py (per-model run), scripts/evaluate_matrix.py
+Consumed by scripts/evaluate_checkpoint.py (per-model run), scripts/evaluate_matrix.py
 (cross-model × cross-dataset matrix), and scripts/predict_locus.py (manuscript figure).
 Single inference + metrics code path keeps the three entry points consistent.
 """
@@ -365,6 +365,24 @@ def evaluate_native_split(
             preds_by_res[res].append(pred_track.float().cpu().numpy())
 
     return {r: np.concatenate(v, axis=0) for r, v in preds_by_res.items() if v}
+
+
+def collect_targets(
+    loader: DataLoader,
+    resolutions: tuple[int, ...],
+    progress_desc: str = "Collecting targets",
+) -> dict[int, np.ndarray]:
+    """Collect target arrays from a genomic loader without model inference.
+
+    This is used by native-only/pretrained evaluation, where the target BigWig
+    values are needed for metrics but no finetuned model is run.
+    """
+    targets_by_res: dict[int, list[np.ndarray]] = {r: [] for r in resolutions}
+    for _, targets_dict in tqdm(loader, desc=progress_desc):
+        for res in resolutions:
+            if res in targets_dict:
+                targets_by_res[res].append(targets_dict[res].numpy())
+    return {r: np.concatenate(v, axis=0) for r, v in targets_by_res.items() if v}
 
 
 # =============================================================================
