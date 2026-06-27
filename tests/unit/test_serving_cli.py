@@ -183,6 +183,18 @@ def test_checkpoint_without_metadata_yields_no_catalog():
     assert adapter.runtime.metadata_catalog is None
 
 
+def test_default_organism_falls_back_to_checkpoint_meta():
+    """Without a single-organism catalog, the top-level meta organism is used."""
+    from alphagenome_pytorch.extensions.serving.cli import _finetuned_default_organism
+
+    # No catalog: the recorded organism labels a mouse fine-tune correctly even
+    # when --track-metadata was not supplied at train time.
+    assert _finetuned_default_organism(None, {'organism': 'mouse'}) == 'mouse'
+    # Neither catalog nor meta organism: fall back to human.
+    assert _finetuned_default_organism(None, {'organism': None}) == 'human'
+    assert _finetuned_default_organism(None, None) == 'human'
+
+
 def test_weights_path_creates_scoring_adapter():
     """``--weights`` builds a ``LocalDnaModelAdapter`` with a ``VariantScorer``."""
     stub_model = _stub_model()
