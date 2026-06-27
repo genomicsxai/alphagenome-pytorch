@@ -193,13 +193,41 @@ def _resolve_finetuned_metadata_catalog(
                 'the embedded catalog.',
                 args.track_metadata,
             )
-        return TrackMetadataCatalog.from_file(args.track_metadata)
+        # Delegate to the shared loader (logs 'Loaded track metadata from %s').
+        # include_bundled=False: fine-tuned heads may be custom, so don't fall
+        # back to bundled pretrained metadata.
+        return _load_metadata_catalog(args, include_bundled=False)
 
     if embedded_rows:
+        catalog = TrackMetadataCatalog.from_rows(embedded_rows)
+        if catalog.is_empty():
+            LOGGER.warning(
+                'Fine-tuned checkpoint embedded an empty track-metadata '
+                'catalog; serving sparse track names instead.'
+            )
+            return None
         LOGGER.info('Using track metadata embedded in the fine-tuned checkpoint.')
-        return TrackMetadataCatalog.from_rows(embedded_rows)
+        return catalog
 
     return None
+
+
+def _finetuned_default_organism(
+    metadata_catalog: "TrackMetadataCatalog | None",
+) -> str | int:
+    """Default organism for a fine-tuned model.
+
+    When the embedded catalog labels a single organism (e.g. a mouse fine-tune),
+    default to it so a request that omits organism still resolves to the
+    organism the tracks belong to and is labelled correctly. The runtime maps
+    that organism onto the head's single trained slot. Falls back to human when
+    the catalog is absent or spans multiple organisms.
+    """
+    if metadata_catalog is not None and not metadata_catalog.is_empty():
+        present = sorted(set(metadata_catalog.organisms))
+        if len(present) == 1:
+            return present[0]
+    return "human"
 
 
 def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
@@ -231,6 +259,7 @@ def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
         metadata_catalog=metadata_catalog,
         track_names=meta.get('track_names'),
         device=args.device,
+        default_organism=_finetuned_default_organism(metadata_catalog),
     )
     scorer = _make_variant_scorer(
         runtime=runtime,

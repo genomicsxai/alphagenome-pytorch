@@ -58,8 +58,20 @@ def _clean_optional(value: Any) -> Any:
         value = value.strip()
         if not value or value.lower() in {"nan", "none", "null"}:
             return None
-    elif isinstance(value, float) and math.isnan(value):
+        return value
+    # Coerce numpy/pandas scalars (np.int64, np.float64, np.bool_) and arrays to
+    # native Python so the catalog stays JSON-serializable when embedded into
+    # checkpoints/delta weights. Parquet columns commonly yield numpy types.
+    if hasattr(value, "item") and not isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.item()
+        except (ValueError, TypeError):
+            # Multi-element array: fall through to tolist() below.
+            pass
+    if isinstance(value, float) and math.isnan(value):
         return None
+    if hasattr(value, "tolist"):
+        return value.tolist()
     return value
 
 
@@ -428,7 +440,11 @@ class TrackMetadataCatalog:
 
     def is_empty(self) -> bool:
         """True if no tracks are registered for any organism/output."""
-        return not any(self._tracks_by_organism.values())
+        return not any(
+            tracks
+            for per_output in self._tracks_by_organism.values()
+            for tracks in per_output.values()
+        )
 
     def to_rows(self) -> list[dict[str, Any]]:
         """Serialize to a list-of-rows representation suitable for round-tripping via ``from_rows``.

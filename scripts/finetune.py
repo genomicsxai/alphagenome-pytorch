@@ -337,6 +337,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "column must match the head name (= --modality)."
         ),
     )
+    data.add_argument(
+        "--organism",
+        type=str,
+        choices=["human", "mouse"],
+        default=None,
+        help=(
+            "Organism for the fine-tuning tracks when they all share one "
+            "(human=0, mouse=1). Applied as the default for --track-metadata "
+            "rows that lack an 'organism' value. For mixed human+mouse tracks, "
+            "omit this and set a per-track 'organism' column in the parquet "
+            "instead (it is authoritative). If --organism is given but the "
+            "parquet declares a different or mixed set of organisms, "
+            "fine-tuning errors out. Defaults to human (organism 0)."
+        ),
+    )
     data.add_argument("--sequence-length", type=int, default=DEFAULTS["sequence_length"])
     data.add_argument(
         "--resolutions",
@@ -1007,10 +1022,24 @@ def create_datasets(
     return train_dataset, val_dataset, modality_track_names, args.modality_resolutions
 
 
+ORGANISM_NAME_TO_INDEX = {"human": 0, "mouse": 1}
+
+
+def organism_index_from_args(args: argparse.Namespace) -> int:
+    """Biological organism index (0=human, 1=mouse) this fine-tune trains.
+
+    Drives the forward pass: mouse data is forwarded at index 1 so it uses the
+    mouse organism embedding. Heads stay ``num_organisms=1`` (organism-agnostic)
+    and ignore the index, so no head capacity is wasted.
+    """
+    return ORGANISM_NAME_TO_INDEX.get(getattr(args, "organism", None) or "human", 0)
+
+
 def load_track_metadata_for_finetune(
     path: str | None,
     modality_track_names: dict[str, list[str]],
     rank: int,
+    organism: str | None = None,
 ) -> tuple[dict[str, list[str]], list[dict[str, Any]] | None]:
     """Load and validate user-supplied track metadata for fine-tuning.
 
@@ -1021,21 +1050,44 @@ def load_track_metadata_for_finetune(
     * ``metadata_rows`` — list-of-dicts ready for embedding into checkpoints,
       or ``None`` when ``path`` is ``None``.
 
-    Validates that every fine-tuning head has a matching ``output_type`` in
-    the catalog with the right number of tracks. Head name == ``--modality``
-    by convention in this script.
+    A fine-tune trains a single organism (the forward uses one organism
+    embedding, selected by ``--organism``), so the metadata must describe that
+    organism. ``organism`` (``"human"``/``"mouse"``, default human) is the
+    organism the heads are trained for; it fills rows whose parquet ``organism``
+    column is absent. If the parquet declares any *other* organism, that is a
+    mistake (mixed human+mouse training is not supported yet) and raises — this
+    also stops mouse data from being embedded while the trainer forwards at the
+    human embedding.
+
+    Validates that every fine-tuning head has a matching ``output_type`` in the
+    catalog with the right number of tracks. Head name == ``--modality`` by
+    convention in this script.
     """
     if path is None:
         return modality_track_names, None
 
-    catalog = TrackMetadataCatalog.from_file(path)
+    organism_index = ORGANISM_NAME_TO_INDEX.get(organism or "human", 0)
+    organism_name = "mouse" if organism_index == 1 else "human"
+    # The default fills rows whose 'organism' value is absent; a per-track
+    # 'organism' column wins (and must agree with --organism, checked below).
+    catalog = TrackMetadataCatalog.from_file(path, default_organism=organism_index)
     print_rank0(f"Loaded track metadata from {path}", rank)
+
+    present = set(catalog.organisms)
+    if present - {organism_index}:
+        raise ValueError(
+            f"--track-metadata declares organism(s) {sorted(present)}, but this "
+            f"fine-tune trains organism {organism_index} ({organism_name}). "
+            "Fine-tuning is single-organism: set every row's 'organism' to match "
+            "--organism (use --organism mouse for mouse tracks). Mixed "
+            "human+mouse training is not supported yet."
+        )
 
     updated_names: dict[str, list[str]] = {}
     for head_name, bigwig_names in modality_track_names.items():
-        tracks = catalog.get_tracks(head_name, organism=0)
+        tracks = catalog.get_tracks(head_name, organism=organism_index)
         if not tracks:
-            available = catalog.outputs(organism=0)
+            available = catalog.outputs(organism=organism_index)
             raise ValueError(
                 f"--track-metadata has no entries for head/output '{head_name}'. "
                 f"Available outputs: {available}. The 'output_type' column "
@@ -1049,7 +1101,10 @@ def load_track_metadata_for_finetune(
             )
         updated_names[head_name] = [t.track_name for t in tracks]
 
-    return updated_names, catalog.to_rows()
+    # Embed all rows (all organism `organism_index` after the check above) so the
+    # served catalog labels the tracks with the correct organism.
+    metadata_rows = catalog.to_rows()
+    return updated_names, metadata_rows
 
 
 def create_dataloaders(
@@ -1161,7 +1216,9 @@ def create_model(
     # encoder-only mode forces 128bp resolution for all heads
     is_encoder_only = args.mode == "encoder-only"
 
-    # Build new_heads dict for TransferConfig (used for delta checkpoints)
+    # Build new_heads dict for TransferConfig (used for delta checkpoints).
+    # Heads stay single-organism (organism-agnostic): the organism only selects
+    # the trunk embedding in the forward, not a head weight slot.
     new_heads_config: dict[str, dict] = {}
     for modality, track_names in modality_track_names.items():
         head_res = (128,) if is_encoder_only else modality_resolutions[modality]
@@ -1367,7 +1424,17 @@ def main(args: argparse.Namespace | None = None) -> None:
     # Optional rich track metadata (overrides BigWig stems with parquet names
     # and embeds the catalog into checkpoints / exported delta weights).
     modality_track_names, track_metadata_rows = load_track_metadata_for_finetune(
-        args.track_metadata, modality_track_names, rank,
+        args.track_metadata, modality_track_names, rank, organism=args.organism,
+    )
+
+    # Track identity embedded into every checkpoint/delta save below. Defined
+    # once and spread as **metadata_kwargs so a new save site cannot silently
+    # drop the embedded metadata.
+    metadata_kwargs = dict(
+        track_names=modality_track_names,
+        modality=args.modalities,
+        resolutions=modality_resolutions,
+        track_metadata=track_metadata_rows,
     )
 
     # Build resolution weights per modality.
@@ -1596,10 +1663,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 model=model_module,
                 optimizer=optimizer,
                 val_loss=best_val_loss,
-                track_names=modality_track_names,
-                modality=args.modalities,
-                resolutions=modality_resolutions,
-                track_metadata=track_metadata_rows,
+                **metadata_kwargs,
                 scheduler=scheduler,
                 best_val_loss=best_val_loss,
                 wandb_run_id=logger.wandb_run_id,
@@ -1616,10 +1680,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 epoch=last_completed,
                 val_loss=best_val_loss,
                 best_val_loss=best_val_loss,
-                track_names=modality_track_names,
-                modality=args.modalities,
-                resolutions=modality_resolutions,
-                track_metadata=track_metadata_rows,
+                **metadata_kwargs,
                 wandb_run_id=logger.wandb_run_id,
             )
             print(f"Preemption delta checkpoint saved to {output_dir / 'checkpoint_preempt.delta.pth'}")
@@ -1644,6 +1705,9 @@ def main(args: argparse.Namespace | None = None) -> None:
         args.mode in ("lora", "locon", "lora+locon") and not has_active_adapters
     )
     encoder_only = args.mode == "encoder-only"
+    # Forward at the fine-tune's organism so mouse data uses the mouse embedding
+    # and head slot (heads are built with num_organisms=2; see create_model).
+    organism_index = organism_index_from_args(args)
 
     try:
         for epoch in range(start_epoch, args.epochs + 1):
@@ -1690,6 +1754,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     gene_loss_weights=gene_loss_weights,
                     gene_cross_track_weight=args.gene_cross_track_weight,
                     strand_channel_masks=gene_strand_channel_masks,
+                    organism=organism_index,
                 )
             else:
                 # Standard multimodal training (uses multihead functions)
@@ -1721,6 +1786,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     gene_loss_weights=gene_loss_weights,
                     gene_cross_track_weight=args.gene_cross_track_weight,
                     strand_channel_masks=gene_strand_channel_masks,
+                    organism=organism_index,
                 )
 
             if handler.preempted:
@@ -1745,6 +1811,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 rank=rank,
                 world_size=world_size,
                 encoder_only=encoder_only,
+                organism=organism_index,
             )
 
             # Synchronize CUDA to ensure all validation ops complete before next epoch
@@ -1797,10 +1864,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                             model=model_module,
                             optimizer=optimizer,
                             val_loss=val_loss,
-                            track_names=modality_track_names,
-                            modality=args.modalities,
-                            resolutions=modality_resolutions,
-                            track_metadata=track_metadata_rows,
+                            **metadata_kwargs,
                             scheduler=scheduler,
                             best_val_loss=best_val_loss,
                             wandb_run_id=logger.wandb_run_id,
@@ -1817,10 +1881,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                             epoch=epoch,
                             val_loss=val_loss,
                             best_val_loss=best_val_loss,
-                            track_names=modality_track_names,
-                            modality=args.modalities,
-                            resolutions=modality_resolutions,
-                            track_metadata=track_metadata_rows,
+                            **metadata_kwargs,
                             wandb_run_id=logger.wandb_run_id,
                         )
                         print(f"  Saved best delta checkpoint (val_loss={val_loss:.4f})")
@@ -1833,10 +1894,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                             model=model_module,
                             optimizer=optimizer,
                             val_loss=val_loss,
-                            track_names=modality_track_names,
-                            modality=args.modalities,
-                            resolutions=modality_resolutions,
-                            track_metadata=track_metadata_rows,
+                            **metadata_kwargs,
                             scheduler=scheduler,
                             best_val_loss=best_val_loss,
                             wandb_run_id=logger.wandb_run_id,
@@ -1852,10 +1910,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                             epoch=epoch,
                             val_loss=val_loss,
                             best_val_loss=best_val_loss,
-                            track_names=modality_track_names,
-                            modality=args.modalities,
-                            resolutions=modality_resolutions,
-                            track_metadata=track_metadata_rows,
+                            **metadata_kwargs,
                             wandb_run_id=logger.wandb_run_id,
                         )
 

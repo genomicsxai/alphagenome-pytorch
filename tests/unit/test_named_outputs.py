@@ -255,6 +255,43 @@ def test_empty_catalog_is_empty_and_to_rows_empty():
     assert catalog.to_rows() == []
 
 
+def test_is_empty_true_when_outputs_have_no_tracks():
+    """is_empty() is True even when an organism maps to outputs with empty
+    track tuples (a present-but-truthy inner dict must not read as non-empty)."""
+    catalog = TrackMetadataCatalog({0: {"atac": ()}})
+    assert catalog.is_empty()
+
+
+def test_to_rows_is_json_serializable_with_numpy_values():
+    """Numpy/pandas scalars and arrays from parquet must survive to_rows() as
+    native Python so the catalog can be json.dumps'd into a checkpoint."""
+    np = pytest.importorskip("numpy")
+    import json
+
+    rows = [
+        {
+            "organism": np.int64(0),
+            "output_type": "atac",
+            "track_name": "t0",
+            "n_reads": np.int64(123),
+            "quality": np.float64(0.95),
+            "flags": np.array([1, 2, 3]),
+            "passed": np.bool_(True),
+        }
+    ]
+    catalog = TrackMetadataCatalog.from_rows(rows)
+
+    serialized = catalog.to_rows()
+    # Must not raise — this is exactly what export_delta_weights does.
+    json.dumps(serialized)
+
+    track = catalog.get_tracks("atac", organism=0)[0]
+    assert track.extras["n_reads"] == 123
+    assert track.extras["quality"] == pytest.approx(0.95)
+    assert track.extras["flags"] == [1, 2, 3]
+    assert track.extras["passed"] is True
+
+
 def test_track_metadata_extras_contain_non_core_fields():
     """Non-core fields are stored in extras dict."""
     rows = [
