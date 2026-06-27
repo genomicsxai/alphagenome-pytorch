@@ -335,6 +335,7 @@ def train_epoch(
     gene_loss_weight: float = 0.0,
     gene_cross_track_weight: float = 5.0,
     strand_channel_mask: Tensor | None = None,
+    organism: int = 0,
 ) -> float:
     """Train for one epoch.
 
@@ -403,8 +404,9 @@ def train_epoch(
         sequences = sequences.to(device)
         targets_dict = {k: v.to(device) for k, v in targets_dict.items() if k in resolutions}
 
-        # Organism index (assume human)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+        # Organism index for this fine-tune (0=human, 1=mouse); the forward
+        # uses the matching organism embedding + head slot.
+        organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
         with amp_context:
             # Forward through trunk
@@ -477,6 +479,7 @@ def validate(
     positional_weight: float,
     use_amp: bool = True,
     resolutions: tuple[int, ...] | None = None,
+    organism: int = 0,
 ) -> float:
     """Validate the model.
 
@@ -516,7 +519,7 @@ def validate(
         for sequences, targets_dict in tqdm(val_loader, desc="Validation"):
             sequences = sequences.to(device)
             targets_dict = {k: v.to(device) for k, v in targets_dict.items() if k in resolutions}
-            organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+            organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
             with amp_context:
                 outputs = model(sequences, organism_idx, return_embeddings=True, channels_last=False)
@@ -695,6 +698,7 @@ def train_epoch_ddp(
     profile_batches: int = 0,
     log_fn: Any | None = None,
     encoder_only: bool = False,
+    organism: int = 0,
 ) -> float:
     """Train for one epoch with DDP and profiling support.
 
@@ -782,7 +786,7 @@ def train_epoch_ddp(
             t0 = time.perf_counter()
 
         sequences = sequences.to(device)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+        organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
         if is_profiling:
             _cuda_sync(device)
@@ -1011,6 +1015,7 @@ def validate_ddp(
     rank: int = 0,
     world_size: int = 1,
     encoder_only: bool = False,
+    organism: int = 0,
 ) -> tuple[float, dict[str, Any]]:
     """Validate the model with DDP support and Pearson R metrics.
 
@@ -1069,7 +1074,7 @@ def validate_ddp(
     with torch.no_grad():
         for sequences, targets_dict in pbar:
             sequences = sequences.to(device)
-            organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+            organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
             resolutions = tuple(resolution_weights.keys())
 
             if encoder_only:
@@ -1235,6 +1240,7 @@ def train_epoch_multihead(
     gene_loss_weights: dict[str, float] | None = None,
     gene_cross_track_weight: float = 5.0,
     strand_channel_masks: dict[str, Tensor] | None = None,
+    organism: int = 0,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with multiple modality heads.
 
@@ -1327,7 +1333,7 @@ def train_epoch_multihead(
             t0 = time.perf_counter()
 
         sequences = sequences.to(device)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+        organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
         if is_profiling:
             _cuda_sync(device)
@@ -1586,6 +1592,7 @@ def validate_multihead(
     rank: int = 0,
     world_size: int = 1,
     encoder_only: bool = False,
+    organism: int = 0,
 ) -> tuple[float, dict[str, Any]]:
     """Validate model with multiple modality heads.
 
@@ -1638,7 +1645,7 @@ def validate_multihead(
     with torch.no_grad():
         for sequences, modality_targets in pbar:
             sequences = sequences.to(device)
-            organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+            organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
             # Collect all resolutions
             all_resolutions = set()
@@ -1804,6 +1811,7 @@ def train_epoch_sequence_parallel(
     gene_loss_weights: dict[str, float] | None = None,
     gene_cross_track_weight: float = 5.0,
     strand_channel_masks: dict[str, Tensor] | None = None,
+    organism: int = 0,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with sequence parallelism.
 
@@ -1888,7 +1896,7 @@ def train_epoch_sequence_parallel(
             sequences, modality_targets = batch_data
             gene_mask = None
         sequences = sequences.to(device)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+        organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
         # Align sequence length to world_size * 128 for sequence parallelism.
         # This ensures each rank's base shard size is divisible by 128, so the

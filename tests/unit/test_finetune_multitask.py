@@ -16,6 +16,7 @@ import finetune as finetune_module  # noqa: E402
 from finetune import (  # noqa: E402
     MultimodalDataset,
     collate_multimodal,
+    load_track_metadata_for_finetune,
     parse_args,
     unwrap_training_model,
 )
@@ -401,3 +402,103 @@ class TestUnwrapTrainingModel:
         wrapped = FakeCompiled(FakeDDP(base))
 
         assert unwrap_training_model(wrapped) is base
+
+
+@pytest.mark.unit
+class TestLoadTrackMetadataForFinetune:
+    """Tests for --track-metadata loading/validation/embedding."""
+
+    @staticmethod
+    def _write_csv(path: Path, lines: list[str]) -> None:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_none_path_returns_unchanged(self):
+        names = {"atac": ["a", "b"]}
+        out_names, rows = load_track_metadata_for_finetune(None, names, rank=0)
+        assert out_names is names
+        assert rows is None
+
+    def test_happy_path_overrides_names_and_embeds_rows(self, tmp_path):
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name,biosample_name",
+            "human,atac,liver,Liver",
+            "human,atac,brain,Brain",
+        ])
+        out_names, rows = load_track_metadata_for_finetune(
+            str(csv), {"atac": ["bw0", "bw1"]}, rank=0,
+        )
+        assert out_names == {"atac": ["liver", "brain"]}
+        assert [r["track_name"] for r in rows] == ["liver", "brain"]
+
+    def test_count_mismatch_raises(self, tmp_path):
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name",
+            "human,atac,liver",
+        ])
+        with pytest.raises(ValueError, match="Counts must match"):
+            load_track_metadata_for_finetune(str(csv), {"atac": ["bw0", "bw1"]}, rank=0)
+
+    def test_mouse_tracks_embed_under_organism_one(self, tmp_path):
+        """--organism mouse validates and embeds mouse (organism=1) tracks."""
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name",
+            "mouse,atac,liver",
+            "mouse,atac,brain",
+        ])
+        out_names, rows = load_track_metadata_for_finetune(
+            str(csv), {"atac": ["bw0", "bw1"]}, rank=0, organism="mouse",
+        )
+        assert out_names == {"atac": ["liver", "brain"]}
+        assert all(int(r["organism"]) == 1 for r in rows)
+
+    def test_mouse_tracks_without_organism_flag_raise(self, tmp_path):
+        """Mouse-tagged tracks without --organism mouse must raise (the trainer
+        would otherwise forward at the human embedding)."""
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name",
+            "mouse,atac,liver",
+            "mouse,atac,brain",
+        ])
+        with pytest.raises(ValueError, match="trains organism 0"):
+            load_track_metadata_for_finetune(str(csv), {"atac": ["bw0", "bw1"]}, rank=0)
+
+    def test_organism_flag_conflicts_with_parquet_raises(self, tmp_path):
+        """--organism mouse but human-tagged parquet -> clear error."""
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name",
+            "human,atac,liver",
+            "human,atac,brain",
+        ])
+        with pytest.raises(ValueError, match="trains organism 1"):
+            load_track_metadata_for_finetune(
+                str(csv), {"atac": ["bw0", "bw1"]}, rank=0, organism="mouse",
+            )
+
+    def test_mixed_organism_not_supported(self, tmp_path):
+        """A mixed human+mouse catalog is rejected (single-organism fine-tune)."""
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name",
+            "human,atac,liver",
+            "mouse,atac,m_liver",
+        ])
+        with pytest.raises(ValueError, match="not supported yet"):
+            load_track_metadata_for_finetune(str(csv), {"atac": ["bw0", "bw1"]}, rank=0)
+
+    def test_organism_flag_fills_missing_column(self, tmp_path):
+        """--organism mouse fills rows lacking an 'organism' value -> organism 1."""
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "output_type,track_name",
+            "atac,liver",
+            "atac,brain",
+        ])
+        _names, rows = load_track_metadata_for_finetune(
+            str(csv), {"atac": ["bw0", "bw1"]}, rank=0, organism="mouse",
+        )
+        assert all(int(r["organism"]) == 1 for r in rows)
