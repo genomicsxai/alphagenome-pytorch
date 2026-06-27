@@ -1435,6 +1435,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         modality=args.modalities,
         resolutions=modality_resolutions,
         track_metadata=track_metadata_rows,
+        organism=args.organism,
     )
 
     # Build resolution weights per modality.
@@ -1705,8 +1706,10 @@ def main(args: argparse.Namespace | None = None) -> None:
         args.mode in ("lora", "locon", "lora+locon") and not has_active_adapters
     )
     encoder_only = args.mode == "encoder-only"
-    # Forward at the fine-tune's organism so mouse data uses the mouse embedding
-    # and head slot (heads are built with num_organisms=2; see create_model).
+    # Forward at the fine-tune's organism so mouse data uses the mouse trunk
+    # embedding. Fine-tuned heads are single-organism (num_organisms=1, see
+    # create_model) and organism-agnostic — they always use slot 0 — so the
+    # organism index only selects the trunk embedding, not a head weight slot.
     organism_index = organism_index_from_args(args)
 
     try:

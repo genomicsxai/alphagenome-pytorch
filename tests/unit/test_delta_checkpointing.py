@@ -695,11 +695,13 @@ class TestExportAndLoadDeltaWeights:
             export_delta_weights(
                 model, config, path, format="pth",
                 track_names=track_names, track_metadata=track_metadata,
+                organism="mouse",
             )
 
             header = _read_delta_export_header(path)
             assert header["track_names"] == track_names
             assert header["track_metadata"] == track_metadata
+            assert header["organism"] == "mouse"
             assert load_delta_config(path).mode == "lora"
 
     def test_export_embeds_track_names_and_metadata_safetensors(self):
@@ -718,11 +720,13 @@ class TestExportAndLoadDeltaWeights:
             export_delta_weights(
                 model, config, path, format="safetensors",
                 track_names=track_names, track_metadata=track_metadata,
+                organism="mouse",
             )
 
             header = _read_delta_export_header(path)
             assert header["track_names"] == track_names
             assert header["track_metadata"] == track_metadata
+            assert header["organism"] == "mouse"
 
     def test_export_without_metadata_is_backwards_compatible(self):
         """Old call sites without track_names/track_metadata still work."""

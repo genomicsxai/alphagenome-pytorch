@@ -936,6 +936,7 @@ def export_delta_weights(
     *,
     track_names: dict[str, list[str]] | list[str] | None = None,
     track_metadata: list[dict[str, Any]] | None = None,
+    organism: str | None = None,
 ) -> None:
     """Export only delta weights (adapters + new heads) for sharing.
 
@@ -954,6 +955,9 @@ def export_delta_weights(
         track_metadata: Optional list of metadata row-dicts (e.g. from
             ``TrackMetadataCatalog.to_rows``). When provided, embeds rich
             biological metadata so the served model is fully self-describing.
+        organism: Optional organism label (``"human"``/``"mouse"``) the tracks
+            were trained on. Embedded so recipients know the provenance without
+            inspecting per-track metadata.
 
     Example:
         >>> # Export just the LoRA weights + head for sharing
@@ -998,6 +1002,8 @@ def export_delta_weights(
             extras["track_names"] = track_names
         if track_metadata is not None:
             extras["track_metadata"] = track_metadata
+        if organism is not None:
+            extras["organism"] = organism
         # safetensors metadata must be str -> str
         metadata = {k: json.dumps(v) for k, v in extras.items()}
         save_file({k: v.cpu() for k, v in weights.items()}, path, metadata=metadata)
@@ -1009,6 +1015,8 @@ def export_delta_weights(
             extras["track_names"] = track_names
         if track_metadata is not None:
             extras["track_metadata"] = track_metadata
+        if organism is not None:
+            extras["organism"] = organism
         torch.save({"weights": weights, **extras}, path)
     else:
         raise ValueError(f"Unknown format: {format}. Use 'safetensors' or 'pth'.")
@@ -1046,6 +1054,8 @@ def _read_delta_export_header(path: Path | str) -> dict[str, Any]:
             header["track_names"] = json.loads(metadata["track_names"])
         if "track_metadata" in metadata:
             header["track_metadata"] = json.loads(metadata["track_metadata"])
+        if "organism" in metadata:
+            header["organism"] = json.loads(metadata["organism"])
     else:
         data = torch.load(path, map_location="cpu", weights_only=False)
         if not isinstance(data, dict) or "transfer_config" not in data:
@@ -1057,6 +1067,8 @@ def _read_delta_export_header(path: Path | str) -> dict[str, Any]:
             header["track_names"] = data["track_names"]
         if "track_metadata" in data:
             header["track_metadata"] = data["track_metadata"]
+        if "organism" in data:
+            header["organism"] = data["organism"]
 
     return header
 
@@ -1259,6 +1271,8 @@ def load_finetuned_model(
         ``modality``, ``resolutions``, ``track_names``,
         ``track_metadata`` (list of row-dicts, when the checkpoint
         embedded a metadata catalog; otherwise ``None``),
+        ``organism`` (``"human"``/``"mouse"`` the tracks were trained on,
+        or ``None`` for older checkpoints that predate this field),
         ``epoch``, ``val_loss``, ``head_names``.
 
     Supported formats: delta checkpoint (``.delta.pth`` from
@@ -1324,6 +1338,7 @@ def load_finetuned_model(
             "resolutions": None,
             "track_names": header.get("track_names"),
             "track_metadata": header.get("track_metadata"),
+            "organism": header.get("organism"),
             "epoch": -1,
             "val_loss": None,
             "head_names": list(config.new_heads.keys()),
@@ -1364,6 +1379,7 @@ def load_finetuned_model(
             "resolutions": metadata.get("resolutions"),
             "track_names": metadata.get("track_names"),
             "track_metadata": metadata.get("track_metadata"),
+            "organism": metadata.get("organism"),
             "epoch": metadata.get("epoch", -1),
             "val_loss": metadata.get("val_loss"),
             "head_names": head_names,
@@ -1378,6 +1394,7 @@ def load_finetuned_model(
             "transfer_config": ckpt["transfer_config"],
             "track_names": ckpt.get("track_names"),
             "track_metadata": ckpt.get("track_metadata"),
+            "organism": ckpt.get("organism"),
         }
         return _finalize_delta_export(header, ckpt["weights"])
 
@@ -1448,6 +1465,7 @@ def load_finetuned_model(
         "resolutions": ckpt.get("resolutions"),
         "track_names": ckpt.get("track_names"),
         "track_metadata": ckpt.get("track_metadata"),
+        "organism": ckpt.get("organism"),
         "epoch": ckpt.get("epoch", -1),
         "val_loss": ckpt.get("val_loss"),
         "head_names": head_names,

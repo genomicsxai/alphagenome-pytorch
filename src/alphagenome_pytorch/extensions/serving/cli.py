@@ -214,19 +214,26 @@ def _resolve_finetuned_metadata_catalog(
 
 def _finetuned_default_organism(
     metadata_catalog: "TrackMetadataCatalog | None",
+    meta: dict | None = None,
 ) -> str | int:
     """Default organism for a fine-tuned model.
 
     When the embedded catalog labels a single organism (e.g. a mouse fine-tune),
     default to it so a request that omits organism still resolves to the
     organism the tracks belong to and is labelled correctly. The runtime maps
-    that organism onto the head's single trained slot. Falls back to human when
-    the catalog is absent or spans multiple organisms.
+    that organism onto the head's single trained slot.
+
+    When no single-organism catalog is available, fall back to the top-level
+    ``organism`` recorded in the checkpoint metadata (``finetune.py --organism``),
+    which labels a mouse fine-tune correctly even without ``--track-metadata``.
+    Falls back to human when neither source resolves a single organism.
     """
     if metadata_catalog is not None and not metadata_catalog.is_empty():
         present = sorted(set(metadata_catalog.organisms))
         if len(present) == 1:
             return present[0]
+    if meta is not None and meta.get("organism"):
+        return meta["organism"]
     return "human"
 
 
@@ -259,7 +266,7 @@ def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
         metadata_catalog=metadata_catalog,
         track_names=meta.get('track_names'),
         device=args.device,
-        default_organism=_finetuned_default_organism(metadata_catalog),
+        default_organism=_finetuned_default_organism(metadata_catalog, meta),
     )
     scorer = _make_variant_scorer(
         runtime=runtime,
