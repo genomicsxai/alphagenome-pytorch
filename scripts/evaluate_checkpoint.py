@@ -66,18 +66,41 @@ from scipy import stats
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
+from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+    load_finetuned_model as _load_finetuned_model,
+)
 from alphagenome_pytorch.extensions.finetuning.datasets import GenomicDataset
 from alphagenome_pytorch.extensions.finetuning.evaluation import (
     collect_targets,
     compute_all_metrics,
     evaluate_native_split,
     evaluate_split,
-    load_finetuned_model,
     load_native_model,
 )
 from alphagenome_pytorch.extensions.finetuning.training import collate_genomic
 
 log = logging.getLogger(__name__)
+
+
+def load_finetuned_model(
+    checkpoint_path: str, pretrained_weights: str, device: torch.device,
+) -> tuple[nn.Module, dict]:
+    """Load a finetuned checkpoint, auto-detecting delta/full/adapter format.
+
+    Full checkpoints embed their TransferConfig (lora/locon targets etc.) at
+    save time, so adapter checkpoints are self-describing -- no external
+    transfer config file is needed.
+    """
+    model, meta = _load_finetuned_model(
+        checkpoint_path=checkpoint_path,
+        pretrained_weights=pretrained_weights,
+        device=device,
+        merge=True,
+    )
+    for p in model.parameters():
+        p.requires_grad = False
+    return model, meta
+
 
 # =============================================================================
 # Plotting
@@ -618,7 +641,10 @@ def main() -> None:
         modality = ckpt_meta["modality"]
         if isinstance(modality, list):
             modality = modality[0]  # single-task evaluation
-        resolutions = tuple(ckpt_meta["resolutions"])
+        resolutions = ckpt_meta["resolutions"]
+        if isinstance(resolutions, dict):
+            resolutions = resolutions.get(modality, (1,))
+        resolutions = tuple(resolutions)
         track_names = ckpt_meta["track_names"]
         if isinstance(track_names, dict):
             track_names = track_names.get(modality, [])
