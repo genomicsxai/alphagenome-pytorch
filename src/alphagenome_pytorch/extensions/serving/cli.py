@@ -166,6 +166,77 @@ def _make_variant_scorer(
     return VariantScorer(runtime, scoring_model)
 
 
+def _resolve_finetuned_metadata_catalog(
+    args: argparse.Namespace,
+    meta: dict,
+) -> TrackMetadataCatalog | None:
+    """Pick the right metadata source for a fine-tuned checkpoint.
+
+    Order of precedence:
+
+    1. ``--track-metadata`` from the CLI (explicit user override). When the
+       checkpoint also embeds metadata, log a warning so the user knows the
+       embedded catalog is being ignored.
+    2. ``track_metadata`` rows embedded in the fine-tuned checkpoint
+       (``finetune.py --track-metadata`` or ``export_delta_weights(...,
+       track_metadata=...)``).
+    3. ``None`` — the runtime falls back to bare ``track_names`` and serves
+       sparse ``TrackMetadata`` entries.
+    """
+    embedded_rows = meta.get('track_metadata')
+
+    if args.track_metadata:
+        if embedded_rows:
+            LOGGER.warning(
+                'Both --track-metadata and an embedded metadata catalog were '
+                'provided; using --track-metadata=%s. Drop the flag to use '
+                'the embedded catalog.',
+                args.track_metadata,
+            )
+        # Delegate to the shared loader (logs 'Loaded track metadata from %s').
+        # include_bundled=False: fine-tuned heads may be custom, so don't fall
+        # back to bundled pretrained metadata.
+        return _load_metadata_catalog(args, include_bundled=False)
+
+    if embedded_rows:
+        catalog = TrackMetadataCatalog.from_rows(embedded_rows)
+        if catalog.is_empty():
+            LOGGER.warning(
+                'Fine-tuned checkpoint embedded an empty track-metadata '
+                'catalog; serving sparse track names instead.'
+            )
+            return None
+        LOGGER.info('Using track metadata embedded in the fine-tuned checkpoint.')
+        return catalog
+
+    return None
+
+
+def _finetuned_default_organism(
+    metadata_catalog: "TrackMetadataCatalog | None",
+    meta: dict | None = None,
+) -> str | int:
+    """Default organism for a fine-tuned model.
+
+    When the embedded catalog labels a single organism (e.g. a mouse fine-tune),
+    default to it so a request that omits organism still resolves to the
+    organism the tracks belong to and is labelled correctly. The runtime maps
+    that organism onto the head's single trained slot.
+
+    When no single-organism catalog is available, fall back to the top-level
+    ``organism`` recorded in the checkpoint metadata (``finetune.py --organism``),
+    which labels a mouse fine-tune correctly even without ``--track-metadata``.
+    Falls back to human when neither source resolves a single organism.
+    """
+    if metadata_catalog is not None and not metadata_catalog.is_empty():
+        present = sorted(set(metadata_catalog.organisms))
+        if len(present) == 1:
+            return present[0]
+    if meta is not None and meta.get("organism"):
+        return meta["organism"]
+    return "human"
+
+
 def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
     """Construct a serving adapter from a fine-tuned checkpoint."""
     from alphagenome_pytorch.extensions.finetuning.checkpointing import (
@@ -188,13 +259,14 @@ def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
         transfer_config=transfer_config,
         merge=not args.no_merge_adapters,
     )
-    metadata_catalog = _load_metadata_catalog(args, include_bundled=False)
+    metadata_catalog = _resolve_finetuned_metadata_catalog(args, meta)
     runtime = AlphaGenomePredictionRuntime(
         model=model,
         fasta_path=args.fasta,
         metadata_catalog=metadata_catalog,
         track_names=meta.get('track_names'),
         device=args.device,
+        default_organism=_finetuned_default_organism(metadata_catalog, meta),
     )
     scorer = _make_variant_scorer(
         runtime=runtime,
