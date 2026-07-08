@@ -303,5 +303,5 @@ Next Steps
 ----------
 
 - :doc:`full_chromosome_prediction` - Genome-wide predictions as BigWig files
-- :doc:`finetuning` - Transfer learning on your own genomic tracks
+- :doc:`finetuning/index` - Transfer learning on your own genomic tracks
 - :doc:`api/model` - Full API reference
