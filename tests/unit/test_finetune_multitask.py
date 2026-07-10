@@ -368,6 +368,110 @@ class TestCollateMultimodal:
         assert torch.equal(modality_targets["atac"][128][0], targets1)
         assert torch.equal(modality_targets["atac"][128][1], targets2)
 
+    def test_collate_preserves_gene_mask(self):
+        # Regression guard: the collate historically dropped item[2], silently
+        # no-op'ing the gene-LFC training loss. It must now survive collation as
+        # extras["gene_mask"], stacked with a leading batch axis.
+        gm1 = torch.zeros(256, 2, 4, dtype=torch.bool)
+        gm2 = torch.ones(256, 2, 4, dtype=torch.bool)
+        batch = [
+            (torch.randn(256, 4), {"rna_seq": {1: torch.randn(256, 3)}}, gm1),
+            (torch.randn(256, 4), {"rna_seq": {1: torch.randn(256, 3)}}, gm2),
+        ]
+        sequences, modality_targets, extras = collate_multimodal(batch)
+        assert "gene_mask" in extras
+        assert extras["gene_mask"].shape == (2, 256, 2, 4)
+        assert torch.equal(extras["gene_mask"][0], gm1)
+        assert torch.equal(extras["gene_mask"][1], gm2)
+        assert "coords" not in extras
+
+    def test_collate_preserves_coords(self):
+        batch = [
+            (torch.randn(256, 4), {"rna_seq": {1: torch.randn(256, 3)}}, ("chr1", 0, 256)),
+            (torch.randn(256, 4), {"rna_seq": {1: torch.randn(256, 3)}}, ("chr2", 5, 261)),
+        ]
+        sequences, modality_targets, extras = collate_multimodal(batch)
+        assert extras["coords"] == [("chr1", 0, 256), ("chr2", 5, 261)]
+        assert "gene_mask" not in extras
+
+    def test_collate_preserves_gene_mask_and_coords(self):
+        gm = torch.ones(256, 2, 4, dtype=torch.bool)
+        batch = [
+            (torch.randn(256, 4), {"rna_seq": {1: torch.randn(256, 3)}}, gm, ("chr1", 0, 256)),
+        ]
+        sequences, modality_targets, extras = collate_multimodal(batch)
+        assert extras["gene_mask"].shape == (1, 256, 2, 4)
+        assert extras["coords"] == [("chr1", 0, 256)]
+
+    def test_unpack_batch_decodes_collate_contract(self):
+        # _unpack_batch is the consumer-side decode of the collate output.
+        from alphagenome_pytorch.extensions.finetuning.training import _unpack_batch
+
+        seqs = torch.randn(2, 8, 4)
+        targets = {"rna_seq": {1: torch.randn(2, 8, 3)}}
+        # 2-tuple (no extras) -> empty extras dict
+        s, t, e = _unpack_batch((seqs, targets))
+        assert s is seqs and t is targets and e == {}
+        # 3-tuple -> extras passed straight through
+        extras = {"gene_mask": torch.ones(2, 8, 2, 4), "coords": [("chr1", 0, 8), ("chr2", 5, 13)]}
+        s, t, e = _unpack_batch((seqs, targets, extras))
+        assert e is extras
+
+
+@pytest.mark.unit
+class TestParseArgsGeneExprEval:
+    """Validation of the --gene-expr-eval flag in scripts/finetune.py."""
+
+    def _rna_cli(self, monkeypatch, extra):
+        monkeypatch.setattr(
+            sys, "argv",
+            _required_cli_args()
+            + ["--modality", "rna_seq", "--bigwig", "rna1.bw"] + extra,
+        )
+
+    def test_happy_path_sets_flags(self, monkeypatch):
+        self._rna_cli(monkeypatch, [
+            "--gene-expr-eval",
+            "--gene-expr-annotation", "gencode.parquet",
+            "--track-strands", "+",
+        ])
+        args = parse_args()
+        assert args.gene_expr_eval is True
+        assert args.gene_expr_annotation == "gencode.parquet"
+
+    def test_falls_back_to_gtf_annotation(self, monkeypatch):
+        self._rna_cli(monkeypatch, [
+            "--gene-expr-eval", "--gtf", "genes.gtf", "--track-strands", "+",
+        ])
+        args = parse_args()  # --gtf satisfies the annotation requirement
+        assert args.gene_expr_eval is True
+
+    def test_requires_annotation(self, monkeypatch):
+        self._rna_cli(monkeypatch, ["--gene-expr-eval", "--track-strands", "+"])
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    def test_requires_strands(self, monkeypatch):
+        self._rna_cli(monkeypatch, [
+            "--gene-expr-eval", "--gene-expr-annotation", "gencode.parquet",
+        ])
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    def test_requires_rna_seq_modality(self, monkeypatch):
+        monkeypatch.setattr(
+            sys, "argv",
+            _required_cli_args()
+            + ["--modality", "atac", "--bigwig", "atac1.bw",
+               "--gene-expr-eval", "--gene-expr-annotation", "gencode.parquet"],
+        )
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    def test_off_by_default(self, monkeypatch):
+        self._rna_cli(monkeypatch, [])
+        assert parse_args().gene_expr_eval is False
+
 
 @pytest.mark.unit
 class TestUnwrapTrainingModel:

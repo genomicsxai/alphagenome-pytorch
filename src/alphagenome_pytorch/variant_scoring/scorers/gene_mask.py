@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from ...aggregation import aggregate_intervals
 from ..aggregations import align_alternate
 from ..types import Interval, OutputType, Variant, VariantScore
 from .base import BaseVariantScorer
@@ -215,15 +216,12 @@ class GeneMaskLFCScorer(BaseVariantScorer):
                 # No coverage in this interval for this gene
                 continue
 
-            # Apply mask and sum
-            mask = gene_mask.unsqueeze(0).unsqueeze(-1)  # (1, S, 1)
-            ref_masked = (ref_preds * mask).sum(dim=1)  # (B, T)
-            alt_masked = (alt_preds_aligned * mask).sum(dim=1)  # (B, T)
-            
-            # Normalize by mask sum to get mean (matches JAX)
-            gene_mask_sum = gene_mask.sum()
-            ref_mean = ref_masked / gene_mask_sum
-            alt_mean = alt_masked / gene_mask_sum
+            # Mean over masked positions via the shared aggregation primitive
+            # (identical to (pred*mask).sum(1)/mask.sum(); the earlier zero-sum
+            # `continue` guarantees a non-empty mask, so the mean is well-defined).
+            gene_mask_col = gene_mask.unsqueeze(-1).to(ref_preds.dtype)  # (S, 1)
+            ref_mean = aggregate_intervals(ref_preds, gene_mask_col, reduce="mean").squeeze(1)  # (B, T)
+            alt_mean = aggregate_intervals(alt_preds_aligned, gene_mask_col, reduce="mean").squeeze(1)
 
             # Log fold change: ln(alt) - ln(ref) using natural log
             lfc = torch.log(alt_mean + eps) - torch.log(ref_mean + eps)
@@ -422,10 +420,11 @@ class GeneMaskActiveScorer(BaseVariantScorer):
                 # No coverage in this interval for this gene
                 continue
 
-            # Apply mask and compute mean (matching JAX implementation)
-            mask = gene_mask.unsqueeze(0).unsqueeze(-1)  # (1, S, 1)
-            ref_mean = (ref_preds * mask).sum(dim=1) / gene_mask_sum  # (B, T)
-            alt_mean = (alt_preds_aligned * mask).sum(dim=1) / gene_mask_sum  # (B, T)
+            # Mean over masked positions via the shared aggregation primitive
+            # (identical to (pred*mask).sum(1)/mask.sum(); non-empty mask guaranteed above).
+            gene_mask_col = gene_mask.unsqueeze(-1).to(ref_preds.dtype)  # (S, 1)
+            ref_mean = aggregate_intervals(ref_preds, gene_mask_col, reduce="mean").squeeze(1)  # (B, T)
+            alt_mean = aggregate_intervals(alt_preds_aligned, gene_mask_col, reduce="mean").squeeze(1)
 
             # Active score: max(mean(ref), mean(alt))
             active_scores = torch.maximum(ref_mean, alt_mean)

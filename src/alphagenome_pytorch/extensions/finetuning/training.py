@@ -651,6 +651,89 @@ def _cuda_sync(device: torch.device) -> None:
         torch.cuda.synchronize()
 
 
+def _unpack_batch(batch_data) -> tuple:
+    """Unpack a ``collate_multimodal`` batch into ``(sequences, targets, extras)``.
+
+    ``collate_multimodal`` yields a 2-tuple ``(sequences, modality_targets)`` or a
+    3-tuple with a trailing ``extras`` dict (``{"gene_mask", "coords"}``). This
+    normalizes both to a 3-tuple with ``extras`` defaulting to an empty dict.
+    """
+    if len(batch_data) == 3:
+        sequences, modality_targets, extras = batch_data
+    else:
+        sequences, modality_targets = batch_data
+        extras = {}
+    return sequences, modality_targets, extras
+
+
+def _accumulate_gene_expr_windows(
+    windows: list,
+    *,
+    pred_unscaled: Tensor,
+    targets: Tensor,
+    coords: list,
+    annotation: Any,
+    track_strands: list[str] | None,
+    window_cache: dict | None = None,
+) -> None:
+    """Append per-window ``(gene_ids, pred[G,C], obs[G,C])`` for the val metric.
+
+    For each window in the batch, build exon masks (≥50%-exon rule, strand-matched
+    to ``track_strands``) and aggregate log-mean exon coverage for the predicted
+    and observed RNA-seq signal. Windows with no qualifying gene are skipped.
+    ``window_cache`` (a plain dict reused across batches and epochs) memoizes the
+    per-window annotation lookup so it runs once per unique window, and lets the
+    pred and obs calls of a window share it.
+    """
+    from alphagenome_pytorch.aggregation import gene_expression_values
+
+    batch_size = pred_unscaled.shape[0]
+    for b in range(batch_size):
+        interval = tuple(coords[b])
+        pred_vals, gene_ids, _ = gene_expression_values(
+            pred_unscaled[b], annotation, interval,
+            log="log1p", track_strands=track_strands, window_cache=window_cache,
+        )
+        if pred_vals.numel() == 0:
+            continue
+        obs_vals, _, _ = gene_expression_values(
+            targets[b], annotation, interval,
+            log="log1p", track_strands=track_strands, window_cache=window_cache,
+        )
+        windows.append((gene_ids, pred_vals.float().cpu(), obs_vals.float().cpu()))
+
+
+def _gene_expr_metrics(
+    gene_expr_windows: list,
+    *,
+    modality: str,
+    world_size: int = 1,
+) -> dict[str, float]:
+    """Reduce accumulated per-window ``(gene_ids, pred, obs)`` to Fig. 2d metrics.
+
+    Gathers windows across ranks (DDP), deduplicates genes, and returns the three
+    correlation flavors plus the gene count under ``{modality}_gene_log_expr_*``
+    keys. Pure given ``gene_expr_windows`` (the ``world_size == 1`` path needs no
+    distributed context), so it is unit-testable without a model.
+    """
+    from alphagenome_pytorch.aggregation import combine_gene_expression
+
+    all_windows = gene_expr_windows
+    if world_size > 1:
+        gathered: list = [None] * world_size
+        dist.all_gather_object(gathered, gene_expr_windows)
+        all_windows = [w for part in gathered if part for w in part]
+
+    ge = combine_gene_expression(all_windows)
+    prefix = f"{modality}_gene_log_expr_pearson"
+    return {
+        f"{prefix}_across_genes": ge["across_genes"],
+        f"{prefix}_across_genes_norm": ge["across_genes_norm"],
+        f"{prefix}_across_tracks_norm": ge["across_tracks_norm"],
+        f"{modality}_gene_log_expr_n_genes": ge["n_genes"],
+    }
+
+
 def _compute_multinomial_resolution(
     seq_len: int,
     num_segments: int = NUM_SEGMENTS,
@@ -1313,13 +1396,11 @@ def train_epoch_multihead(
     gene_loss_weights = gene_loss_weights or {}
 
     for batch_idx, batch_data in enumerate(pbar):
-        # Dataset returns 3-tuple when gene_mask is configured, else 2-tuple.
-        if len(batch_data) == 3:
-            sequences, modality_targets, gene_mask = batch_data
+        # collate_multimodal yields an optional extras dict (gene_mask/coords).
+        sequences, modality_targets, extras = _unpack_batch(batch_data)
+        gene_mask = extras.get("gene_mask")
+        if gene_mask is not None:
             gene_mask = gene_mask.to(device)
-        else:
-            sequences, modality_targets = batch_data
-            gene_mask = None
 
         is_profiling = do_profile and batch_idx < profile_batches
 
@@ -1593,6 +1674,11 @@ def validate_multihead(
     world_size: int = 1,
     encoder_only: bool = False,
     organism: int = 0,
+    gene_annotation: Any = None,
+    gene_expr_track_strands: list[str] | None = None,
+    gene_expr_modality: str = "rna_seq",
+    gene_expr_resolution: int = 1,
+    gene_expr_window_cache: dict | None = None,
 ) -> tuple[float, dict[str, Any]]:
     """Validate model with multiple modality heads.
 
@@ -1613,6 +1699,24 @@ def validate_multihead(
         world_size: Total number of processes.
         encoder_only: If True, run only the CNN encoder and pass raw encoder output
             (B, S//128, 1536) to all heads as resolution 128.
+        gene_annotation: Optional ``GeneAnnotation`` (with exon rows) enabling the
+            paper's Fig. 2d gene-expression validation metric for
+            ``gene_expr_modality``. When set (and ``compute_pearson``), per-window
+            log-mean exon coverage is aggregated for predictions and observed
+            targets, deduplicated across windows, and three Pearson correlations
+            are emitted: ``{modality}_gene_log_expr_pearson_{across_genes,
+            across_genes_norm, across_tracks_norm}``.
+        gene_expr_track_strands: Per-track strand chars (``'+'/'-'/'.'``) for
+            ``gene_expr_modality``, used for sense-strand matching. Required for a
+            correct metric when tracks are stranded.
+        gene_expr_modality: Modality the gene-expression metric applies to
+            (default ``"rna_seq"``).
+        gene_expr_resolution: Resolution at which to compute the metric
+            (default ``1`` bp, matching the paper).
+        gene_expr_window_cache: Optional dict reused across epochs to memoize the
+            per-window exon-mask lookup (the only pandas-heavy step). Create once
+            in the training driver and pass it every epoch so each validation
+            window's gene selection is built exactly once for the whole run.
 
     Returns:
         Tuple of (avg_total_loss, metrics_dict).
@@ -1637,13 +1741,23 @@ def validate_multihead(
     accumulated_pred_counts: dict[str, dict[int, list[Tensor]]] = {m: defaultdict(list) for m in heads}
     accumulated_true_counts: dict[str, dict[int, list[Tensor]]] = {m: defaultdict(list) for m in heads}
 
+    # For the exon-based gene-expression metric: per-window (gene_ids, pred, obs).
+    gene_expr_enabled = (
+        gene_annotation is not None
+        and compute_pearson
+        and gene_expr_modality in heads
+    )
+    gene_expr_windows: list[tuple[list[str], Tensor, Tensor]] = []
+
     if is_main_process(rank):
         pbar = tqdm(val_loader, desc="Validation")
     else:
         pbar = val_loader
 
     with torch.no_grad():
-        for sequences, modality_targets in pbar:
+        for batch_data in pbar:
+            sequences, modality_targets, extras = _unpack_batch(batch_data)
+            coords = extras.get("coords")
             sequences = sequences.to(device)
             organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
@@ -1728,6 +1842,23 @@ def validate_multihead(
                         accumulated_pred_counts[modality][res].append(pred_unscaled.sum(dim=1).float().cpu())
                         accumulated_true_counts[modality][res].append(targets.sum(dim=1).float().cpu())
 
+                        # Exon-based gene-expression metric (paper Fig. 2d).
+                        if (
+                            gene_expr_enabled
+                            and modality == gene_expr_modality
+                            and res == gene_expr_resolution
+                            and coords is not None
+                        ):
+                            _accumulate_gene_expr_windows(
+                                gene_expr_windows,
+                                pred_unscaled=pred_unscaled,
+                                targets=targets,
+                                coords=coords,
+                                annotation=gene_annotation,
+                                track_strands=gene_expr_track_strands,
+                                window_cache=gene_expr_window_cache,
+                            )
+
                 weighted_modality_loss = modality_loss * modality_weight
                 loss = loss + weighted_modality_loss
                 modality_loss_accum[modality] += modality_loss.item()
@@ -1777,6 +1908,13 @@ def validate_multihead(
                         metrics[f"{modality}_{res}bp_count_pearson_r"] = count_r.mean().item()
                     else:
                         metrics[f"{modality}_{res}bp_count_pearson_r"] = float("nan")
+
+    # Exon-based gene-expression metric (paper Fig. 2d): gather per-window
+    # (gene_ids, pred, obs) across ranks, dedup genes, and emit three Pearsons.
+    if gene_expr_enabled:
+        metrics.update(_gene_expr_metrics(
+            gene_expr_windows, modality=gene_expr_modality, world_size=world_size,
+        ))
 
     return avg_loss, metrics
 
@@ -1888,13 +2026,11 @@ def train_epoch_sequence_parallel(
     gene_loss_weights = gene_loss_weights or {}
 
     for batch_idx, batch_data in enumerate(pbar):
-        # Dataset returns 3-tuple when gene_mask is configured, else 2-tuple.
-        if len(batch_data) == 3:
-            sequences, modality_targets, gene_mask = batch_data
+        # collate_multimodal yields an optional extras dict (gene_mask/coords).
+        sequences, modality_targets, extras = _unpack_batch(batch_data)
+        gene_mask = extras.get("gene_mask")
+        if gene_mask is not None:
             gene_mask = gene_mask.to(device)
-        else:
-            sequences, modality_targets = batch_data
-            gene_mask = None
         sequences = sequences.to(device)
         organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 

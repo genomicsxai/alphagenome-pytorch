@@ -438,6 +438,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
 
+    # Gene-expression validation metric (paper Fig. 2d) for the rna_seq head.
+    gene_eval = parser.add_argument_group("Gene expression eval")
+    gene_eval.add_argument(
+        "--gene-expr-eval",
+        action="store_true",
+        help=(
+            "Report the paper's Fig. 2d gene-expression correlations for the "
+            "rna_seq head each validation epoch: log-transformed mean coverage "
+            "over annotated exons, strand-matched, keeping genes with >=50%% of "
+            "their exons in-window. Emits rna_seq_gene_log_expr_pearson_* keys. "
+            "Requires an annotation with exon rows (--gene-expr-annotation or "
+            "--gtf) and rna_seq strands (--track-strands / config)."
+        ),
+    )
+    gene_eval.add_argument(
+        "--gene-expr-annotation",
+        type=str,
+        default=None,
+        help=(
+            "Annotation for --gene-expr-eval: a parquet (fast, recommended) or "
+            "GTF/GFF (slow, needs pyranges) that INCLUDES exon rows. If unset, "
+            "falls back to --gtf. Unlike --gtf's gene-only table (gene LFC loss), "
+            "this needs exon features."
+        ),
+    )
+
     # Model arguments
     model = parser.add_argument_group("Model")
     model.add_argument("--pretrained-weights", type=str, required=False, help="Pretrained weights .pth")
@@ -708,8 +734,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "track_strands",
         "gene_loss_weight",
         "gene_cross_track_weight",
+        "gene_expr_annotation",
     ):
         _apply_config_scalar(attr, config_data)
+
+    if "--gene-expr-eval" not in cli_flags and "gene_expr_eval" in config_data:
+        args.gene_expr_eval = bool(config_data["gene_expr_eval"])
 
     # Boolean aliases / migration-friendly keys
     if "--no-amp" not in cli_flags:
@@ -869,6 +899,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error(
                 "--gene-loss-weight > 0 requires per-track strand info for "
                 "rna_seq. Pass --track-strands or set "
+                "modalities.rna_seq.strand in the config."
+            )
+
+    # Validate gene-expression-eval config consistency.
+    if getattr(args, "gene_expr_eval", False):
+        if not (args.gene_expr_annotation or args.gtf):
+            parser.error(
+                "--gene-expr-eval requires an annotation with exon rows: pass "
+                "--gene-expr-annotation (parquet/GTF) or --gtf."
+            )
+        if "rna_seq" not in args.modality_to_bigwigs:
+            parser.error(
+                "--gene-expr-eval requires rna_seq in --modality / config; "
+                f"got modalities: {sorted(args.modality_to_bigwigs)}"
+            )
+        if "rna_seq" not in args.modality_strands:
+            parser.error(
+                "--gene-expr-eval requires per-track strand info for rna_seq "
+                "(sense-strand matching). Pass --track-strands or set "
                 "modalities.rna_seq.strand in the config."
             )
 
@@ -1421,6 +1470,24 @@ def main(args: argparse.Namespace | None = None) -> None:
     # Create datasets
     train_dataset, val_dataset, modality_track_names, modality_resolutions = create_datasets(args, rank)
 
+    # Optional gene-expression validation metric (paper Fig. 2d) for rna_seq.
+    # Load a GeneAnnotation WITH exon rows (decoupled from --gene-loss-weight,
+    # which only needs a gene-only body table) and stream per-window coords to
+    # the val loop so it can build exon masks.
+    gene_expr_annotation = None
+    gene_expr_track_strands = None
+    # Per-window exon-mask cache, created once and reused every val epoch so the
+    # pandas-heavy gene lookup runs once per window for the whole run.
+    gene_expr_window_cache: dict = {}
+    if getattr(args, "gene_expr_eval", False):
+        from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+
+        ann_path = args.gene_expr_annotation or args.gtf
+        print_rank0(f"Loading annotation for gene-expression eval: {ann_path}", rank)
+        gene_expr_annotation = GeneAnnotation(ann_path)
+        gene_expr_track_strands = list(args.modality_strands["rna_seq"])
+        val_dataset.return_coords = True
+
     # Optional rich track metadata (overrides BigWig stems with parquet names
     # and embeds the catalog into checkpoints / exported delta weights).
     modality_track_names, track_metadata_rows = load_track_metadata_for_finetune(
@@ -1815,6 +1882,9 @@ def main(args: argparse.Namespace | None = None) -> None:
                 world_size=world_size,
                 encoder_only=encoder_only,
                 organism=organism_index,
+                gene_annotation=gene_expr_annotation,
+                gene_expr_track_strands=gene_expr_track_strands,
+                gene_expr_window_cache=gene_expr_window_cache,
             )
 
             # Synchronize CUDA to ensure all validation ops complete before next epoch

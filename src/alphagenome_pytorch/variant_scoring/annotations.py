@@ -61,7 +61,14 @@ class GeneAnnotation:
         self.annotation_path = Path(annotation_path)
         self._df: pd.DataFrame | None = None
         self._gene_index: dict[str, GeneInfo] = {}
+        # Exon coordinates by (versionless) gene id. Built once, lazily, in a
+        # single groupby pass — see `_get_exons_for_gene`.
         self._exon_cache: dict[str, list[tuple[int, int]]] = {}
+        self._exon_index_built: bool = False
+        # Per-chromosome start-sorted gene index for fast interval overlap
+        # queries; built lazily in `get_genes_in_interval`.
+        self._interval_index: dict[str, dict[str, Any]] | None = None
+        self._max_gene_span: int = 0
 
         # Detect file format
         suffix = self.annotation_path.suffix.lower()
@@ -140,43 +147,46 @@ class GeneAnnotation:
                 strand=row.get('Strand', '.'),
             )
 
-    def _get_exons_for_gene(self, gene_id: str) -> list[tuple[int, int]]:
-        """Get exon coordinates for a gene.
+    @staticmethod
+    def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """Sort and merge overlapping/adjacent (start, end) intervals."""
+        if not intervals:
+            return []
+        intervals = sorted(intervals)
+        merged = [intervals[0]]
+        for start, end in intervals[1:]:
+            if start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
 
-        Args:
-            gene_id: Gene ID (without version)
+    def _build_exon_index(self) -> None:
+        """Index merged exon coordinates by versionless gene id in one pass.
 
-        Returns:
-            List of (start, end) tuples for exons (0-based coordinates)
+        Replaces per-gene full-frame filtering: a single ``groupby`` over the
+        exon rows populates ``_exon_cache`` for every gene at once, so
+        ``_get_exons_for_gene`` is O(1) even on a cold cache. Built lazily the
+        first time exons are requested, so gene-only consumers never pay for it.
         """
-        if gene_id in self._exon_cache:
-            return self._exon_cache[gene_id]
-
-        # Filter for exons of this gene
-        # Match both versioned and unversioned gene IDs
         exons_df = self.df[self.df['Feature'] == 'exon']
-        exons_df = exons_df[exons_df['gene_id'].str.split('.').str[0] == gene_id]
+        if not exons_df.empty:
+            # Group exon (start, end) pairs by versionless gene id, then merge.
+            base_ids = exons_df['gene_id'].str.split('.').str[0].to_numpy()
+            starts = exons_df['Start'].astype(int).to_numpy()
+            ends = exons_df['End'].astype(int).to_numpy()
+            by_gene: dict[str, list[tuple[int, int]]] = {}
+            for gid, s, e in zip(base_ids, starts, ends):
+                by_gene.setdefault(gid, []).append((int(s), int(e)))
+            for gid, ivals in by_gene.items():
+                self._exon_cache[gid] = self._merge_intervals(ivals)
+        self._exon_index_built = True
 
-        exons = []
-        for _, row in exons_df.iterrows():
-            # Coordinates are 0-based
-            start = int(row['Start'])
-            end = int(row['End'])
-            exons.append((start, end))
-
-        # Merge overlapping exons
-        if exons:
-            exons.sort()
-            merged = [exons[0]]
-            for start, end in exons[1:]:
-                if start <= merged[-1][1]:
-                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-                else:
-                    merged.append((start, end))
-            exons = merged
-
-        self._exon_cache[gene_id] = exons
-        return exons
+    def _get_exons_for_gene(self, gene_id: str) -> list[tuple[int, int]]:
+        """Get merged exon coordinates for a gene (0-based (start, end) tuples)."""
+        if not self._exon_index_built:
+            self._build_exon_index()
+        return self._exon_cache.get(gene_id, [])
 
     def get_gene_info(self, gene_id: str) -> dict[str, Any] | None:
         """Get information for a gene.
@@ -221,32 +231,73 @@ class GeneAnnotation:
         Returns:
             List of gene IDs (without version)
         """
-        # Ensure index is built by accessing df
-        _ = self.df
+        import bisect
 
-        genes = []
-        chrom = interval.chromosome
+        if self._interval_index is None:
+            self._build_interval_index()
 
-        for gene_id, info in self._gene_index.items():
-            # Check chromosome match (handle chr prefix)
-            if info.chromosome != chrom:
-                if info.chromosome == 'chr' + chrom or chrom == 'chr' + info.chromosome:
-                    pass  # Match with chr prefix difference
-                else:
-                    continue
-
-            # Check overlap
-            if info.end <= interval.start or info.start >= interval.end:
+        genes: list[tuple[int, str]] = []  # (insertion_rank, gene_id)
+        for key in self._matching_chrom_keys(interval.chromosome):
+            entry = self._interval_index.get(key)
+            if entry is None:
                 continue
+            starts = entry['starts']
+            ends = entry['ends']
+            ids = entry['ids']
+            ranks = entry['ranks']
+            # An overlapping gene has start < interval.end and start >=
+            # interval.start - max_gene_span (any gene starting earlier than that
+            # cannot reach into the interval). Bisect both bounds on the
+            # start-sorted array, then filter end > interval.start.
+            lo = bisect.bisect_left(starts, interval.start - self._max_gene_span)
+            hi = bisect.bisect_left(starts, interval.end)
+            for i in range(lo, hi):
+                if ends[i] <= interval.start:
+                    continue  # start < interval.end already guaranteed
+                if gene_types is not None:
+                    if self._gene_index[ids[i]].gene_type not in gene_types:
+                        continue
+                genes.append((ranks[i], ids[i]))
 
-            # Check gene type if specified
-            if gene_types is not None:
-                if info.gene_type not in gene_types:
-                    continue
+        # Preserve the original _gene_index insertion order of the results.
+        genes.sort()
+        return [gid for _, gid in genes]
 
-            genes.append(gene_id)
+    def _matching_chrom_keys(self, chrom: str) -> list[str]:
+        """Index keys matching a query chromosome, tolerating 'chr' prefix diffs.
 
-        return genes
+        Mirrors the original overlap check: a gene on chromosome ``K`` matches a
+        query ``Q`` when ``K == Q``, ``K == 'chr'+Q``, or ``Q == 'chr'+K``.
+        """
+        keys = {chrom, 'chr' + chrom}
+        if chrom.startswith('chr'):
+            keys.add(chrom[3:])
+        return list(keys)
+
+    def _build_interval_index(self) -> None:
+        """Per-chromosome, start-sorted gene arrays for O(log G + k) overlap."""
+        _ = self.df  # ensure gene index is built
+        by_chrom: dict[str, list[tuple[int, int, str, int]]] = {}
+        max_span = 0
+        for rank, (gene_id, info) in enumerate(self._gene_index.items()):
+            by_chrom.setdefault(info.chromosome, []).append(
+                (info.start, info.end, gene_id, rank)
+            )
+            span = info.end - info.start
+            if span > max_span:
+                max_span = span
+
+        index: dict[str, dict[str, Any]] = {}
+        for chrom, entries in by_chrom.items():
+            entries.sort(key=lambda e: e[0])  # by start
+            index[chrom] = {
+                'starts': [e[0] for e in entries],
+                'ends': [e[1] for e in entries],
+                'ids': [e[2] for e in entries],
+                'ranks': [e[3] for e in entries],
+            }
+        self._interval_index = index
+        self._max_gene_span = max_span
 
     def get_genes_overlapping_variant(
         self,
@@ -313,31 +364,40 @@ class GeneAnnotation:
         Returns:
             Boolean mask tensor of shape (seq_length,) where True = exonic
         """
-        gene_id_base = gene_id.split('.')[0]
-        exons = self._get_exons_for_gene(gene_id_base)
-
         mask = torch.zeros(seq_length, dtype=torch.bool, device=device)
+        for bin_start, bin_end in self.get_exon_bin_ranges(
+            gene_id, interval, resolution, seq_length
+        ):
+            mask[bin_start:bin_end] = True
+        return mask
 
+    def get_exon_bin_ranges(
+        self,
+        gene_id: str,
+        interval: 'Interval',
+        resolution: int,
+        seq_length: int,
+    ) -> list[tuple[int, int]]:
+        """Exonic ``[bin_start, bin_end)`` ranges for a gene within an interval.
+
+        The compact form underlying :meth:`get_exon_mask` — a few int pairs per
+        gene instead of a dense ``[seq_length]`` tensor. Cheap to cache and to
+        rebuild a mask from (see ``aggregation._ExonWindow``).
+        """
+        exons = self._get_exons_for_gene(gene_id.split('.')[0])
+        ranges: list[tuple[int, int]] = []
         for exon_start, exon_end in exons:
-            # Convert to interval-relative coordinates
+            # Interval-relative coordinates
             rel_start = max(0, exon_start - interval.start)
             rel_end = min(interval.width, exon_end - interval.start)
-
             if rel_start >= interval.width or rel_end <= 0:
                 continue
-
-            # Convert to bin coordinates
-            bin_start = rel_start // resolution
-            bin_end = (rel_end + resolution - 1) // resolution  # Ceiling division
-
-            # Clamp to sequence length
-            bin_start = max(0, min(bin_start, seq_length))
-            bin_end = max(0, min(bin_end, seq_length))
-
+            # Bin coordinates (ceiling division on the end), clamped.
+            bin_start = max(0, min(rel_start // resolution, seq_length))
+            bin_end = max(0, min((rel_end + resolution - 1) // resolution, seq_length))
             if bin_start < bin_end:
-                mask[bin_start:bin_end] = True
-
-        return mask
+                ranges.append((bin_start, bin_end))
+        return ranges
 
     def get_gene_mask(
         self,
