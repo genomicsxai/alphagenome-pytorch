@@ -169,6 +169,9 @@ class GeneAnnotation:
         ``_get_exons_for_gene`` is O(1) even on a cold cache. Built lazily the
         first time exons are requested, so gene-only consumers never pay for it.
         """
+        if 'Feature' not in self.df.columns:
+            self._exon_index_built = True
+            return
         exons_df = self.df[self.df['Feature'] == 'exon']
         if not exons_df.empty:
             # Group exon (start, end) pairs by versionless gene id, then merge.
@@ -187,6 +190,12 @@ class GeneAnnotation:
         if not self._exon_index_built:
             self._build_exon_index()
         return self._exon_cache.get(gene_id, [])
+
+    def has_exon_annotations(self) -> bool:
+        """True if the annotation contains any exon rows (needed for exon masks)."""
+        if not self._exon_index_built:
+            self._build_exon_index()
+        return bool(self._exon_cache)
 
     def get_gene_info(self, gene_id: str) -> dict[str, Any] | None:
         """Get information for a gene.

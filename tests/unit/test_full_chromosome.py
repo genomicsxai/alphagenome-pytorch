@@ -385,6 +385,37 @@ class TestStitchingWithMockModel:
         assert counts["ENSX"] == pytest.approx(3.0)  # 3 exon bins, all-A -> 1.0 each
         assert counts["ENSY"] == pytest.approx(3.0)  # reconstructed across the tile seam
 
+    def test_gene_counts_anndata_requires_exon_rows(self):
+        """over='exons' with a gene-only annotation errors up front, not after inference."""
+        import pandas as pd
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            predict_full_chromosomes_to_anndata,
+            GenomeSequenceProvider,
+        )
+        from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+
+        chrom_len = 131072
+        config = TilingConfig(crop_bp=0, resolution=128, batch_size=1)
+        model = self._MockModel(resolution=128, n_tracks=1)
+        provider = self._build_in_memory_provider(GenomeSequenceProvider, chrom_len)
+        # Gene-only annotation: no exon rows.
+        ann = GeneAnnotation("/tmp/does_not_exist.parquet")
+        ann._df = pd.DataFrame([
+            dict(Feature="gene", Chromosome="chr1", Start=256, End=640, Strand="+",
+                 gene_id="ENSX", gene_name="X", gene_type="protein_coding"),
+        ])
+        ann._build_gene_index()
+
+        kwargs = dict(chromosomes=["chr1"], config=config, track_indices=[0],
+                      device="cpu", show_progress=False)
+        with pytest.raises(ValueError, match="exon rows"):
+            predict_full_chromosomes_to_anndata(model, provider, ann, "atac",
+                                                over="exons", **kwargs)
+        # gene_body works with the same gene-only annotation.
+        gc = predict_full_chromosomes_to_anndata(model, provider, ann, "atac",
+                                                 over="gene_body", **kwargs)
+        assert list(gc.gene_metadata["gene_id"]) == ["ENSX"]
+
     def test_gene_counts_anndata_write_path(self, tmp_path):
         """End-to-end: write .h5ad and read it back; check orientation + metadata."""
         import pandas as pd

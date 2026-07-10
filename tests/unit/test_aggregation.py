@@ -475,3 +475,25 @@ def test_accumulator_strand_and_track_metadata():
     g = gc.gene_metadata.index[gc.gene_metadata["gene_id"] == "ENSG"][0]  # '+' gene
     assert not torch.isnan(gc.counts[0, g, 0])       # '+' track kept
     assert torch.isnan(gc.counts[0, g, 1])           # '-' track NaN'd
+
+
+# --------------------------------------------------------------------------- #
+# strand-label validation (API must agree with the CLI)
+# --------------------------------------------------------------------------- #
+def test_gene_expression_values_rejects_invalid_strand_labels():
+    ann = _make_annotation()
+    pred = _position_preds()  # 3 tracks
+    with pytest.raises(ValueError, match="track strands must be"):
+        gene_expression_values(pred, ann, INTERVAL, track_strands=["plus", "-", "."])
+
+
+def test_gene_expression_match_rejects_invalid_track_metadata_strand():
+    ann = _make_annotation()
+    pred = _position_preds()
+    bad_tracks = [
+        TrackMetadata(0, "rna_seq", 0, "t0", {"strand": "+"}),
+        TrackMetadata(1, "rna_seq", 0, "t1", {"strand": "?"}),   # invalid
+        TrackMetadata(2, "rna_seq", 0, "t2", {"strand": "."}),
+    ]
+    with pytest.raises(ValueError, match="track strands must be"):
+        gene_expression(pred, ann, INTERVAL, track_metadata=bad_tracks, strand="match")

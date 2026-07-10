@@ -359,6 +359,17 @@ def _track_metadata_frame(
     return pd.DataFrame([t.to_dict() for t in track_metadata])
 
 
+def _validate_track_strands(strands: "Sequence[str]") -> None:
+    """Reject strand labels outside ``{'+', '-', '.'}``.
+
+    Unknown labels (``'plus'``, ``'?'``, …) would otherwise be silently treated as
+    strand-incompatible by the matching logic, producing all-NaN gene rows.
+    """
+    invalid = sorted({str(s) for s in strands if str(s) not in ("+", "-", ".")})
+    if invalid:
+        raise ValueError(f"track strands must be '+', '-', or '.'; got invalid {invalid}")
+
+
 def _track_strands(track_frame: "pd.DataFrame") -> list[str]:
     if "strand" not in track_frame.columns:
         raise ValueError(
@@ -366,7 +377,9 @@ def _track_strands(track_frame: "pd.DataFrame") -> list[str]:
             "(none found). Pass track_metadata with per-track strand, or use "
             "strand=None."
         )
-    return [str(s) for s in track_frame["strand"].tolist()]
+    strands = [str(s) for s in track_frame["strand"].tolist()]
+    _validate_track_strands(strands)
+    return strands
 
 
 def _apply_strand(
@@ -795,6 +808,7 @@ def _strand_match_values(
         )
     gs = list(gene_strands)
     ts = [str(t) for t in track_strands]
+    _validate_track_strands(ts)
     compat = torch.ones(len(gs), len(ts), dtype=torch.bool)
     for gi, g in enumerate(gs):
         for ci, t in enumerate(ts):

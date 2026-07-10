@@ -567,6 +567,8 @@ def _build_track_frame(track_indices, track_names=None, track_strands=None):
         if len(track_strands) != n:
             raise ValueError(f"track_strands has {len(track_strands)} entries but "
                              f"{n} tracks are being aggregated.")
+        from ...aggregation import _validate_track_strands
+        _validate_track_strands(track_strands)
         data["strand"] = [str(s) for s in track_strands]
     return pd.DataFrame(data)
 
@@ -646,6 +648,12 @@ def predict_full_chromosomes_to_anndata(
         annotation_path if isinstance(annotation_path, GeneAnnotation)
         else GeneAnnotation(annotation_path)
     )
+    if over == "exons" and not annotation.has_exon_annotations():
+        raise ValueError(
+            "over='exons' needs an annotation with exon rows, but none were found "
+            f"in {annotation_path!r}. Provide a GTF/parquet that includes exon "
+            "features, or use over='gene_body'."
+        )
     accumulator = GeneCountAccumulator(
         annotation, resolution=config.resolution, over=over, reduce=reduce,
     )
