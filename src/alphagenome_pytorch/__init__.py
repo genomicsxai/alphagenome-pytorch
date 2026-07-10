@@ -33,6 +33,7 @@ from .aggregation import (
     normalize_expression,
     gene_expression_correlations,
     GeneCounts,
+    GeneCountAccumulator,
 )
 
 __all__ = [
@@ -46,4 +47,5 @@ __all__ = [
     'normalize_expression',
     'gene_expression_correlations',
     'GeneCounts',
+    'GeneCountAccumulator',
 ]

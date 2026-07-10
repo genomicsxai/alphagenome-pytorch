@@ -1,6 +1,6 @@
 """Unit tests for the gene / interval aggregation module.
 
-Covers the shared primitive, the Fig. 2d correlation helpers, and the two
+Covers the shared primitive, the gene-expression correlation helpers, and the two
 serving helpers (`aggregate_genes` gene-body, `gene_expression` exon-based),
 plus the `GeneCounts` converters. Uses dependency-free toy fixtures (no pyranges,
 no bigwigs).
@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from alphagenome_pytorch.aggregation import (
+    GeneCountAccumulator,
     GeneCounts,
     aggregate_genes,
     aggregate_intervals,
@@ -69,7 +70,7 @@ def _make_annotation():
              gene_id="ENSGB", gene_name="B", gene_type="protein_coding"),
         dict(Feature="exon", Chromosome="chr1", Start=110, End=116, Strand="-",
              gene_id="ENSGB", gene_name="B", gene_type="protein_coding"),
-        # geneC : mostly outside interval — total exon 20bp, only 2bp inside -> dropped by >=50% rule
+        # geneC : 0 of its 2 exons fall fully within [100,120) -> dropped by the >=50% count rule
         dict(Feature="gene", Chromosome="chr1", Start=118, End=200, Strand="+",
              gene_id="ENSGC", gene_name="C", gene_type="protein_coding"),
         dict(Feature="exon", Chromosome="chr1", Start=118, End=128, Strand="+",
@@ -203,6 +204,42 @@ def test_gene_expression_exon_log_and_50pct_rule():
     assert ge.counts[0, row, 0].item() == pytest.approx(math.log1p(4.5), abs=1e-5)
 
 
+def test_gene_expression_50pct_rule_counts_contained_exons_not_basepairs():
+    """The >=50% rule counts whole exons *contained* in the interval, not bases.
+
+    ENSKEEP: 1 tiny in-window exon + 1 large out-of-window exon -> base-pair
+    fraction ~2% (the old rule dropped it) but 1/2 = 50% of exons are contained,
+    so the count rule keeps it. ENSDROP: 1 contained exon + a boundary-straddling
+    exon + 1 fully-outside exon -> only 1/3 contained (< 50%), so it is dropped;
+    the straddling exon is contained in neither side and does not count.
+    """
+    interval = ("chr1", 100, 120)
+    rows = [
+        dict(Feature="gene", Chromosome="chr1", Start=101, End=230, Strand="+",
+             gene_id="ENSKEEP", gene_name="K", gene_type="protein_coding"),
+        dict(Feature="exon", Chromosome="chr1", Start=101, End=103, Strand="+",
+             gene_id="ENSKEEP", gene_name="K", gene_type="protein_coding"),   # contained
+        dict(Feature="exon", Chromosome="chr1", Start=130, End=230, Strand="+",
+             gene_id="ENSKEEP", gene_name="K", gene_type="protein_coding"),   # outside
+        dict(Feature="gene", Chromosome="chr1", Start=104, End=127, Strand="+",
+             gene_id="ENSDROP", gene_name="D", gene_type="protein_coding"),
+        dict(Feature="exon", Chromosome="chr1", Start=104, End=106, Strand="+",
+             gene_id="ENSDROP", gene_name="D", gene_type="protein_coding"),   # contained
+        dict(Feature="exon", Chromosome="chr1", Start=118, End=122, Strand="+",
+             gene_id="ENSDROP", gene_name="D", gene_type="protein_coding"),   # straddles 120
+        dict(Feature="exon", Chromosome="chr1", Start=125, End=127, Strand="+",
+             gene_id="ENSDROP", gene_name="D", gene_type="protein_coding"),   # outside
+    ]
+    ann = GeneAnnotation("/tmp/does_not_exist.parquet")
+    ann._df = pd.DataFrame(rows)
+    ann._build_gene_index()
+
+    _, gene_ids, _ = gene_expression_values(
+        torch.ones(1, 20, 1), ann, interval, track_strands=None
+    )
+    assert gene_ids == ["ENSKEEP"]
+
+
 def test_gene_expression_linear_and_strand_default_match():
     pred = _position_preds()
     ann = _make_annotation()
@@ -326,3 +363,115 @@ def test_gene_expression_values_window_cache_reuse():
     # A different window adds a distinct cache entry.
     gene_expression_values(pred, ann, ("chr1", 100_000, 100_020), window_cache=cache)
     assert len(cache) == 2
+
+
+# --------------------------------------------------------------------------- #
+# GeneCountAccumulator (whole-chromosome streaming aggregation)
+# --------------------------------------------------------------------------- #
+def _two_tile_annotation():
+    """geneG spans two tiles; geneH lives only in the second tile.
+
+    geneG(+): exons [2,4) (tile A) and [12,15) (tile B); body [2,15).
+    geneH(-): exon [16,18) (tile B only); body [16,18).
+    """
+    rows = [
+        dict(Feature="gene", Chromosome="chr1", Start=2, End=15, Strand="+",
+             gene_id="ENSG", gene_name="G", gene_type="protein_coding"),
+        dict(Feature="exon", Chromosome="chr1", Start=2, End=4, Strand="+",
+             gene_id="ENSG", gene_name="G", gene_type="protein_coding"),
+        dict(Feature="exon", Chromosome="chr1", Start=12, End=15, Strand="+",
+             gene_id="ENSG", gene_name="G", gene_type="protein_coding"),
+        dict(Feature="gene", Chromosome="chr1", Start=16, End=18, Strand="-",
+             gene_id="ENSH", gene_name="H", gene_type="protein_coding"),
+        dict(Feature="exon", Chromosome="chr1", Start=16, End=18, Strand="-",
+             gene_id="ENSH", gene_name="H", gene_type="protein_coding"),
+    ]
+    ann = GeneAnnotation("/tmp/does_not_exist.parquet")
+    ann._df = pd.DataFrame(rows)
+    ann._build_gene_index()
+    return ann
+
+
+def _coord_preds(start, end, n_tracks=1):
+    """[n_bins, n_tracks] where every track's value == the genomic position."""
+    pos = torch.arange(start, end, dtype=torch.float32)
+    return torch.stack([pos for _ in range(n_tracks)], dim=-1)
+
+
+def test_accumulator_sum_reconstructs_gene_across_tiles():
+    ann = _two_tile_annotation()
+    acc = GeneCountAccumulator(ann, resolution=1, over="exons", reduce="sum")
+    # Tile A = genomic [0,10), tile B = [10,20); values == genomic position.
+    acc.add_tile(_coord_preds(0, 10), "chr1", 0, 10)
+    acc.add_tile(_coord_preds(10, 20), "chr1", 10, 20)
+
+    gc = acc.to_gene_counts()
+    assert list(gc.gene_metadata["gene_id"]) == ["ENSG", "ENSH"]  # first-seen order
+    g = gc.gene_metadata.index[gc.gene_metadata["gene_id"] == "ENSG"][0]
+    # geneG exon signal: tile A [2,4)->2+3=5 ; tile B [12,15)->12+13+14=39 ; total 44.
+    assert gc.counts[0, g, 0].item() == pytest.approx(44.0)
+    h = gc.gene_metadata.index[gc.gene_metadata["gene_id"] == "ENSH"][0]
+    assert gc.counts[0, h, 0].item() == pytest.approx(16.0 + 17.0)
+
+
+def test_accumulator_mean_and_log():
+    ann = _two_tile_annotation()
+    acc = GeneCountAccumulator(ann, resolution=1, over="exons", reduce="mean")
+    acc.add_tile(_coord_preds(0, 10), "chr1", 0, 10)
+    acc.add_tile(_coord_preds(10, 20), "chr1", 10, 20)
+    gc = acc.to_gene_counts(log=True)
+    g = gc.gene_metadata.index[gc.gene_metadata["gene_id"] == "ENSG"][0]
+    # mean over 5 exon bases = 44/5 = 8.8 ; then log1p.
+    assert gc.space == "log"
+    assert gc.counts[0, g, 0].item() == pytest.approx(math.log1p(44.0 / 5.0), abs=1e-5)
+
+
+def test_accumulator_gene_body_includes_introns():
+    ann = _two_tile_annotation()
+    acc = GeneCountAccumulator(ann, resolution=1, over="gene_body", reduce="sum")
+    acc.add_tile(_coord_preds(0, 10), "chr1", 0, 10)
+    acc.add_tile(_coord_preds(10, 20), "chr1", 10, 20)
+    gc = acc.to_gene_counts()
+    g = gc.gene_metadata.index[gc.gene_metadata["gene_id"] == "ENSG"][0]
+    # body [2,15): sum of positions 2..14 == 104 (includes the [4,12) intron).
+    assert gc.counts[0, g, 0].item() == pytest.approx(sum(range(2, 15)))
+
+
+def test_accumulator_merges_bins_shared_by_exons_at_128bp():
+    """Two exons landing in the same 128bp bin must not double-count that bin."""
+    rows = [
+        dict(Feature="gene", Chromosome="chr1", Start=10, End=150, Strand="+",
+             gene_id="ENSG", gene_name="G", gene_type="protein_coding"),
+        dict(Feature="exon", Chromosome="chr1", Start=10, End=20, Strand="+",
+             gene_id="ENSG", gene_name="G", gene_type="protein_coding"),   # -> bin 0
+        dict(Feature="exon", Chromosome="chr1", Start=30, End=40, Strand="+",
+             gene_id="ENSG", gene_name="G", gene_type="protein_coding"),   # -> bin 0 (shared)
+        dict(Feature="exon", Chromosome="chr1", Start=140, End=150, Strand="+",
+             gene_id="ENSG", gene_name="G", gene_type="protein_coding"),   # -> bin 1
+    ]
+    ann = GeneAnnotation("/tmp/does_not_exist.parquet")
+    ann._df = pd.DataFrame(rows)
+    ann._build_gene_index()
+    preds = torch.tensor([[5.0], [7.0]])  # [2 bins, 1 track]: bin0=5, bin1=7
+
+    acc = GeneCountAccumulator(ann, resolution=128, over="exons", reduce="sum")
+    acc.add_tile(preds, "chr1", 0, 256)  # 2 bins x 128bp
+    # bin0 counted once despite two exons in it: 5 + 7 = 12 (not 5 + 5 + 7).
+    assert acc.to_gene_counts().counts[0, 0, 0].item() == pytest.approx(12.0)
+
+    acc_mean = GeneCountAccumulator(ann, resolution=128, over="exons", reduce="mean")
+    acc_mean.add_tile(preds, "chr1", 0, 256)
+    # mean over 2 distinct bins = 6.0 (not 17/3 from counting bin0 twice).
+    assert acc_mean.to_gene_counts().counts[0, 0, 0].item() == pytest.approx(6.0)
+
+
+def test_accumulator_strand_and_track_metadata():
+    ann = _two_tile_annotation()
+    acc = GeneCountAccumulator(ann, resolution=1, over="exons", reduce="sum")
+    acc.add_tile(_coord_preds(0, 10, n_tracks=2), "chr1", 0, 10)
+    acc.add_tile(_coord_preds(10, 20, n_tracks=2), "chr1", 10, 20)
+    track_frame = pd.DataFrame({"track_index": [0, 1], "strand": ["+", "-"]})
+    gc = acc.to_gene_counts(track_metadata=track_frame, strand="match")
+    g = gc.gene_metadata.index[gc.gene_metadata["gene_id"] == "ENSG"][0]  # '+' gene
+    assert not torch.isnan(gc.counts[0, g, 0])       # '+' track kept
+    assert torch.isnan(gc.counts[0, g, 1])           # '-' track NaN'd

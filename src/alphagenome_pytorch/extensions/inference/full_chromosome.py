@@ -232,6 +232,99 @@ def _generate_tiles(
     return tiles
 
 
+def _resolve_head_config(model, head: str, resolution: int) -> dict:
+    """Resolve a head's ``{num_tracks, resolutions}`` and validate ``resolution``.
+
+    Introspects the model's live heads first (finetuned/custom heads), falling
+    back to the hardcoded ``HEAD_CONFIGS`` for stock pretrained heads.
+    """
+    _inner = getattr(model, '_orig_mod', model)  # unwrap torch.compile
+    heads = getattr(_inner, 'heads', None)
+    head_module = heads[head] if heads is not None and head in heads else None
+
+    if head_module is not None:
+        head_config = {
+            'num_tracks': head_module.num_tracks,
+            'resolutions': list(head_module.resolutions),
+        }
+    elif head in HEAD_CONFIGS:
+        head_config = HEAD_CONFIGS[head]
+    else:
+        available = list(heads.keys()) if heads is not None else list(HEAD_CONFIGS.keys())
+        raise ValueError(f"Unknown head: {head}. Available: {available}")
+
+    if resolution not in head_config['resolutions']:
+        raise ValueError(
+            f"Head '{head}' does not support resolution {resolution}. "
+            f"Supported: {head_config['resolutions']}"
+        )
+    return head_config
+
+
+def _iter_tile_predictions(
+    model,
+    genome: "GenomeSequenceProvider",
+    chrom: str,
+    head: str,
+    config: TilingConfig,
+    track_indices: list[int],
+    output_length: int,
+    *,
+    organism_index: int = 0,
+    device: str | torch.device = "cuda",
+    show_progress: bool = True,
+):
+    """Yield ``(out_start_res, kept_preds)`` for each tile's kept central region.
+
+    ``kept_preds`` is a ``[n_bins, n_tracks]`` float32 ndarray for output-resolution
+    positions ``[out_start_res, out_start_res + n_bins)``, clamped to the chromosome
+    and with the ``config.crop_bp`` edges removed. Shared by the BigWig and
+    gene-count output paths.
+    """
+    tiles = _generate_tiles(genome.chrom_sizes[chrom], config)
+    if not tiles:
+        return
+    model.eval()
+    device = torch.device(device)
+
+    n_batches = (len(tiles) + config.batch_size - 1) // config.batch_size
+    iterator = range(0, len(tiles), config.batch_size)
+    if show_progress:
+        iterator = tqdm(iterator, total=n_batches, desc=f"Predicting {chrom}")
+
+    for batch_start in iterator:
+        batch_tiles = tiles[batch_start:batch_start + config.batch_size]
+
+        sequences = [genome.fetch(chrom, ws, we) for ws, we, _, _ in batch_tiles]
+        batch_seq = torch.tensor(np.stack(sequences), device=device)
+        batch_org = torch.tensor(
+            [organism_index] * len(batch_tiles), device=device, dtype=torch.long
+        )
+
+        with torch.no_grad():
+            preds = model.predict(
+                batch_seq, batch_org,
+                resolutions=(config.resolution,), heads=(head,),
+            )
+
+        # (batch, seq_len_at_res, n_tracks)
+        head_preds = preds[head][config.resolution][:, :, track_indices].cpu().numpy()
+        del preds, batch_seq, batch_org
+
+        for i, (window_start, window_end, keep_start, keep_end) in enumerate(batch_tiles):
+            keep_start_res = keep_start // config.resolution
+            keep_end_res = keep_end // config.resolution
+            genome_pos = (window_start + keep_start) // config.resolution
+
+            out_start = max(0, genome_pos)
+            out_end = min(output_length, genome_pos + (keep_end_res - keep_start_res))
+            pred_start = keep_start_res + (out_start - genome_pos)
+            pred_end = pred_start + (out_end - out_start)
+
+            if out_start < out_end:
+                yield out_start, head_preds[i, pred_start:pred_end]
+
+
 def predict_full_chromosome(
     model,
     genome: GenomeSequenceProvider | str | Path,
@@ -262,31 +355,7 @@ def predict_full_chromosome(
     """
     config = config or TilingConfig()
 
-    # Validate head — introspect the model first, fall back to hardcoded
-    # HEAD_CONFIGS for pretrained heads.
-    _inner = getattr(model, '_orig_mod', model)  # unwrap torch.compile
-    heads = getattr(_inner, 'heads', None)
-    head_module = heads[head] if heads is not None and head in heads else None
-
-    if head_module is not None:
-        head_config = {
-            'num_tracks': head_module.num_tracks,
-            'resolutions': list(head_module.resolutions),
-        }
-    elif head in HEAD_CONFIGS:
-        head_config = HEAD_CONFIGS[head]
-    else:
-        available = list(heads.keys()) if heads is not None else list(HEAD_CONFIGS.keys())
-        raise ValueError(
-            f"Unknown head: {head}. "
-            f"Available: {available}"
-        )
-
-    if config.resolution not in head_config['resolutions']:
-        raise ValueError(
-            f"Head '{head}' does not support resolution {config.resolution}. "
-            f"Supported: {head_config['resolutions']}"
-        )
+    head_config = _resolve_head_config(model, head, config.resolution)
 
     # Setup genome provider
     if isinstance(genome, (str, Path)):
@@ -307,78 +376,22 @@ def predict_full_chromosome(
     # Initialize output array
     predictions = np.zeros((output_length, n_output_tracks), dtype=np.float32)
 
-    # Generate tiles
     tiles = _generate_tiles(chrom_length, config)
-
     if len(tiles) == 0:
         return predictions
 
-    # Process in batches
-    model.eval()
-    device = torch.device(device)
-
-    n_batches = (len(tiles) + config.batch_size - 1) // config.batch_size
-
     if show_progress:
-        output_mb = predictions.nbytes / 1e6
+        n_batches = (len(tiles) + config.batch_size - 1) // config.batch_size
         print(f"  Tiles: {len(tiles)}, Batches: {n_batches}")
-        print(f"  Output array: {output_mb:.1f} MB ({output_length:,} x {n_output_tracks} float32)")
+        print(f"  Output array: {predictions.nbytes / 1e6:.1f} MB "
+              f"({output_length:,} x {n_output_tracks} float32)")
 
-    iterator = range(0, len(tiles), config.batch_size)
-    if show_progress:
-        iterator = tqdm(iterator, total=n_batches, desc=f"Predicting {chrom}")
-
-    for batch_start in iterator:
-        batch_tiles = tiles[batch_start:batch_start + config.batch_size]
-
-        # Extract sequences
-        sequences = []
-        for window_start, window_end, _, _ in batch_tiles:
-            seq = genome.fetch(chrom, window_start, window_end)
-            sequences.append(seq)
-
-        # Stack and predict
-        batch_seq = torch.tensor(np.stack(sequences), device=device)
-        batch_org = torch.tensor(
-            [organism_index] * len(batch_tiles),
-            device=device,
-            dtype=torch.long,
-        )
-
-        with torch.no_grad():
-            preds = model.predict(
-                batch_seq,
-                batch_org,
-                resolutions=(config.resolution,),
-                heads=(head,),
-            )
-
-        # Extract predictions for the requested head
-        # Output shape: (batch, seq_len_at_res, n_tracks)
-        head_preds = preds[head][config.resolution]
-        head_preds = head_preds[:, :, track_indices].cpu().numpy()
-
-        del preds, batch_seq, batch_org
-
-        # Place kept regions into output
-        for i, (window_start, window_end, keep_start, keep_end) in enumerate(batch_tiles):
-            # Convert to output resolution
-            keep_start_res = keep_start // config.resolution
-            keep_end_res = keep_end // config.resolution
-
-            # Genomic position of kept region start (at output resolution)
-            genome_pos = (window_start + keep_start) // config.resolution
-
-            # Handle edges
-            out_start = max(0, genome_pos)
-            out_end = min(output_length, genome_pos + (keep_end_res - keep_start_res))
-
-            # Corresponding indices in the prediction
-            pred_start = keep_start_res + (out_start - genome_pos)
-            pred_end = pred_start + (out_end - out_start)
-
-            if out_start < out_end:
-                predictions[out_start:out_end] = head_preds[i, pred_start:pred_end]
+    # Stitch each tile's kept region into the full-chromosome array.
+    for out_start, kept in _iter_tile_predictions(
+        model, genome, chrom, head, config, track_indices, output_length,
+        organism_index=organism_index, device=device, show_progress=show_progress,
+    ):
+        predictions[out_start:out_start + kept.shape[0]] = kept
 
     return predictions
 
@@ -537,3 +550,124 @@ def predict_full_chromosomes_to_bigwig(
         print(f"  Wrote {len(written)} file(s): {[p.name for p in written]}")
 
     return results
+
+
+def _build_track_frame(track_indices, track_names=None, track_strands=None):
+    """A ``[C]``-row track-metadata DataFrame for the AnnData ``obs`` table."""
+    import pandas as pd
+
+    n = len(track_indices)
+    data: dict = {"track_index": list(track_indices)}
+    if track_names is not None:
+        if len(track_names) != n:
+            raise ValueError(f"track_names has {len(track_names)} entries but "
+                             f"{n} tracks are being aggregated.")
+        data["track_name"] = list(track_names)
+    if track_strands is not None:
+        if len(track_strands) != n:
+            raise ValueError(f"track_strands has {len(track_strands)} entries but "
+                             f"{n} tracks are being aggregated.")
+        data["strand"] = [str(s) for s in track_strands]
+    return pd.DataFrame(data)
+
+
+def predict_full_chromosomes_to_anndata(
+    model,
+    fasta_path: str | Path,
+    annotation_path: str | Path,
+    head: str,
+    *,
+    output_path: str | Path | None = None,
+    chromosomes: list[str] | None = None,
+    config: TilingConfig | None = None,
+    track_indices: list[int] | None = None,
+    track_names: list[str] | None = None,
+    track_strands: list[str] | None = None,
+    over: str = "exons",
+    reduce: str = "sum",
+    log: bool = False,
+    strand: str | None = None,
+    organism_index: int = 0,
+    device: str | torch.device = "cuda",
+    show_progress: bool = True,
+):
+    """Aggregate whole-chromosome predictions into a per-gene × per-track table.
+
+    Tiles each chromosome, streams every tile's predictions through a
+    :class:`~alphagenome_pytorch.aggregation.GeneCountAccumulator`, and returns a
+    single :class:`~alphagenome_pytorch.aggregation.GeneCounts` (``.to_anndata()``
+    for an AnnData).
+
+    Args:
+        model: loaded AlphaGenome model.
+        fasta_path: reference genome FASTA (or a prebuilt provider).
+        annotation_path: GTF/parquet gene annotation (or a prebuilt
+            ``GeneAnnotation``); needs exon rows when ``over="exons"``.
+        head: prediction head (e.g. ``"rna_seq"``).
+        output_path: optional ``.h5ad`` to write (via ``GeneCounts.to_anndata``).
+        chromosomes: default ``chr1..22, chrX``.
+        config: :class:`TilingConfig` (use ``crop_bp`` to trim edge artifacts).
+        track_indices / track_names / track_strands: track subset + labels; strands
+            are required for ``strand="match"``.
+        over: ``"exons"`` (default) or ``"gene_body"``.
+        reduce: ``"sum"`` (default, count-like) or ``"mean"``.
+        log: if True, apply ``log1p`` after the reduce.
+        strand: ``None``/``"match"``/``"merge"`` post-processing.
+
+    Returns:
+        A :class:`GeneCounts` with ``B == 1`` (whole run collapsed to one table).
+    """
+    from ...aggregation import GeneCountAccumulator
+    from ...variant_scoring.annotations import GeneAnnotation
+
+    config = config or TilingConfig()
+    if chromosomes is None:
+        chromosomes = [f"chr{i}" for i in range(1, 23)] + ["chrX"]
+
+    # `fasta_path` / `annotation_path` accept prebuilt objects too (handy for tests
+    # and for reusing an already-loaded genome / annotation).
+    if isinstance(fasta_path, GenomeSequenceProvider):
+        genome = fasta_path
+    else:
+        genome = GenomeSequenceProvider(fasta_path, chromosomes=set(chromosomes), cache=True)
+    chromosomes = [c for c in chromosomes if c in genome.chrom_sizes]
+    if not chromosomes:
+        raise ValueError("No valid chromosomes found in genome")
+
+    head_config = _resolve_head_config(model, head, config.resolution)
+    if track_indices is None:
+        track_indices = list(range(head_config['num_tracks']))
+
+    # Build (and length-validate) the track-metadata frame up front, so a
+    # track_names / track_strands mismatch fails now instead of after inference.
+    track_frame = _build_track_frame(track_indices, track_names, track_strands)
+
+    annotation = (
+        annotation_path if isinstance(annotation_path, GeneAnnotation)
+        else GeneAnnotation(annotation_path)
+    )
+    accumulator = GeneCountAccumulator(
+        annotation, resolution=config.resolution, over=over, reduce=reduce,
+    )
+
+    print(f"Aggregating {head} over {over} for {len(chromosomes)} chromosomes: {chromosomes}")
+    for chrom in chromosomes:
+        print(f"\nProcessing {chrom}...")
+        output_length = genome.chrom_sizes[chrom] // config.resolution
+        for out_start, kept in _iter_tile_predictions(
+            model, genome, chrom, head, config, track_indices, output_length,
+            organism_index=organism_index, device=device, show_progress=show_progress,
+        ):
+            start_bp = out_start * config.resolution
+            end_bp = start_bp + kept.shape[0] * config.resolution
+            accumulator.add_tile(kept, chrom, start_bp, end_bp)
+        print(f"  Genes so far: {accumulator.n_genes}")
+
+    gene_counts = accumulator.to_gene_counts(track_metadata=track_frame, log=log, strand=strand)
+
+    if output_path is not None:
+        adata = gene_counts.to_anndata()
+        adata.write_h5ad(str(output_path))
+        print(f"\nWrote AnnData ({adata.shape[0]} tracks x {adata.shape[1]} genes) to {output_path}")
+
+    return gene_counts

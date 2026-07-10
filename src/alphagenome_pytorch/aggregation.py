@@ -8,14 +8,14 @@ Two user-facing helpers build on the primitive:
 
 * :func:`aggregate_genes` — loss-style **gene-body** counts (exons + introns),
   mirroring the training gene-LFC aggregation. Linear space.
-* :func:`gene_expression` — the AlphaGenome paper's Fig. 2d quantity:
+* :func:`gene_expression` — gene-expression:
   **log-transformed mean coverage over a gene's annotated exons**, strand-matched,
   keeping genes with ≥50% of their exons inside the interval.
 
 Both return a :class:`GeneCounts` object with torch-native data plus DataFrame /
 AnnData converters. The correlation helpers (:func:`normalize_expression`,
-:func:`gene_expression_correlations`) implement the three Fig. 2d flavors and are
-reused by the fine-tuning validation metric.
+:func:`gene_expression_correlations`) implement the three gene-expression
+correlation flavors and are reused by the fine-tuning validation metric.
 
 Design notes
 ------------
@@ -49,6 +49,7 @@ __all__ = [
     "normalize_expression",
     "gene_expression_correlations",
     "GeneCounts",
+    "GeneCountAccumulator",
     "aggregate_genes",
     "gene_expression",
     "gene_expression_values",
@@ -104,7 +105,7 @@ def aggregate_intervals(
 
 
 # --------------------------------------------------------------------------- #
-# Correlation helpers (Fig. 2d)
+# Correlation helpers (gene-expression)
 # --------------------------------------------------------------------------- #
 def _nan_pearson(pred: Tensor, obs: Tensor, dim: int, eps: float = 1e-8) -> Tensor:
     """Pearson correlation over ``dim``, ignoring entries where either is NaN.
@@ -140,10 +141,10 @@ def _nan_pearson(pred: Tensor, obs: Tensor, dim: int, eps: float = 1e-8) -> Tens
 def normalize_expression(matrix: Tensor) -> Tensor:
     """Quantile-normalize across genes per track, then gene-mean-center.
 
-    Implements the AlphaGenome Fig. 2d normalization for the *specificity*
-    panels: for each track (column) the gene values are quantile-normalized
-    across genes to a common reference (the mean of the per-column sorted
-    values); then each gene's (row) mean across tracks is subtracted.
+    Implements the AlphaGenome *specificity* normalization: for each track
+    (column) the gene values are quantile-normalized across genes to a common
+    reference (the mean of the per-column sorted values); then each gene's (row)
+    mean across tracks is subtracted.
 
     Args:
         matrix: ``[G, C]`` gene × track expression (no NaN). Genes are rows.
@@ -176,7 +177,7 @@ def gene_expression_correlations(
     *,
     eps: float = 1e-8,
 ) -> dict[str, float]:
-    """The three AlphaGenome Fig. 2d gene-expression correlations.
+    """The three AlphaGenome gene-expression correlations.
 
     Args:
         pred: ``[G, C]`` predicted (log-space) gene × track expression.
@@ -186,11 +187,10 @@ def gene_expression_correlations(
 
     Returns:
         Dict with mean correlations:
-          * ``across_genes`` — raw, per-track across genes (Fig. 2d left)
+          * ``across_genes`` — raw, per-track across genes
           * ``across_genes_norm`` — quantile-normalized + gene-mean-centered,
-            per-track across genes (middle)
+            per-track across genes
           * ``across_tracks_norm`` — same normalized data, per-gene across tracks
-            (right)
     """
     if pred.shape != obs.shape:
         raise ValueError(f"pred {tuple(pred.shape)} and obs {tuple(obs.shape)} must match")
@@ -329,8 +329,8 @@ class GeneCounts:
             import anndata
         except ImportError:
             raise ImportError(
-                "anndata is required for AnnData output. "
-                "Install with: pip install anndata"
+                "anndata is required for AnnData output. Install with: "
+                "pip install anndata  (or pip install 'alphagenome-pytorch[inference-anndata]')"
             )
         x, obs, var = self.to_tables()
         obs = obs.copy()
@@ -420,7 +420,7 @@ def _merge_strand_pairs(counts: Tensor, track_frame: "pd.DataFrame"):
             order.append(key)
         groups[key].append(ci)
 
-    merged = torch.zeros(b, g, len(order), dtype=counts.dtype)
+    merged = counts.new_zeros(b, g, len(order))  # preserve device + dtype
     new_rows = []
     for out_i, key in enumerate(order):
         idxs = groups[key]
@@ -491,7 +491,7 @@ def aggregate_genes(
 
 
 # --------------------------------------------------------------------------- #
-# gene_expression — exon-based, log-space (paper Fig. 2d)
+# gene_expression — exon-based, log-space
 # --------------------------------------------------------------------------- #
 def gene_expression(
     predictions: Tensor,
@@ -504,7 +504,7 @@ def gene_expression(
     min_exon_fraction: float = 0.5,
     reduce: str = "mean",
 ) -> GeneCounts:
-    """AlphaGenome Fig. 2d gene expression: log mean coverage over annotated exons.
+    """AlphaGenome gene expression: log mean coverage over annotated exons.
 
     Args:
         predictions: ``[B, S, C]`` (or ``[S, C]``) RNA-seq tensor in experimental
@@ -516,9 +516,10 @@ def gene_expression(
         log: ``"log1p"`` (default), ``"log"``, or ``None`` for linear.
         strand: default ``"match"`` (sense-strand expression). Same modes as
             :func:`aggregate_genes`.
-        min_exon_fraction: keep a gene only if at least this fraction of its total
-            exonic bases falls inside the interval (paper: ≥50%).
-        reduce: ``"mean"`` (paper) or ``"sum"``.
+        min_exon_fraction: keep a gene only if at least this fraction of its
+            annotated exons fall fully within the interval — a count of whole
+            exons, not a base-pair fraction.
+        reduce: ``"mean"`` (default) or ``"sum"``.
     """
     per_gene = _exon_expression_matrix(
         predictions, annotation, interval,
@@ -612,9 +613,13 @@ def _build_exon_window(
         exons = annotation._get_exons_for_gene(base)
         if not exons:
             continue
-        total_bp = sum(e - s for s, e in exons)
-        in_bp = sum(max(0, min(e, end) - max(s, start)) for s, e in exons)
-        if total_bp <= 0 or (in_bp / total_bp) < min_exon_fraction:
+        # Keep a gene when at least ``min_exon_fraction`` of its annotated exons
+        # fall fully within the interval — a count of whole contained exons, not a
+        # base-pair fraction. "Exons" here are the gene's *merged* exonic blocks
+        # (overlapping/adjacent records collapsed across transcripts by
+        # ``_get_exons_for_gene``), not raw GTF exon rows.
+        n_within = sum(1 for s, e in exons if s >= start and e <= end)
+        if (n_within / len(exons)) < min_exon_fraction:
             continue
         ranges = annotation.get_exon_bin_ranges(gid, iv, resolution, seq_len)
         if not ranges:
@@ -749,8 +754,8 @@ def gene_expression_values(
 
     Returns ``(values, gene_ids, gene_strands)`` where ``values`` is ``[G, C]``
     (log-space by default). If ``track_strands`` is given, strand-incompatible
-    ``(gene, track)`` cells are set to NaN (sense-strand matching, as in the
-    paper). ``resolution`` is informational here; the interval width and the
+    ``(gene, track)`` cells are set to NaN (sense-strand matching).
+    ``resolution`` is informational here; the interval width and the
     prediction sequence length determine the true bin size.
 
     Args:
@@ -804,11 +809,11 @@ def combine_gene_expression(
     *,
     eps: float = 1e-8,
 ) -> dict[str, float]:
-    """Combine per-window ``(gene_ids, pred[G,C], obs[G,C])`` into Fig. 2d metrics.
+    """Combine per-window ``(gene_ids, pred[G,C], obs[G,C])`` into gene-expression correlations.
 
-    Genes are deduplicated by id across windows (first occurrence wins, matching
-    the paper's "avoid duplicate genes across test intervals"). Returns the three
-    correlation flavors plus ``n_genes``.
+    Genes are deduplicated by id across windows (first occurrence wins), avoiding
+    duplicate genes across overlapping windows. Returns the three correlation
+    flavors plus ``n_genes``.
     """
     seen: dict[str, int] = {}
     pred_rows: list[Tensor] = []
@@ -834,6 +839,171 @@ def combine_gene_expression(
     result = gene_expression_correlations(pred_m, obs_m, eps=eps)
     result["n_genes"] = len(pred_rows)
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Whole-chromosome streaming accumulator (tiled inference -> gene counts)
+# --------------------------------------------------------------------------- #
+class GeneCountAccumulator:
+    """Accumulate per-gene counts from tiled whole-chromosome predictions.
+
+    Feed each tile's predictions with their genomic coordinates via
+    :meth:`add_tile`; the signal over each gene's exons (or gene body) is summed
+    (or averaged) into a running ``[gene, track]`` matrix. A gene whose exons span
+    several tiles is summed across all of them. Call :meth:`to_gene_counts` for a
+    :class:`GeneCounts` (``.to_anndata()`` for an AnnData).
+
+    Args:
+        annotation: a :class:`GeneAnnotation`; exon rows required for
+            ``over="exons"``.
+        resolution: bp per prediction bin (1 or 128).
+        over: ``"exons"`` (default) or ``"gene_body"``.
+        reduce: ``"sum"`` (default, count-like) or ``"mean"`` (length-normalized).
+    """
+
+    def __init__(
+        self,
+        annotation: "GeneAnnotation",
+        *,
+        resolution: int,
+        over: str = "exons",
+        reduce: str = "sum",
+    ) -> None:
+        if over not in ("exons", "gene_body"):
+            raise ValueError(f"over must be 'exons' or 'gene_body', got {over!r}")
+        if reduce not in ("sum", "mean"):
+            raise ValueError(f"reduce must be 'sum' or 'mean', got {reduce!r}")
+        self.annotation = annotation
+        self.resolution = int(resolution)
+        self.over = over
+        self.reduce = reduce
+        self.n_tracks: int | None = None
+        self._sum: dict[str, Any] = {}     # base gene id -> np.ndarray [n_tracks] running sum
+        self._len: dict[str, float] = {}   # base gene id -> total masked bins (for mean)
+        self._meta: dict[str, dict] = {}   # base gene id -> gene metadata row
+        self._order: list[str] = []        # first-seen gene order
+
+    @property
+    def n_genes(self) -> int:
+        return len(self._order)
+
+    def add_tile(self, preds, chrom: str, start: int, end: int) -> None:
+        """Accumulate one tile's kept-region predictions.
+
+        Args:
+            preds: ``[n_bins, n_tracks]`` predictions covering genomic
+                ``[start, end)`` at ``self.resolution`` (``n_bins == (end-start)
+                // resolution``). Tensor or ndarray.
+            chrom, start, end: genomic span of ``preds`` (0-based half-open,
+                resolution-aligned).
+        """
+        import numpy as np
+        from .variant_scoring.types import Interval
+
+        arr = preds.detach().cpu().numpy() if isinstance(preds, Tensor) else np.asarray(preds)
+        if arr.ndim != 2:
+            raise ValueError(f"preds must be [n_bins, n_tracks], got {arr.shape}")
+        n_bins, c = arr.shape
+        if self.n_tracks is None:
+            self.n_tracks = c
+        elif c != self.n_tracks:
+            raise ValueError(f"tile has {c} tracks but accumulator holds {self.n_tracks}")
+
+        iv = Interval(chrom, start, end)
+        for gid in self.annotation.get_genes_in_interval(iv):
+            if self.over == "exons":
+                ranges = self.annotation.get_exon_bin_ranges(gid, iv, self.resolution, n_bins)
+            else:
+                ranges = self._body_bin_ranges(gid, start, end, n_bins)
+            if not ranges:
+                continue
+            # Merge overlapping/adjacent bin ranges so a bin shared by two exons
+            # (e.g. exons split by a short intron under coarse resolution) is
+            # counted once, not once per exon.
+            signal = np.zeros(c, dtype=np.float64)
+            length = 0
+            for b0, b1 in self.annotation._merge_intervals(ranges):
+                signal += arr[b0:b1].sum(axis=0)
+                length += b1 - b0
+            if length == 0:
+                continue
+            base = gid.split(".")[0]
+            if base not in self._sum:
+                self._order.append(base)
+                self._sum[base] = np.zeros(c, dtype=np.float64)
+                self._len[base] = 0.0
+                self._meta[base] = self._gene_meta_row(gid, base)
+            self._sum[base] += signal
+            self._len[base] += length
+
+    def _body_bin_ranges(self, gid: str, start: int, end: int, n_bins: int):
+        """Single ``[bin_start, bin_end)`` range for a gene body within the tile."""
+        info = self.annotation.get_gene_info(gid)
+        if not info or info.get("start") is None or info.get("end") is None:
+            return []
+        res, width = self.resolution, end - start
+        rel_start = max(0, int(info["start"]) - start)
+        rel_end = min(width, int(info["end"]) - start)
+        if rel_start >= width or rel_end <= 0:
+            return []
+        b0 = max(0, min(rel_start // res, n_bins))
+        b1 = max(0, min((rel_end + res - 1) // res, n_bins))
+        return [(b0, b1)] if b0 < b1 else []
+
+    def _gene_meta_row(self, gid: str, base: str) -> dict:
+        info = self.annotation.get_gene_info(gid) or {}
+        return {
+            "gene_id": info.get("gene_id", base),
+            "gene_name": info.get("gene_name"),
+            "gene_type": info.get("gene_type"),
+            "strand": info.get("strand", "."),
+            "Start": info.get("start"),
+            "End": info.get("end"),
+        }
+
+    def to_gene_counts(
+        self,
+        *,
+        track_metadata: "Sequence[TrackMetadata] | pd.DataFrame | None" = None,
+        log: bool = False,
+        strand: str | None = None,
+    ) -> GeneCounts:
+        """Finalize accumulated signal into a single-interval :class:`GeneCounts`.
+
+        Args:
+            track_metadata: per-track metadata (``TrackMetadata`` sequence or a
+                ready ``[C]``-row DataFrame) for the ``obs`` table and strand logic.
+            log: if True, apply ``log1p`` after the reduce.
+            strand: ``None``/``"match"``/``"merge"`` post-processing on the
+                ``[gene × track]`` matrix (see :func:`aggregate_genes`).
+        """
+        import pandas as pd
+
+        ids = self._order
+        c = self.n_tracks or 0
+        counts = torch.zeros(1, len(ids), c, dtype=torch.float32)
+        for gi, base in enumerate(ids):
+            s = torch.from_numpy(self._sum[base]).float()
+            counts[0, gi] = s / max(self._len[base], 1.0) if self.reduce == "mean" else s
+        if log:
+            counts = torch.log1p(counts)
+
+        if isinstance(track_metadata, pd.DataFrame):
+            track_frame = track_metadata.reset_index(drop=True)
+        else:
+            track_frame = _track_metadata_frame(track_metadata, c)
+        gene_frame = (
+            pd.DataFrame([self._meta[b] for b in ids]) if ids
+            else pd.DataFrame(columns=_GENE_FRAME_COLUMNS)
+        )
+        gene_strands = [self._meta[b]["strand"] for b in ids]
+        counts, track_frame = _apply_strand(counts, gene_strands, track_frame, strand)
+        return GeneCounts(
+            counts=counts,
+            gene_metadata=gene_frame,
+            track_metadata=track_frame,
+            space="log" if log else "linear",
+        )
 
 
 # --------------------------------------------------------------------------- #

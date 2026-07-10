@@ -41,6 +41,18 @@ Examples:
         --resolution 1 \\
         --batch-size 2
 
+    # Per-gene RNA-seq count matrix (AnnData) by summing exon signal
+    python scripts/predict_full_chromosome.py \\
+        --model model.pth \\
+        --fasta hg38.fa \\
+        --output predictions/ \\
+        --head rna_seq \\
+        --resolution 1 --crop-bp 16384 \\
+        --anndata rna_seq_gene_counts.h5ad \\
+        --annotation gencode.v46.parquet \\
+        --aggregate-over exons --aggregate-func sum \\
+        --chromosomes chr20,chr21
+
     # Finetuned model with delta checkpoint
     python scripts/predict_full_chromosome.py \\
         --model pretrained.pth \\
@@ -87,12 +99,57 @@ def main():
     parser.add_argument(
         "--output",
         required=True,
-        help="Output directory for BigWig files",
+        help="Directory for output files such as BigWig files",
     )
     parser.add_argument(
         "--head",
         required=True,
         help="Prediction head to use (e.g., 'atac', 'dnase', or a custom finetuned head name)",
+    )
+
+    # Gene-count / AnnData output (aggregate signal into a per-gene x per-track table)
+    gene_out = parser.add_argument_group("Gene-count AnnData output")
+    gene_out.add_argument(
+        "--anndata",
+        type=str,
+        default=None,
+        help="Write a per-gene x per-track AnnData with this filename in --output, by "
+             "summing whole-chromosome signal over each gene's exons (or body), instead "
+             "of BigWig. Requires --annotation.",
+    )
+    gene_out.add_argument(
+        "--annotation",
+        type=str,
+        default=None,
+        help="GTF/parquet gene annotation for --anndata. Needs exon rows when "
+             "--aggregate-over exons (the default).",
+    )
+    gene_out.add_argument(
+        "--aggregate-over",
+        choices=["exons", "gene-body"],
+        default="exons",
+        help="Aggregate signal over each gene's exons (default) or its full gene body.",
+    )
+    gene_out.add_argument(
+        "--aggregate-func",
+        choices=["sum", "mean", "log-mean"],
+        default="sum",
+        help="AnnData X value: raw sum / counts (default), length-normalized mean, "
+             "or log1p(mean) (log-mean exon expression).",
+    )
+    gene_out.add_argument(
+        "--gene-strand",
+        choices=["all", "match"],
+        default="all",
+        help="Strand handling for the gene x track matrix: 'all' keeps every track "
+             "(dense, default); 'match' NaNs strand-incompatible cells (needs --track-strands).",
+    )
+    gene_out.add_argument(
+        "--track-strands",
+        type=str,
+        default=None,
+        help="Per-track strand chars ('+','-','.') for --gene-strand match, one per output "
+             "track. Accepts compact ('+-+-') or separated ('+,-,+,-') form.",
     )
 
     # Track selection
@@ -227,6 +284,27 @@ def main():
         print(f"Error: Transfer config not found: {args.transfer_config}", file=sys.stderr)
         sys.exit(1)
 
+    # Validate gene-count AnnData options.
+    if args.anndata:
+        if not args.annotation:
+            parser.error("--anndata requires --annotation (a GTF/parquet with exon rows)")
+        if not Path(args.annotation).exists():
+            print(f"Error: Annotation not found: {args.annotation}", file=sys.stderr)
+            sys.exit(1)
+        if args.gene_strand == "match" and not args.track_strands:
+            parser.error("--gene-strand match requires --track-strands")
+        # Fail fast (before the model load) if the AnnData deps aren't installed.
+        import importlib.util
+        ann_suffix = Path(args.annotation).suffix.lower()
+        engine = "pyranges" if ann_suffix in (".gtf", ".gff", ".gff3") else "pyarrow"
+        missing = [m for m in ("pandas", "anndata", engine)
+                   if importlib.util.find_spec(m) is None]
+        if missing:
+            parser.error(
+                f"--anndata needs {', '.join(missing)} (not installed). Install with: "
+                "pip install 'alphagenome-pytorch[inference-anndata]'"
+            )
+
     # Parse track indices
     track_indices = None
     if args.tracks:
@@ -236,6 +314,14 @@ def main():
     track_names = None
     if args.track_names:
         track_names = [t.strip() for t in args.track_names.split(",")]
+
+    # Parse per-track strands for --gene-strand match (compact or separated form).
+    track_strands = None
+    if args.track_strands:
+        track_strands = [c for c in args.track_strands if c not in ", \t"]
+        invalid = sorted({c for c in track_strands if c not in "+-."})
+        if invalid:
+            parser.error(f"--track-strands has invalid characters {invalid}; use only + - .")
 
     # Parse chromosomes
     chromosomes = None
@@ -249,6 +335,7 @@ def main():
     from alphagenome_pytorch.extensions.inference import (
         TilingConfig,
         predict_full_chromosomes_to_bigwig,
+        predict_full_chromosomes_to_anndata,
     )
 
     # Configure dtype policy
@@ -294,6 +381,10 @@ def main():
                 track_names = ckpt_track_names.get(args.head)
             else:
                 track_names = ckpt_track_names
+            # Checkpoint names cover the full head; subset to the selected tracks
+            # (explicit --track-names already describes only the selected tracks).
+            if track_names is not None and track_indices is not None:
+                track_names = [track_names[i] for i in track_indices]
     else:
         # Standard pretrained model (existing behavior)
         print(f"Loading model from {model_path}...")
@@ -335,26 +426,49 @@ def main():
     print(f"  Resolution: {config.resolution} bp")
     print(f"  Batch size: {config.batch_size}")
 
-    # Run prediction
+    # Run prediction. --anndata produces the gene-count table; otherwise BigWig.
     print(f"\nPredicting head '{args.head}'...")
 
-    results = predict_full_chromosomes_to_bigwig(
-        model=model,
-        fasta_path=str(fasta_path),
-        output_dir=args.output,
-        head=args.head,
-        chromosomes=chromosomes,
-        config=config,
-        track_indices=track_indices,
-        track_names=track_names,
-        organism_index=args.organism,
-        device=args.device,
-        show_progress=not args.quiet,
-    )
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Summary
-    total_files = sum(len(paths) for paths in results.values())
-    print(f"\nDone! Wrote {total_files} BigWig file(s) to {args.output}")
+    if args.anndata:
+        # sum -> counts; mean -> length-normalized; log-mean -> log1p(mean).
+        predict_full_chromosomes_to_anndata(
+            model=model,
+            fasta_path=str(fasta_path),
+            annotation_path=args.annotation,
+            head=args.head,
+            output_path=str(output_dir / args.anndata),
+            chromosomes=chromosomes,
+            config=config,
+            track_indices=track_indices,
+            track_names=track_names,
+            track_strands=track_strands,
+            over="exons" if args.aggregate_over == "exons" else "gene_body",
+            reduce="sum" if args.aggregate_func == "sum" else "mean",
+            log=args.aggregate_func == "log-mean",
+            strand=None if args.gene_strand == "all" else args.gene_strand,
+            organism_index=args.organism,
+            device=args.device,
+            show_progress=not args.quiet,
+        )
+    else:
+        results = predict_full_chromosomes_to_bigwig(
+            model=model,
+            fasta_path=str(fasta_path),
+            output_dir=args.output,
+            head=args.head,
+            chromosomes=chromosomes,
+            config=config,
+            track_indices=track_indices,
+            track_names=track_names,
+            organism_index=args.organism,
+            device=args.device,
+            show_progress=not args.quiet,
+        )
+        total_files = sum(len(paths) for paths in results.values())
+        print(f"\nDone! Wrote {total_files} BigWig file(s) to {args.output}")
 
 
 if __name__ == "__main__":

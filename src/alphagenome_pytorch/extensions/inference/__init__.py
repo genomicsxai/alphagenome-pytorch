@@ -32,6 +32,7 @@ from .full_chromosome import (
     GenomeSequenceProvider,
     predict_full_chromosome,
     predict_full_chromosomes_to_bigwig,
+    predict_full_chromosomes_to_anndata,
     write_bigwig,
     HEAD_CONFIGS,
 )
@@ -57,6 +58,7 @@ __all__ = [
     'GenomeSequenceProvider',
     'predict_full_chromosome',
     'predict_full_chromosomes_to_bigwig',
+    'predict_full_chromosomes_to_anndata',
     'write_bigwig',
     'HEAD_CONFIGS',
     # Region / locus / sequence prediction

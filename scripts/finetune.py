@@ -438,13 +438,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
 
-    # Gene-expression validation metric (paper Fig. 2d) for the rna_seq head.
+    # Gene-expression validation metric for the rna_seq head.
     gene_eval = parser.add_argument_group("Gene expression eval")
     gene_eval.add_argument(
         "--gene-expr-eval",
         action="store_true",
         help=(
-            "Report the paper's Fig. 2d gene-expression correlations for the "
+            "Report gene-expression correlations for the "
             "rna_seq head each validation epoch: log-transformed mean coverage "
             "over annotated exons, strand-matched, keeping genes with >=50%% of "
             "their exons in-window. Emits rna_seq_gene_log_expr_pearson_* keys. "
@@ -1470,7 +1470,7 @@ def main(args: argparse.Namespace | None = None) -> None:
     # Create datasets
     train_dataset, val_dataset, modality_track_names, modality_resolutions = create_datasets(args, rank)
 
-    # Optional gene-expression validation metric (paper Fig. 2d) for rna_seq.
+    # Optional gene-expression validation metric for rna_seq.
     # Load a GeneAnnotation WITH exon rows (decoupled from --gene-loss-weight,
     # which only needs a gene-only body table) and stream per-window coords to
     # the val loop so it can build exon masks.

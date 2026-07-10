@@ -709,7 +709,7 @@ def _gene_expr_metrics(
     modality: str,
     world_size: int = 1,
 ) -> dict[str, float]:
-    """Reduce accumulated per-window ``(gene_ids, pred, obs)`` to Fig. 2d metrics.
+    """Reduce accumulated per-window ``(gene_ids, pred, obs)`` to gene-expression correlations.
 
     Gathers windows across ranks (DDP), deduplicates genes, and returns the three
     correlation flavors plus the gene count under ``{modality}_gene_log_expr_*``
@@ -1700,7 +1700,7 @@ def validate_multihead(
         encoder_only: If True, run only the CNN encoder and pass raw encoder output
             (B, S//128, 1536) to all heads as resolution 128.
         gene_annotation: Optional ``GeneAnnotation`` (with exon rows) enabling the
-            paper's Fig. 2d gene-expression validation metric for
+            gene-expression validation metric for
             ``gene_expr_modality``. When set (and ``compute_pearson``), per-window
             log-mean exon coverage is aggregated for predictions and observed
             targets, deduplicated across windows, and three Pearson correlations
@@ -1712,7 +1712,7 @@ def validate_multihead(
         gene_expr_modality: Modality the gene-expression metric applies to
             (default ``"rna_seq"``).
         gene_expr_resolution: Resolution at which to compute the metric
-            (default ``1`` bp, matching the paper).
+            (default ``1`` bp).
         gene_expr_window_cache: Optional dict reused across epochs to memoize the
             per-window exon-mask lookup (the only pandas-heavy step). Create once
             in the training driver and pass it every epoch so each validation
@@ -1842,7 +1842,7 @@ def validate_multihead(
                         accumulated_pred_counts[modality][res].append(pred_unscaled.sum(dim=1).float().cpu())
                         accumulated_true_counts[modality][res].append(targets.sum(dim=1).float().cpu())
 
-                        # Exon-based gene-expression metric (paper Fig. 2d).
+                        # Exon-based gene-expression metric.
                         if (
                             gene_expr_enabled
                             and modality == gene_expr_modality
@@ -1909,7 +1909,7 @@ def validate_multihead(
                     else:
                         metrics[f"{modality}_{res}bp_count_pearson_r"] = float("nan")
 
-    # Exon-based gene-expression metric (paper Fig. 2d): gather per-window
+    # Exon-based gene-expression metric: gather per-window
     # (gene_ids, pred, obs) across ranks, dedup genes, and emit three Pearsons.
     if gene_expr_enabled:
         metrics.update(_gene_expr_metrics(

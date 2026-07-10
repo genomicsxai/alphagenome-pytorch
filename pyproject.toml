@@ -45,6 +45,16 @@ inference = [
     "pyfaidx",
     "tqdm",
 ]
+# Whole-chromosome gene-count / AnnData export (predict_full_chromosome.py --anndata):
+# adds pandas (metadata), anndata (.h5ad), and annotation readers (pyranges for
+# GTF, pyarrow for parquet) on top of the base inference deps.
+inference-anndata = [
+    "alphagenome-pytorch[inference]",
+    "pandas",
+    "anndata",
+    "pyranges",
+    "pyarrow",
+]
 finetuning = [
     "pybigwig",
     "pandas",
