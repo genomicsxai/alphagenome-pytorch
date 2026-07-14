@@ -51,6 +51,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import logging
 import sys
@@ -72,7 +73,6 @@ from alphagenome_pytorch.extensions.finetuning.checkpointing import (
 from alphagenome_pytorch.extensions.finetuning.datasets import GenomicDataset
 from alphagenome_pytorch.extensions.finetuning.evaluation import (
     collect_targets,
-    compute_all_metrics,
     evaluate_native_split,
     evaluate_split,
     load_native_model,
@@ -168,6 +168,17 @@ def plot_correlation_histogram(
     native_label: str = "Native",
 ) -> None:
     """Histogram of per-region values, optionally overlaid with native."""
+    ft_values = np.asarray(ft_values)
+    ft_values = ft_values[np.isfinite(ft_values)]
+    if native_values is not None:
+        native_values = np.asarray(native_values)
+        native_values = native_values[np.isfinite(native_values)]
+    if ft_values.size == 0:
+        log.warning("Skipping %s because no finite values are available", out_path)
+        return
+    if native_values is not None and native_values.size == 0:
+        native_values = None
+
     fig, ax = plt.subplots(figsize=(7, 4))
 
     bins = np.linspace(
@@ -396,6 +407,262 @@ def run_ism_for_regions(
 
 
 # =============================================================================
+# Resolution-matched metrics
+# =============================================================================
+
+
+@dataclass
+class _PearsonRState:
+    """State to compute PearsonR correlation coefficient."""
+
+    xy_sum: np.ndarray
+    x_sum: np.ndarray
+    xx_sum: np.ndarray
+    y_sum: np.ndarray
+    yy_sum: np.ndarray
+    count: np.ndarray
+
+    def __add__(self, other: "_PearsonRState") -> "_PearsonRState":
+        return _PearsonRState(*(
+            getattr(self, field) + getattr(other, field)
+            for field in self.__dataclass_fields__
+        ))
+
+
+def _pearsonr_initialize() -> _PearsonRState:
+    """Initialize PearsonrState with zeros."""
+    return _PearsonRState(
+        # JAX uses float32 here under AlphaGenome's default x64-disabled
+        # configuration; make that implicit reference behavior explicit in
+        # this NumPy port.
+        xy_sum=np.zeros((), dtype=np.float32),
+        x_sum=np.zeros((), dtype=np.float32),
+        xx_sum=np.zeros((), dtype=np.float32),
+        y_sum=np.zeros((), dtype=np.float32),
+        yy_sum=np.zeros((), dtype=np.float32),
+        count=np.zeros((), dtype=np.float32),
+    )
+
+
+def _pearsonr_update(
+    x: np.ndarray,
+    y: np.ndarray,
+    axis: tuple[int, ...] | int | None = None,
+    mask: np.ndarray | None = None,
+) -> _PearsonRState:
+    """Construct PearsonrState by correlating two arrays."""
+    if mask is not None:
+        mask = np.asarray(mask, dtype=bool)
+    where = True if mask is None else mask
+    return _PearsonRState(
+        xy_sum=np.sum(x * y, axis=axis, where=where, dtype=np.float32),
+        x_sum=np.sum(x, axis=axis, where=where, dtype=np.float32),
+        xx_sum=np.sum(np.square(x), axis=axis, where=where, dtype=np.float32),
+        y_sum=np.sum(y, axis=axis, where=where, dtype=np.float32),
+        yy_sum=np.sum(np.square(y), axis=axis, where=where, dtype=np.float32),
+        count=np.sum(
+            np.ones_like(x), axis=axis, where=where, dtype=np.float32,
+        ),
+    )
+
+
+def _pearsonr_result(state: _PearsonRState) -> np.ndarray:
+    """Get PearsonR correlation coefficient."""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        x_mean = state.x_sum / state.count
+        y_mean = state.y_sum / state.count
+
+        covariance = state.xy_sum - state.count * x_mean * y_mean
+
+        x_var = state.xx_sum - state.count * x_mean * x_mean
+        y_var = state.yy_sum - state.count * y_mean * y_mean
+        variance = x_var**0.5 * y_var**0.5
+        eps = np.finfo(variance.dtype).eps
+        return covariance / (variance + eps)
+
+
+def center_crop_profiles(
+    preds: np.ndarray,
+    targets: np.ndarray,
+    score_window_bp: int | None,
+    source_resolution: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Center-crop aligned arrays after full-context model inference."""
+    if preds.shape != targets.shape:
+        raise ValueError(
+            f"Prediction/target shape mismatch: {preds.shape} != {targets.shape}"
+        )
+    if preds.ndim != 3:
+        raise ValueError(f"Expected (regions, positions, tracks), got {preds.shape}")
+    if source_resolution <= 0:
+        raise ValueError("source_resolution must be positive")
+    if score_window_bp is None:
+        return preds, targets
+    if score_window_bp <= 0 or score_window_bp % source_resolution:
+        raise ValueError(
+            "score_window_bp must be positive and divisible by source_resolution"
+        )
+
+    width = score_window_bp // source_resolution
+    available = preds.shape[1]
+    if width > available:
+        raise ValueError(
+            f"Requested {score_window_bp:,} bp scoring window, but predictions "
+            f"cover only {available * source_resolution:,} bp. A 131-kbp model "
+            "cannot be scored over the 196,608-bp Borzoi window without tiling."
+        )
+    left = (available - width) // 2
+    right = left + width
+    return preds[:, left:right, :], targets[:, left:right, :]
+
+
+def pool_profiles(
+    values: np.ndarray, factor: int, reduction: str = "sum",
+) -> np.ndarray:
+    """Aggregate adjacent positions with a sum or mean reduction."""
+    if factor <= 0:
+        raise ValueError("Pooling factor must be positive")
+    if factor == 1:
+        return values
+    if values.shape[1] % factor:
+        raise ValueError(
+            f"Profile length {values.shape[1]} is not divisible by pooling factor {factor}"
+        )
+    n_regions, n_positions, n_tracks = values.shape
+    grouped = values.reshape(
+        n_regions, n_positions // factor, factor, n_tracks,
+    )
+    if reduction == "sum":
+        return grouped.sum(axis=2)
+    if reduction == "mean":
+        return grouped.mean(axis=2)
+    raise ValueError(f"Unknown pooling reduction: {reduction}")
+
+
+def build_metric_views(
+    preds: np.ndarray,
+    targets: np.ndarray,
+    *,
+    source_resolution: int,
+    bin_sizes: tuple[int, ...],
+    score_window_bp: int | None,
+    reduction: str = "sum",
+) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
+    """Crop once, then construct aligned metric-resolution views."""
+    cropped_preds, cropped_targets = center_crop_profiles(
+        preds, targets, score_window_bp, source_resolution,
+    )
+    pred_views: dict[int, np.ndarray] = {}
+    target_views: dict[int, np.ndarray] = {}
+    for bin_size in bin_sizes:
+        if bin_size < source_resolution or bin_size % source_resolution:
+            raise ValueError(
+                f"Metric bin size {bin_size} must be a multiple of source "
+                f"resolution {source_resolution}"
+            )
+        factor = bin_size // source_resolution
+        pred_views[bin_size] = pool_profiles(cropped_preds, factor, reduction)
+        target_views[bin_size] = pool_profiles(cropped_targets, factor, reduction)
+    return pred_views, target_views
+
+
+def _pearson_or_nan(x: np.ndarray, y: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(x) & np.isfinite(y)
+    x, y = x[finite], y[finite]
+    if x.size < 2 or np.std(x) <= 1e-10 or np.std(y) <= 1e-10:
+        return float("nan")
+    return float(stats.pearsonr(x, y)[0])
+
+
+def compute_comparison_metrics(
+    preds: np.ndarray,
+    targets: np.ndarray,
+    *,
+    profile_transform: str = "none",
+) -> dict[str, float | int | np.ndarray]:
+    """Compute per-region profiles, regional counts, and profile JSD metrics."""
+    if preds.shape != targets.shape or preds.ndim != 3:
+        raise ValueError(
+            "preds and targets must have matching (regions, positions, tracks) shapes"
+        )
+    if np.any(preds < 0) or np.any(targets < 0):
+        raise ValueError("Jensen-Shannon metrics require non-negative profiles")
+
+    if profile_transform == "none":
+        profile_preds, profile_targets = preds, targets
+    elif profile_transform == "log1p":
+        profile_preds, profile_targets = np.log1p(preds), np.log1p(targets)
+    else:
+        raise ValueError(f"Unknown profile transform: {profile_transform}")
+
+    profile_rs = np.asarray([
+        _pearson_or_nan(profile_preds[i], profile_targets[i])
+        for i in range(preds.shape[0])
+    ])
+    pred_counts = preds.sum(axis=1).reshape(-1)
+    target_counts = targets.sum(axis=1).reshape(-1)
+    count_raw = _pearson_or_nan(pred_counts, target_counts)
+    count_log1p = _pearson_or_nan(np.log1p(pred_counts), np.log1p(target_counts))
+
+    eps = 1e-8
+    p = targets / (targets.sum(axis=1, keepdims=True) + eps)
+    q = preds / (preds.sum(axis=1, keepdims=True) + eps)
+    m = 0.5 * (p + q)
+    js_by_track = 0.5 * (
+        np.sum(p * np.log((p + eps) / (m + eps)), axis=1)
+        + np.sum(q * np.log((q + eps) / (m + eps)), axis=1)
+    )
+    js_divergence = np.mean(js_by_track, axis=1)
+    js_distance = np.sqrt(np.maximum(js_divergence, 0.0))
+
+    pearson_state = _pearsonr_initialize()
+    pearson_state += _pearsonr_update(
+        profile_targets, profile_preds, axis=(-2, -3),
+    )
+    track_pearson = _pearsonr_result(pearson_state)
+    counted_tracks = pearson_state.count > 0
+
+    flat_preds = profile_preds.reshape(-1)
+    flat_targets = profile_targets.reshape(-1)
+    if flat_preds.size > 2_000_000:
+        idx = np.random.default_rng(42).choice(
+            flat_preds.size, 2_000_000, replace=False,
+        )
+        flat_preds, flat_targets = flat_preds[idx], flat_targets[idx]
+
+    return {
+        "profile_transform": profile_transform,
+        "profile_pearson_r_all": profile_rs,
+        "profile_pearson_r_mean": float(np.nanmean(profile_rs)),
+        "profile_pearson_r_median": float(np.nanmedian(profile_rs)),
+        "profile_pearson_r_n_valid": int(np.isfinite(profile_rs).sum()),
+        "track_pearson_r_accumulated_all": track_pearson,
+        "track_pearson_r_accumulated_mean": float(
+            np.mean(track_pearson, where=counted_tracks)
+        ),
+        "track_pearson_r_accumulated_n_valid": int(counted_tracks.sum()),
+        "count_pearson_r": count_raw,
+        "count_pearson_r_raw": count_raw,
+        "count_pearson_r_log1p": count_log1p,
+        "jsd_all": js_divergence,
+        "jsd_mean": float(np.nanmean(js_divergence)),
+        "jsd_median": float(np.nanmedian(js_divergence)),
+        "js_divergence_all": js_divergence,
+        "js_divergence_mean": float(np.nanmean(js_divergence)),
+        "js_distance_all": js_distance,
+        "js_distance_mean": float(np.nanmean(js_distance)),
+        "js_distance_median": float(np.nanmedian(js_distance)),
+        "mse": float(np.mean(np.square(preds - targets))),
+        "spearman_global": float(stats.spearmanr(flat_preds, flat_targets)[0]),
+        "n_regions": int(preds.shape[0]),
+        "n_positions_per_region": int(preds.shape[1]),
+        "n_tracks": int(preds.shape[2]),
+    }
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 
@@ -426,18 +693,26 @@ def format_summary_table(
         rows = [
             ("Profile r (mean)", "profile_pearson_r_mean"),
             ("Profile r (median)", "profile_pearson_r_median"),
-            ("Count r", "count_pearson_r"),
-            ("JSD (mean)", "jsd_mean"),
-            ("JSD (median)", "jsd_median"),
+            ("Track r (accumulated)", "track_pearson_r_accumulated_mean"),
+            ("Count r (raw)", "count_pearson_r_raw"),
+            ("Count r (log1p; paper)", "count_pearson_r_log1p"),
+            ("JS divergence (mean)", "js_divergence_mean"),
+            ("JS distance (mean; paper)", "js_distance_mean"),
             ("MSE", "mse"),
             ("Spearman (global)", "spearman_global"),
         ]
         for label, key in rows:
+            fallback = {
+                "count_pearson_r_raw": "count_pearson_r",
+                "js_divergence_mean": "jsd_mean",
+            }.get(key)
             line = f"{label:<28}"
             if ft is not None:
-                line += f"{ft[key]:>12.4f}"
+                value = ft.get(key, ft.get(fallback, float("nan")))
+                line += f"{value:>12.4f}"
             if nat is not None:
-                line += f"  {nat[key]:>20.4f}"
+                value = nat.get(key, nat.get(fallback, float("nan")))
+                line += f"  {value:>20.4f}"
             lines.append(line)
         line = f"{'N regions':<28}"
         if ft is not None:
@@ -456,6 +731,7 @@ def save_summary_json(
     native_info: dict | None,
     loss: float | None,
     out_path: Path,
+    evaluation_info: dict | None = None,
 ) -> None:
     """Save machine-readable JSON summary."""
     def _clean(m: dict) -> dict:
@@ -466,6 +742,8 @@ def save_summary_json(
         }
 
     data: dict = {"checkpoint": checkpoint_meta}
+    if evaluation_info:
+        data["evaluation"] = evaluation_info
     if loss is not None:
         data["loss"] = loss
 
@@ -550,11 +828,32 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Comma-separated resolutions for --native-only mode (default: 128)",
     )
+    p.add_argument(
+        "--metric-bin-sizes",
+        default=None,
+        help=(
+            "Comma-separated scoring resolutions derived from one model output "
+            "using count-preserving sum pooling (for example: 1,32). If omitted, "
+            "score each model output at its native resolution."
+        ),
+    )
+    p.add_argument(
+        "--metric-source-resolution", type=int, default=1,
+        help="Model output resolution from which --metric-bin-sizes are derived",
+    )
+    p.add_argument(
+        "--score-window-bp", type=int, default=None,
+        help=(
+            "Centered scoring width in bp, applied after full-context inference. "
+            "Use 196608 for the 1-Mbp AlphaGenome/Borzoi comparison; omit for "
+            "native 131-kbp finetuning comparisons."
+        ),
+    )
     p.add_argument("--sequence-length", type=int, default=131072)
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--max-regions", type=int, default=2000,
-                    help="Max regions for metrics (0=all)")
+    p.add_argument("--max-regions", type=int, default=0,
+                    help="Max regions for metrics (default: 0, evaluate all)")
     p.add_argument("--ism-window-size", type=int, default=21)
     p.add_argument("--save-predictions", action="store_true")
     p.add_argument("--device", default=None, help="Device (default: auto)")
@@ -568,6 +867,17 @@ def parse_resolutions(raw: str | None) -> tuple[int, ...]:
     return tuple(int(part.strip()) for part in raw.split(",") if part.strip())
 
 
+def parse_metric_bin_sizes(raw: str | None) -> tuple[int, ...] | None:
+    if raw is None:
+        return None
+    values = tuple(int(part.strip()) for part in raw.split(",") if part.strip())
+    if not values or any(value <= 0 for value in values):
+        raise ValueError("--metric-bin-sizes must contain positive integers")
+    if len(set(values)) != len(values):
+        raise ValueError("--metric-bin-sizes must not contain duplicates")
+    return values
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -578,6 +888,10 @@ def main() -> None:
         level=logging.INFO, format="%(levelname)s: %(message)s",
     )
     args = parse_args()
+    try:
+        metric_bin_sizes = parse_metric_bin_sizes(args.metric_bin_sizes)
+    except ValueError as exc:
+        sys.exit(f"Error: {exc}")
 
     # Resolve device
     if args.device:
@@ -616,6 +930,11 @@ def main() -> None:
         sys.exit("Error: --regions requires --regions-bed and --bigwig")
     if run_ism and (not args.regions_bed or not args.genome):
         sys.exit("Error: --ism requires --regions-bed and --genome")
+    if args.score_window_bp is not None and args.score_window_bp > args.sequence_length:
+        sys.exit(
+            "Error: --score-window-bp cannot exceed --sequence-length. "
+            "Use 196608 only with the 1-Mbp model; score the 131-kbp model natively."
+        )
 
     model = None
     if args.native_only:
@@ -658,6 +977,12 @@ def main() -> None:
             ckpt_meta["epoch"], ckpt_meta["val_loss"],
         )
 
+    if metric_bin_sizes and args.metric_source_resolution not in resolutions:
+        sys.exit(
+            f"Error: --metric-source-resolution={args.metric_source_resolution} is "
+            f"not present in checkpoint/model resolutions {resolutions}"
+        )
+
     # ---- Optionally load native model ----
     native_model, native_track_idx, native_display_name = None, None, None
     if want_native:
@@ -669,6 +994,10 @@ def main() -> None:
     # ---- Feature: metrics ----
     ft_metrics_by_res: dict[int, dict] = {}
     native_metrics_by_res: dict[int, dict] = {}
+    metric_resolutions = metric_bin_sizes or resolutions
+    ft_metric_preds: dict[int, np.ndarray] = {}
+    native_metric_preds: dict[int, np.ndarray] = {}
+    metric_targets: dict[int, np.ndarray] = {}
     loss = None
 
     if run_metrics:
@@ -718,19 +1047,50 @@ def main() -> None:
             )
             log.info("Loss: %.4f", loss)
 
-            for res in resolutions:
-                if res not in ft_preds:
+        if metric_bin_sizes:
+            source = args.metric_source_resolution
+            source_preds = None if args.native_only else ft_preds[source]
+            source_targets = targets[source]
+            if source_preds is not None:
+                ft_metric_preds, metric_targets = build_metric_views(
+                    source_preds,
+                    source_targets,
+                    source_resolution=source,
+                    bin_sizes=metric_bin_sizes,
+                    score_window_bp=args.score_window_bp,
+                    reduction="sum",
+                )
+            else:
+                # Native-only mode has no finetuned predictions, but targets
+                # must undergo exactly the same crop and pooling operation.
+                metric_targets, _ = build_metric_views(
+                    source_targets,
+                    source_targets,
+                    source_resolution=source,
+                    bin_sizes=metric_bin_sizes,
+                    score_window_bp=args.score_window_bp,
+                    reduction="sum",
+                )
+        else:
+            ft_metric_preds = ft_preds
+            metric_targets = targets
+
+        if not args.native_only:
+            for res in metric_resolutions:
+                if res not in ft_metric_preds:
                     continue
-                p, t = ft_preds[res], targets[res]
+                p, t = ft_metric_preds[res], metric_targets[res]
                 log.info("Resolution %dbp: preds %s, targets %s", res, p.shape, t.shape)
 
-                ft_m = compute_all_metrics(p, t)
+                ft_m = compute_comparison_metrics(p, t, profile_transform="none")
                 ft_metrics_by_res[res] = ft_m
 
                 log.info("  Profile r (mean):  %.4f", ft_m["profile_pearson_r_mean"])
-                log.info("  Profile r (median):%.4f", ft_m["profile_pearson_r_median"])
-                log.info("  Count r:           %.4f", ft_m["count_pearson_r"])
-                log.info("  JSD (mean):        %.4f", ft_m["jsd_mean"])
+                log.info("  Track r (accum.):  %.4f", ft_m["track_pearson_r_accumulated_mean"])
+                log.info("  Count r (raw):     %.4f", ft_m["count_pearson_r_raw"])
+                log.info("  Count r (log1p):   %.4f", ft_m["count_pearson_r_log1p"])
+                log.info("  JS divergence:     %.4f", ft_m["js_divergence_mean"])
+                log.info("  JS distance:       %.4f", ft_m["js_distance_mean"])
 
                 # Scatter plots
                 plot_scatter(
@@ -755,12 +1115,27 @@ def main() -> None:
                 loader, device, resolutions,
             )
 
-            for res in resolutions:
-                if res not in native_preds or res not in targets:
+            if metric_bin_sizes:
+                source = args.metric_source_resolution
+                native_metric_preds, _ = build_metric_views(
+                    native_preds[source],
+                    targets[source],
+                    source_resolution=source,
+                    bin_sizes=metric_bin_sizes,
+                    score_window_bp=args.score_window_bp,
+                    reduction="sum",
+                )
+            else:
+                native_metric_preds = native_preds
+
+            for res in metric_resolutions:
+                if res not in native_metric_preds or res not in metric_targets:
                     continue
-                nat_p = native_preds[res]
-                t = targets[res]
-                nat_m = compute_all_metrics(nat_p, t)
+                nat_p = native_metric_preds[res]
+                t = metric_targets[res]
+                nat_m = compute_comparison_metrics(
+                    nat_p, t, profile_transform="none",
+                )
                 native_metrics_by_res[res] = nat_m
 
                 log.info(
@@ -775,7 +1150,7 @@ def main() -> None:
                 model = model.to(model_device)
 
         # Generate histogram plots (overlaid if native available)
-        for res in resolutions:
+        for res in metric_resolutions:
             ft_m = ft_metrics_by_res.get(res)
             nat_m = native_metrics_by_res.get(res)
             if ft_m is None and nat_m is None:
@@ -828,6 +1203,22 @@ def main() -> None:
                     np.save(pred_dir / f"test_targets_{res}bp.npy", targets[res].astype(np.float16))
                 if native_model is not None and res in native_preds:
                     np.save(pred_dir / f"native_preds_{res}bp.npy", native_preds[res].astype(np.float16))
+            if metric_bin_sizes:
+                for res in metric_resolutions:
+                    if res in ft_metric_preds:
+                        np.save(
+                            pred_dir / f"test_preds_scored_{res}bp.npy",
+                            ft_metric_preds[res].astype(np.float16),
+                        )
+                    np.save(
+                        pred_dir / f"test_targets_scored_{res}bp.npy",
+                        metric_targets[res].astype(np.float16),
+                    )
+                    if res in native_metric_preds:
+                        np.save(
+                            pred_dir / f"native_preds_scored_{res}bp.npy",
+                            native_metric_preds[res].astype(np.float16),
+                        )
 
     # ---- Feature: region exploration ----
     if run_regions:
@@ -924,7 +1315,7 @@ def main() -> None:
         ft_metrics_by_res if ft_metrics_by_res else None,
         native_metrics_by_res if native_metrics_by_res else None,
         native_display_name,
-        resolutions,
+        metric_resolutions,
     )
     if summary_text:
         print(summary_text)
@@ -948,6 +1339,16 @@ def main() -> None:
         },
         native_info, loss,
         out_dir / "summary.json",
+        evaluation_info={
+            "test_bed": args.test_bed,
+            "sequence_length_bp": args.sequence_length,
+            "score_window_bp": args.score_window_bp or args.sequence_length,
+            "metric_source_resolution_bp": args.metric_source_resolution,
+            "metric_bin_sizes_bp": list(metric_resolutions),
+            "pooling": "sum" if metric_bin_sizes else "native_model_output",
+            "profile_transform": "none",
+            "fold": "fold_1 expected; determined by --test-bed",
+        } if run_metrics else None,
     )
 
     log.info("Done. Output: %s", out_dir)
