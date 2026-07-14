@@ -1,10 +1,5 @@
 #!/usr/bin/env python
-"""Evaluate a finetuned AlphaGenome RNA-seq checkpoint on fold test regions.
-
-The model always receives ``--sequence-length`` bases. Metrics may optionally
-be restricted to a centered scoring window after inference. For the Borzoi
-comparison, use a 1-Mbp model with ``--score-window-bp 196608``. For 131-kbp
-finetuning comparisons, omit ``--score-window-bp``.
+"""Evaluate an AlphaGenome checkpoint on exon-specific metrics.
 
 RNA profile Pearson follows the AlphaGenome paper by applying log(1 + x).
 Jensen-Shannon metrics use raw, non-negative profiles. Regional total-count
@@ -62,7 +57,7 @@ log = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate a finetuned AlphaGenome RNA-seq checkpoint",
+        description="Evaluate an AlphaGenome checkpoint",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--checkpoint", required=True)
