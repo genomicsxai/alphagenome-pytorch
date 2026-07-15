@@ -1485,6 +1485,16 @@ def main(args: argparse.Namespace | None = None) -> None:
         ann_path = args.gene_expr_annotation or args.gtf
         print_rank0(f"Loading annotation for gene-expression eval: {ann_path}", rank)
         gene_expr_annotation = GeneAnnotation(ann_path)
+        # The metric aggregates over exons, but --gtf may legitimately be a
+        # gene-only annotation (the gene-LFC loss only needs gene rows). Without
+        # exons the metric finds no genes and reports NaN every epoch, silently,
+        # for the whole run — so fail here, as the AnnData export path does.
+        if not gene_expr_annotation.has_exon_annotations():
+            raise ValueError(
+                f"--gene-expr-eval needs an annotation with exon rows, but none were "
+                f"found in {ann_path}. Pass --gene-expr-annotation pointing at a "
+                f"GTF/parquet that includes exon features."
+            )
         gene_expr_track_strands = list(args.modality_strands["rna_seq"])
         val_dataset.return_coords = True
 
