@@ -134,8 +134,11 @@ def main():
         "--aggregate-func",
         choices=["sum", "mean", "log-mean"],
         default="sum",
-        help="AnnData X value: raw sum / counts (default), length-normalized mean, "
-             "or log1p(mean) (log-mean exon expression).",
+        help="AnnData X value: raw sum / counts (default), mean coverage per base, "
+             "or log1p of it (log-mean exon expression). The per-base means account "
+             "for 128bp predictions being bin sums, so they are comparable across "
+             "--resolution; at 128bp they stay approximate, since a bin an exon only "
+             "partly covers is summed whole.",
     )
     gene_out.add_argument(
         "--gene-strand",

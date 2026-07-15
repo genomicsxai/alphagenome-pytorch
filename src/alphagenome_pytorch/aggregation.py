@@ -26,6 +26,21 @@ Design notes
   the resulting ``[genes × tracks]`` matrix (see :func:`aggregate_genes`).
 * Users bring their own GTF/parquet; no bundled annotation. ``anndata`` is an
   optional, lazily-imported dependency.
+
+Units
+-----
+AlphaGenome's 128bp predictions are **bin sums**, not per-base values —
+``heads.predictions_scaling`` multiplies by ``resolution`` to reach experimental
+space, and the fine-tuning pipeline bins targets the same way. So a mean over a
+region must divide by *bases*, not by elements, or it comes out ``resolution``×
+too large. That is what ``bin_size`` is for.
+
+This buys **unit consistency**, not exact agreement between resolutions. Region
+means at 128bp remain an approximation: :meth:`GeneAnnotation.get_exon_bin_ranges`
+includes every bin an exon *touches*, and such a boundary bin is an already-summed
+total that mixes exonic and non-exonic bases. No choice of divisor can separate
+them after the fact. Only regions whose boundaries land on bin edges agree exactly
+with the 1bp result.
 """
 
 from __future__ import annotations
@@ -64,16 +79,25 @@ def aggregate_intervals(
     predictions: Tensor,
     mask: Tensor,
     reduce: str = "sum",
+    bin_size: int = 1,
 ) -> Tensor:
     """Aggregate per-position predictions over R interval masks.
 
     Args:
-        predictions: ``[B, S, C]`` (or ``[S, C]``) per-position values.
+        predictions: ``[B, S, C]`` (or ``[S, C]``) per-element values.
         mask: ``[S, R]`` interval masks (bool or float); column ``r`` selects the
-            positions belonging to region ``r``.
+            elements belonging to region ``r``.
         reduce: ``"sum"`` for raw summed signal, or ``"mean"`` for the
             length-normalized mean (divides by each region's masked length,
             clamped to ``>= 1`` so an empty mask yields 0 rather than NaN).
+        bin_size: Number of bases integrated into each element of
+            ``predictions``. Only ``"mean"`` uses it: the divisor becomes
+            ``masked_elements * bin_size``, i.e. bases rather than elements.
+            Leave at 1 for per-base inputs (1bp predictions). Pass the bin width
+            only when the inputs are **bin sums** — AlphaGenome's 128bp outputs
+            are, since ``predictions_scaling`` multiplies by ``resolution`` to
+            reach experimental space. Passing it for per-base inputs would
+            wrongly shrink the mean by that factor.
 
     Returns:
         ``[B, R, C]`` aggregated values (a leading batch axis is always present,
@@ -92,6 +116,8 @@ def aggregate_intervals(
             f"mask length {mask.shape[0]} != predictions sequence length "
             f"{predictions.shape[1]}"
         )
+    if bin_size <= 0:
+        raise ValueError(f"bin_size must be positive, got {bin_size}")
 
     mask_f = mask.to(predictions.dtype)
     out = torch.einsum("bsc,sr->brc", predictions, mask_f)  # [B, R, C]
@@ -99,7 +125,7 @@ def aggregate_intervals(
     if reduce == "sum":
         return out
     if reduce == "mean":
-        lengths = mask_f.sum(dim=0).clamp(min=1.0)  # [R]
+        lengths = (mask_f.sum(dim=0) * bin_size).clamp(min=1.0)  # [R], in bases
         return out / lengths[None, :, None]
     raise ValueError(f"reduce must be 'sum' or 'mean', got {reduce!r}")
 
@@ -495,7 +521,11 @@ def aggregate_genes(
     mask = _bp_mask_to_bins(body_mask_np.any(axis=1), resolution, seq_len)  # [S, G]
     mask_t = torch.from_numpy(mask).to(predictions.device)
 
-    counts = aggregate_intervals(predictions, mask_t, reduce=reduce)  # [B, G, C]
+    # bin_size=resolution: 128bp predictions are bin sums, so "mean" must divide
+    # by bases to stay per-base (see the module's Units note).
+    counts = aggregate_intervals(
+        predictions, mask_t, reduce=reduce, bin_size=resolution
+    )  # [B, G, C]
 
     track_frame = _track_metadata_frame(track_metadata, predictions.shape[-1])
     counts, track_frame = _apply_strand(counts, gene_strands, track_frame, strand)
@@ -569,6 +599,7 @@ class _ExonWindow:
     gene_frame: "pd.DataFrame"
     bin_ranges: list[list[tuple[int, int]]]
     seq_len: int
+    resolution: int
 
     def build_mask(self, device=None, dtype: torch.dtype = torch.float32) -> Tensor:
         """Reconstruct the ``[S, G]`` exon mask from the cached bin-ranges."""
@@ -660,6 +691,7 @@ def _build_exon_window(
         gene_frame=gene_frame,
         bin_ranges=kept_ranges,
         seq_len=seq_len,
+        resolution=resolution,
     )
 
 
@@ -711,7 +743,9 @@ def _aggregate_exon_window(
         predictions = predictions.unsqueeze(0)
     if window.gene_ids:
         mask = window.build_mask(predictions.device, predictions.dtype)  # [S, G]
-        counts = aggregate_intervals(predictions, mask, reduce=reduce)   # [B, G, C]
+        counts = aggregate_intervals(
+            predictions, mask, reduce=reduce, bin_size=window.resolution
+        )  # [B, G, C]
     else:
         counts = predictions.new_zeros((predictions.shape[0], 0, predictions.shape[-1]))
     return _apply_log(counts, log)
@@ -998,7 +1032,10 @@ class GeneCountAccumulator:
         counts = torch.zeros(1, len(ids), c, dtype=torch.float32)
         for gi, base in enumerate(ids):
             s = torch.from_numpy(self._sum[base]).float()
-            counts[0, gi] = s / max(self._len[base], 1.0) if self.reduce == "mean" else s
+            # `_len` counts bins; 128bp values are bin sums, so a per-base mean
+            # divides by bases (see the module's Units note).
+            n_bases = max(self._len[base] * self.resolution, 1.0)
+            counts[0, gi] = s / n_bases if self.reduce == "mean" else s
         if log:
             counts = torch.log1p(counts)
 

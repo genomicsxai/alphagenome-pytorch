@@ -453,8 +453,9 @@ def test_accumulator_merges_bins_shared_by_exons_at_128bp():
 
     acc_mean = GeneCountAccumulator(ann, resolution=128, over="exons", reduce="mean")
     acc_mean.add_tile(preds, "chr1", 0, 256)
-    # mean over 2 distinct bins = 6.0 (not 17/3 from counting bin0 twice).
-    assert acc_mean.to_gene_counts().counts[0, 0, 0].item() == pytest.approx(6.0)
+    # Per-base mean over 2 distinct bins: 12 / (2 bins * 128 bases). Counting bin0
+    # twice would instead give 17 / (3 * 128), so this still pins the dedup.
+    assert acc_mean.to_gene_counts().counts[0, 0, 0].item() == pytest.approx(12.0 / (2 * 128))
 
 
 def test_accumulator_strand_and_track_metadata():
@@ -516,3 +517,139 @@ def test_to_gene_counts_rejects_mismatched_dataframe_track_metadata():
     ok = pd.DataFrame({"track_index": [0, 1], "track_name": ["a", "b"]})
     gc = acc.to_gene_counts(track_metadata=ok)
     assert gc.counts.shape[-1] == len(gc.track_metadata) == 2
+
+
+# --------------------------------------------------------------------------- #
+# Unit consistency between 1bp and 128bp (bin-sum inputs)
+# --------------------------------------------------------------------------- #
+def _per_base_signal(n_bases: int, seed: int = 0):
+    """Nonconstant per-base coverage. Constant signal hides divisor errors."""
+    g = torch.Generator().manual_seed(seed)
+    return torch.rand(n_bases, 1, generator=g) * 10.0
+
+
+def _to_bin_sums(per_base: torch.Tensor, resolution: int) -> torch.Tensor:
+    """Bin the 1bp signal the way the pipeline does: sum the bases in each bin.
+
+    Mirrors datasets.py (`reshape(output_len, res, n_tracks).sum(axis=1)`) and
+    heads.predictions_scaling, which multiplies by `resolution` to reach
+    experimental space. This is what makes 128bp values bin sums.
+    """
+    n, c = per_base.shape
+    return per_base.reshape(n // resolution, resolution, c).sum(axis=1)
+
+
+def _one_gene_annotation(exon_start: int, exon_end: int, gene_end: int | None = None):
+    import pandas as pd
+
+    end = gene_end if gene_end is not None else exon_end
+    return GeneAnnotation(pd.DataFrame([
+        dict(Feature="gene", Chromosome="chr1", Start=exon_start, End=end, Strand="+",
+             gene_id="ENSG1", gene_name="G1", gene_type="protein_coding"),
+        dict(Feature="exon", Chromosome="chr1", Start=exon_start, End=exon_end, Strand="+",
+             gene_id="ENSG1", gene_name="G1", gene_type="protein_coding"),
+    ]))
+
+
+def test_aggregate_intervals_bin_size_normalizes_to_bases():
+    per_base = _per_base_signal(1280)
+    binned = _to_bin_sums(per_base, 128)          # [10, 1] bin sums
+
+    mask_1bp = torch.ones(1280, 1)
+    mask_128 = torch.ones(10, 1)
+
+    # Sums agree regardless of resolution: a sum of sums is the same total.
+    s1 = aggregate_intervals(per_base, mask_1bp, "sum")[0, 0, 0]
+    s128 = aggregate_intervals(binned, mask_128, "sum")[0, 0, 0]
+    assert torch.isclose(s1, s128, rtol=1e-5)
+
+    # Per-base means agree only once bin_size converts elements -> bases.
+    m1 = aggregate_intervals(per_base, mask_1bp, "mean", bin_size=1)[0, 0, 0]
+    m128 = aggregate_intervals(binned, mask_128, "mean", bin_size=128)[0, 0, 0]
+    assert torch.isclose(m1, m128, rtol=1e-5)
+    assert torch.isclose(m1, per_base.mean(), rtol=1e-5)
+
+    # Without bin_size the 128bp mean is a per-bin mean: 128x too large.
+    wrong = aggregate_intervals(binned, mask_128, "mean")[0, 0, 0]
+    assert torch.isclose(wrong, m1 * 128, rtol=1e-5)
+
+
+def test_aggregate_intervals_rejects_nonpositive_bin_size():
+    pred, mask = torch.ones(1, 4, 1), torch.ones(4, 1)
+    for bad in (0, -1, -128):
+        with pytest.raises(ValueError, match="bin_size must be positive"):
+            aggregate_intervals(pred, mask, "mean", bin_size=bad)
+
+
+def test_gene_expression_unit_consistent_for_bin_aligned_exons():
+    """Exon on 128bp boundaries -> 1bp and 128bp agree, in linear and log space."""
+    per_base = _per_base_signal(2560)
+    binned = _to_bin_sums(per_base, 128)
+    ann = _one_gene_annotation(0, 1280)           # exon [0,1280): bins [0,10)
+    tracks = [TrackMetadata(0, "rna_seq", 0, "t+", {"strand": "+"})]
+    iv = ("chr1", 0, 2560)
+    truth = per_base[0:1280].mean()
+
+    lin1 = gene_expression(per_base, ann, iv, track_metadata=tracks, log=None)
+    lin128 = gene_expression(binned, ann, iv, track_metadata=tracks, log=None)
+    assert torch.isclose(lin1.counts[0, 0, 0], truth, rtol=1e-5)
+    assert torch.isclose(lin128.counts[0, 0, 0], truth, rtol=1e-5)
+
+    # log1p(mean) must be taken after normalization, or the 128x lands inside the log.
+    log1 = gene_expression(per_base, ann, iv, track_metadata=tracks)
+    log128 = gene_expression(binned, ann, iv, track_metadata=tracks)
+    assert torch.isclose(log1.counts[0, 0, 0], torch.log1p(truth), rtol=1e-5)
+    assert torch.isclose(log128.counts[0, 0, 0], torch.log1p(truth), rtol=1e-5)
+
+
+def test_gene_expression_128bp_is_approximate_for_unaligned_exons():
+    """An exon off the bin grid cannot be recovered exactly from summed bins.
+
+    get_exon_bin_ranges includes every bin the exon *touches*, and such a bin is
+    an already-summed total mixing exonic and non-exonic bases. This pins the
+    approximation as expected behavior rather than a regression.
+    """
+    per_base = _per_base_signal(2560, seed=1)
+    binned = _to_bin_sums(per_base, 128)
+    ann = _one_gene_annotation(100, 1200)         # straddles bins 0 and 9
+    tracks = [TrackMetadata(0, "rna_seq", 0, "t+", {"strand": "+"})]
+    iv = ("chr1", 0, 2560)
+
+    exact = gene_expression(per_base, ann, iv, track_metadata=tracks, log=None)
+    approx = gene_expression(binned, ann, iv, track_metadata=tracks, log=None)
+    e, a = exact.counts[0, 0, 0], approx.counts[0, 0, 0]
+
+    # Same order of magnitude (units are right) but not equal (mask is coarse).
+    assert not torch.isclose(e, a, rtol=1e-4)
+    assert 0.5 < (a / e).item() < 2.0
+
+
+def test_accumulator_mean_is_per_base_at_128bp():
+    per_base = _per_base_signal(1280, seed=2)
+    binned = _to_bin_sums(per_base, 128)
+    ann = _one_gene_annotation(0, 1280)
+    truth = per_base[0:1280].mean()
+
+    acc1 = GeneCountAccumulator(ann, resolution=1, over="exons", reduce="mean")
+    acc1.add_tile(per_base, "chr1", 0, 1280)
+    acc128 = GeneCountAccumulator(ann, resolution=128, over="exons", reduce="mean")
+    acc128.add_tile(binned, "chr1", 0, 1280)
+
+    v1 = acc1.to_gene_counts().counts[0, 0, 0]
+    v128 = acc128.to_gene_counts().counts[0, 0, 0]
+    assert torch.isclose(v1, truth, rtol=1e-5)
+    assert torch.isclose(v128, truth, rtol=1e-5)
+
+
+def test_gene_expression_values_unit_consistent_at_both_resolutions():
+    per_base = _per_base_signal(2560, seed=3)
+    binned = _to_bin_sums(per_base, 128)
+    ann = _one_gene_annotation(0, 1280)
+    iv = ("chr1", 0, 2560)
+    truth = torch.log1p(per_base[0:1280].mean())
+
+    v1, ids1, _ = gene_expression_values(per_base, ann, iv, track_strands=None)
+    v128, ids128, _ = gene_expression_values(binned, ann, iv, track_strands=None)
+    assert ids1 == ids128 == ["ENSG1"]
+    assert torch.isclose(v1[0, 0], truth, rtol=1e-5)
+    assert torch.isclose(v128[0, 0], truth, rtol=1e-5)
