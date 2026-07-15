@@ -1003,6 +1003,15 @@ class GeneCountAccumulator:
             counts = torch.log1p(counts)
 
         if isinstance(track_metadata, pd.DataFrame):
+            # Same length check the TrackMetadata path gets via
+            # _track_metadata_frame: a frame that doesn't describe the accumulated
+            # tracks yields a GeneCounts whose counts and obs disagree, which only
+            # surfaces later as a dimension error from inside anndata.
+            if len(track_metadata) != c:
+                raise ValueError(
+                    f"track_metadata has {len(track_metadata)} rows but predictions "
+                    f"have {c} tracks."
+                )
             track_frame = track_metadata.reset_index(drop=True)
         else:
             track_frame = _track_metadata_frame(track_metadata, c)

@@ -489,3 +489,30 @@ def test_gene_expression_match_rejects_invalid_track_metadata_strand():
     ]
     with pytest.raises(ValueError, match="track strands must be"):
         gene_expression(pred, ann, INTERVAL, track_metadata=bad_tracks, strand="match")
+
+
+def test_to_gene_counts_rejects_mismatched_dataframe_track_metadata():
+    """A DataFrame must describe the accumulated tracks, like a TrackMetadata list does.
+
+    Without the check the mismatch survives into GeneCounts and only surfaces
+    later as a dimension error from inside anndata, about X vs obs rather than
+    about the metadata the caller passed.
+    """
+    import pandas as pd
+
+    ann = GeneAnnotation(pd.DataFrame([
+        dict(Feature="gene", Chromosome="chr1", Start=0, End=10, Strand="+",
+             gene_id="ENSG1", gene_name="G1", gene_type="protein_coding"),
+        dict(Feature="exon", Chromosome="chr1", Start=0, End=10, Strand="+",
+             gene_id="ENSG1", gene_name="G1", gene_type="protein_coding"),
+    ]))
+    acc = GeneCountAccumulator(ann, resolution=1, over="exons", reduce="sum")
+    acc.add_tile(torch.ones(10, 2), "chr1", 0, 10)  # 2 tracks
+
+    bad = pd.DataFrame({"track_index": [0, 1, 2], "track_name": ["a", "b", "c"]})
+    with pytest.raises(ValueError, match="3 rows but predictions have 2 tracks"):
+        acc.to_gene_counts(track_metadata=bad)
+
+    ok = pd.DataFrame({"track_index": [0, 1], "track_name": ["a", "b"]})
+    gc = acc.to_gene_counts(track_metadata=ok)
+    assert gc.counts.shape[-1] == len(gc.track_metadata) == 2
