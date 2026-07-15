@@ -13,7 +13,61 @@ and carries metadata (cell type, assay, ontology, strand, …). You almost never
 want a raw channel index — you want "DNase in GM12878" or "everything in K562".
 The named-outputs API turns that metadata into a query layer over the tensors.
 
-## The 30-second version
+**Reach for the CLI first.** If you just need predictions written to disk for some
+regions, `agt predict` already does it — no Python required. Drop to the Python API
+when you need tensors in-process, or track selection richer than `--tracks` allows.
+
+## Command line: `agt predict`
+
+`agt` is the supported entry point (installed with the package). One head per run;
+output format follows the input mode.
+
+```bash
+# One locus → BigWig
+agt predict --model model.pth --output out/ --head dnase \
+    --locus chr1:1000000-1131072 --fasta hg38.fa --resolution 128
+
+# Many regions from a BED → BigWig (merged)
+agt predict --model model.pth --output out/ --head atac \
+    --bed regions.bed --fasta hg38.fa
+
+# Whole chromosomes, tiled → BigWig
+agt predict --model model.pth --output out/ --head rna_seq \
+    --chromosomes chr20,chr21 --fasta hg38.fa --crop-bp 16384
+
+# Raw FASTA sequences → NPZ per sequence
+agt predict --model model.pth --output out/ --head atac --sequences seqs.fa
+
+# Per-gene count table → AnnData (.h5ad)
+agt predict --model model.pth --output out/ --head rna_seq \
+    --chromosomes chr20 --fasta hg38.fa --resolution 1 --crop-bp 16384 \
+    --anndata gene_counts.h5ad --annotation gencode.v46.parquet \
+    --aggregate-over exons --aggregate-func sum
+```
+
+Notes:
+
+- Input modes are mutually exclusive: `--locus`, `--bed`, `--sequences`, `--chromosomes`.
+- Short `--locus`/`--bed` regions are padded with real reference flanks; long ones are
+  center-cut unless you pass `--tile`. FASTA `--sequences` must match the window size
+  exactly, or need `--tile`.
+- `--anndata` aggregates signal per gene (over `exons` by default, or `gene-body`) into
+  a genes × tracks matrix. It requires `--annotation` (GTF/parquet), which needs exon
+  rows when aggregating over exons.
+- Finetuned models: pass the base weights as `--model` and the finetuned checkpoint as
+  `--checkpoint` (plus `--transfer-config` if it isn't embedded).
+- Useful extras: `--tracks` / `--track-names`, `--resolution {1,128}`, `--organism {0,1}`,
+  `--batch-size`, `--device`, `--dtype-policy`, `--compile`. See `agt predict --help`.
+
+Install extras: `pip install 'alphagenome-pytorch[inference]'`, or
+`'alphagenome-pytorch[inference-anndata]'` for `--anndata`.
+
+**Relationship to the scripts.** `agt predict` is the same code path as the older
+`scripts/predict_locus.py` and `scripts/predict_full_chromosome.py`; those remain as
+thin shims for backwards compatibility. Prefer `agt` — the scripts are not part of the
+installed package and only work from a repo clone.
+
+## The 30-second version (Python)
 
 ```python
 import torch

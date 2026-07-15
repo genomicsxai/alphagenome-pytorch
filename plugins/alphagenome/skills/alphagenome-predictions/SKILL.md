@@ -1,6 +1,6 @@
 ---
 name: alphagenome-predictions
-description: Run AlphaGenome-PyTorch to get genomic track predictions for a specific assay, cell type, or resolution — e.g. "get DNase predictions from GM12878 at 128bp", "write a wrapper for all K562 predictions", filtering tracks by metadata (biosample, assay, ontology, strand). Use when the task is about USING the model for inference/predictions, not developing the package.
+description: Run AlphaGenome-PyTorch to get genomic track predictions — via the `agt predict` CLI (single locus, BED regions, whole chromosomes, raw FASTA sequences, or per-gene count tables/AnnData) or the Python API. Covers picking a specific assay, cell type, or resolution, e.g. "get DNase predictions from GM12878 at 128bp", "write a wrapper for all K562 predictions", filtering tracks by metadata (biosample, assay, ontology, strand). Use when the task is about USING the model for inference/predictions, not developing the package.
 ---
 
 # Getting predictions from AlphaGenome-PyTorch
@@ -11,10 +11,44 @@ The full guide is bundled with this plugin. **Read it before writing code:**
 cat "${CLAUDE_PLUGIN_ROOT}/skills/alphagenome-predictions/reference/usage.md"
 ```
 
-It covers input shapes, the output heads and their exact track counts, selecting
-tracks by metadata, worked recipes, and gotchas (padding, precision).
+It covers the CLI, input shapes, the output heads and their exact track counts,
+selecting tracks by metadata, worked recipes, and gotchas (padding, precision).
 
-## Quick orientation
+## Try the CLI first
+
+If the task is "write predictions for these regions to disk", `agt predict` already
+does it — no Python needed. One head per run; output format follows the input mode.
+
+```bash
+agt predict --model model.pth --output out/ --head dnase \
+    --locus chr1:1000000-1131072 --fasta hg38.fa --resolution 128   # → BigWig
+
+agt predict --model model.pth --output out/ --head atac \
+    --bed regions.bed --fasta hg38.fa                                # → BigWig
+
+agt predict --model model.pth --output out/ --head rna_seq \
+    --chromosomes chr20,chr21 --fasta hg38.fa --crop-bp 16384        # → BigWig, tiled
+
+agt predict --model model.pth --output out/ --head atac \
+    --sequences seqs.fa                                              # → NPZ per sequence
+
+# Per-gene count table (genes × tracks) → AnnData
+agt predict --model model.pth --output out/ --head rna_seq \
+    --chromosomes chr20 --fasta hg38.fa --resolution 1 --crop-bp 16384 \
+    --anndata gene_counts.h5ad --annotation gencode.v46.parquet \
+    --aggregate-over exons --aggregate-func sum
+```
+
+`--locus`/`--bed`/`--sequences`/`--chromosomes` are mutually exclusive. For a
+finetuned model pass base weights as `--model` and the checkpoint as `--checkpoint`.
+`agt predict --help` is the ground truth. `agt predict` is the same code path as the
+older `scripts/predict_locus.py` / `scripts/predict_full_chromosome.py` shims — prefer
+`agt`, since `scripts/` only exists in a repo clone.
+
+Use the Python API below when you need tensors in-process or metadata-based track
+selection beyond `--tracks`/`--track-names`.
+
+## Quick orientation (Python API)
 
 AlphaGenome emits thousands of tracks grouped into output heads (assays). Each
 track is one channel in a tensor carrying metadata (cell type, assay, ontology,

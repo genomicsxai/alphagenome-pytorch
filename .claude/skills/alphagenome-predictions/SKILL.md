@@ -1,6 +1,6 @@
 ---
 name: alphagenome-predictions
-description: Run AlphaGenome-PyTorch to get genomic track predictions for a specific assay, cell type, or resolution — e.g. "get DNase predictions from GM12878 at 128bp", "write a wrapper for all K562 predictions", filtering tracks by metadata (biosample, assay, ontology, strand). Use when the task is about USING the model for inference/predictions, not developing the package.
+description: Run AlphaGenome-PyTorch to get genomic track predictions — via the `agt predict` CLI (single locus, BED regions, whole chromosomes, raw FASTA sequences, or per-gene count tables/AnnData) or the Python API. Covers picking a specific assay, cell type, or resolution, e.g. "get DNase predictions from GM12878 at 128bp", "write a wrapper for all K562 predictions", filtering tracks by metadata (biosample, assay, ontology, strand). Use when the task is about USING the model for inference/predictions, not developing the package.
 ---
 
 # Getting predictions from AlphaGenome-PyTorch
@@ -8,7 +8,20 @@ description: Run AlphaGenome-PyTorch to get genomic track predictions for a spec
 Read **`docs/alphagenome-usage.md`** for the full guide. It is the
 source-of-truth for running the model and selecting tracks by metadata.
 
-Quick orientation:
+**Try the CLI first** — `agt predict` writes predictions to disk without any Python:
+
+```bash
+agt predict --model model.pth --output out/ --head dnase \
+    --locus chr1:1000000-1131072 --fasta hg38.fa --resolution 128
+```
+
+Input modes (mutually exclusive): `--locus` (one interval), `--bed` (many regions),
+`--chromosomes` (whole chromosomes, tiled), `--sequences` (raw FASTA → NPZ). Add
+`--anndata FILE --annotation GTF` for a per-gene count table (AnnData). `agt predict`
+is the same code path as the `scripts/predict_*.py` shims — prefer `agt`, which ships
+with the package. See `agt predict --help`.
+
+Use the Python API when you need tensors in-process or metadata-based selection:
 
 - Load: `AlphaGenome.from_pretrained("model.pth", device=...)`.
 - Predict with metadata: `model.predict(dna, organism_index, named_outputs=True)`

@@ -1,6 +1,6 @@
 ---
 name: alphagenome-finetuning
-description: Fine-tune or transfer-learn AlphaGenome-PyTorch on custom genomic data — pick a mode (linear probe, LoRA, Locon, full), train on BigWig tracks with scripts/finetune.py, use adapters, delta checkpoints, multi-GPU/sequence parallelism, or the Python transfer API. Use when ADAPTING/TRAINING the model on new data, not when running predictions with the pretrained model.
+description: Fine-tune or transfer-learn AlphaGenome-PyTorch on custom genomic data — pick a mode (linear probe, LoRA, Locon, full), train on BigWig tracks with `agt finetune`, use adapters, delta checkpoints, multi-GPU/sequence parallelism, or the Python transfer API. Use when ADAPTING/TRAINING the model on new data, not when running predictions with the pretrained model.
 ---
 
 # Fine-tuning AlphaGenome-PyTorch
@@ -14,7 +14,7 @@ Read **`docs/finetuning/`** for the full guide — it is the source of truth:
 - `docs/finetuning/adapters.rst` — linear probing, LoRA, Locon, IA3, merging
 - `docs/finetuning/api_reference.rst` — API reference
 
-`scripts/finetune.py --help` is the ground truth for flags.
+`agt finetune --help` is the ground truth for flags.
 
 ## Quick orientation
 
@@ -25,12 +25,17 @@ Modes (`--mode`, default `lora`): `linear-probe` (heads only, fastest baseline),
 `encoder-only`. Escalate only if the cheaper mode underfits.
 
 ```bash
-python scripts/finetune.py --mode lora \
+agt finetune --mode lora \
     --genome hg38.fa \
     --modality atac --bigwig data/*.bw \
     --train-bed train.bed --val-bed val.bed \
     --pretrained-weights model.pth
 ```
+
+`agt finetune` and `python scripts/finetune.py` are the same code path with the same
+flags — use `agt` (it ships with the package; `scripts/` only exists in a clone).
+For multi-GPU, `torchrun` needs a module target:
+`torchrun --nproc_per_node=2 -m alphagenome_pytorch.cli finetune ...`
 
 Modalities: `rna_seq`, `atac`, `dnase`, `procap`, `cage` (1bp + 128bp);
 `chip_tf`, `chip_histone` (128bp only).

@@ -1,6 +1,6 @@
 ---
 name: alphagenome-finetuning
-description: Fine-tune or transfer-learn AlphaGenome-PyTorch on custom genomic data — pick a mode (linear probe, LoRA, Locon, full), train on BigWig tracks with scripts/finetune.py, use adapters, delta checkpoints, multi-GPU/sequence parallelism, or the Python transfer API. Use when ADAPTING/TRAINING the model on new data, not when running predictions with the pretrained model.
+description: Fine-tune or transfer-learn AlphaGenome-PyTorch on custom genomic data — pick a mode (linear probe, LoRA, Locon, full), train on BigWig tracks with `agt finetune`, use adapters, delta checkpoints, multi-GPU/sequence parallelism, or the Python transfer API. Use when ADAPTING/TRAINING the model on new data, not when running predictions with the pretrained model.
 ---
 
 # Fine-tuning AlphaGenome-PyTorch
@@ -9,8 +9,15 @@ Fine-tuning reuses the pretrained trunk as a sequence-representation extractor a
 trains new heads (plus optionally adapters) on your tracks. The workflow is always:
 **load trunk → choose transfer mode → add heads for your tracks → train.**
 
-`scripts/finetune.py` is the supported entry point; it covers every mode below and
-takes CLI flags or a YAML config (`--config`, CLI overrides YAML).
+`agt finetune` is the supported entry point; it covers every mode below and takes CLI
+flags or a YAML config (`--config`, CLI overrides YAML). Run `agt finetune --help` for
+the authoritative flag list.
+
+> **`agt finetune` ≡ `python scripts/finetune.py`.** They are the same code path with
+> the same flags; `agt finetune --mode lora ...` and `python scripts/finetune.py --mode
+> lora ...` are interchangeable. Prefer `agt` — it ships with the installed package,
+> whereas `scripts/` only exists in a repo clone. The script remains as a thin shim, so
+> older commands and configs keep working.
 
 ## 1. Pick a mode (`--mode`, default `lora`)
 
@@ -28,7 +35,7 @@ Escalate only if the cheaper mode underfits: `linear-probe` → `lora` → `lora
 ## 2. Minimum viable command
 
 ```bash
-python scripts/finetune.py --mode lora \
+agt finetune --mode lora \
     --genome hg38.fa \
     --modality atac --bigwig data/*.bw \
     --train-bed train.bed --val-bed val.bed \
@@ -36,8 +43,11 @@ python scripts/finetune.py --mode lora \
 ```
 
 Inputs: a genome FASTA, one or more BigWig signal tracks, train/val BED interval
-files, and the pretrained checkpoint. Nothing is `required=True` at the argparse
-level because any flag may come from `--config`; missing inputs fail at runtime.
+files, and the pretrained checkpoint. No flag is strictly required at the argparse
+level because any of them may come from `--config`; missing inputs fail at runtime
+(e.g. `--bigwig is required (or provide modalities in --config)`).
+
+Requires the finetuning extra: `pip install 'alphagenome-pytorch[finetuning]'`.
 
 ## 3. Modalities (`--modality`)
 
@@ -68,9 +78,11 @@ Training: `--epochs 10`, `--batch-size 1`, `--lr 1e-4`, `--weight-decay 0.1`,
 ```
 Works with every mode **except `full`** (which trains all parameters).
 
-**Multi-GPU** — DDP, or sequence parallelism to split one long sequence across GPUs:
+**Multi-GPU** — DDP, or sequence parallelism to split one long sequence across GPUs.
+`torchrun` needs a module or script target, so use `-m`:
 ```bash
-torchrun --nproc_per_node=2 scripts/finetune.py --sequence-parallel --overlap-highres 1024 ...
+torchrun --nproc_per_node=2 -m alphagenome_pytorch.cli finetune \
+    --sequence-parallel --overlap-highres 1024 ...
 ```
 There is **no `--overlap-lowres` flag**; the low-res overlap is computed as
 `overlap_highres // 128`.
@@ -116,8 +128,8 @@ Don't guess flags or API shapes — these are authoritative and current:
 - Adapter families and merging: https://alphagenome-pytorch.readthedocs.io/en/latest/finetuning/adapters.html
 - API reference: https://alphagenome-pytorch.readthedocs.io/en/latest/finetuning/api_reference.html
 
-If working inside a clone of the repo, the same pages are `docs/finetuning/*.rst`,
-and `scripts/finetune.py --help` is the ground truth for flags.
+If working inside a clone of the repo, the same pages are `docs/finetuning/*.rst`.
+`agt finetune --help` is the ground truth for flags.
 
 To run *predictions* with a pretrained or finetuned model instead, see the
-`alphagenome-predictions` skill.
+`alphagenome-predictions` skill. To score variants, see `agt score --help`.
