@@ -1,0 +1,123 @@
+---
+name: alphagenome-finetuning
+description: Fine-tune or transfer-learn AlphaGenome-PyTorch on custom genomic data — pick a mode (linear probe, LoRA, Locon, full), train on BigWig tracks with scripts/finetune.py, use adapters, delta checkpoints, multi-GPU/sequence parallelism, or the Python transfer API. Use when ADAPTING/TRAINING the model on new data, not when running predictions with the pretrained model.
+---
+
+# Fine-tuning AlphaGenome-PyTorch
+
+Fine-tuning reuses the pretrained trunk as a sequence-representation extractor and
+trains new heads (plus optionally adapters) on your tracks. The workflow is always:
+**load trunk → choose transfer mode → add heads for your tracks → train.**
+
+`scripts/finetune.py` is the supported entry point; it covers every mode below and
+takes CLI flags or a YAML config (`--config`, CLI overrides YAML).
+
+## 1. Pick a mode (`--mode`, default `lora`)
+
+| Mode | Trains | Use when |
+|------|--------|----------|
+| `linear-probe` | heads only, trunk frozen | fastest; strong baseline; start here to sanity-check the data |
+| `lora` | heads + LoRA on attention projections | **recommended default** for most tasks |
+| `locon` | heads + Locon on Conv1d layers | the convolutional tower needs adapting (e.g. new assay statistics) |
+| `lora+locon` | both adapter families | attention *and* conv tower need adapting |
+| `full` | all parameters | large target dataset, willing to pay compute + risk of forgetting |
+| `encoder-only` | encoder path only | specialised; see docs |
+
+Escalate only if the cheaper mode underfits: `linear-probe` → `lora` → `lora+locon` / `full`.
+
+## 2. Minimum viable command
+
+```bash
+python scripts/finetune.py --mode lora \
+    --genome hg38.fa \
+    --modality atac --bigwig data/*.bw \
+    --train-bed train.bed --val-bed val.bed \
+    --pretrained-weights model.pth
+```
+
+Inputs: a genome FASTA, one or more BigWig signal tracks, train/val BED interval
+files, and the pretrained checkpoint. Nothing is `required=True` at the argparse
+level because any flag may come from `--config`; missing inputs fail at runtime.
+
+## 3. Modalities (`--modality`)
+
+`rna_seq`, `atac`, `dnase`, `procap`, `cage` support **1bp and 128bp**.
+`chip_tf`, `chip_histone` are **128bp only**.
+
+Repeat `--modality`/`--bigwig` in pairs for multi-modality training.
+
+## 4. Defaults worth knowing
+
+`--resolutions` defaults to `1` (1bp only) — set `--resolutions 128` for
+`chip_tf`/`chip_histone`, which have no 1bp output.
+
+LoRA: `--lora-rank 8`, `--lora-alpha 16`, `--lora-targets q_proj,v_proj`.
+Locon: `--locon-rank 4`, `--locon-alpha 1`, `--locon-targets` **empty by default —
+you must set it** when Locon is enabled, e.g. `down_blocks.5` (last conv block) or
+`down_blocks.4,down_blocks.5` (last two).
+
+Training: `--epochs 10`, `--batch-size 1`, `--lr 1e-4`, `--weight-decay 0.1`,
+`--warmup-steps 500`, `--lr-schedule cosine`, `--sequence-length 131072`,
+`--output-dir finetuning_output`.
+
+## 5. Common variations
+
+**Delta checkpoints** (adapters + heads only, ~5–10MB vs ~1GB):
+```bash
+--save-delta [--no-full-checkpoint]
+```
+Works with every mode **except `full`** (which trains all parameters).
+
+**Multi-GPU** — DDP, or sequence parallelism to split one long sequence across GPUs:
+```bash
+torchrun --nproc_per_node=2 scripts/finetune.py --sequence-parallel --overlap-highres 1024 ...
+```
+There is **no `--overlap-lowres` flag**; the low-res overlap is computed as
+`overlap_highres // 128`.
+
+**Memory pressure**: `--gradient-checkpointing`, `--gradient-accumulation-steps`,
+`--batch-size 1`, `--dtype`/`--no-amp`.
+
+**Tracking**: `--wandb` (`--wandb-project`, default `alphagenome-finetune`).
+
+## 6. Python API (when the CLI doesn't fit)
+
+```python
+from alphagenome_pytorch import AlphaGenome
+from alphagenome_pytorch.extensions.finetuning.transfer import (
+    TransferConfig, load_trunk, prepare_for_transfer,
+)
+
+model = AlphaGenome()
+model = load_trunk(model, "model.pth")            # trunk only, excludes heads
+model = prepare_for_transfer(model, TransferConfig(
+    mode="lora",
+    new_heads={"atac": {"modality": "atac", "num_tracks": 1}},
+    lora_rank=8,
+))
+```
+
+Note the import path: `load_trunk` and `prepare_for_transfer` live in
+`...extensions.finetuning.transfer` and are **not** exported from the top-level
+`alphagenome_pytorch` package.
+
+Re-exported from `alphagenome_pytorch.extensions.finetuning`: `TransferConfig`,
+`MODALITY_CONFIGS`, `LoRA`, `Locon`, `IA3`, `train_epoch`, `validate`,
+`save_checkpoint`, `export_delta_weights`, and datasets (`ATACDataset`,
+`RNASeqDataset`, `MultimodalDataset`, `CachedGenome`).
+
+## 7. Read the docs for depth
+
+Don't guess flags or API shapes — these are authoritative and current:
+
+- Overview & quick start: https://alphagenome-pytorch.readthedocs.io/en/latest/finetuning/index.html
+- All CLI flags, YAML configs, delta checkpoints, multi-modality: https://alphagenome-pytorch.readthedocs.io/en/latest/finetuning/cli.html
+- Transfer API, heads, saving/loading delta weights: https://alphagenome-pytorch.readthedocs.io/en/latest/finetuning/python_api.html
+- Adapter families and merging: https://alphagenome-pytorch.readthedocs.io/en/latest/finetuning/adapters.html
+- API reference: https://alphagenome-pytorch.readthedocs.io/en/latest/finetuning/api_reference.html
+
+If working inside a clone of the repo, the same pages are `docs/finetuning/*.rst`,
+and `scripts/finetune.py --help` is the ground truth for flags.
+
+To run *predictions* with a pretrained or finetuned model instead, see the
+`alphagenome-predictions` skill.
