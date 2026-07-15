@@ -20,9 +20,7 @@ from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
 
 
 def _annotation(rows: list[dict]) -> GeneAnnotation:
-    ann = GeneAnnotation("/tmp/does_not_exist.parquet")  # suffix only; never read
-    ann._df = pd.DataFrame(rows)
-    ann._build_gene_index()
+    ann = GeneAnnotation(pd.DataFrame(rows))
     return ann
 
 
@@ -31,9 +29,9 @@ def _gene(gene_id, start, end, *, chrom="chr1", strand="+", gtype="protein_codin
                 gene_id=gene_id, gene_name=gene_id, gene_type=gtype)
 
 
-def _exon(gene_id, start, end, *, chrom="chr1", strand="+"):
+def _exon(gene_id, start, end, *, chrom="chr1", strand="+", gtype="protein_coding"):
     return dict(Feature="exon", Chromosome=chrom, Start=start, End=end, Strand=strand,
-                gene_id=gene_id, gene_name=gene_id, gene_type="protein_coding")
+                gene_id=gene_id, gene_name=gene_id, gene_type=gtype)
 
 
 def _brute_overlap(ann, interval, gene_types=None):
@@ -116,3 +114,55 @@ def test_exon_bin_ranges_consistent_with_mask():
         for b0, b1 in ranges:
             rebuilt[b0:b1] = True
         assert torch.equal(rebuilt, mask)
+
+
+class TestDataFrameConstructor:
+    """GeneAnnotation accepts a pre-filtered DataFrame, and rejects unusable ones.
+
+    Filtering with pandas is the supported way to restrict an annotation, so the
+    constructor has to validate what it is handed — a frame that lost its gene
+    rows answers every lookup with an empty result rather than raising, which is
+    the failure these tests pin down.
+    """
+
+    def test_dataframe_is_indexed_without_a_path(self):
+        ann = GeneAnnotation(pd.DataFrame([_gene("ENSG1", 100, 200), _exon("ENSG1", 100, 150)]))
+        assert ann.get_genes_in_interval(Interval("chr1", 0, 300)) == ["ENSG1"]
+        assert ann._get_exons_for_gene("ENSG1") == [(100, 150)]
+        # No file backs this annotation; the path aliases report that honestly.
+        assert ann.annotation_path is None
+        assert ann.gtf_path is None
+
+    def test_pre_filtering_restricts_the_gene_set(self):
+        rows = [
+            _gene("ENSG1", 100, 200), _exon("ENSG1", 100, 150),
+            _gene("ENSG2", 300, 400, gtype="lncRNA"), _exon("ENSG2", 300, 350, gtype="lncRNA"),
+        ]
+        df = pd.DataFrame(rows)
+        # gene_type sits on gene and exon rows alike, so one predicate covers both.
+        ann = GeneAnnotation(df[df.gene_type == "protein_coding"])
+        assert ann.get_genes_in_interval(Interval("chr1", 0, 500)) == ["ENSG1"]
+        assert ann._get_exons_for_gene("ENSG1") == [(100, 150)]
+        assert ann._get_exons_for_gene("ENSG2") == []
+
+    def test_filtering_away_gene_rows_raises(self):
+        """The MANE_Select footgun: transcript-level tags never match gene rows."""
+        df = pd.DataFrame([
+            dict(_gene("ENSG1", 100, 200), tag=None),
+            dict(_exon("ENSG1", 100, 150), tag="MANE_Select"),
+        ])
+        kept = df[df["tag"].astype(str).str.contains("MANE_Select")]
+        assert len(kept) == 1 and (kept.Feature == "gene").sum() == 0  # gene row dropped
+        with pytest.raises(ValueError, match="no `Feature == 'gene'` rows"):
+            GeneAnnotation(kept)
+
+    def test_missing_required_columns_raise(self):
+        df = pd.DataFrame([_gene("ENSG1", 100, 200)]).drop(columns=["gene_id"])
+        with pytest.raises(ValueError, match="missing required column"):
+            GeneAnnotation(df)
+
+    def test_gene_only_annotation_is_allowed(self):
+        """Exon rows are optional — gene-body aggregation does not need them."""
+        ann = GeneAnnotation(pd.DataFrame([_gene("ENSG1", 100, 200)]))
+        assert ann.get_genes_in_interval(Interval("chr1", 0, 300)) == ["ENSG1"]
+        assert not ann.has_exon_annotations()

@@ -3,7 +3,7 @@
 This module provides classes for loading and querying gene annotations
 from GTF/GFF or Parquet files for use with gene-centric variant scorers.
 
-For best performance, convert GTF files to Parquet format using:
+Convert GTF files to Parquet with:
     python scripts/convert_gtf_to_parquet.py --input annotation.gtf --output annotation.parquet
 """
 
@@ -32,35 +32,78 @@ class GeneInfo:
     strand: str
 
 
-class GeneAnnotation:
-    """Load and query gene/exon annotations from GTF or Parquet files.
+_REQUIRED_COLUMNS = ('Feature', 'Chromosome', 'Start', 'End', 'gene_id')
 
-    Supports both GTF/GFF files (using pyranges) and pre-converted Parquet files.
-    Parquet files load ~50-100x faster than GTF files.
+
+def _validate_annotation_frame(df: pd.DataFrame, source: str) -> None:
+    """Reject frames GeneAnnotation cannot index, at the point of supply.
+
+    Gene lookups are driven entirely by ``Feature == 'gene'`` rows, so a frame
+    without them answers every query with an empty result instead of raising.
+    Filtering a GTF on a transcript-level attribute (``tag``, ``transcript_type``)
+    drops those rows — fail loudly instead.
+    """
+    missing = [c for c in _REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Annotation from {source} is missing required column(s): {missing}. "
+            f"Expected at least {list(_REQUIRED_COLUMNS)}."
+        )
+    if not (df['Feature'] == 'gene').any():
+        raise ValueError(
+            f"Annotation from {source} contains no `Feature == 'gene'` rows, so "
+            "every gene lookup would return empty. Filtering a GTF on a "
+            "transcript-level attribute (e.g. tag == 'MANE_Select') drops them — "
+            "keep the gene rows alongside the filtered transcript/exon rows."
+        )
+
+
+class GeneAnnotation:
+    """Load and query gene/exon annotations from a GTF, Parquet file, or DataFrame.
+
+    Accepts GTF/GFF files (via pyranges), Parquet files, or an in-memory
+    DataFrame in the same layout — one row per GTF feature, with at least
+    ``Feature``, ``Chromosome``, ``Start``, ``End``, and ``gene_id`` columns,
+    and coordinates 0-based half-open.
+
+    Passing a DataFrame is the supported way to restrict the annotation: filter
+    it with pandas first. Keep the ``Feature == 'gene'`` rows — gene lookups are
+    built from those, and a frame without them is rejected at construction.
 
     To convert GTF to Parquet:
         python scripts/convert_gtf_to_parquet.py --input annotation.gtf --output annotation.parquet
 
     Example:
-        >>> # Fast loading from Parquet (recommended)
         >>> annotation = GeneAnnotation('/path/to/gencode.parquet')
         >>> genes = annotation.get_genes_in_interval(interval)
         >>>
-        >>> # Traditional GTF loading (slower)
         >>> annotation = GeneAnnotation('/path/to/gencode.gtf')
+        >>>
+        >>> # Pre-filtered DataFrame (e.g. protein-coding only). `gene_type` is
+        >>> # present on gene and exon rows alike, so one predicate covers both.
+        >>> import pandas as pd
+        >>> gtf = pd.read_parquet('/path/to/gencode.parquet')
+        >>> annotation = GeneAnnotation(gtf[gtf.gene_type == 'protein_coding'])
     """
 
-    def __init__(self, annotation_path: str | Path):
-        """Initialize with path to annotation file.
+    def __init__(self, annotation: str | Path | pd.DataFrame):
+        """Initialize from an annotation path or a DataFrame.
 
         Args:
-            annotation_path: Path to annotation file. Supports:
-                - Parquet files (.parquet) - fast loading, recommended
-                - GTF/GFF files (.gtf, .gff, .gff3) - slow, requires pyranges
+            annotation: One of:
+                - Parquet file path (.parquet)
+                - GTF/GFF file path (.gtf, .gff, .gff3), requires pyranges
+                - A pandas DataFrame in GTF layout (see the class docstring).
+                  Held by reference and not copied, so do not mutate it
+                  afterwards; the indices built from it would go stale.
+
+        Raises:
+            ValueError: If a DataFrame is missing required columns or has no
+                ``Feature == 'gene'`` rows.
         """
-        self.annotation_path = Path(annotation_path)
         self._df: pd.DataFrame | None = None
         self._gene_index: dict[str, GeneInfo] = {}
+        self._gene_index_built: bool = False
         # Exon coordinates by (versionless) gene id. Built once, lazily, in a
         # single groupby pass — see `_get_exons_for_gene`.
         self._exon_cache: dict[str, list[tuple[int, int]]] = {}
@@ -69,6 +112,17 @@ class GeneAnnotation:
         # queries; built lazily in `get_genes_in_interval`.
         self._interval_index: dict[str, dict[str, Any]] | None = None
         self._max_gene_span: int = 0
+
+        if isinstance(annotation, pd.DataFrame):
+            # Validate eagerly: there is no IO to defer, and raising here points
+            # at the caller's filter rather than at some later gene lookup.
+            _validate_annotation_frame(annotation, 'DataFrame')
+            self.annotation_path = None
+            self._file_format = 'dataframe'
+            self._df = annotation
+            return
+
+        self.annotation_path = Path(annotation)
 
         # Detect file format
         suffix = self.annotation_path.suffix.lower()
@@ -82,10 +136,11 @@ class GeneAnnotation:
                 del _pr
             except ImportError:
                 raise ImportError(
-                    "pyranges is required for GTF files. "
+                    "pyranges is required to read GTF/GFF files. "
                     "Install with: pip install pyranges\n"
-                    "Or convert to Parquet for faster loading: "
-                    "python scripts/convert_gtf_to_parquet.py"
+                    "Or pass a .parquet file or a DataFrame, neither of which "
+                    "needs it. (scripts/convert_gtf_to_parquet.py converts a GTF "
+                    "once, but itself runs on pyranges.)"
                 )
         else:
             raise ValueError(
@@ -95,18 +150,23 @@ class GeneAnnotation:
 
     # Keep gtf_path as alias for backward compatibility
     @property
-    def gtf_path(self) -> Path:
-        """Alias for annotation_path (backward compatibility)."""
+    def gtf_path(self) -> Path | None:
+        """Alias for annotation_path (backward compatibility).
+
+        ``None`` when built from a DataFrame.
+        """
         return self.annotation_path
 
     @property
     def df(self) -> pd.DataFrame:
-        """Lazy-loaded annotation DataFrame."""
+        """Annotation DataFrame; loaded and indexed on first access."""
         if self._df is None:
             if self._file_format == 'parquet':
                 self._load_from_parquet()
             else:
                 self._load_from_gtf()
+            _validate_annotation_frame(self._df, str(self.annotation_path))
+        if not self._gene_index_built:
             self._build_gene_index()
         return self._df
 
@@ -130,6 +190,7 @@ class GeneAnnotation:
         """Build index of gene information."""
         # Filter for gene features
         genes_df = self._df[self._df['Feature'] == 'gene']
+        self._gene_index_built = True
 
         for _, row in genes_df.iterrows():
             gene_id = row.get('gene_id', '')
@@ -458,8 +519,13 @@ class PolyAAnnotation:
     """PolyA site annotations from GENCODE polyAs GTF or linked parquet.
 
     This class loads and queries polyadenylation site annotations from
-    GENCODE polyAs files. For best results, use a linked parquet created
-    by scripts/preprocess_polya.py which contains proper Ensembl gene IDs.
+    GENCODE polyAs files.
+
+    A *linked* parquet (from scripts/preprocess_polya.py) carries Ensembl gene
+    IDs, which changes what this class can do rather than just how fast it is:
+    PAS are matched to a gene by ID, mirroring the JAX reference. Without them,
+    :meth:`get_pas_for_gene` falls back to spatial overlap and
+    :meth:`get_total_pas_count_for_gene` returns 0.
 
     Features read: polyA_site, polyA_signal, pseudo_polyA
 
@@ -473,9 +539,10 @@ class PolyAAnnotation:
 
         Args:
             polya_path: Path to annotation file. Supports:
-                - Linked parquet files (recommended, created by preprocess_polya.py)
+                - Linked parquet from preprocess_polya.py (carries Ensembl gene
+                  IDs; see the class docstring for what they enable)
                 - Raw parquet files (.parquet)
-                - GTF files (.gtf) - slower, requires pyranges
+                - GTF files (.gtf), requires pyranges
         """
         self.polya_path = Path(polya_path)
         self._df: pd.DataFrame | None = None
@@ -493,9 +560,11 @@ class PolyAAnnotation:
                 del _pr
             except ImportError:
                 raise ImportError(
-                    "pyranges is required for GTF files. "
+                    "pyranges is required to read GTF/GFF files. "
                     "Install with: pip install pyranges\n"
-                    "Or convert to Parquet for faster loading."
+                    "Or pass a .parquet file, which does not need it. "
+                    "(scripts/preprocess_polya.py converts a GTF once, but "
+                    "itself runs on pyranges.)"
                 )
         else:
             raise ValueError(

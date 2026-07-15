@@ -370,9 +370,7 @@ class TestStitchingWithMockModel:
             dict(Feature="exon", Chromosome="chr1", Start=130944, End=131328, Strand="+",
                  gene_id="ENSY", gene_name="Y", gene_type="protein_coding"),
         ]
-        ann = GeneAnnotation("/tmp/does_not_exist.parquet")
-        ann._df = pd.DataFrame(rows)
-        ann._build_gene_index()
+        ann = GeneAnnotation(pd.DataFrame(rows))
 
         gc = predict_full_chromosomes_to_anndata(
             model, provider, ann, "atac",
@@ -399,12 +397,10 @@ class TestStitchingWithMockModel:
         model = self._MockModel(resolution=128, n_tracks=1)
         provider = self._build_in_memory_provider(GenomeSequenceProvider, chrom_len)
         # Gene-only annotation: no exon rows.
-        ann = GeneAnnotation("/tmp/does_not_exist.parquet")
-        ann._df = pd.DataFrame([
+        ann = GeneAnnotation(pd.DataFrame([
             dict(Feature="gene", Chromosome="chr1", Start=256, End=640, Strand="+",
                  gene_id="ENSX", gene_name="X", gene_type="protein_coding"),
-        ])
-        ann._build_gene_index()
+        ]))
 
         kwargs = dict(chromosomes=["chr1"], config=config, track_indices=[0],
                       device="cpu", show_progress=False)
@@ -436,9 +432,7 @@ class TestStitchingWithMockModel:
             dict(Feature="exon", Chromosome="chr1", Start=256, End=640, Strand="+",
                  gene_id="ENSX", gene_name="X", gene_type="protein_coding"),  # bins [2,5)
         ]
-        ann = GeneAnnotation("/tmp/does_not_exist.parquet")
-        ann._df = pd.DataFrame(rows)
-        ann._build_gene_index()
+        ann = GeneAnnotation(pd.DataFrame(rows))
 
         out = tmp_path / "gene_counts.h5ad"
         predict_full_chromosomes_to_anndata(

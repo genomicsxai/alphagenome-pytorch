@@ -40,9 +40,7 @@ def _make_annotation() -> GeneAnnotation:
         dict(Feature="exon", Chromosome="chr1", Start=110, End=116, Strand="-",
              gene_id="ENSGB", gene_name="B", gene_type="protein_coding"),
     ]
-    ann = GeneAnnotation("/tmp/does_not_exist.parquet")  # suffix only; never read
-    ann._df = pd.DataFrame(rows)
-    ann._build_gene_index()
+    ann = GeneAnnotation(pd.DataFrame(rows))
     return ann
 
 

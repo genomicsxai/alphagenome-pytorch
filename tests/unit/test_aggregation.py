@@ -79,9 +79,7 @@ def _make_annotation():
              gene_id="ENSGC", gene_name="C", gene_type="protein_coding"),
     ]
     df = pd.DataFrame(rows)
-    ann = GeneAnnotation("/tmp/does_not_exist.parquet")  # suffix only; file never read
-    ann._df = df
-    ann._build_gene_index()
+    ann = GeneAnnotation(df)
     return ann
 
 
@@ -230,9 +228,7 @@ def test_gene_expression_50pct_rule_counts_contained_exons_not_basepairs():
         dict(Feature="exon", Chromosome="chr1", Start=125, End=127, Strand="+",
              gene_id="ENSDROP", gene_name="D", gene_type="protein_coding"),   # outside
     ]
-    ann = GeneAnnotation("/tmp/does_not_exist.parquet")
-    ann._df = pd.DataFrame(rows)
-    ann._build_gene_index()
+    ann = GeneAnnotation(pd.DataFrame(rows))
 
     _, gene_ids, _ = gene_expression_values(
         torch.ones(1, 20, 1), ann, interval, track_strands=None
@@ -386,9 +382,7 @@ def _two_tile_annotation():
         dict(Feature="exon", Chromosome="chr1", Start=16, End=18, Strand="-",
              gene_id="ENSH", gene_name="H", gene_type="protein_coding"),
     ]
-    ann = GeneAnnotation("/tmp/does_not_exist.parquet")
-    ann._df = pd.DataFrame(rows)
-    ann._build_gene_index()
+    ann = GeneAnnotation(pd.DataFrame(rows))
     return ann
 
 
@@ -449,9 +443,7 @@ def test_accumulator_merges_bins_shared_by_exons_at_128bp():
         dict(Feature="exon", Chromosome="chr1", Start=140, End=150, Strand="+",
              gene_id="ENSG", gene_name="G", gene_type="protein_coding"),   # -> bin 1
     ]
-    ann = GeneAnnotation("/tmp/does_not_exist.parquet")
-    ann._df = pd.DataFrame(rows)
-    ann._build_gene_index()
+    ann = GeneAnnotation(pd.DataFrame(rows))
     preds = torch.tensor([[5.0], [7.0]])  # [2 bins, 1 track]: bin0=5, bin1=7
 
     acc = GeneCountAccumulator(ann, resolution=128, over="exons", reduce="sum")
