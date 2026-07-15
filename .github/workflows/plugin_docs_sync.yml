@@ -1,0 +1,25 @@
+name: Plugin docs sync
+
+on:
+  pull_request:
+    paths:
+      - 'docs/alphagenome-usage.md'
+      - 'plugins/alphagenome/skills/alphagenome-predictions/reference/usage.md'
+  push:
+    branches: [main]
+
+jobs:
+  check-usage-guide-in-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bundled plugin guide must match docs/alphagenome-usage.md
+        run: |
+          if ! diff -u docs/alphagenome-usage.md \
+                       plugins/alphagenome/skills/alphagenome-predictions/reference/usage.md; then
+            echo
+            echo "::error::The plugin's bundled usage guide has drifted from docs/alphagenome-usage.md."
+            echo "docs/alphagenome-usage.md is the source of truth. Re-sync with:"
+            echo "  cp docs/alphagenome-usage.md plugins/alphagenome/skills/alphagenome-predictions/reference/usage.md"
+            exit 1
+          fi

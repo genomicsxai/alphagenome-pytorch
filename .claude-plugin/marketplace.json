@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "alphagenome",
+  "description": "Plugins for working with AlphaGenome-PyTorch, a PyTorch port of the AlphaGenome genomics model.",
+  "owner": {
+    "name": "genomicsxai",
+    "url": "https://github.com/genomicsxai/alphagenome-pytorch"
+  },
+  "plugins": [
+    {
+      "name": "alphagenome",
+      "description": "Get genomic track predictions from AlphaGenome-PyTorch by assay, cell type, and resolution — filter tracks by metadata (biosample, assay, ontology, strand).",
+      "version": "0.1.0",
+      "category": "data-science",
+      "tags": ["genomics", "alphagenome", "pytorch", "bioinformatics"],
+      "source": "./plugins/alphagenome",
+      "homepage": "https://github.com/genomicsxai/alphagenome-pytorch"
+    }
+  ]
+}

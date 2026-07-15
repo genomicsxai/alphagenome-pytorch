@@ -28,6 +28,23 @@ For fine-tuning (incl. BigWig data loading):
 pip install alphagenome-pytorch[finetuning]  # adds pyBigWig, pyfaidx
 ```
 
+### Use with coding agents
+
+If you use a coding agent, [`docs/alphagenome-usage.md`](docs/alphagenome-usage.md) is an
+agent-agnostic guide to running the model and pulling out predictions for a specific
+assay, cell type, or resolution.
+
+For Claude Code, install it as a plugin so the agent picks it up automatically in any
+project:
+
+```
+/plugin marketplace add genomicsxai/alphagenome-pytorch
+/plugin install alphagenome@alphagenome
+```
+
+Then ask things like *"get DNase predictions from GM12878 at 128bp"* or *"write a wrapper
+to get all the K562 predictions"*.
+
 ## Quick Start
 
 ```python
