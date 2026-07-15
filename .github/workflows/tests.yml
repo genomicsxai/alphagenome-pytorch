@@ -27,10 +27,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: project.toml
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          # python -m pip install --upgrade pip
           # Install CPU-only PyTorch to avoid downloading CUDA/NVIDIA drivers
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           # Install alphagenome_research
