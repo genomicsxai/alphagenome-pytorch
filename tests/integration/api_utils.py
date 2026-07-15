@@ -150,6 +150,7 @@ def save_api_scores(
     api_scores: list['anndata.AnnData'],
     cache_dir: Path | str | None = None,
     variant_str: str | None = None,
+    cache_path: Path | str | None = None,
 ) -> Path:
     """Save API scores to cache.
 
@@ -157,11 +158,19 @@ def save_api_scores(
         api_scores: List of AnnData objects from API
         cache_dir: Directory to save cache. If None, uses default.
         variant_str: Variant string for metadata
+        cache_path: Exact file to write. Takes precedence over ``cache_dir``.
+            Callers that read from a specific file must write back to that same
+            file — deriving a directory from it is not enough, since the
+            ``cache_dir`` form would rename it to ``variant_scores.pkl`` and the
+            next read would miss.
 
     Returns:
         Path to saved pickle file
     """
-    if cache_dir is None:
+    if cache_path is not None:
+        cache_path = Path(cache_path)
+        cache_dir = cache_path.parent
+    elif cache_dir is None:
         cache_path = get_cache_path()
         cache_dir = cache_path.parent
     else:
@@ -229,9 +238,10 @@ def get_or_fetch_api_scores(
 
         api_scores = fetch_api_scores(api_key=api_key)
 
-        # Save to cache for future use
+        # Save to cache for future use — back to the file we read from, or the
+        # caller misses and refetches from the API on every single call.
         variant_str = f"{DEFAULT_VARIANT_CHROMOSOME}:{DEFAULT_VARIANT_POSITION}:{DEFAULT_VARIANT_REFERENCE_BASES}>{DEFAULT_VARIANT_ALTERNATE_BASES}"
-        save_path = save_api_scores(api_scores, variant_str=variant_str)
+        save_path = save_api_scores(api_scores, variant_str=variant_str, cache_path=cache_path)
         if verbose:
             print(f"Fetched {len(api_scores)} scorer results from API")
             print(f"Saved to cache: {save_path}")
@@ -386,9 +396,24 @@ def save_api_predictions(
     predictions: dict,
     cache_dir: Path | str | None = None,
     variant_str: str | None = None,
+    cache_path: Path | str | None = None,
 ) -> Path:
-    """Save windowed API predictions to cache (mirrors save_api_scores)."""
-    if cache_dir is None:
+    """Save windowed API predictions to cache (mirrors save_api_scores).
+
+    Args:
+        predictions: Windowed predictions keyed by output type.
+        cache_dir: Directory to write into; the filename is chosen for you.
+        variant_str: Variant string for the metadata sidecar.
+        cache_path: Exact file to write. Takes precedence over ``cache_dir``.
+            Callers that read from a specific file must write back to that same
+            file — deriving a directory from it is not enough, since the
+            ``cache_dir`` form would rename it to ``variant_predictions.pkl``
+            and the next read would miss.
+    """
+    if cache_path is not None:
+        cache_path = Path(cache_path)
+        cache_dir = cache_path.parent
+    elif cache_dir is None:
         cache_path = get_predictions_cache_path()
         cache_dir = cache_path.parent
     else:
@@ -439,7 +464,11 @@ def get_or_fetch_api_predictions(
             f"{DEFAULT_VARIANT_CHROMOSOME}:{DEFAULT_VARIANT_POSITION}:"
             f"{DEFAULT_VARIANT_REFERENCE_BASES}>{DEFAULT_VARIANT_ALTERNATE_BASES}"
         )
-        save_path = save_api_predictions(predictions, variant_str=variant_str)
+        # Write back to the file we read from, or the caller misses and refetches
+        # from the API on every single call.
+        save_path = save_api_predictions(
+            predictions, variant_str=variant_str, cache_path=cache_path
+        )
         if verbose:
             print(f"Fetched predictions for {len(predictions)} output types from API")
             print(f"Saved to cache: {save_path}")
