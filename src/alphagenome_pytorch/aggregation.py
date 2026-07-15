@@ -757,7 +757,6 @@ def gene_expression_values(
     annotation: "GeneAnnotation",
     interval: tuple[str, int, int],
     *,
-    resolution: int = 1,
     min_exon_fraction: float = 0.5,
     log: str | None = "log1p",
     track_strands: "Sequence[str] | None" = None,
@@ -768,8 +767,9 @@ def gene_expression_values(
     Returns ``(values, gene_ids, gene_strands)`` where ``values`` is ``[G, C]``
     (log-space by default). If ``track_strands`` is given, strand-incompatible
     ``(gene, track)`` cells are set to NaN (sense-strand matching).
-    ``resolution`` is informational here; the interval width and the
-    prediction sequence length determine the true bin size.
+
+    Bin size is derived from the interval width and the prediction sequence
+    length, so predictions at any resolution work without being told which.
 
     Args:
         predictions: ``[S, C]`` or ``[1, S, C]`` predictions for one window.

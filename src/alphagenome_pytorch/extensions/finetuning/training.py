@@ -1677,7 +1677,7 @@ def validate_multihead(
     gene_annotation: Any = None,
     gene_expr_track_strands: list[str] | None = None,
     gene_expr_modality: str = "rna_seq",
-    gene_expr_resolution: int = 1,
+    gene_expr_resolution: int | None = None,
     gene_expr_window_cache: dict | None = None,
 ) -> tuple[float, dict[str, Any]]:
     """Validate model with multiple modality heads.
@@ -1711,8 +1711,12 @@ def validate_multihead(
             correct metric when tracks are stranded.
         gene_expr_modality: Modality the gene-expression metric applies to
             (default ``"rna_seq"``).
-        gene_expr_resolution: Resolution at which to compute the metric
-            (default ``1`` bp).
+        gene_expr_resolution: Resolution of the head output the metric reads.
+            Defaults to 128 under ``encoder_only`` (those heads emit 128bp only)
+            and 1 otherwise. The metric itself is resolution-agnostic — it
+            derives bin size from the interval width — so this only selects
+            *which* head output to consume. It must be a resolution the head
+            actually emits, or no windows accumulate and the metric is NaN.
         gene_expr_window_cache: Optional dict reused across epochs to memoize the
             per-window exon-mask lookup (the only pandas-heavy step). Create once
             in the training driver and pass it every epoch so each validation
@@ -1747,6 +1751,22 @@ def validate_multihead(
         and compute_pearson
         and gene_expr_modality in heads
     )
+    # Encoder-only heads emit 128bp only, so the 1bp default would match no
+    # output and the metric would silently report NaN every epoch.
+    if gene_expr_resolution is None:
+        gene_expr_resolution = 128 if encoder_only else 1
+    if gene_expr_enabled:
+        # The metric only reads the head output at `gene_expr_resolution`. If the
+        # modality never emits it, no window ever accumulates and every epoch
+        # reports n_genes=0 with NaN correlations and no error. Fail instead.
+        available = sorted(resolution_weights.get(gene_expr_modality, {}))
+        if gene_expr_resolution not in available:
+            raise ValueError(
+                f"gene-expression metric requested at {gene_expr_resolution}bp, but "
+                f"'{gene_expr_modality}' emits {available or 'no resolutions'}"
+                + (" (encoder_only forces 128bp)" if encoder_only else "")
+                + ". Pass gene_expr_resolution matching an emitted resolution."
+            )
     gene_expr_windows: list[tuple[list[str], Tensor, Tensor]] = []
 
     if is_main_process(rank):

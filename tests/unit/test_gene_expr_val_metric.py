@@ -169,3 +169,45 @@ def test_gene_expr_metrics_modality_prefix_and_empty():
     m = _gene_expr_metrics([], modality="cage", world_size=1)
     assert m["cage_gene_log_expr_n_genes"] == 0
     assert math.isnan(m["cage_gene_log_expr_pearson_across_genes"])
+
+
+class TestGeneExprResolutionSelection:
+    """The metric only reads the head output at `gene_expr_resolution`.
+
+    A resolution the modality never emits matches nothing, so no window
+    accumulates and every epoch reports n_genes=0 with NaN correlations and no
+    error — a whole run's metric silently void. These pin the guard and the
+    encoder-only default that caused it.
+    """
+
+    class _Stub:
+        def eval(self):
+            return self
+
+    def _validate(self, *, encoder_only, res_weights, gene_expr_resolution=None):
+        from alphagenome_pytorch.extensions.finetuning.training import validate_multihead
+
+        return validate_multihead(
+            model=self._Stub(), heads={"rna_seq": self._Stub()}, val_loader=[],
+            device="cpu", modality_weights={"rna_seq": 1.0},
+            resolution_weights={"rna_seq": res_weights},
+            positional_weight=1.0, count_weight=1.0, use_amp=False,
+            encoder_only=encoder_only, gene_annotation=_make_annotation(),
+            gene_expr_resolution=gene_expr_resolution,
+        )
+
+    def test_encoder_only_defaults_to_128bp(self):
+        # Encoder-only heads emit 128bp only; the 1bp default would match nothing.
+        self._validate(encoder_only=True, res_weights={128: 1.0})
+
+    def test_default_is_1bp_otherwise(self):
+        self._validate(encoder_only=False, res_weights={1: 1.0, 128: 1.0})
+
+    def test_resolution_the_modality_never_emits_raises(self):
+        with pytest.raises(ValueError, match="requested at 1bp"):
+            self._validate(encoder_only=False, res_weights={128: 1.0})
+
+    def test_encoder_only_forced_to_1bp_raises_and_says_why(self):
+        with pytest.raises(ValueError, match="encoder_only forces 128bp"):
+            self._validate(encoder_only=True, res_weights={128: 1.0},
+                           gene_expr_resolution=1)
