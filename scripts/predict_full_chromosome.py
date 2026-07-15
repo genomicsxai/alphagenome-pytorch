@@ -141,8 +141,14 @@ def main():
         "--gene-strand",
         choices=["all", "match"],
         default="all",
-        help="Strand handling for the gene x track matrix: 'all' keeps every track "
-             "(dense, default); 'match' NaNs strand-incompatible cells (needs --track-strands).",
+        help="Strand handling for the gene x track matrix. 'all' (default) fills "
+             "every cell, so each gene is also scored by tracks reading the "
+             "opposite strand -- that signal is antisense, not the gene's own "
+             "expression. 'match' sets those cells to NaN, leaving each gene "
+             "scored only by tracks on its strand; unstranded ('.') tracks match "
+             "everything. NaN rather than 0 so the cells drop out of downstream "
+             "means and correlations instead of averaging in as zeros. "
+             "Needs --track-strands.",
     )
     gene_out.add_argument(
         "--track-strands",
