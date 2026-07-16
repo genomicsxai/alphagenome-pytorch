@@ -6,7 +6,7 @@
 - **Fine-tuning / transfer learning** (linear probing, LoRA, Locon, adapters,
   training on BigWig data, delta checkpoints, multi-GPU): see
   [`docs/finetuning/index.rst`](docs/finetuning/index.rst) and
-  `scripts/finetune.py --help`.
+  `agt finetune --help`.
 - **Developing this package** (architecture, tests, weight conversion,
   conventions): see [`CLAUDE.md`](CLAUDE.md).
 - **Named-outputs API reference**: see [`docs/named_outputs.rst`](docs/named_outputs.rst).

@@ -95,9 +95,8 @@ There is **no `--overlap-lowres` flag**; the low-res overlap is computed as
 ## 6. Python API (when the CLI doesn't fit)
 
 ```python
-from alphagenome_pytorch import AlphaGenome
-from alphagenome_pytorch.extensions.finetuning.transfer import (
-    TransferConfig, load_trunk, prepare_for_transfer,
+from alphagenome_pytorch import (
+    AlphaGenome, TransferConfig, load_trunk, prepare_for_transfer,
 )
 
 model = AlphaGenome()
@@ -108,10 +107,6 @@ model = prepare_for_transfer(model, TransferConfig(
     lora_rank=8,
 ))
 ```
-
-Note the import path: `load_trunk` and `prepare_for_transfer` live in
-`...extensions.finetuning.transfer` and are **not** exported from the top-level
-`alphagenome_pytorch` package.
 
 Re-exported from `alphagenome_pytorch.extensions.finetuning`: `TransferConfig`,
 `MODALITY_CONFIGS`, `LoRA`, `Locon`, `IA3`, `train_epoch`, `validate`,

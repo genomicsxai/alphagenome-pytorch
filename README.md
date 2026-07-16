@@ -128,9 +128,8 @@ emb['embeddings_128bp']  # (B, 1024, 3072) at 128bp
 Train a new head on your data with frozen trunk (linear probing) or with LoRA adapters:
 
 ```python
-from alphagenome_pytorch import AlphaGenome
-from alphagenome_pytorch.extensions.finetuning.transfer import (
-    TransferConfig, load_trunk, prepare_for_transfer,
+from alphagenome_pytorch import (
+    AlphaGenome, TransferConfig, load_trunk, prepare_for_transfer,
 )
 
 # Load trunk, freeze, add custom heads

@@ -1,8 +1,9 @@
 # Using AlphaGenome-PyTorch to get predictions
 
-This is the source-of-truth guide for *running* AlphaGenome and pulling out
-predictions for a specific assay, cell type, or resolution. It is
-agent-agnostic — any human or coding agent can follow it. (For *developing*
+This is the canonical guide for *running* AlphaGenome and pulling out predictions
+for a specific assay, cell type, or resolution. The installable plugin carries a
+CI-checked vendored mirror so it remains usable outside a repository clone. This
+guide is agent-agnostic — any human or coding agent can follow it. (For *developing*
 the package, see [`CLAUDE.md`](https://github.com/genomicsxai/alphagenome-pytorch/blob/main/CLAUDE.md).
 For the full named-outputs API reference, see
 [`docs/named_outputs.rst`](https://github.com/genomicsxai/alphagenome-pytorch/blob/main/docs/named_outputs.rst).)
@@ -16,6 +17,16 @@ The named-outputs API turns that metadata into a query layer over the tensors.
 **Reach for the CLI first.** If you just need predictions written to disk for some
 regions, `agt predict` already does it — no Python required. Drop to the Python API
 when you need tensors in-process, or track selection richer than `--tracks` allows.
+
+## Contents
+
+- [Command line: `agt predict`](#command-line-agt-predict)
+- [The 30-second version (Python)](#the-30-second-version-python)
+- [Step 1 — Inputs and shapes](#step-1--inputs-and-shapes)
+- [Step 2 — Output heads and resolutions](#step-2--output-heads-assays-and-resolutions)
+- [Step 3 — Selecting tracks by metadata](#step-3--selecting-tracks-by-metadata)
+- [Recipes](#recipes-the-users-actual-asks)
+- [Gotchas](#gotchas)
 
 ## Command line: `agt predict`
 

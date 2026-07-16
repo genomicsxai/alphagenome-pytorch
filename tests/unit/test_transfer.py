@@ -16,6 +16,19 @@ from alphagenome_pytorch.extensions.finetuning.transfer import (
 )
 
 
+def test_transfer_helpers_are_exported_from_package_root():
+    """The README's fine-tuning imports are part of the public API."""
+    from alphagenome_pytorch import (
+        TransferConfig as RootTransferConfig,
+        load_trunk as root_load_trunk,
+        prepare_for_transfer as root_prepare_for_transfer,
+    )
+
+    assert RootTransferConfig is TransferConfig
+    assert root_load_trunk is load_trunk
+    assert root_prepare_for_transfer is prepare_for_transfer
+
+
 # Mock model for testing (simpler than full AlphaGenome)
 class MockAlphaGenome(nn.Module):
     """Simplified AlphaGenome-like model for testing."""

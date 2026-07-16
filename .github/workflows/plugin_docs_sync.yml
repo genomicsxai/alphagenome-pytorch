@@ -5,6 +5,9 @@ on:
     paths:
       - 'docs/alphagenome-usage.md'
       - 'plugins/alphagenome/skills/alphagenome-predictions/reference/usage.md'
+      - 'scripts/check_usage_metadata.py'
+      - 'src/alphagenome_pytorch/data/track_metadata_human.parquet'
+      - 'src/alphagenome_pytorch/data/track_metadata_mouse.parquet'
   push:
     branches: [main]
 
@@ -13,13 +16,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Bundled plugin guide must match docs/alphagenome-usage.md
-        run: |
-          if ! diff -u docs/alphagenome-usage.md \
-                       plugins/alphagenome/skills/alphagenome-predictions/reference/usage.md; then
-            echo
-            echo "::error::The plugin's bundled usage guide has drifted from docs/alphagenome-usage.md."
-            echo "docs/alphagenome-usage.md is the source of truth. Re-sync with:"
-            echo "  cp docs/alphagenome-usage.md plugins/alphagenome/skills/alphagenome-predictions/reference/usage.md"
-            exit 1
-          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install metadata reader
+        run: pip install pandas pyarrow
+      - name: Validate vendored guide and metadata facts
+        run: python scripts/check_usage_metadata.py

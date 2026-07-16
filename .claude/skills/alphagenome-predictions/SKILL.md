@@ -5,8 +5,13 @@ description: Run AlphaGenome-PyTorch to get genomic track predictions — via th
 
 # Getting predictions from AlphaGenome-PyTorch
 
-Read **`docs/alphagenome-usage.md`** for the full guide. It is the
-source-of-truth for running the model and selecting tracks by metadata.
+`docs/alphagenome-usage.md` is the canonical guide. Read only the relevant sections:
+
+- Disk output: `Command line: agt predict`
+- Python tensors and input shapes: `The 30-second version` and `Step 1`
+- Assay/cell-type/resolution selection: `Step 2`, `Step 3`, and `Recipes`
+- Exact counts and metadata literals: `Step 2` and `Available metadata fields`
+- Padding, custom metadata, precision, or raw outputs: `Gotchas`
 
 **Try the CLI first** — `agt predict` writes predictions to disk without any Python:
 

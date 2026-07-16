@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "alphagenome",
-      "description": "Get genomic track predictions from AlphaGenome-PyTorch by assay, cell type, and resolution — filter tracks by metadata (biosample, assay, ontology, strand).",
+      "description": "Run metadata-aware predictions and fine-tune AlphaGenome-PyTorch on custom genomic tracks.",
       "version": "0.1.0",
       "category": "data-science",
       "tags": ["genomics", "alphagenome", "pytorch", "bioinformatics"],
