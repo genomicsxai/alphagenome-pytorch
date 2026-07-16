@@ -33,7 +33,9 @@ pytest tests/jax_comparison/ -v
 pytest tests/ -n 4 --jax-checkpoint=...
 
 # Convert JAX weights to PyTorch (includes track means)
-python scripts/convert_weights.py --input jax_checkpoint --output model.pth
+agt convert --input jax_checkpoint --output model.pth
+# equivalently (the script takes the checkpoint as a positional argument):
+python scripts/convert_weights.py jax_checkpoint --output model.pth
 ```
 
 ## Architecture

@@ -60,6 +60,9 @@ def __getattr__(name):
                 "compute_track_means", "MultimodalDataset", "collate_multimodal"):
         from alphagenome_pytorch.extensions.finetuning import datasets
         return getattr(datasets, name)
+    if name in ("convert_bigwigs_to_mmap", "convert_single_bigwig"):
+        from alphagenome_pytorch.extensions.finetuning import preprocessing
+        return getattr(preprocessing, name)
     if name in (
         "apply_atac_transforms",
         "apply_rnaseq_transforms",
@@ -88,6 +91,9 @@ __all__ = [
     "collate_multimodal",
     "CachedGenome",
     "compute_track_means",
+    # BigWig -> mmap preprocessing (lazy-loaded)
+    "convert_bigwigs_to_mmap",
+    "convert_single_bigwig",
     # Adapters
     "LoRA",
     "Locon",

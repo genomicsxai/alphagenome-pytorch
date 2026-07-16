@@ -1,4 +1,4 @@
-"""Unit tests for multimodal support in scripts/finetune.py."""
+"""Unit tests for multimodal support in the finetuning entry point."""
 
 from __future__ import annotations
 
@@ -9,18 +9,15 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-# Import script module symbols directly (tests run from repository root)
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
-
-import finetune as finetune_module  # noqa: E402
-from finetune import (  # noqa: E402
+from alphagenome_pytorch.extensions.finetuning import runner as finetune_module
+from alphagenome_pytorch.extensions.finetuning.args import parse_args
+from alphagenome_pytorch.extensions.finetuning.runner import (
     MultimodalDataset,
     collate_multimodal,
     load_track_metadata_for_finetune,
-    parse_args,
     unwrap_training_model,
 )
-from alphagenome_pytorch.extensions.finetuning.training import (  # noqa: E402
+from alphagenome_pytorch.extensions.finetuning.training import (
     _compute_multinomial_resolution,
 )
 
