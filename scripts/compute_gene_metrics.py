@@ -1,10 +1,15 @@
 #!/usr/bin/env python
-"""Evaluate an AlphaGenome checkpoint on exon-specific metrics.
+"""Evaluate an AlphaGenome checkpoint on RNA profile and gene metrics.
 
 RNA profile Pearson follows the AlphaGenome paper by applying log(1 + x).
 Jensen-Shannon metrics use raw, non-negative profiles. Regional total-count
 metrics are computed from the cropped 1-bp arrays and are therefore identical
 for every reported display resolution.
+
+Gene expression follows the AlphaGenome paper protocol: log1p of mean coverage
+over unioned GENCODE v46 exon bases, strand matching, one assignment per gene
+when at least 50% of its unique exon bases fall in a test interval, and raw plus
+quantile-normalized correlations across genes and across tracks.
 
 Example:
 
@@ -34,25 +39,21 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
 from scipy import stats
-from torch.utils.data import DataLoader, Subset
-
-from alphagenome_pytorch.extensions.finetuning.datasets import GenomicDataset
-from alphagenome_pytorch.extensions.finetuning.evaluation import evaluate_split
-from alphagenome_pytorch.extensions.finetuning.training import collate_genomic
-
-from evaluate_checkpoint import (
-    build_metric_views,
-    center_crop_profiles,
-    compute_comparison_metrics,
-    load_finetuned_model,
-    _pearson_or_nan,
-    parse_metric_bin_sizes,
-)
 
 
 log = logging.getLogger(__name__)
+
+
+def _pearson_or_nan(x: np.ndarray, y: np.ndarray) -> float:
+    """Pearson correlation with the same finite/constant guards as ATAC eval."""
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(x) & np.isfinite(y)
+    x, y = x[finite], y[finite]
+    if x.size < 2 or np.std(x) <= 1e-10 or np.std(y) <= 1e-10:
+        return float("nan")
+    return float(stats.pearsonr(x, y)[0])
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,7 +71,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-bed", required=True, help="fold_1 test BED")
     parser.add_argument(
         "--gtf-parquet", required=True,
-        help="Processed GTF parquet containing exon coordinates and gene metadata",
+        help=(
+            "GENCODE v46 GTF parquet containing exon coordinates and gene "
+            "metadata; the path must identify v46 or release_46"
+        ),
     )
     parser.add_argument(
         "--samples", nargs="+", default=None,
@@ -88,8 +92,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gene-score-window-bp", type=int, default=None,
         help=(
-            "Centered post-inference width for TSS selection and gene exon-mean "
-            "metrics; omit to use the full inference interval"
+            "Centered post-inference test width for the paper's >=50%% exon "
+            "selection and exon-mean metrics; omit to use the full inference "
+            "interval"
         ),
     )
     parser.add_argument("--source-resolution", type=int, default=1)
@@ -114,8 +119,19 @@ def _clean_json(value):
     return value
 
 
+def validate_gencode_v46_path(path: str) -> None:
+    """Require annotation provenance identifying GENCODE release 46."""
+    normalized_path = str(Path(path)).lower().replace("-", "_")
+    if "v46" not in normalized_path and "release_46" not in normalized_path:
+        raise ValueError(
+            "AlphaGenome paper gene metrics require GENCODE v46; "
+            f"the annotation path does not identify v46: {path}"
+        )
+
+
 def load_gtf(gtf_parquet: str) -> pd.DataFrame:
-    """Load columns needed by the official AlphaGenome gene-mask path."""
+    """Load the GENCODE v46 columns needed for paper gene-expression metrics."""
+    validate_gencode_v46_path(gtf_parquet)
     return pd.read_parquet(
         gtf_parquet,
         columns=[
@@ -125,199 +141,186 @@ def load_gtf(gtf_parquet: str) -> pd.DataFrame:
     )
 
 
-# Direct NumPy ports of the public AlphaGenome gene-mask implementation in
-# alphagenome/data/gene_annotation.py and
-# alphagenome_research/model/variant_scoring/gene_mask_extractor.py.
-def extract_tss(gtf: pd.DataFrame, feature: str = "transcript") -> pd.DataFrame:
-    """Extract strand-aware transcription start sites from a GTF DataFrame."""
-    tss = gtf[gtf.Feature == feature].copy()
-    tss["feature_start"] = tss.Start
-    tss["feature_end"] = tss.End
-    new_start = np.where(tss.Strand == "-", tss.End, tss.Start)
-    tss.Start = new_start
-    tss.End = new_start
-    return tss
+def downsample_gene_mask_weights(mask: np.ndarray, resolution: int) -> np.ndarray:
+    """Count exact exonic bases per output bin for paper exon means.
 
-
-class _PositionExtractor:
-    """Extract rows whose position lies in a half-open genomic interval."""
-
-    def __init__(
-        self,
-        frame: pd.DataFrame,
-        position_column: str,
-        chromosome_column: str = "Chromosome",
-    ):
-        self._df_position = {
-            chromosome: (group, group[position_column].values)
-            for chromosome, group in frame.groupby(
-                chromosome_column, observed=False,
-            )
-        }
-        self._df_empty = frame.iloc[:0]
-
-    def extract(self, chromosome: str, start: int, end: int) -> pd.DataFrame:
-        if chromosome not in self._df_position:
-            return self._df_empty
-        frame, position = self._df_position[chromosome]
-        return frame[(position >= start) & (position < end)]
-
-
-class _ExonExtractor:
-    """Extract exon intervals for one transcript."""
-
-    def __init__(self, gtf: pd.DataFrame):
-        self._exons_by_transcript_id = gtf[gtf.Feature == "exon"][
-            ["Chromosome", "Start", "End", "Strand", "transcript_id"]
-        ].groupby("transcript_id", sort=False)
-
-    def extract(self, transcript_id: str) -> list[tuple[str, int, int, str]]:
-        try:
-            exons = self._exons_by_transcript_id.get_group(transcript_id)
-        except KeyError:
-            return []
-        return list(zip(
-            exons.Chromosome,
-            exons.Start.astype(int),
-            exons.End.astype(int),
-            exons.Strand,
-        ))
-
-
-class _ExonMaskExtractor:
-    """Generate a boolean exon mask for one transcript."""
-
-    def __init__(self, gtf: pd.DataFrame):
-        self._exon_extractor = _ExonExtractor(gtf)
-
-    def extract(
-        self,
-        chromosome: str,
-        start: int,
-        end: int,
-        transcript_id: str,
-    ) -> np.ndarray:
-        mask = np.zeros(end - start, dtype=bool)
-        for exon_chromosome, exon_start, exon_end, _ in (
-            self._exon_extractor.extract(transcript_id)
-        ):
-            if exon_chromosome != chromosome:
-                continue
-            if exon_start < end and exon_end > start:
-                relative_start = max(exon_start - start, 0)
-                relative_end = min(exon_end - start, end - start)
-                mask[relative_start:relative_end] = True
-        return mask
-
-
-class _OfficialGeneExonMaskExtractor:
-    """Port of GeneMaskExtractor(EXONS, INTERVAL_CONTAINED)."""
-
-    _GENE_COLUMNS = [
-        "Chromosome", "Start", "End", "Strand", "gene_id", "gene_name",
-        "gene_type",
-    ]
-
-    def __init__(self, gtf: pd.DataFrame):
-        self._exon_mask_extractor = _ExonMaskExtractor(gtf)
-        self._tss = _PositionExtractor(
-            extract_tss(gtf), position_column="Start",
-        )
-        self._gene_df = gtf[gtf.Feature == "gene"][self._GENE_COLUMNS].set_index(
-            "gene_id"
-        )
-
-    def extract(
-        self, chromosome: str, start: int, end: int,
-    ) -> tuple[np.ndarray, pd.DataFrame]:
-        transcript_subset = self._tss.extract(chromosome, start, end)
-        gene_masks: dict[str, np.ndarray] = {}
-
-        for row in transcript_subset.itertuples():
-            exon_mask = self._exon_mask_extractor.extract(
-                chromosome, start, end, row.transcript_id,
-            )
-            if (gene_mask := gene_masks.get(row.gene_id)) is not None:
-                gene_mask |= exon_mask
-            else:
-                gene_masks[row.gene_id] = exon_mask
-
-        unique_gene_ids = list(transcript_subset["gene_id"].unique())
-        if not unique_gene_ids:
-            return (
-                np.empty((end - start, 0), dtype=bool),
-                pd.DataFrame(columns=[
-                    "gene_id", "strand", "gene_name", "gene_type",
-                    "interval_start", "Chromosome", "Start", "End",
-                ]),
-            )
-        gene_metadata = self._gene_df.loc[unique_gene_ids]
-        mask = np.empty((end - start, len(unique_gene_ids)), dtype=bool)
-        for index, gene_id in enumerate(unique_gene_ids):
-            mask[:, index] = gene_masks[gene_id]
-
-        metadata = pd.DataFrame({
-            "gene_id": unique_gene_ids,
-            "strand": gene_metadata.Strand.values,
-            "gene_name": gene_metadata.gene_name.values,
-            "gene_type": gene_metadata.gene_type.values,
-            "interval_start": [start] * len(unique_gene_ids),
-            "Chromosome": gene_metadata.Chromosome.values,
-            "Start": gene_metadata.Start.values,
-            "End": gene_metadata.End.values,
-        }).reset_index(drop=True)
-        return mask, metadata
-
-
-def downsample_gene_mask(mask: np.ndarray, resolution: int) -> np.ndarray:
-    """Match GeneIntervalScorer's max pooling of masks at coarse resolution."""
+    Weighting a mean-pooled coarse prediction by this count is equivalent to
+    upsampling the prediction and averaging it over the original 1-bp mask.
+    """
     if resolution == 1:
-        return mask
+        return mask.astype(np.int64)
     if mask.shape[0] % resolution:
         raise ValueError(
             f"Gene mask length {mask.shape[0]} is not divisible by {resolution}"
         )
     return mask.reshape(
         mask.shape[0] // resolution, resolution, -1,
-    ).max(axis=1)
+    ).sum(axis=1)
 
 
 def score_gene_interval_mean(tracks: np.ndarray, masks: np.ndarray) -> np.ndarray:
-    """Direct NumPy port of GeneIntervalScorer.MEAN."""
+    """Mean coverage using boolean masks or per-bin exon-base weights."""
     return np.einsum("lt,lg->gt", tracks, masks) / np.expand_dims(
         masks.sum(axis=0), axis=-1,
     )
 
 
-def assign_genes_to_nearest_center(
-    gtf: pd.DataFrame,
-    positions: list[tuple[str, int, int]],
-) -> dict[str, int]:
-    """Assign each TSS-selected gene to one overlapping evaluation interval.
-
-    AlphaGenome's extractor scores genes independently in every requested
-    interval. The fold-1 BED contains overlapping windows, so a dataset-level
-    correlation additionally needs a deterministic one-row-per-gene rule.
-    Among intervals containing a transcript TSS, use the interval whose center
-    is closest to any TSS for that gene (ties resolve to the earlier BED row).
-    """
-    tss_extractor = _PositionExtractor(
-        extract_tss(gtf), position_column="Start",
-    )
-    best: dict[str, tuple[float, int]] = {}
-    for interval_index, (chromosome, start, end) in enumerate(positions):
-        transcript_subset = tss_extractor.extract(chromosome, start, end)
-        if transcript_subset.empty:
+def _merge_intervals(
+    intervals: list[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    """Return the genomic union of half-open intervals."""
+    merged: list[list[int]] = []
+    for start, end in sorted(intervals):
+        if end <= start:
             continue
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return tuple((start, end) for start, end in merged)
+
+
+def build_paper_gene_annotations(gtf: pd.DataFrame) -> pd.DataFrame:
+    """Build one GENCODE gene record with a union of all annotated exons.
+
+    GENCODE can contain overlapping exon records from multiple transcripts.
+    Treating the exon annotation as a genomic mask, as AlphaGenome's public
+    GeneIntervalScorer does, ensures every exonic base contributes once.
+    """
+    exons = gtf[gtf["Feature"] == "exon"].copy()
+    if exons.empty:
+        raise ValueError("GENCODE annotation contains no exon rows")
+
+    records: list[dict] = []
+    for gene_id, gene_exons in exons.groupby("gene_id", sort=False):
+        chromosomes = gene_exons["Chromosome"].dropna().unique()
+        strands = gene_exons["Strand"].dropna().unique()
+        if len(chromosomes) != 1 or len(strands) != 1:
+            raise ValueError(
+                f"Gene {gene_id!r} has inconsistent chromosome or strand "
+                "annotations"
+            )
+        intervals = _merge_intervals(list(zip(
+            gene_exons["Start"].astype(int),
+            gene_exons["End"].astype(int),
+        )))
+        exon_bp = sum(end - start for start, end in intervals)
+        if exon_bp == 0:
+            continue
+        first = gene_exons.iloc[0]
+        records.append({
+            "gene_id": gene_id,
+            "gene_name": first.get("gene_name", gene_id),
+            "gene_type": first.get("gene_type", None),
+            "chrom": chromosomes[0],
+            "strand": strands[0],
+            "exon_intervals": intervals,
+            "total_unique_exon_bp": exon_bp,
+            "exon_start": intervals[0][0],
+            "exon_end": intervals[-1][1],
+        })
+    return pd.DataFrame.from_records(records).set_index("gene_id", drop=False)
+
+
+def _exon_overlap_bp(
+    intervals: tuple[tuple[int, int], ...], start: int, end: int,
+) -> int:
+    return sum(
+        max(0, min(exon_end, end) - max(exon_start, start))
+        for exon_start, exon_end in intervals
+    )
+
+
+def assign_paper_genes_to_intervals(
+    gene_annotations: pd.DataFrame,
+    positions: list[tuple[str, int, int]],
+    minimum_exon_fraction: float = 0.5,
+) -> dict[str, dict]:
+    """Assign genes satisfying the paper's >=50% exon criterion exactly once.
+
+    The percentage is calculated over unique annotated exon bases. If
+    overlapping test intervals both qualify, use the interval containing the
+    greatest number of exon bases, then the closest interval center, then BED
+    order. The tie-break normally has no effect but makes deduplication stable.
+    """
+    if not 0 < minimum_exon_fraction <= 1:
+        raise ValueError("minimum_exon_fraction must be in (0, 1]")
+
+    candidates: dict[str, list[dict]] = {}
+    for interval_index, (chrom, start, end) in enumerate(positions):
+        chrom_genes = gene_annotations[
+            (gene_annotations["chrom"] == chrom)
+            & (gene_annotations["exon_start"] < end)
+            & (gene_annotations["exon_end"] > start)
+        ]
         center = (start + end) / 2
-        distances = (transcript_subset["Start"] - center).abs()
-        for gene_id, distance in distances.groupby(
-            transcript_subset["gene_id"], sort=False,
-        ).min().items():
-            candidate = (float(distance), interval_index)
-            if gene_id not in best or candidate < best[gene_id]:
-                best[gene_id] = candidate
-    return {gene_id: interval_index for gene_id, (_, interval_index) in best.items()}
+        for gene in chrom_genes.itertuples():
+            overlap_bp = _exon_overlap_bp(gene.exon_intervals, start, end)
+            fraction = overlap_bp / gene.total_unique_exon_bp
+            if fraction < minimum_exon_fraction:
+                continue
+            exon_center = (gene.exon_start + gene.exon_end) / 2
+            candidates.setdefault(gene.gene_id, []).append({
+                "interval_index": interval_index,
+                "exon_overlap_bp": overlap_bp,
+                "exon_fraction_in_interval": fraction,
+                "center_distance_bp": abs(exon_center - center),
+            })
+
+    assignments: dict[str, dict] = {}
+    for gene_id, gene_candidates in candidates.items():
+        best = min(gene_candidates, key=lambda item: (
+            -item["exon_overlap_bp"],
+            item["center_distance_bp"],
+            item["interval_index"],
+        ))
+        assignments[gene_id] = {
+            **best,
+            "n_qualifying_intervals": len(gene_candidates),
+        }
+    return assignments
+
+
+def build_interval_gene_masks(
+    gene_annotations: pd.DataFrame,
+    assignments: dict[str, dict],
+    interval_index: int,
+    chrom: str,
+    start: int,
+    end: int,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """Build union-exon masks for genes assigned to one scored interval."""
+    gene_ids = [
+        gene_id for gene_id, assignment in assignments.items()
+        if assignment["interval_index"] == interval_index
+    ]
+    mask = np.zeros((end - start, len(gene_ids)), dtype=bool)
+    metadata_rows: list[dict] = []
+    for gene_index, gene_id in enumerate(gene_ids):
+        gene = gene_annotations.loc[gene_id]
+        if gene["chrom"] != chrom:
+            raise ValueError(f"Assigned gene {gene_id!r} is on the wrong chromosome")
+        for exon_start, exon_end in gene["exon_intervals"]:
+            relative_start = max(exon_start, start) - start
+            relative_end = min(exon_end, end) - start
+            if relative_end > relative_start:
+                mask[relative_start:relative_end, gene_index] = True
+        assignment = assignments[gene_id]
+        metadata_rows.append({
+            "gene_id": gene_id,
+            "gene_name": gene["gene_name"],
+            "gene_type": gene["gene_type"],
+            "strand": gene["strand"],
+            "total_unique_exon_bp": int(gene["total_unique_exon_bp"]),
+            "scored_unique_exon_bp": int(mask[:, gene_index].sum()),
+            "exon_fraction_in_interval": float(
+                assignment["exon_fraction_in_interval"]
+            ),
+            "n_qualifying_intervals": int(
+                assignment["n_qualifying_intervals"]
+            ),
+        })
+    return mask, pd.DataFrame(metadata_rows)
 
 
 def center_crop_genomic_positions(
@@ -427,26 +430,30 @@ def collect_gene_expression_rows(
     bin_sizes: tuple[int, ...],
     sample_names: list[str],
 ) -> pd.DataFrame:
-    """Collect one official exon-mean expression row per gene and track."""
+    """Collect paper-protocol exon-mean expression per gene and sample."""
     columns = [
         "bin_size_bp", "gene_id", "gene_name", "chrom", "strand",
         "interval_index", "original_interval_index", "track_index", "sample",
+        "total_unique_exon_bp", "scored_unique_exon_bp",
+        "exon_fraction_in_interval", "n_qualifying_intervals",
         "pred_mean", "obs_mean", "pred_log1p_mean", "obs_log1p_mean",
     ]
     rows: list[dict] = []
-    gene_owner = assign_genes_to_nearest_center(gtf, positions)
-    mask_extractor = _OfficialGeneExonMaskExtractor(gtf)
+    gene_annotations = build_paper_gene_annotations(gtf)
+    assignments = assign_paper_genes_to_intervals(gene_annotations, positions)
     for interval_index, (chrom, window_start, window_end) in enumerate(positions):
-        one_bp_masks, metadata = mask_extractor.extract(
-            chrom, window_start, window_end,
+        one_bp_masks, metadata = build_interval_gene_masks(
+            gene_annotations=gene_annotations,
+            assignments=assignments,
+            interval_index=interval_index,
+            chrom=chrom,
+            start=window_start,
+            end=window_end,
         )
-        keep = metadata["gene_id"].map(gene_owner).eq(interval_index).to_numpy()
-        metadata = metadata.loc[keep].reset_index(drop=True)
-        one_bp_masks = one_bp_masks[:, keep]
         if metadata.empty:
             continue
         for bin_size in bin_sizes:
-            masks = downsample_gene_mask(one_bp_masks, bin_size)
+            masks = downsample_gene_mask_weights(one_bp_masks, bin_size)
             pred_means = score_gene_interval_mean(
                 prediction_views[bin_size][interval_index], masks,
             )
@@ -475,6 +482,18 @@ def collect_gene_expression_rows(
                         ),
                         "track_index": track_index,
                         "sample": sample_names[track_index // 2],
+                        "total_unique_exon_bp": int(
+                            gene["total_unique_exon_bp"]
+                        ),
+                        "scored_unique_exon_bp": int(
+                            gene["scored_unique_exon_bp"]
+                        ),
+                        "exon_fraction_in_interval": float(
+                            gene["exon_fraction_in_interval"]
+                        ),
+                        "n_qualifying_intervals": int(
+                            gene["n_qualifying_intervals"]
+                        ),
                         "pred_mean": float(pred_means[gene_index, track_index]),
                         "obs_mean": float(target_means[gene_index, track_index]),
                         "pred_log1p_mean": float(np.log1p(
@@ -487,55 +506,162 @@ def collect_gene_expression_rows(
     return pd.DataFrame(rows, columns=columns)
 
 
+def quantile_normalize_columns(values: np.ndarray) -> np.ndarray:
+    """Quantile-normalize a genes-by-tracks matrix across its track columns.
+
+    Predicted and observed matrices are normalized independently. Tied values
+    receive the mean reference quantile across all ranks occupied by the tie.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 2:
+        raise ValueError("quantile normalization expects a 2D matrix")
+    if not np.isfinite(values).all():
+        raise ValueError("quantile normalization requires finite values")
+    if values.size == 0:
+        return values.copy()
+
+    sorted_values = np.sort(values, axis=0, kind="mergesort")
+    reference_quantiles = sorted_values.mean(axis=1)
+    normalized = np.empty_like(values)
+    for column_index in range(values.shape[1]):
+        column = values[:, column_index]
+        order = np.argsort(column, kind="mergesort")
+        sorted_column = column[order]
+        group_start = 0
+        while group_start < len(order):
+            group_end = group_start + 1
+            while (
+                group_end < len(order)
+                and sorted_column[group_end] == sorted_column[group_start]
+            ):
+                group_end += 1
+            normalized[order[group_start:group_end], column_index] = (
+                reference_quantiles[group_start:group_end].mean()
+            )
+            group_start = group_end
+    return normalized
+
+
+def _paper_expression_matrices(
+    subset: pd.DataFrame,
+) -> tuple[list[str], list[str], np.ndarray, np.ndarray]:
+    """Return aligned complete gene-by-sample log-expression matrices."""
+    if subset.duplicated(["gene_id", "sample"]).any():
+        duplicates = subset.loc[
+            subset.duplicated(["gene_id", "sample"], keep=False),
+            ["gene_id", "sample"],
+        ]
+        raise ValueError(
+            "Expected one strand-matched value per gene and sample; found "
+            f"duplicates including {duplicates.iloc[0].to_dict()}"
+        )
+
+    sample_order = list(dict.fromkeys(subset["sample"].tolist()))
+    pred = subset.pivot(index="gene_id", columns="sample", values="pred_log1p_mean")
+    obs = subset.pivot(index="gene_id", columns="sample", values="obs_log1p_mean")
+    gene_order = sorted(set(pred.index).intersection(obs.index))
+    pred = pred.reindex(index=gene_order, columns=sample_order)
+    obs = obs.reindex(index=gene_order, columns=sample_order)
+    complete = pred.notna().all(axis=1) & obs.notna().all(axis=1)
+    pred = pred.loc[complete]
+    obs = obs.loc[complete]
+    return (
+        pred.index.tolist(),
+        sample_order,
+        pred.to_numpy(dtype=np.float64),
+        obs.to_numpy(dtype=np.float64),
+    )
+
+
 def summarize_gene_expression(
     rows: pd.DataFrame,
     bin_sizes: tuple[int, ...],
-) -> tuple[dict[int, dict], pd.DataFrame]:
-    """Summarize log1p exon-mean expression across gene-track pairs."""
+) -> tuple[dict[int, dict], pd.DataFrame, pd.DataFrame]:
+    """Compute the three AlphaGenome paper gene-expression correlations."""
     summary: dict[int, dict] = {}
     per_track_rows: list[dict] = []
+    per_gene_rows: list[dict] = []
     for bin_size in bin_sizes:
         subset = rows[rows["bin_size_bp"] == bin_size]
-        pred = subset["pred_log1p_mean"].to_numpy(dtype=np.float64)
-        obs = subset["obs_log1p_mean"].to_numpy(dtype=np.float64)
-        summary[bin_size] = {
-            "pearson_r_log1p_exon_mean": _pearson_or_nan(pred, obs),
-            "spearman_r_log1p_exon_mean": float(stats.spearmanr(pred, obs)[0])
-            if len(pred) >= 2 else float("nan"),
-            "mse_log1p_exon_mean": float(np.mean(np.square(pred - obs)))
-            if len(pred) else float("nan"),
-            "mae_log1p_exon_mean": float(np.mean(np.abs(pred - obs)))
-            if len(pred) else float("nan"),
-            "n_gene_track_pairs": int(len(subset)),
-            "n_unique_genes": int(subset["gene_id"].nunique()),
-        }
-        track_pearsons: list[float] = []
-        for (track_index, sample), track_rows in subset.groupby(
-            ["track_index", "sample"], sort=True,
-        ):
-            track_pred = track_rows["pred_log1p_mean"].to_numpy(dtype=np.float64)
-            track_obs = track_rows["obs_log1p_mean"].to_numpy(dtype=np.float64)
-            track_pearson = _pearson_or_nan(track_pred, track_obs)
-            track_pearsons.append(track_pearson)
+        gene_ids, samples, pred, obs = _paper_expression_matrices(subset)
+
+        pred_quantile = quantile_normalize_columns(pred)
+        obs_quantile = quantile_normalize_columns(obs)
+        pred_normalized = pred_quantile - pred_quantile.mean(axis=1, keepdims=True)
+        obs_normalized = obs_quantile - obs_quantile.mean(axis=1, keepdims=True)
+
+        raw_across_genes: list[float] = []
+        normalized_across_genes: list[float] = []
+        for track_index, sample in enumerate(samples):
+            raw_pearson = _pearson_or_nan(pred[:, track_index], obs[:, track_index])
+            normalized_pearson = _pearson_or_nan(
+                pred_normalized[:, track_index],
+                obs_normalized[:, track_index],
+            )
+            raw_across_genes.append(raw_pearson)
+            normalized_across_genes.append(normalized_pearson)
             per_track_rows.append({
                 "bin_size_bp": bin_size,
-                "track_index": int(track_index),
                 "sample": sample,
-                "pearson_r_log1p_exon_mean": track_pearson,
-                "n_genes": len(track_rows),
+                "raw_pearson_r_across_genes": raw_pearson,
+                "normalized_pearson_r_across_genes": normalized_pearson,
+                "n_genes": len(gene_ids),
             })
-        finite_track_pearsons = np.asarray(track_pearsons, dtype=np.float64)
-        finite_track_pearsons = finite_track_pearsons[
-            np.isfinite(finite_track_pearsons)
+
+        normalized_across_tracks: list[float] = []
+        for gene_index, gene_id in enumerate(gene_ids):
+            pearson = _pearson_or_nan(
+                pred_normalized[gene_index], obs_normalized[gene_index],
+            )
+            normalized_across_tracks.append(pearson)
+            per_gene_rows.append({
+                "bin_size_bp": bin_size,
+                "gene_id": gene_id,
+                "normalized_pearson_r_across_tracks": pearson,
+                "n_tracks": len(samples),
+            })
+
+        raw_finite = np.asarray(raw_across_genes, dtype=np.float64)
+        raw_finite = raw_finite[np.isfinite(raw_finite)]
+        normalized_gene_finite = np.asarray(
+            normalized_across_genes, dtype=np.float64,
+        )
+        normalized_gene_finite = normalized_gene_finite[
+            np.isfinite(normalized_gene_finite)
         ]
-        summary[bin_size]["pearson_r_mean_across_tracks"] = (
-            float(finite_track_pearsons.mean())
-            if finite_track_pearsons.size else float("nan")
+        normalized_track_finite = np.asarray(
+            normalized_across_tracks, dtype=np.float64,
         )
-        summary[bin_size]["n_tracks_with_valid_pearson"] = int(
-            finite_track_pearsons.size
-        )
-    return summary, pd.DataFrame(per_track_rows)
+        normalized_track_finite = normalized_track_finite[
+            np.isfinite(normalized_track_finite)
+        ]
+        summary[bin_size] = {
+            "raw_pearson_r_mean_across_tracks": (
+                float(raw_finite.mean()) if raw_finite.size else float("nan")
+            ),
+            "normalized_pearson_r_mean_across_genes_by_track": (
+                float(normalized_gene_finite.mean())
+                if normalized_gene_finite.size else float("nan")
+            ),
+            "normalized_pearson_r_mean_across_tracks_by_gene": (
+                float(normalized_track_finite.mean())
+                if normalized_track_finite.size else float("nan")
+            ),
+            "n_genes": len(gene_ids),
+            "n_tracks": len(samples),
+            "n_raw_track_correlations": int(raw_finite.size),
+            "n_normalized_track_correlations": int(
+                normalized_gene_finite.size
+            ),
+            "n_normalized_gene_correlations": int(
+                normalized_track_finite.size
+            ),
+        }
+    return (
+        summary,
+        pd.DataFrame(per_track_rows),
+        pd.DataFrame(per_gene_rows),
+    )
 
 
 def _write_per_region_csv(
@@ -575,6 +701,23 @@ def _write_per_region_csv(
 
 
 def main() -> None:
+    # Keep model-framework imports out of module scope. Borzoi reuses the
+    # NumPy/Pandas gene-metric helpers from this file and must not load
+    # PyTorch's CUDA runtime into its TensorFlow process.
+    import torch
+    from torch.utils.data import DataLoader, Subset
+
+    from alphagenome_pytorch.extensions.finetuning.datasets import GenomicDataset
+    from alphagenome_pytorch.extensions.finetuning.evaluation import evaluate_split
+    from alphagenome_pytorch.extensions.finetuning.training import collate_genomic
+    from evaluate_checkpoint import (
+        build_metric_views,
+        center_crop_profiles,
+        compute_comparison_metrics,
+        load_finetuned_model,
+        parse_metric_bin_sizes,
+    )
+
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args()
     try:
@@ -677,7 +820,7 @@ def main() -> None:
         source_resolution=source,
         bin_sizes=bin_sizes,
         score_window_bp=args.score_window_bp,
-        reduction="mean",
+        reduction="sum",
     )
     gene_prediction_views, gene_target_views = build_metric_views(
         predictions[source],
@@ -729,16 +872,22 @@ def main() -> None:
         bin_sizes=bin_sizes,
         sample_names=sample_names,
     )
-    gene_metrics, gene_metrics_per_track = summarize_gene_expression(
-        gene_rows, bin_sizes,
-    )
+    (
+        gene_metrics,
+        gene_metrics_per_track,
+        gene_metrics_per_gene,
+    ) = summarize_gene_expression(gene_rows, bin_sizes)
     for bin_size, metrics in gene_metrics.items():
         log.info(
-            "%dbp gene expression: Pearson r=%.4f across %d genes (%d pairs)",
+            "%dbp gene expression: raw across-genes r=%.4f, normalized "
+            "across-genes r=%.4f, normalized across-tracks r=%.4f "
+            "(%d genes, %d tracks)",
             bin_size,
-            metrics["pearson_r_log1p_exon_mean"],
-            metrics["n_unique_genes"],
-            metrics["n_gene_track_pairs"],
+            metrics["raw_pearson_r_mean_across_tracks"],
+            metrics["normalized_pearson_r_mean_across_genes_by_track"],
+            metrics["normalized_pearson_r_mean_across_tracks_by_gene"],
+            metrics["n_genes"],
+            metrics["n_tracks"],
         )
 
     summary = {
@@ -752,7 +901,7 @@ def main() -> None:
             "source_resolution_bp": source,
             "bin_sizes_bp": list(bin_sizes),
             "profile_transform": "log1p",
-            "profile_pooling": "mean",
+            "profile_pooling": "sum",
             "count_source": "cropped_source_resolution_profile",
             "gene_score_window_bp": (
                 args.gene_score_window_bp or args.sequence_length
@@ -761,10 +910,25 @@ def main() -> None:
                 "center_crop" if args.gene_score_window_bp is not None
                 else "full_inference_test_interval"
             ),
-            "gene_selection": "official_transcript_tss",
-            "gene_interval_assignment": "nearest_interval_center_to_gene_tss",
-            "gene_mask_aggregation": "union_exon_mask_then_mean",
+            "gene_annotation": "GENCODE_v46_required",
+            "gene_selection": "at_least_50pct_unique_exon_bp_in_test_interval",
+            "gene_interval_assignment": (
+                "maximum_unique_exon_overlap_then_center_distance_then_bed_order"
+            ),
+            "gene_mask_aggregation": "union_all_annotated_exons_then_mean",
             "gene_expression_transform": "log1p_mean_exonic_coverage",
+            "gene_strand_matching": (
+                "forward_for_plus_reverse_for_minus_combined_per_sample"
+            ),
+            "gene_correlations": [
+                "raw_across_genes_per_track",
+                "quantile_normalized_gene_centered_across_genes_per_track",
+                "quantile_normalized_gene_centered_across_tracks_per_gene",
+            ],
+            "quantile_normalization": (
+                "predicted_and_observed_gene_by_track_matrices_independently_"
+                "normalized_across_track_columns"
+            ),
             "gtf_parquet": args.gtf_parquet,
             "n_regions": len(positions),
             "loss": loss,
@@ -784,6 +948,9 @@ def main() -> None:
     gene_rows.to_csv(output_dir / "gene_expression_per_gene.csv", index=False)
     gene_metrics_per_track.to_csv(
         output_dir / "gene_expression_metrics_per_track.csv", index=False,
+    )
+    gene_metrics_per_gene.to_csv(
+        output_dir / "gene_expression_metrics_per_gene.csv", index=False,
     )
 
     if args.save_predictions:

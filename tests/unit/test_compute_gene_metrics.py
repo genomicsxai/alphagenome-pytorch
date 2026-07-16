@@ -74,29 +74,13 @@ def test_gene_expression_rows_use_exon_means_and_matching_strand(script_module):
     assert minus_1bp["pred_mean"] == pytest.approx(65.0)
     assert plus_1bp["pred_log1p_mean"] == pytest.approx(np.log1p(2.5))
 
-    summary, per_track = script_module.summarize_gene_expression(rows, (1, 2))
-    assert summary[1]["pearson_r_log1p_exon_mean"] == pytest.approx(1.0)
-    assert summary[1]["n_unique_genes"] == 2
-    assert len(per_track) == 4
-
-
-def test_gene_assignment_uses_nearest_interval_center_once(script_module):
-    columns = [
-        "Chromosome", "Start", "End", "Strand", "Feature", "gene_id",
-        "gene_name", "gene_type", "transcript_id",
-    ]
-    gtf = pd.DataFrame([
-        ["chr1", 6, 8, "+", "transcript", "shared", "SHARED", "pc", "tx1"],
-        ["chr1", 10, 11, "+", "transcript", "second", "SECOND", "pc", "tx2"],
-    ], columns=columns)
-    positions = [("chr1", 0, 10), ("chr1", 2, 12)]
-
-    assignments = script_module.assign_genes_to_nearest_center(gtf, positions)
-    # The first gene is eligible in both windows. Its center distance ties, so
-    # BED order deterministically selects the first window.
-    assert assignments["shared"] == 0
-    # Half-open containment excludes TSS=10 from [0, 10).
-    assert assignments["second"] == 1
+    summary, per_track, per_gene = script_module.summarize_gene_expression(
+        rows, (1, 2),
+    )
+    assert summary[1]["raw_pearson_r_mean_across_tracks"] == pytest.approx(1.0)
+    assert summary[1]["n_genes"] == 2
+    assert len(per_track) == 2
+    assert len(per_gene) == 4
 
 
 def test_center_crop_genomic_positions_matches_profile_crop(script_module):
@@ -116,33 +100,96 @@ def test_center_crop_genomic_positions_matches_profile_crop(script_module):
         script_module.center_crop_genomic_positions(positions, 1001)
 
 
-def test_official_gene_selection_uses_transcript_tss(script_module):
+def test_exon_base_weights_preserve_partial_coarse_bins(script_module):
+    mask = np.zeros((8, 1), dtype=bool)
+    mask[2:7, 0] = True
+    profile = np.arange(8, dtype=np.float64)[:, None]
+    mean = script_module.score_gene_interval_mean(profile, mask)
+    assert mean[0, 0] == pytest.approx(np.mean(np.arange(2, 7)))
+
+    weighted_mask = script_module.downsample_gene_mask_weights(mask, 2)
+    np.testing.assert_array_equal(
+        weighted_mask[:, 0], np.asarray([0, 2, 2, 1]),
+    )
+
+
+def test_paper_gene_selection_uses_unique_exon_bases(script_module):
     columns = [
         "Chromosome", "Start", "End", "Strand", "Feature", "gene_id",
         "gene_name", "gene_type", "transcript_id",
     ]
     gtf = pd.DataFrame([
-        ["chr1", 0, 20, "+", "gene", "inside", "INSIDE", "pc", None],
-        ["chr1", 2, 12, "+", "transcript", "inside", "INSIDE", "pc", "tx1"],
-        ["chr1", 2, 5, "+", "exon", "inside", "INSIDE", "pc", "tx1"],
-        ["chr1", 4, 7, "+", "exon", "inside", "INSIDE", "pc", "tx1"],
-        ["chr1", 0, 20, "+", "gene", "outside", "OUTSIDE", "pc", None],
-        ["chr1", 12, 18, "+", "transcript", "outside", "OUTSIDE", "pc", "tx2"],
-        ["chr1", 6, 8, "+", "exon", "outside", "OUTSIDE", "pc", "tx2"],
+        # The two overlapping exon annotations have a 15-bp union. The [5, 10)
+        # interval contains only 5/15 unique exon bases and must not qualify;
+        # counting the overlapping annotations twice would incorrectly give 50%.
+        ["chr1", 0, 10, "+", "exon", "overlap", "OVERLAP", "pc", "tx1"],
+        ["chr1", 5, 15, "+", "exon", "overlap", "OVERLAP", "pc", "tx2"],
+        ["chr1", 20, 30, "+", "exon", "assigned", "ASSIGNED", "pc", "tx3"],
     ], columns=columns)
+    annotations = script_module.build_paper_gene_annotations(gtf)
+    assert annotations.loc["overlap", "total_unique_exon_bp"] == 15
 
-    extractor = script_module._OfficialGeneExonMaskExtractor(gtf)
-    mask, metadata = extractor.extract("chr1", 0, 8)
-    assert metadata["gene_id"].tolist() == ["inside"]
-
-    # Overlapping exon rows are combined as a boolean union: positions 2..6
-    # are counted once, matching the official GeneIntervalScorer mask.
-    profile = np.arange(8, dtype=np.float64)[:, None]
-    mean = script_module.score_gene_interval_mean(profile, mask)
-    assert mean[0, 0] == pytest.approx(np.mean(np.arange(2, 7)))
-
-    # AlphaGenome max-pools a gene mask when the output resolution is coarse.
-    pooled_mask = script_module.downsample_gene_mask(mask, 2)
-    np.testing.assert_array_equal(
-        pooled_mask[:, 0], np.asarray([False, True, True, True]),
+    positions = [("chr1", 5, 10), ("chr1", 20, 26), ("chr1", 22, 30)]
+    assignments = script_module.assign_paper_genes_to_intervals(
+        annotations, positions,
     )
+    assert "overlap" not in assignments
+    assert assignments["assigned"]["interval_index"] == 2
+    assert assignments["assigned"]["n_qualifying_intervals"] == 2
+
+    mask, metadata = script_module.build_interval_gene_masks(
+        annotations, assignments, 2, "chr1", 22, 30,
+    )
+    assert metadata["gene_id"].tolist() == ["assigned"]
+    assert mask[:, 0].sum() == 8
+    assert metadata.iloc[0]["exon_fraction_in_interval"] == pytest.approx(0.8)
+
+
+def test_paper_correlations_combine_strands_by_sample(script_module):
+    values = {
+        "gene1": (0.0, 3.0),
+        "gene2": (1.0, 1.0),
+        "gene3": (3.0, 0.0),
+    }
+    rows = []
+    for gene_index, (gene_id, sample_values) in enumerate(values.items()):
+        strand = "+" if gene_index % 2 == 0 else "-"
+        for sample_index, value in enumerate(sample_values):
+            rows.append({
+                "bin_size_bp": 1,
+                "gene_id": gene_id,
+                "sample": f"sample{sample_index}",
+                # Plus and minus rows originate from different physical tracks,
+                # but are one strand-matched biological track in the paper.
+                "track_index": 2 * sample_index + (strand == "-"),
+                "pred_log1p_mean": value,
+                "obs_log1p_mean": value,
+            })
+
+    summary, per_track, per_gene = script_module.summarize_gene_expression(
+        pd.DataFrame(rows), (1,),
+    )
+    metrics = summary[1]
+    assert metrics["raw_pearson_r_mean_across_tracks"] == pytest.approx(1.0)
+    assert metrics[
+        "normalized_pearson_r_mean_across_genes_by_track"
+    ] == pytest.approx(1.0)
+    assert metrics[
+        "normalized_pearson_r_mean_across_tracks_by_gene"
+    ] == pytest.approx(1.0)
+    assert len(per_track) == 2
+    assert metrics["n_normalized_gene_correlations"] == 2
+    assert len(per_gene) == 3
+
+
+def test_quantile_normalization_averages_tied_ranks(script_module):
+    values = np.asarray([
+        [0.0, 2.0],
+        [0.0, 1.0],
+        [2.0, 0.0],
+    ])
+    normalized = script_module.quantile_normalize_columns(values)
+    # Reference quantiles are [0, 0.5, 2]. The tied zeros in column 0 occupy
+    # the first two ranks and both receive their mean, 0.25.
+    np.testing.assert_allclose(normalized[:, 0], [0.25, 0.25, 2.0])
+    np.testing.assert_allclose(normalized[:, 1], [2.0, 0.5, 0.0])
