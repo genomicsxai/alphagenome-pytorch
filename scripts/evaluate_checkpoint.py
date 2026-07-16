@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Evaluate a fine-tuned AlphaGenome model.
+"""Evaluate AlphaGenome checkpoints.
 
 Supports three opt-in features (--metrics, --regions, --ism) and an optional
 native-head comparison layer (--native-biosample) that enriches all outputs.
@@ -7,22 +7,31 @@ native-head comparison layer (--native-biosample) that enriches all outputs.
 Usage examples:
 
     # Metrics only
-    python scripts/evaluate_finetuned.py \
+    python scripts/evaluate_checkpoint.py \
         --checkpoint best_model.pth \
         --pretrained-weights model_fold1.pth \
         --genome GRCh38.fa --bigwig signal.bw \
         --test-bed test.bed --output-dir eval/ --metrics
 
     # Metrics + native comparison
-    python scripts/evaluate_finetuned.py \
+    python scripts/evaluate_checkpoint.py \
         --checkpoint best_model.pth \
         --pretrained-weights model_fold1.pth \
         --genome GRCh38.fa --bigwig signal.bw \
         --test-bed test.bed --output-dir eval/ --metrics \
         --native-biosample "WTC11"
 
+    # Native/pretrained model metrics only
+    python scripts/evaluate_checkpoint.py \
+        --native-only --metrics \
+        --pretrained-weights model_fold1.pth \
+        --genome GRCh38.fa --bigwig signal.bw \
+        --test-bed test.bed --output-dir eval_native/ \
+        --modality atac --native-biosample "K562" \
+        --sequence-length 131072 --resolutions 128
+
     # Regions + ISM
-    python scripts/evaluate_finetuned.py \
+    python scripts/evaluate_checkpoint.py \
         --checkpoint best_model.pth \
         --pretrained-weights model_fold1.pth \
         --genome GRCh38.fa --bigwig signal.bw \
@@ -30,7 +39,7 @@ Usage examples:
         --regions --ism --ism-window-size 21
 
     # Everything
-    python scripts/evaluate_finetuned.py \
+    python scripts/evaluate_checkpoint.py \
         --checkpoint best_model.pth \
         --pretrained-weights model_fold1.pth \
         --genome GRCh38.fa --bigwig signal.bw \
@@ -42,6 +51,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import logging
 import sys
@@ -57,40 +67,30 @@ from scipy import stats
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.extensions.finetuning.checkpointing import (
-    is_delta_checkpoint,
-    load_delta_checkpoint,
     load_finetuned_model as _load_finetuned_model,
 )
 from alphagenome_pytorch.extensions.finetuning.datasets import GenomicDataset
-from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head
+from alphagenome_pytorch.extensions.finetuning.evaluation import (
+    collect_targets,
+    evaluate_native_split,
+    evaluate_split,
+    load_native_model,
+)
 from alphagenome_pytorch.extensions.finetuning.training import collate_genomic
-from alphagenome_pytorch.extensions.finetuning.transfer import load_trunk
-from alphagenome_pytorch.losses import multinomial_loss
-from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
 
 log = logging.getLogger(__name__)
 
-NUM_SEGMENTS = 8
-
-
-# =============================================================================
-# Model loading
-# =============================================================================
-
 
 def load_finetuned_model(
-    checkpoint_path: str,
-    pretrained_weights: str,
-    device: torch.device,
+    checkpoint_path: str, pretrained_weights: str, device: torch.device,
 ) -> tuple[nn.Module, dict]:
-    """Load a finetuned model, auto-detecting checkpoint format.
+    """Load a finetuned checkpoint, auto-detecting delta/full/adapter format.
 
-    Returns (model, metadata_dict).
-    metadata_dict always contains: modality, resolutions, track_names, epoch, val_loss.
+    Full checkpoints embed their TransferConfig (lora/locon targets etc.) at
+    save time, so adapter checkpoints are self-describing -- no external
+    transfer config file is needed.
     """
-    log.info("Loading checkpoint: %s", Path(checkpoint_path).name)
     model, meta = _load_finetuned_model(
         checkpoint_path=checkpoint_path,
         pretrained_weights=pretrained_weights,
@@ -100,298 +100,6 @@ def load_finetuned_model(
     for p in model.parameters():
         p.requires_grad = False
     return model, meta
-
-
-def load_native_model(
-    pretrained_weights: str,
-    native_biosample: str | None,
-    native_track_index: int | None,
-    modality: str,
-    device: torch.device,
-) -> tuple[nn.Module, int, str]:
-    """Load pretrained model with all native heads and find matching track.
-
-    Returns (model, track_index, display_name).
-    """
-    log.info("Loading native model for comparison...")
-    model = AlphaGenome.from_pretrained(pretrained_weights, device=device)
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad = False
-
-    catalog = TrackMetadataCatalog.load_builtin("human")
-    model.set_track_metadata_catalog(catalog)
-
-    if native_track_index is not None:
-        # Direct index — validate it exists
-        tracks = catalog.get_tracks(modality, organism=0)
-        if native_track_index >= len(tracks):
-            raise ValueError(
-                f"Track index {native_track_index} out of range for "
-                f"{modality} ({len(tracks)} tracks)"
-            )
-        track = tracks[native_track_index]
-        display_name = track.get("biosample_name") or track.track_name
-        log.info(
-            "Native track: index=%d, name=%s", native_track_index, display_name
-        )
-        return model, native_track_index, display_name
-
-    # Search by biosample name (substring, case-insensitive)
-    tracks = catalog.get_tracks(modality, organism=0)
-    query = native_biosample.lower()
-    matches = [
-        t for t in tracks
-        if not t.is_padding and query in (t.get("biosample_name") or "").lower()
-    ]
-
-    if not matches:
-        available = sorted({
-            t.get("biosample_name")
-            for t in tracks
-            if not t.is_padding and t.get("biosample_name")
-        })
-        raise ValueError(
-            f"No {modality} track found matching biosample '{native_biosample}'. "
-            f"Available biosamples ({len(available)}): {available[:20]}"
-        )
-
-    if len(matches) > 1:
-        log.warning(
-            "Multiple tracks match '%s': %s. Using first.",
-            native_biosample,
-            [(m.track_index, m.get("biosample_name")) for m in matches[:5]],
-        )
-
-    track = matches[0]
-    display_name = track.get("biosample_name") or track.track_name
-    log.info("Native track: index=%d, name=%s", track.track_index, display_name)
-    return model, track.track_index, display_name
-
-
-# =============================================================================
-# Inference
-# =============================================================================
-
-
-@torch.no_grad()
-def evaluate_split(
-    model: nn.Module,
-    modality: str,
-    loader: DataLoader,
-    device: torch.device,
-    resolutions: tuple[int, ...],
-    positional_weight: float = 5.0,
-) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], float]:
-    """Run finetuned model inference. Returns (preds, targets, avg_loss).
-
-    Predictions are in experimental space (unscaled).
-    """
-    model.eval()
-    head = model.heads[modality]
-
-    preds_by_res: dict[int, list[np.ndarray]] = {r: [] for r in resolutions}
-    targets_by_res: dict[int, list[np.ndarray]] = {r: [] for r in resolutions}
-    total_loss = 0.0
-    n_batches = 0
-
-    for sequences, targets_dict in tqdm(loader, desc="Evaluating (finetuned)"):
-        sequences = sequences.to(device)
-        organism_idx = torch.zeros(
-            sequences.shape[0], dtype=torch.long, device=device
-        )
-
-        with torch.autocast(
-            device_type=device.type, dtype=torch.bfloat16,
-            enabled=device.type == "cuda",
-        ):
-            outputs = model(
-                sequences, organism_idx,
-                embeddings_only=True, resolutions=resolutions,
-                channels_last=False,
-            )
-            embeddings_dict = {
-                res: outputs[f"embeddings_{res}bp"]
-                for res in resolutions
-                if f"embeddings_{res}bp" in outputs
-            }
-            scaled_preds = head(embeddings_dict, organism_idx, return_scaled=True)
-            exp_preds = head(embeddings_dict, organism_idx, return_scaled=False)
-
-        # Loss
-        loss = torch.tensor(0.0, device=device)
-        for res in resolutions:
-            if res not in scaled_preds or res not in targets_dict:
-                continue
-            pred = scaled_preds[res]
-            targets = targets_dict[res].to(device)
-            targets_scaled = head.scale(targets, organism_idx, resolution=res)
-            mask = torch.ones(
-                pred.shape[0], 1, pred.shape[-1],
-                dtype=torch.bool, device=device,
-            )
-            seq_len = pred.shape[-2]
-            mn_res = max(1, seq_len // NUM_SEGMENTS)
-            while mn_res > 1 and seq_len % mn_res != 0:
-                mn_res -= 1
-            ld = multinomial_loss(
-                y_pred=pred, y_true=targets_scaled, mask=mask,
-                multinomial_resolution=mn_res,
-                positional_weight=positional_weight,
-            )
-            loss = loss + ld["loss"]
-
-        total_loss += loss.item()
-        n_batches += 1
-
-        for res in resolutions:
-            if res in exp_preds:
-                preds_by_res[res].append(exp_preds[res].float().cpu().numpy())
-            if res in targets_dict:
-                targets_by_res[res].append(targets_dict[res].numpy())
-
-    all_preds = {r: np.concatenate(v, axis=0) for r, v in preds_by_res.items() if v}
-    all_targets = {
-        r: np.concatenate(v, axis=0) for r, v in targets_by_res.items() if v
-    }
-    avg_loss = total_loss / max(1, n_batches)
-    return all_preds, all_targets, avg_loss
-
-
-@torch.no_grad()
-def evaluate_native_split(
-    model: nn.Module,
-    modality: str,
-    track_index: int,
-    loader: DataLoader,
-    device: torch.device,
-    resolutions: tuple[int, ...],
-) -> dict[int, np.ndarray]:
-    """Run native model on same data, extract a single track.
-
-    Returns dict[resolution -> (N, seq_len, 1)] predictions.
-    """
-    model.eval()
-
-    preds_by_res: dict[int, list[np.ndarray]] = {r: [] for r in resolutions}
-
-    for sequences, _ in tqdm(loader, desc="Evaluating (native)"):
-        sequences = sequences.to(device)
-        organism_idx = torch.zeros(
-            sequences.shape[0], dtype=torch.long, device=device,
-        )
-
-        with torch.autocast(
-            device_type=device.type, dtype=torch.bfloat16,
-            enabled=device.type == "cuda",
-        ):
-            outputs = model(sequences, organism_idx)
-
-        if modality not in outputs:
-            continue
-        head_outputs = outputs[modality]  # dict[int, (B, S, T)] channels_last by default
-        for res in resolutions:
-            if res not in head_outputs:
-                continue
-            pred = head_outputs[res]
-            # Extract single track
-            pred_track = pred[:, :, track_index : track_index + 1]
-            preds_by_res[res].append(pred_track.float().cpu().numpy())
-
-    return {r: np.concatenate(v, axis=0) for r, v in preds_by_res.items() if v}
-
-
-# =============================================================================
-# Metrics
-# =============================================================================
-
-
-def jsd_per_region(
-    preds: np.ndarray, targets: np.ndarray, eps: float = 1e-8,
-) -> np.ndarray:
-    """Jensen-Shannon divergence per region between normalized profiles.
-
-    Args:
-        preds: (N, seq_len, n_tracks)
-        targets: (N, seq_len, n_tracks)
-
-    Returns:
-        (N, n_tracks) array of JSD values.
-    """
-    # Normalize along position axis to get probability distributions
-    p = targets / (targets.sum(axis=1, keepdims=True) + eps)
-    q = preds / (preds.sum(axis=1, keepdims=True) + eps)
-    m = 0.5 * (p + q)
-    kl_pm = np.sum(p * np.log((p + eps) / (m + eps)), axis=1)
-    kl_qm = np.sum(q * np.log((q + eps) / (m + eps)), axis=1)
-    return 0.5 * (kl_pm + kl_qm)
-
-
-def compute_all_metrics(
-    preds: np.ndarray, targets: np.ndarray,
-) -> dict[str, float | np.ndarray]:
-    """Compute comprehensive evaluation metrics.
-
-    Args:
-        preds: (N, seq_len, n_tracks)
-        targets: (N, seq_len, n_tracks)
-
-    Returns dict with:
-        profile_pearson_r_all (N,), profile_pearson_r_mean, profile_pearson_r_median,
-        count_pearson_r, jsd_all (N,), jsd_mean, jsd_median,
-        mse, spearman_global, n_regions
-    """
-    n_regions = preds.shape[0]
-
-    # Per-region profile Pearson r
-    profile_rs = []
-    for i in range(n_regions):
-        p = preds[i].flatten()
-        t = targets[i].flatten()
-        if np.std(t) > 1e-10 and np.std(p) > 1e-10:
-            r, _ = stats.pearsonr(p, t)
-            profile_rs.append(r)
-        else:
-            profile_rs.append(0.0)
-    profile_rs = np.array(profile_rs)
-
-    # Count Pearson r: sum signal per region, correlate all at once
-    pred_counts = preds.sum(axis=1).flatten()   # (N * n_tracks,)
-    target_counts = targets.sum(axis=1).flatten()
-    if np.std(pred_counts) > 1e-10 and np.std(target_counts) > 1e-10:
-        count_r = stats.pearsonr(pred_counts, target_counts)[0]
-    else:
-        count_r = 0.0
-
-    # JSD per region (average across tracks)
-    jsd_vals = jsd_per_region(preds, targets)  # (N, n_tracks)
-    jsd_per_reg = jsd_vals.mean(axis=1)  # (N,)
-
-    # Global metrics (subsample for speed)
-    p_flat = preds.flatten()
-    t_flat = targets.flatten()
-    if len(p_flat) > 2_000_000:
-        idx = np.random.default_rng(42).choice(
-            len(p_flat), 2_000_000, replace=False,
-        )
-        p_flat = p_flat[idx]
-        t_flat = t_flat[idx]
-
-    spearman_global = stats.spearmanr(p_flat, t_flat)[0]
-    mse = float(np.mean((preds - targets) ** 2))
-
-    return {
-        "profile_pearson_r_all": profile_rs,
-        "profile_pearson_r_mean": float(np.mean(profile_rs)),
-        "profile_pearson_r_median": float(np.median(profile_rs)),
-        "count_pearson_r": float(count_r),
-        "jsd_all": jsd_per_reg,
-        "jsd_mean": float(np.mean(jsd_per_reg)),
-        "jsd_median": float(np.median(jsd_per_reg)),
-        "mse": mse,
-        "spearman_global": float(spearman_global),
-        "n_regions": n_regions,
-    }
 
 
 # =============================================================================
@@ -460,6 +168,17 @@ def plot_correlation_histogram(
     native_label: str = "Native",
 ) -> None:
     """Histogram of per-region values, optionally overlaid with native."""
+    ft_values = np.asarray(ft_values)
+    ft_values = ft_values[np.isfinite(ft_values)]
+    if native_values is not None:
+        native_values = np.asarray(native_values)
+        native_values = native_values[np.isfinite(native_values)]
+    if ft_values.size == 0:
+        log.warning("Skipping %s because no finite values are available", out_path)
+        return
+    if native_values is not None and native_values.size == 0:
+        native_values = None
+
     fig, ax = plt.subplots(figsize=(7, 4))
 
     bins = np.linspace(
@@ -688,6 +407,262 @@ def run_ism_for_regions(
 
 
 # =============================================================================
+# Resolution-matched metrics
+# =============================================================================
+
+
+@dataclass
+class _PearsonRState:
+    """State to compute PearsonR correlation coefficient."""
+
+    xy_sum: np.ndarray
+    x_sum: np.ndarray
+    xx_sum: np.ndarray
+    y_sum: np.ndarray
+    yy_sum: np.ndarray
+    count: np.ndarray
+
+    def __add__(self, other: "_PearsonRState") -> "_PearsonRState":
+        return _PearsonRState(*(
+            getattr(self, field) + getattr(other, field)
+            for field in self.__dataclass_fields__
+        ))
+
+
+def _pearsonr_initialize() -> _PearsonRState:
+    """Initialize PearsonrState with zeros."""
+    return _PearsonRState(
+        # JAX uses float32 here under AlphaGenome's default x64-disabled
+        # configuration; make that implicit reference behavior explicit in
+        # this NumPy port.
+        xy_sum=np.zeros((), dtype=np.float32),
+        x_sum=np.zeros((), dtype=np.float32),
+        xx_sum=np.zeros((), dtype=np.float32),
+        y_sum=np.zeros((), dtype=np.float32),
+        yy_sum=np.zeros((), dtype=np.float32),
+        count=np.zeros((), dtype=np.float32),
+    )
+
+
+def _pearsonr_update(
+    x: np.ndarray,
+    y: np.ndarray,
+    axis: tuple[int, ...] | int | None = None,
+    mask: np.ndarray | None = None,
+) -> _PearsonRState:
+    """Construct PearsonrState by correlating two arrays."""
+    if mask is not None:
+        mask = np.asarray(mask, dtype=bool)
+    where = True if mask is None else mask
+    return _PearsonRState(
+        xy_sum=np.sum(x * y, axis=axis, where=where, dtype=np.float32),
+        x_sum=np.sum(x, axis=axis, where=where, dtype=np.float32),
+        xx_sum=np.sum(np.square(x), axis=axis, where=where, dtype=np.float32),
+        y_sum=np.sum(y, axis=axis, where=where, dtype=np.float32),
+        yy_sum=np.sum(np.square(y), axis=axis, where=where, dtype=np.float32),
+        count=np.sum(
+            np.ones_like(x), axis=axis, where=where, dtype=np.float32,
+        ),
+    )
+
+
+def _pearsonr_result(state: _PearsonRState) -> np.ndarray:
+    """Get PearsonR correlation coefficient."""
+    with np.errstate(invalid="ignore", divide="ignore"):
+        x_mean = state.x_sum / state.count
+        y_mean = state.y_sum / state.count
+
+        covariance = state.xy_sum - state.count * x_mean * y_mean
+
+        x_var = state.xx_sum - state.count * x_mean * x_mean
+        y_var = state.yy_sum - state.count * y_mean * y_mean
+        variance = x_var**0.5 * y_var**0.5
+        eps = np.finfo(variance.dtype).eps
+        return covariance / (variance + eps)
+
+
+def center_crop_profiles(
+    preds: np.ndarray,
+    targets: np.ndarray,
+    score_window_bp: int | None,
+    source_resolution: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Center-crop aligned arrays after full-context model inference."""
+    if preds.shape != targets.shape:
+        raise ValueError(
+            f"Prediction/target shape mismatch: {preds.shape} != {targets.shape}"
+        )
+    if preds.ndim != 3:
+        raise ValueError(f"Expected (regions, positions, tracks), got {preds.shape}")
+    if source_resolution <= 0:
+        raise ValueError("source_resolution must be positive")
+    if score_window_bp is None:
+        return preds, targets
+    if score_window_bp <= 0 or score_window_bp % source_resolution:
+        raise ValueError(
+            "score_window_bp must be positive and divisible by source_resolution"
+        )
+
+    width = score_window_bp // source_resolution
+    available = preds.shape[1]
+    if width > available:
+        raise ValueError(
+            f"Requested {score_window_bp:,} bp scoring window, but predictions "
+            f"cover only {available * source_resolution:,} bp. A 131-kbp model "
+            "cannot be scored over the 196,608-bp Borzoi window without tiling."
+        )
+    left = (available - width) // 2
+    right = left + width
+    return preds[:, left:right, :], targets[:, left:right, :]
+
+
+def pool_profiles(
+    values: np.ndarray, factor: int, reduction: str = "sum",
+) -> np.ndarray:
+    """Aggregate adjacent positions with a sum or mean reduction."""
+    if factor <= 0:
+        raise ValueError("Pooling factor must be positive")
+    if factor == 1:
+        return values
+    if values.shape[1] % factor:
+        raise ValueError(
+            f"Profile length {values.shape[1]} is not divisible by pooling factor {factor}"
+        )
+    n_regions, n_positions, n_tracks = values.shape
+    grouped = values.reshape(
+        n_regions, n_positions // factor, factor, n_tracks,
+    )
+    if reduction == "sum":
+        return grouped.sum(axis=2)
+    if reduction == "mean":
+        return grouped.mean(axis=2)
+    raise ValueError(f"Unknown pooling reduction: {reduction}")
+
+
+def build_metric_views(
+    preds: np.ndarray,
+    targets: np.ndarray,
+    *,
+    source_resolution: int,
+    bin_sizes: tuple[int, ...],
+    score_window_bp: int | None,
+    reduction: str = "sum",
+) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray]]:
+    """Crop once, then construct aligned metric-resolution views."""
+    cropped_preds, cropped_targets = center_crop_profiles(
+        preds, targets, score_window_bp, source_resolution,
+    )
+    pred_views: dict[int, np.ndarray] = {}
+    target_views: dict[int, np.ndarray] = {}
+    for bin_size in bin_sizes:
+        if bin_size < source_resolution or bin_size % source_resolution:
+            raise ValueError(
+                f"Metric bin size {bin_size} must be a multiple of source "
+                f"resolution {source_resolution}"
+            )
+        factor = bin_size // source_resolution
+        pred_views[bin_size] = pool_profiles(cropped_preds, factor, reduction)
+        target_views[bin_size] = pool_profiles(cropped_targets, factor, reduction)
+    return pred_views, target_views
+
+
+def _pearson_or_nan(x: np.ndarray, y: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(x) & np.isfinite(y)
+    x, y = x[finite], y[finite]
+    if x.size < 2 or np.std(x) <= 1e-10 or np.std(y) <= 1e-10:
+        return float("nan")
+    return float(stats.pearsonr(x, y)[0])
+
+
+def compute_comparison_metrics(
+    preds: np.ndarray,
+    targets: np.ndarray,
+    *,
+    profile_transform: str = "none",
+) -> dict[str, float | int | np.ndarray]:
+    """Compute per-region profiles, regional counts, and profile JSD metrics."""
+    if preds.shape != targets.shape or preds.ndim != 3:
+        raise ValueError(
+            "preds and targets must have matching (regions, positions, tracks) shapes"
+        )
+    if np.any(preds < 0) or np.any(targets < 0):
+        raise ValueError("Jensen-Shannon metrics require non-negative profiles")
+
+    if profile_transform == "none":
+        profile_preds, profile_targets = preds, targets
+    elif profile_transform == "log1p":
+        profile_preds, profile_targets = np.log1p(preds), np.log1p(targets)
+    else:
+        raise ValueError(f"Unknown profile transform: {profile_transform}")
+
+    profile_rs = np.asarray([
+        _pearson_or_nan(profile_preds[i], profile_targets[i])
+        for i in range(preds.shape[0])
+    ])
+    pred_counts = preds.sum(axis=1).reshape(-1)
+    target_counts = targets.sum(axis=1).reshape(-1)
+    count_raw = _pearson_or_nan(pred_counts, target_counts)
+    count_log1p = _pearson_or_nan(np.log1p(pred_counts), np.log1p(target_counts))
+
+    eps = 1e-8
+    p = targets / (targets.sum(axis=1, keepdims=True) + eps)
+    q = preds / (preds.sum(axis=1, keepdims=True) + eps)
+    m = 0.5 * (p + q)
+    js_by_track = 0.5 * (
+        np.sum(p * np.log((p + eps) / (m + eps)), axis=1)
+        + np.sum(q * np.log((q + eps) / (m + eps)), axis=1)
+    )
+    js_divergence = np.mean(js_by_track, axis=1)
+    js_distance = np.sqrt(np.maximum(js_divergence, 0.0))
+
+    pearson_state = _pearsonr_initialize()
+    pearson_state += _pearsonr_update(
+        profile_targets, profile_preds, axis=(-2, -3),
+    )
+    track_pearson = _pearsonr_result(pearson_state)
+    counted_tracks = pearson_state.count > 0
+
+    flat_preds = profile_preds.reshape(-1)
+    flat_targets = profile_targets.reshape(-1)
+    if flat_preds.size > 2_000_000:
+        idx = np.random.default_rng(42).choice(
+            flat_preds.size, 2_000_000, replace=False,
+        )
+        flat_preds, flat_targets = flat_preds[idx], flat_targets[idx]
+
+    return {
+        "profile_transform": profile_transform,
+        "profile_pearson_r_all": profile_rs,
+        "profile_pearson_r_mean": float(np.nanmean(profile_rs)),
+        "profile_pearson_r_median": float(np.nanmedian(profile_rs)),
+        "profile_pearson_r_n_valid": int(np.isfinite(profile_rs).sum()),
+        "track_pearson_r_accumulated_all": track_pearson,
+        "track_pearson_r_accumulated_mean": float(
+            np.mean(track_pearson, where=counted_tracks)
+        ),
+        "track_pearson_r_accumulated_n_valid": int(counted_tracks.sum()),
+        "count_pearson_r": count_raw,
+        "count_pearson_r_raw": count_raw,
+        "count_pearson_r_log1p": count_log1p,
+        "jsd_all": js_divergence,
+        "jsd_mean": float(np.nanmean(js_divergence)),
+        "jsd_median": float(np.nanmedian(js_divergence)),
+        "js_divergence_all": js_divergence,
+        "js_divergence_mean": float(np.nanmean(js_divergence)),
+        "js_distance_all": js_distance,
+        "js_distance_mean": float(np.nanmean(js_distance)),
+        "js_distance_median": float(np.nanmedian(js_distance)),
+        "mse": float(np.mean(np.square(preds - targets))),
+        "spearman_global": float(stats.spearmanr(flat_preds, flat_targets)[0]),
+        "n_regions": int(preds.shape[0]),
+        "n_positions_per_region": int(preds.shape[1]),
+        "n_tracks": int(preds.shape[2]),
+    }
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 
@@ -703,12 +678,13 @@ def format_summary_table(
     for res in resolutions:
         ft = ft_metrics.get(res) if ft_metrics else None
         nat = native_metrics.get(res) if native_metrics else None
-        if ft is None:
+        if ft is None and nat is None:
             continue
 
         lines.append(f"\n--- {res}bp resolution ---")
         header = f"{'Metric':<28}"
-        header += f"{'Finetuned':>12}"
+        if ft is not None:
+            header += f"{'Finetuned':>12}"
         if nat is not None:
             header += f"  {'Native(' + (native_display_name or '?') + ')':>20}"
         lines.append(header)
@@ -717,18 +693,33 @@ def format_summary_table(
         rows = [
             ("Profile r (mean)", "profile_pearson_r_mean"),
             ("Profile r (median)", "profile_pearson_r_median"),
-            ("Count r", "count_pearson_r"),
-            ("JSD (mean)", "jsd_mean"),
-            ("JSD (median)", "jsd_median"),
+            ("Track r (accumulated)", "track_pearson_r_accumulated_mean"),
+            ("Count r (raw)", "count_pearson_r_raw"),
+            ("Count r (log1p; paper)", "count_pearson_r_log1p"),
+            ("JS divergence (mean)", "js_divergence_mean"),
+            ("JS distance (mean; paper)", "js_distance_mean"),
             ("MSE", "mse"),
             ("Spearman (global)", "spearman_global"),
         ]
         for label, key in rows:
-            line = f"{label:<28}{ft[key]:>12.4f}"
+            fallback = {
+                "count_pearson_r_raw": "count_pearson_r",
+                "js_divergence_mean": "jsd_mean",
+            }.get(key)
+            line = f"{label:<28}"
+            if ft is not None:
+                value = ft.get(key, ft.get(fallback, float("nan")))
+                line += f"{value:>12.4f}"
             if nat is not None:
-                line += f"  {nat[key]:>20.4f}"
+                value = nat.get(key, nat.get(fallback, float("nan")))
+                line += f"  {value:>20.4f}"
             lines.append(line)
-        lines.append(f"{'N regions':<28}{ft['n_regions']:>12d}")
+        line = f"{'N regions':<28}"
+        if ft is not None:
+            line += f"{ft['n_regions']:>12d}"
+        if nat is not None:
+            line += f"  {nat['n_regions']:>20d}"
+        lines.append(line)
 
     return "\n".join(lines)
 
@@ -740,6 +731,7 @@ def save_summary_json(
     native_info: dict | None,
     loss: float | None,
     out_path: Path,
+    evaluation_info: dict | None = None,
 ) -> None:
     """Save machine-readable JSON summary."""
     def _clean(m: dict) -> dict:
@@ -750,6 +742,8 @@ def save_summary_json(
         }
 
     data: dict = {"checkpoint": checkpoint_meta}
+    if evaluation_info:
+        data["evaluation"] = evaluation_info
     if loss is not None:
         data["loss"] = loss
 
@@ -775,12 +769,12 @@ def save_summary_json(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Evaluate fine-tuned AlphaGenome models",
+        description="Evaluate AlphaGenome checkpoints",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     # Required
-    p.add_argument("--checkpoint", required=True, help="Finetuned checkpoint path")
+    p.add_argument("--checkpoint", help="Finetuned checkpoint path")
     p.add_argument(
         "--pretrained-weights", required=True,
         help="Pretrained trunk weights (e.g. model_fold1.pth)",
@@ -800,6 +794,13 @@ def parse_args() -> argparse.Namespace:
         "--ism", action="store_true",
         help="Run ISM on predefined regions (needs --regions-bed + --genome)",
     )
+    p.add_argument(
+        "--native-only", action="store_true",
+        help=(
+            "Evaluate the pretrained/native model directly. Requires --metrics, "
+            "--modality, and --native-biosample or --native-track-index."
+        ),
+    )
 
     # Data inputs
     p.add_argument("--genome", help="Reference genome FASTA")
@@ -816,18 +817,65 @@ def parse_args() -> argparse.Namespace:
         "--native-track-index", type=int,
         help="Direct track index for native head (alternative to --native-biosample)",
     )
+    p.add_argument(
+        "--modality",
+        help="Native head/modality to evaluate in --native-only mode (e.g. atac)",
+    )
 
     # Options
+    p.add_argument(
+        "--resolutions",
+        default=None,
+        help="Comma-separated resolutions for --native-only mode (default: 128)",
+    )
+    p.add_argument(
+        "--metric-bin-sizes",
+        default=None,
+        help=(
+            "Comma-separated scoring resolutions derived from one model output "
+            "using count-preserving sum pooling (for example: 1,32). If omitted, "
+            "score each model output at its native resolution."
+        ),
+    )
+    p.add_argument(
+        "--metric-source-resolution", type=int, default=1,
+        help="Model output resolution from which --metric-bin-sizes are derived",
+    )
+    p.add_argument(
+        "--score-window-bp", type=int, default=None,
+        help=(
+            "Centered scoring width in bp, applied after full-context inference. "
+            "Use 196608 for the 1-Mbp AlphaGenome/Borzoi comparison; omit for "
+            "native 131-kbp finetuning comparisons."
+        ),
+    )
     p.add_argument("--sequence-length", type=int, default=131072)
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--max-regions", type=int, default=2000,
-                    help="Max regions for metrics (0=all)")
+    p.add_argument("--max-regions", type=int, default=0,
+                    help="Max regions for metrics (default: 0, evaluate all)")
     p.add_argument("--ism-window-size", type=int, default=21)
     p.add_argument("--save-predictions", action="store_true")
     p.add_argument("--device", default=None, help="Device (default: auto)")
 
     return p.parse_args()
+
+
+def parse_resolutions(raw: str | None) -> tuple[int, ...]:
+    if raw is None:
+        return (128,)
+    return tuple(int(part.strip()) for part in raw.split(",") if part.strip())
+
+
+def parse_metric_bin_sizes(raw: str | None) -> tuple[int, ...] | None:
+    if raw is None:
+        return None
+    values = tuple(int(part.strip()) for part in raw.split(",") if part.strip())
+    if not values or any(value <= 0 for value in values):
+        raise ValueError("--metric-bin-sizes must contain positive integers")
+    if len(set(values)) != len(values):
+        raise ValueError("--metric-bin-sizes must not contain duplicates")
+    return values
 
 
 # =============================================================================
@@ -840,6 +888,10 @@ def main() -> None:
         level=logging.INFO, format="%(levelname)s: %(message)s",
     )
     args = parse_args()
+    try:
+        metric_bin_sizes = parse_metric_bin_sizes(args.metric_bin_sizes)
+    except ValueError as exc:
+        sys.exit(f"Error: {exc}")
 
     # Resolve device
     if args.device:
@@ -853,41 +905,83 @@ def main() -> None:
     log.info("Device: %s", device)
 
     # Determine which features to run
-    any_explicit = args.metrics or args.regions or args.ism
+    any_explicit = args.metrics or args.regions or args.ism or args.native_only
     run_metrics = args.metrics or (not any_explicit and args.test_bed is not None)
     run_regions = args.regions or (not any_explicit and args.regions_bed is not None)
     run_ism = args.ism  # Always explicit
+    want_native = bool(args.native_biosample or args.native_track_index is not None)
 
     # Validate inputs
+    if not args.native_only and not args.checkpoint:
+        sys.exit("Error: --checkpoint is required unless --native-only is set")
+    if args.native_only and not args.metrics:
+        sys.exit("Error: --native-only currently supports metrics only; pass --metrics")
+    if args.native_only and (run_regions or run_ism):
+        sys.exit("Error: --native-only does not support --regions or --ism")
+    if args.native_only and not args.modality:
+        sys.exit("Error: --native-only requires --modality")
+    if args.native_only and not want_native:
+        sys.exit("Error: --native-only requires --native-biosample or --native-track-index")
     if run_metrics and (not args.test_bed or not args.bigwig):
         sys.exit("Error: --metrics requires --test-bed and --bigwig")
+    if args.native_only and args.bigwig and len(args.bigwig) != 1:
+        sys.exit("Error: --native-only evaluates one native track; pass exactly one --bigwig")
     if run_regions and (not args.regions_bed or not args.bigwig):
         sys.exit("Error: --regions requires --regions-bed and --bigwig")
     if run_ism and (not args.regions_bed or not args.genome):
         sys.exit("Error: --ism requires --regions-bed and --genome")
+    if args.score_window_bp is not None and args.score_window_bp > args.sequence_length:
+        sys.exit(
+            "Error: --score-window-bp cannot exceed --sequence-length. "
+            "Use 196608 only with the 1-Mbp model; score the 131-kbp model natively."
+        )
 
-    want_native = bool(args.native_biosample or args.native_track_index is not None)
+    model = None
+    if args.native_only:
+        modality = args.modality
+        resolutions = parse_resolutions(args.resolutions)
+        track_names = []
+        ckpt_meta = {
+            "mode": "native_only",
+            "pretrained_weights": args.pretrained_weights,
+            "modality": modality,
+            "resolutions": resolutions,
+            "track_names": track_names,
+        }
+        log.info(
+            "Native-only modality: %s, Resolutions: %s",
+            modality, resolutions,
+        )
+    else:
+        # ---- Load finetuned model ----
+        model, ckpt_meta = load_finetuned_model(
+            args.checkpoint, args.pretrained_weights, device,
+        )
+        modality = ckpt_meta["modality"]
+        if isinstance(modality, list):
+            modality = modality[0]  # single-task evaluation
+        resolutions = ckpt_meta["resolutions"]
+        if isinstance(resolutions, dict):
+            resolutions = resolutions.get(modality, (1,))
+        resolutions = tuple(resolutions)
+        track_names = ckpt_meta["track_names"]
+        if isinstance(track_names, dict):
+            track_names = track_names.get(modality, [])
 
-    # ---- Load finetuned model ----
-    model, ckpt_meta = load_finetuned_model(
-        args.checkpoint, args.pretrained_weights, device,
-    )
-    modality = ckpt_meta["modality"]
-    if isinstance(modality, list):
-        modality = modality[0]  # single-task evaluation
-    resolutions = tuple(ckpt_meta["resolutions"])
-    track_names = ckpt_meta["track_names"]
-    if isinstance(track_names, dict):
-        track_names = track_names.get(modality, [])
+        log.info(
+            "Modality: %s, Tracks: %s, Resolutions: %s",
+            modality, track_names, resolutions,
+        )
+        log.info(
+            "Checkpoint epoch: %s, val_loss: %s",
+            ckpt_meta["epoch"], ckpt_meta["val_loss"],
+        )
 
-    log.info(
-        "Modality: %s, Tracks: %s, Resolutions: %s",
-        modality, track_names, resolutions,
-    )
-    log.info(
-        "Checkpoint epoch: %s, val_loss: %s",
-        ckpt_meta["epoch"], ckpt_meta["val_loss"],
-    )
+    if metric_bin_sizes and args.metric_source_resolution not in resolutions:
+        sys.exit(
+            f"Error: --metric-source-resolution={args.metric_source_resolution} is "
+            f"not present in checkpoint/model resolutions {resolutions}"
+        )
 
     # ---- Optionally load native model ----
     native_model, native_track_idx, native_display_name = None, None, None
@@ -900,6 +994,10 @@ def main() -> None:
     # ---- Feature: metrics ----
     ft_metrics_by_res: dict[int, dict] = {}
     native_metrics_by_res: dict[int, dict] = {}
+    metric_resolutions = metric_bin_sizes or resolutions
+    ft_metric_preds: dict[int, np.ndarray] = {}
+    native_metric_preds: dict[int, np.ndarray] = {}
+    metric_targets: dict[int, np.ndarray] = {}
     loss = None
 
     if run_metrics:
@@ -936,41 +1034,80 @@ def main() -> None:
             collate_fn=collate_genomic,
         )
 
-        # Finetuned evaluation
-        ft_preds, targets, loss = evaluate_split(
-            model, modality, loader, device, resolutions,
-        )
-        log.info("Loss: %.4f", loss)
+        ft_preds: dict[int, np.ndarray] = {}
+        native_preds: dict[int, np.ndarray] = {}
+        targets: dict[int, np.ndarray]
 
-        for res in resolutions:
-            if res not in ft_preds:
-                continue
-            p, t = ft_preds[res], targets[res]
-            log.info("Resolution %dbp: preds %s, targets %s", res, p.shape, t.shape)
-
-            ft_m = compute_all_metrics(p, t)
-            ft_metrics_by_res[res] = ft_m
-
-            log.info("  Profile r (mean):  %.4f", ft_m["profile_pearson_r_mean"])
-            log.info("  Profile r (median):%.4f", ft_m["profile_pearson_r_median"])
-            log.info("  Count r:           %.4f", ft_m["count_pearson_r"])
-            log.info("  JSD (mean):        %.4f", ft_m["jsd_mean"])
-
-            # Scatter plots
-            plot_scatter(
-                p, t, metrics_dir / f"scatter_test_{res}bp.png",
-                title_suffix=f"(test, {res}bp)",
+        if args.native_only:
+            targets = collect_targets(loader, resolutions)
+        else:
+            # Finetuned evaluation
+            ft_preds, targets, loss = evaluate_split(
+                model, modality, loader, device, resolutions,
             )
-            plot_scatter_counts(
-                p, t, metrics_dir / f"scatter_counts_test_{res}bp.png",
-                title_suffix=f"(test, {res}bp)",
-            )
+            log.info("Loss: %.4f", loss)
+
+        if metric_bin_sizes:
+            source = args.metric_source_resolution
+            source_preds = None if args.native_only else ft_preds[source]
+            source_targets = targets[source]
+            if source_preds is not None:
+                ft_metric_preds, metric_targets = build_metric_views(
+                    source_preds,
+                    source_targets,
+                    source_resolution=source,
+                    bin_sizes=metric_bin_sizes,
+                    score_window_bp=args.score_window_bp,
+                    reduction="sum",
+                )
+            else:
+                # Native-only mode has no finetuned predictions, but targets
+                # must undergo exactly the same crop and pooling operation.
+                metric_targets, _ = build_metric_views(
+                    source_targets,
+                    source_targets,
+                    source_resolution=source,
+                    bin_sizes=metric_bin_sizes,
+                    score_window_bp=args.score_window_bp,
+                    reduction="sum",
+                )
+        else:
+            ft_metric_preds = ft_preds
+            metric_targets = targets
+
+        if not args.native_only:
+            for res in metric_resolutions:
+                if res not in ft_metric_preds:
+                    continue
+                p, t = ft_metric_preds[res], metric_targets[res]
+                log.info("Resolution %dbp: preds %s, targets %s", res, p.shape, t.shape)
+
+                ft_m = compute_comparison_metrics(p, t, profile_transform="none")
+                ft_metrics_by_res[res] = ft_m
+
+                log.info("  Profile r (mean):  %.4f", ft_m["profile_pearson_r_mean"])
+                log.info("  Track r (accum.):  %.4f", ft_m["track_pearson_r_accumulated_mean"])
+                log.info("  Count r (raw):     %.4f", ft_m["count_pearson_r_raw"])
+                log.info("  Count r (log1p):   %.4f", ft_m["count_pearson_r_log1p"])
+                log.info("  JS divergence:     %.4f", ft_m["js_divergence_mean"])
+                log.info("  JS distance:       %.4f", ft_m["js_distance_mean"])
+
+                # Scatter plots
+                plot_scatter(
+                    p, t, metrics_dir / f"scatter_test_{res}bp.png",
+                    title_suffix=f"(test, {res}bp)",
+                )
+                plot_scatter_counts(
+                    p, t, metrics_dir / f"scatter_counts_test_{res}bp.png",
+                    title_suffix=f"(test, {res}bp)",
+                )
 
         # Native evaluation on same data
         if native_model is not None:
-            # Move finetuned model to CPU to free GPU memory
+            # Move finetuned model to CPU to free GPU memory.
             model_device = device
-            model.cpu()
+            if model is not None:
+                model.cpu()
             native_model = native_model.to(device)
 
             native_preds = evaluate_native_split(
@@ -978,12 +1115,27 @@ def main() -> None:
                 loader, device, resolutions,
             )
 
-            for res in resolutions:
-                if res not in native_preds or res not in targets:
+            if metric_bin_sizes:
+                source = args.metric_source_resolution
+                native_metric_preds, _ = build_metric_views(
+                    native_preds[source],
+                    targets[source],
+                    source_resolution=source,
+                    bin_sizes=metric_bin_sizes,
+                    score_window_bp=args.score_window_bp,
+                    reduction="sum",
+                )
+            else:
+                native_metric_preds = native_preds
+
+            for res in metric_resolutions:
+                if res not in native_metric_preds or res not in metric_targets:
                     continue
-                nat_p = native_preds[res]
-                t = targets[res]
-                nat_m = compute_all_metrics(nat_p, t)
+                nat_p = native_metric_preds[res]
+                t = metric_targets[res]
+                nat_m = compute_comparison_metrics(
+                    nat_p, t, profile_transform="none",
+                )
                 native_metrics_by_res[res] = nat_m
 
                 log.info(
@@ -994,13 +1146,30 @@ def main() -> None:
 
             # Move models back
             native_model.cpu()
-            model = model.to(model_device)
+            if model is not None:
+                model = model.to(model_device)
 
         # Generate histogram plots (overlaid if native available)
-        for res in resolutions:
+        for res in metric_resolutions:
             ft_m = ft_metrics_by_res.get(res)
             nat_m = native_metrics_by_res.get(res)
+            if ft_m is None and nat_m is None:
+                continue
             if ft_m is None:
+                plot_correlation_histogram(
+                    nat_m["profile_pearson_r_all"],
+                    metrics_dir / f"native_correlation_hist_test_{res}bp.png",
+                    xlabel="Pearson r (per region)",
+                    title=f"Native profile correlation distribution ({res}bp)",
+                    ft_label=f"Native ({native_display_name})" if native_display_name else "Native",
+                )
+                plot_correlation_histogram(
+                    nat_m["jsd_all"],
+                    metrics_dir / f"native_jsd_hist_test_{res}bp.png",
+                    xlabel="JSD (per region)",
+                    title=f"Native JSD distribution ({res}bp)",
+                    ft_label=f"Native ({native_display_name})" if native_display_name else "Native",
+                )
                 continue
 
             plot_correlation_histogram(
@@ -1034,6 +1203,22 @@ def main() -> None:
                     np.save(pred_dir / f"test_targets_{res}bp.npy", targets[res].astype(np.float16))
                 if native_model is not None and res in native_preds:
                     np.save(pred_dir / f"native_preds_{res}bp.npy", native_preds[res].astype(np.float16))
+            if metric_bin_sizes:
+                for res in metric_resolutions:
+                    if res in ft_metric_preds:
+                        np.save(
+                            pred_dir / f"test_preds_scored_{res}bp.npy",
+                            ft_metric_preds[res].astype(np.float16),
+                        )
+                    np.save(
+                        pred_dir / f"test_targets_scored_{res}bp.npy",
+                        metric_targets[res].astype(np.float16),
+                    )
+                    if res in native_metric_preds:
+                        np.save(
+                            pred_dir / f"native_preds_scored_{res}bp.npy",
+                            native_metric_preds[res].astype(np.float16),
+                        )
 
     # ---- Feature: region exploration ----
     if run_regions:
@@ -1130,7 +1315,7 @@ def main() -> None:
         ft_metrics_by_res if ft_metrics_by_res else None,
         native_metrics_by_res if native_metrics_by_res else None,
         native_display_name,
-        resolutions,
+        metric_resolutions,
     )
     if summary_text:
         print(summary_text)
@@ -1154,6 +1339,16 @@ def main() -> None:
         },
         native_info, loss,
         out_dir / "summary.json",
+        evaluation_info={
+            "test_bed": args.test_bed,
+            "sequence_length_bp": args.sequence_length,
+            "score_window_bp": args.score_window_bp or args.sequence_length,
+            "metric_source_resolution_bp": args.metric_source_resolution,
+            "metric_bin_sizes_bp": list(metric_resolutions),
+            "pooling": "sum" if metric_bin_sizes else "native_model_output",
+            "profile_transform": "none",
+            "fold": "fold_1 expected; determined by --test-bed",
+        } if run_metrics else None,
     )
 
     log.info("Done. Output: %s", out_dir)

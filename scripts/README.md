@@ -58,6 +58,24 @@ python scripts/finetune.py --mode lora \
 torchrun --nproc_per_node=4 scripts/finetune.py --mode lora ...
 ```
 
+### evaluate_checkpoint.py
+Evaluate fine-tuned checkpoints or native pretrained heads against held-out
+BigWig targets.
+
+```bash
+# Native/pretrained head metrics without a fine-tuned checkpoint
+python scripts/evaluate_checkpoint.py \
+    --native-only --metrics \
+    --pretrained-weights model_fold1.safetensors \
+    --modality atac --native-biosample K562 \
+    --genome hg38.fa \
+    --test-bed test.bed \
+    --bigwig K562_ATAC.bw \
+    --sequence-length 131072 \
+    --resolutions 128 \
+    --output-dir native_eval/
+```
+
 ## Data Preprocessing
 
 ### convert_bigwigs_to_mmap.py
