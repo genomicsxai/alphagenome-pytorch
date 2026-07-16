@@ -75,29 +75,29 @@ def _run_bigwig_to_mmap(args: argparse.Namespace) -> int:
     json_mode = getattr(args, "json_output", False)
 
     import numpy as np
-    from scripts.convert_bigwigs_to_mmap import convert_single_bigwig
+    from alphagenome_pytorch.extensions.finetuning.preprocessing import (
+        convert_bigwigs_to_mmap,
+    )
 
-    bigwig_files = args.input
-    output_base = Path(args.output)
     dtype = np.float32 if args.dtype == "float32" else np.float16
 
-    if len(bigwig_files) == 1:
-        outputs = [(bigwig_files[0], output_base)]
-    else:
-        outputs = [(bw, output_base / Path(bw).stem) for bw in bigwig_files]
+    def _report(record: dict) -> None:
+        print(f"  {Path(record['input']).name} -> {record['output']} "
+              f"({record['elapsed_s']:.1f}s, {record['size_mb']:.1f} MB)")
 
-    results = []
-    for bw_path, out_path in outputs:
-        if not json_mode:
-            print(f"Converting: {Path(bw_path).name}")
-        _, elapsed, size_mb = convert_single_bigwig(bw_path, out_path, args.chromosomes, dtype)
-        results.append({
-            "path": str(out_path),
-            "tracks": 1,
-            "size_mb": round(size_mb, 1),
-        })
-        if not json_mode:
-            print(f"  -> {out_path} ({elapsed:.1f}s, {size_mb:.1f} MB)")
+    records = convert_bigwigs_to_mmap(
+        args.input,
+        args.output,
+        chromosomes=args.chromosomes,
+        dtype=dtype,
+        workers=args.workers,
+        on_result=None if json_mode else _report,
+    )
+
+    results = [
+        {"path": record["output"], "tracks": 1, "size_mb": round(record["size_mb"], 1)}
+        for record in records
+    ]
 
     if json_mode:
         emit_json({

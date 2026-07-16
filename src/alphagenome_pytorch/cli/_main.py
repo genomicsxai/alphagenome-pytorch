@@ -66,7 +66,11 @@ def main(argv: list[str] | None = None) -> int:
     Returns an integer exit code (0 = success).
     """
     parser = build_parser()
-    args = parser.parse_args(argv)
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(tokens)
+    # Subcommands that let a config file supply values need to know which flags
+    # were passed explicitly, which only the raw tokens record.
+    args._argv = tokens
 
     if args.command is None:
         parser.print_help()

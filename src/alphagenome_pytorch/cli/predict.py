@@ -75,6 +75,38 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--compile", action="store_true",
                    help="Use torch.compile for faster inference")
 
+    # Gene-count / AnnData output (aggregate signal into a per-gene x per-track table)
+    gene_out = p.add_argument_group("Gene-count AnnData output (--chromosomes mode)")
+    gene_out.add_argument("--anndata", type=str, default=None,
+                          help="Write a per-gene x per-track AnnData with this filename in "
+                               "--output, by summing whole-chromosome signal over each gene's "
+                               "exons (or body), instead of BigWig. Requires --annotation.")
+    gene_out.add_argument("--annotation", type=str, default=None,
+                          help="GTF/parquet gene annotation for --anndata. Needs exon rows "
+                               "when --aggregate-over exons (the default).")
+    gene_out.add_argument("--aggregate-over", choices=["exons", "gene-body"], default="exons",
+                          help="Aggregate signal over each gene's exons (default) or its "
+                               "full gene body.")
+    gene_out.add_argument("--aggregate-func", choices=["sum", "mean", "log-mean"], default="sum",
+                          help="AnnData X value: raw sum / counts (default), mean coverage per "
+                               "base, or log1p of it (log-mean exon expression). The per-base "
+                               "means account for 128bp predictions being bin sums, so they are "
+                               "comparable across --resolution; at 128bp they stay approximate, "
+                               "since a bin an exon only partly covers is summed whole.")
+    gene_out.add_argument("--gene-strand", choices=["all", "match"], default="all",
+                          help="Strand handling for the gene x track matrix. 'all' (default) "
+                               "fills every cell, so each gene is also scored by tracks reading "
+                               "the opposite strand -- that signal is antisense, not the gene's "
+                               "own expression. 'match' sets those cells to NaN, leaving each "
+                               "gene scored only by tracks on its strand; unstranded ('.') "
+                               "tracks match everything. NaN rather than 0 so the cells drop out "
+                               "of downstream means and correlations instead of averaging in as "
+                               "zeros. Needs --track-strands.")
+    gene_out.add_argument("--track-strands", type=str, default=None,
+                          help="Per-track strand chars ('+','-','.') for --gene-strand match, "
+                               "one per output track. Accepts compact ('+-+-') or separated "
+                               "('+,-,+,-') form.")
+
     # Finetuned model options
     ft = p.add_argument_group("Finetuned model (optional)")
     ft.add_argument("--checkpoint", type=str, default=None,
@@ -93,6 +125,22 @@ def _parse_csv_ints(s: str | None) -> list[int] | None:
 
 def _parse_csv_strs(s: str | None) -> list[str] | None:
     return [t.strip() for t in s.split(",")] if s else None
+
+
+def _parse_track_strands(s: str | None) -> list[str] | None:
+    """Parse --track-strands into one char per track.
+
+    Accepts compact ('+-+-') or separated ('+,-,+,-' / '+ - + -') form.
+    """
+    if not s:
+        return None
+    strands = [c for c in s if c not in ", \t"]
+    invalid = sorted({c for c in strands if c not in "+-."})
+    if invalid:
+        raise ValueError(
+            f"--track-strands has invalid characters {invalid}; use only + - ."
+        )
+    return strands
 
 
 def _load_model(args, dtype_policy, json_mode):
@@ -172,6 +220,7 @@ def run(args: argparse.Namespace) -> int:
         TilingConfig,
         parse_bed,
         parse_locus,
+        predict_full_chromosomes_to_anndata,
         predict_full_chromosomes_to_bigwig,
         predict_region_auto,
         predict_sequence_auto,
@@ -184,6 +233,10 @@ def run(args: argparse.Namespace) -> int:
     # Validate paths
     if not Path(args.model).exists():
         raise FileNotFoundError(f"Model file not found: {args.model}")
+    if args.checkpoint and not Path(args.checkpoint).exists():
+        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+    if args.transfer_config and not Path(args.transfer_config).exists():
+        raise FileNotFoundError(f"Transfer config not found: {args.transfer_config}")
 
     # Determine the effective input mode.
     mode_flags = {
@@ -218,8 +271,37 @@ def run(args: argparse.Namespace) -> int:
         if not Path(args.fasta).exists():
             raise FileNotFoundError(f"FASTA file not found: {args.fasta}")
 
+    # Gene-count AnnData output. Validated before the model load so a missing
+    # annotation or extra fails in seconds rather than after loading weights.
+    if args.anndata:
+        if effective_mode != "chromosomes":
+            raise ValueError(
+                f"--anndata cannot be combined with --{effective_mode}; it aggregates "
+                "whole-chromosome predictions, so use it with --chromosomes."
+            )
+        if not args.annotation:
+            raise ValueError("--anndata requires --annotation (a GTF/parquet with exon rows)")
+        if not Path(args.annotation).exists():
+            raise FileNotFoundError(f"Annotation not found: {args.annotation}")
+        if args.gene_strand == "match" and not args.track_strands:
+            raise ValueError("--gene-strand match requires --track-strands")
+        import importlib.util
+        engine = (
+            "pyranges"
+            if Path(args.annotation).suffix.lower() in (".gtf", ".gff", ".gff3")
+            else "pyarrow"
+        )
+        missing = [m for m in ("pandas", "anndata", engine)
+                   if importlib.util.find_spec(m) is None]
+        if missing:
+            raise ImportError(
+                f"--anndata needs {', '.join(missing)} (not installed). Install with: "
+                "pip install 'alphagenome-pytorch[inference-anndata]'"
+            )
+
     track_indices = _parse_csv_ints(args.tracks)
     track_names = _parse_csv_strs(args.track_names)
+    track_strands = _parse_track_strands(args.track_strands)
 
     dtype_policy = (
         DtypePolicy.mixed_precision()
@@ -230,6 +312,12 @@ def run(args: argparse.Namespace) -> int:
     model, track_names_from_ckpt = _load_model(args, dtype_policy, json_mode)
     if track_names is None and track_names_from_ckpt is not None:
         track_names = track_names_from_ckpt
+        # Checkpoint names cover the full head; subset to the selected tracks.
+        # (An explicit --track-names already describes only the selected tracks.)
+        # Without this, writers zip the full name list against the narrowed
+        # prediction array and index past its end.
+        if track_indices is not None:
+            track_names = [track_names[i] for i in track_indices]
     model.eval()
 
     inner_model = getattr(model, "_orig_mod", model)
@@ -255,6 +343,45 @@ def run(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------ dispatch
     if effective_mode == "chromosomes":
         chromosomes = _parse_csv_strs(args.chromosomes)
+
+        if args.anndata:
+            out_path = output_dir / args.anndata
+            predict_full_chromosomes_to_anndata(
+                model=model,
+                fasta_path=args.fasta,
+                annotation_path=args.annotation,
+                head=args.head,
+                output_path=str(out_path),
+                chromosomes=chromosomes,
+                config=config,
+                track_indices=track_indices,
+                track_names=track_names,
+                track_strands=track_strands,
+                over="exons" if args.aggregate_over == "exons" else "gene_body",
+                reduce="sum" if args.aggregate_func == "sum" else "mean",
+                log=args.aggregate_func == "log-mean",
+                strand=None if args.gene_strand == "all" else args.gene_strand,
+                organism_index=args.organism,
+                device=args.device,
+                show_progress=show_progress,
+            )
+            if json_mode:
+                emit_json({
+                    "output_files": [{
+                        "path": str(out_path),
+                        "head": args.head,
+                        "format": "anndata",
+                        "aggregate_over": args.aggregate_over,
+                        "aggregate_func": args.aggregate_func,
+                        "resolution_bp": args.resolution,
+                        "handling": "tiled",
+                    }],
+                    "warnings": [],
+                })
+            else:
+                print(f"\nDone! Wrote gene-count AnnData to {out_path}")
+            return 0
+
         results = predict_full_chromosomes_to_bigwig(
             model=model,
             fasta_path=args.fasta,

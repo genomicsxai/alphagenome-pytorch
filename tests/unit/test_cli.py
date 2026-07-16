@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
 import sys
 import types
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -713,3 +716,585 @@ class TestScoreRun:
         )
         with pytest.raises(FileNotFoundError, match="Model"):
             score_cli.run(rc_args)
+
+
+# =============================================================================
+# agt finetune — flags are declared on the subparser, impl lives in the package
+# =============================================================================
+
+class TestFinetuneCommand:
+    """Regressions for the two bugs that made 'agt finetune' unusable.
+
+    Previously the subparser took its arguments as argparse.REMAINDER, which
+    rejects leading flags ('unrecognized arguments: --mode'), and run() imported
+    'scripts.finetune', which is not importable from an installed wheel.
+    """
+
+    def test_leading_flags_are_accepted(self):
+        """--mode lora used to die with 'unrecognized arguments: --mode'."""
+        parser = build_parser()
+        args = parser.parse_args(["finetune", "--mode", "lora", "--lr", "0.001"])
+        assert args.command == "finetune"
+        assert args.mode == "lora"
+        assert args.lr == 0.001
+
+    def test_help_lists_real_flags(self):
+        """--help must show the training flags, not a REMAINDER placeholder."""
+        parser = build_parser()
+        sub = parser._subparsers._group_actions[0].choices["finetune"]
+        text = sub.format_help()
+        for flag in ("--mode", "--genome", "--bigwig", "--lora-rank",
+                     "--sequence-parallel", "--pretrained-weights"):
+            assert flag in text, f"{flag} missing from 'agt finetune --help'"
+        assert "finetune_args" not in text
+
+    def test_does_not_import_scripts_package(self):
+        """The impl must resolve from the package, not a repo-root 'scripts' dir."""
+        import alphagenome_pytorch.cli.finetune as ft
+        src = Path(ft.__file__).read_text()
+        assert "from scripts" not in src and "import scripts" not in src
+
+    def test_help_works_outside_repo_via_module_entry(self, tmp_path):
+        """The wheel-install case, end to end.
+
+        Run from a cwd outside the repo with PYTHONPATH cleared, so a repo-root
+        'scripts' package is not importable. This covers both the module entry
+        point torchrun needs and the flags being declared on the subparser.
+        """
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)
+        proc = subprocess.run(
+            [sys.executable, "-m", "alphagenome_pytorch.cli", "finetune", "--help"],
+            cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=300,
+        )
+        assert proc.returncode == 0, f"stderr:\n{proc.stderr}"
+        for flag in ("--mode", "--sequence-parallel", "--pretrained-weights"):
+            assert flag in proc.stdout, f"{flag} missing from help"
+
+    def test_flag_parity_with_standalone_script_parser(self):
+        """agt finetune and scripts/finetune.py must accept the same options."""
+        from alphagenome_pytorch.extensions.finetuning.args import build_parser as ft_build
+
+        standalone = {o for a in ft_build()._actions for o in a.option_strings}
+        parser = build_parser()
+        sub = parser._subparsers._group_actions[0].choices["finetune"]
+        via_agt = {o for a in sub._actions for o in a.option_strings}
+        assert standalone - via_agt == set(), "flags missing from 'agt finetune'"
+
+    def test_cli_entry_module_exists_for_torchrun(self):
+        """torchrun needs a module target: python -m alphagenome_pytorch.cli."""
+        import alphagenome_pytorch.cli
+        main_py = Path(alphagenome_pytorch.cli.__file__).parent / "__main__.py"
+        assert main_py.exists(), "cli/__main__.py missing; torchrun -m would fail"
+
+    def test_run_forwards_parsed_args_to_runner(self):
+        """run() should hand the namespace it parsed straight to the runner."""
+        from alphagenome_pytorch.cli import finetune as ft_cli
+
+        parser = build_parser()
+        args = parser.parse_args([
+            "finetune", "--mode", "lora", "--modality", "atac", "--bigwig", "a.bw",
+            "--genome", "g.fa", "--train-bed", "t.bed", "--val-bed", "v.bed",
+            "--pretrained-weights", "w.pth",
+        ])
+        args._argv = ["finetune", "--mode", "lora"]
+
+        seen = {}
+        fake_runner = types.ModuleType("runner")
+        fake_runner.main = lambda a: seen.setdefault("args", a) and 0
+        with mock.patch.dict(sys.modules, {
+            "alphagenome_pytorch.extensions.finetuning.runner": fake_runner
+        }):
+            rc = ft_cli.run(args)
+        assert rc == 0
+        assert seen["args"].mode == "lora"
+        # postprocess_args ran: derived fields are present
+        assert seen["args"].modalities == ["atac"]
+
+
+# =============================================================================
+# agt predict — gene-count AnnData output
+# =============================================================================
+
+class TestPredictAnnData:
+    def test_anndata_flags_registered(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "predict", "--model", "m.pth", "--output", "out", "--head", "rna_seq",
+            "--chromosomes", "chr1", "--fasta", "hg38.fa",
+            "--anndata", "counts.h5ad", "--annotation", "genes.parquet",
+            "--aggregate-over", "gene-body", "--aggregate-func", "log-mean",
+        ])
+        assert args.anndata == "counts.h5ad"
+        assert args.annotation == "genes.parquet"
+        assert args.aggregate_over == "gene-body"
+        assert args.aggregate_func == "log-mean"
+
+    def test_defaults_match_script(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "predict", "--model", "m.pth", "--output", "out", "--head", "rna_seq",
+            "--chromosomes", "chr1", "--fasta", "hg38.fa",
+        ])
+        assert args.anndata is None
+        assert args.aggregate_over == "exons"
+        assert args.aggregate_func == "sum"
+
+    def test_anndata_requires_annotation(self, tmp_path):
+        from alphagenome_pytorch.cli import predict as predict_cli
+
+        model = tmp_path / "m.pth"; model.write_text("")
+        fasta = tmp_path / "g.fa"; fasta.write_text("")
+        parser = build_parser()
+        args = parser.parse_args([
+            "predict", "--model", str(model), "--output", str(tmp_path),
+            "--head", "rna_seq", "--chromosomes", "chr1", "--fasta", str(fasta),
+            "--anndata", "counts.h5ad",
+        ])
+        with pytest.raises(ValueError, match="requires --annotation"):
+            predict_cli.run(args)
+
+    def test_anndata_rejects_non_chromosome_modes(self, tmp_path):
+        from alphagenome_pytorch.cli import predict as predict_cli
+
+        model = tmp_path / "m.pth"; model.write_text("")
+        fasta = tmp_path / "g.fa"; fasta.write_text("")
+        ann = tmp_path / "genes.parquet"; ann.write_text("")
+        parser = build_parser()
+        args = parser.parse_args([
+            "predict", "--model", str(model), "--output", str(tmp_path),
+            "--head", "rna_seq", "--locus", "chr1:1-100", "--fasta", str(fasta),
+            "--anndata", "counts.h5ad", "--annotation", str(ann),
+        ])
+        with pytest.raises(ValueError, match="--anndata cannot be combined"):
+            predict_cli.run(args)
+
+    def test_missing_annotation_file_raises(self, tmp_path):
+        from alphagenome_pytorch.cli import predict as predict_cli
+
+        model = tmp_path / "m.pth"; model.write_text("")
+        fasta = tmp_path / "g.fa"; fasta.write_text("")
+        parser = build_parser()
+        args = parser.parse_args([
+            "predict", "--model", str(model), "--output", str(tmp_path),
+            "--head", "rna_seq", "--chromosomes", "chr1", "--fasta", str(fasta),
+            "--anndata", "counts.h5ad", "--annotation", str(tmp_path / "nope.parquet"),
+        ])
+        with pytest.raises(FileNotFoundError, match="Annotation not found"):
+            predict_cli.run(args)
+
+
+class TestPredictAnnDataWiring:
+    """The --aggregate-* flags must map onto the packaged function's kwargs.
+
+    A wrong mapping here yields silently wrong numbers rather than an error,
+    so pin the translation: sum -> reduce='sum'; mean -> reduce='mean';
+    log-mean -> reduce='mean' with log=True.
+    """
+
+    class _FakeModel:
+        def __init__(self):
+            self.heads = {"rna_seq": object()}
+
+        def eval(self):
+            return self
+
+    def _run(self, tmp_path, *extra):
+        from alphagenome_pytorch.cli import predict as predict_cli
+        from alphagenome_pytorch.extensions import inference as inf
+
+        model = tmp_path / "m.pth"; model.write_text("")
+        fasta = tmp_path / "g.fa"; fasta.write_text("")
+        ann = tmp_path / "genes.parquet"; ann.write_text("")
+        parser = build_parser()
+        args = parser.parse_args([
+            "predict", "--model", str(model), "--output", str(tmp_path),
+            "--head", "rna_seq", "--chromosomes", "chr1,chr2", "--fasta", str(fasta),
+            "--anndata", "counts.h5ad", "--annotation", str(ann), "--device", "cpu",
+            *extra,
+        ])
+        captured = {}
+        with mock.patch.object(predict_cli, "_load_model",
+                               return_value=(self._FakeModel(), None)), \
+             mock.patch.object(inf, "predict_full_chromosomes_to_anndata",
+                               side_effect=lambda **kw: captured.update(kw)):
+            rc = predict_cli.run(args)
+        assert rc == 0
+        return captured
+
+    def test_sum_is_default(self, tmp_path):
+        kw = self._run(tmp_path)
+        assert kw["over"] == "exons"
+        assert kw["reduce"] == "sum"
+        assert kw["log"] is False
+
+    def test_mean(self, tmp_path):
+        kw = self._run(tmp_path, "--aggregate-func", "mean")
+        assert kw["reduce"] == "mean" and kw["log"] is False
+
+    def test_log_mean_maps_to_mean_plus_log(self, tmp_path):
+        kw = self._run(tmp_path, "--aggregate-func", "log-mean")
+        assert kw["reduce"] == "mean" and kw["log"] is True
+
+    def test_gene_body_maps_to_underscore_form(self, tmp_path):
+        """The CLI spells it 'gene-body'; the function expects 'gene_body'."""
+        kw = self._run(tmp_path, "--aggregate-over", "gene-body")
+        assert kw["over"] == "gene_body"
+
+    def test_output_path_and_chromosomes(self, tmp_path):
+        kw = self._run(tmp_path)
+        assert kw["output_path"] == str(tmp_path / "counts.h5ad")
+        assert kw["chromosomes"] == ["chr1", "chr2"]
+        assert kw["head"] == "rna_seq"
+
+
+# =============================================================================
+# agt convert / preprocess — impl must resolve from the package, not scripts/
+# =============================================================================
+
+class TestScriptsIndependence:
+    """Regression for 'No module named scripts.*' on pip/wheel installs.
+
+    convert and preprocess imported from scripts/ lazily inside run(), so
+    --help parsed fine and only execution failed. A subprocess run from a tmp
+    cwd with PYTHONPATH cleared is what actually catches that.
+    """
+
+    @pytest.mark.parametrize("module", ["convert", "preprocess", "finetune", "predict"])
+    def test_cli_module_does_not_import_scripts(self, module):
+        import importlib
+        mod = importlib.import_module(f"alphagenome_pytorch.cli.{module}")
+        src = Path(mod.__file__).read_text()
+        assert "from scripts" not in src, f"cli/{module}.py still imports from scripts/"
+        assert "import scripts" not in src, f"cli/{module}.py still imports scripts/"
+
+    def test_no_cli_module_imports_scripts(self):
+        """Belt and braces: sweep the whole cli package."""
+        import alphagenome_pytorch.cli
+        cli_dir = Path(alphagenome_pytorch.cli.__file__).parent
+        offenders = [
+            p.name for p in cli_dir.glob("*.py")
+            if "from scripts" in p.read_text() or "import scripts" in p.read_text()
+        ]
+        assert offenders == [], f"cli modules still importing scripts/: {offenders}"
+
+    def _run_outside_repo(self, tmp_path, argv):
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)
+        return subprocess.run(
+            [sys.executable, "-m", "alphagenome_pytorch.cli", *argv],
+            cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=300,
+        )
+
+    def test_convert_reaches_real_work_outside_repo(self, tmp_path):
+        """Must fail on the checkpoint's contents, not on importing scripts/."""
+        ckpt = tmp_path / "fake_ckpt"; ckpt.mkdir()
+        proc = self._run_outside_repo(
+            tmp_path, ["convert", "--input", str(ckpt), "--output", "out.pth"]
+        )
+        combined = proc.stdout + proc.stderr
+        assert "No module named 'scripts" not in combined, combined
+        # Got far enough to hand the path to the checkpoint reader.
+        assert "_METADATA" in combined or "Loading JAX checkpoint" in combined, combined
+
+    def test_preprocess_reaches_real_work_outside_repo(self, tmp_path):
+        """Must fail inside the BigWig reader, not on importing scripts/."""
+        bw = tmp_path / "fake.bw"; bw.write_text("not a bigwig")
+        proc = self._run_outside_repo(
+            tmp_path,
+            ["preprocess", "bigwig-to-mmap", "--input", str(bw), "--output", str(tmp_path / "out")],
+        )
+        combined = proc.stdout + proc.stderr
+        assert "No module named 'scripts" not in combined, combined
+        assert "error during file opening" in combined or "bw is NULL" in combined, combined
+
+
+class TestBigwigToMmapWiring:
+    """agt preprocess must delegate to the packaged batch function."""
+
+    def test_honours_workers_flag(self, tmp_path):
+        """--workers was accepted but ignored before; it must reach the impl."""
+        from alphagenome_pytorch.cli import preprocess as pre_cli
+        from alphagenome_pytorch.extensions.finetuning import preprocessing
+
+        seen = {}
+
+        def fake(files, output_dir, **kw):
+            seen["files"], seen["output_dir"] = list(files), output_dir
+            seen.update(kw)
+            return [{"input": f, "output": f"{output_dir}/{i}",
+                     "elapsed_s": 0.1, "size_mb": 1.0} for i, f in enumerate(files)]
+
+        parser = build_parser()
+        args = parser.parse_args([
+            "preprocess", "bigwig-to-mmap", "--input", "a.bw", "b.bw",
+            "--output", str(tmp_path), "--workers", "7", "--dtype", "float16",
+            "--chromosomes", "chr1", "chr2",
+        ])
+        with mock.patch.object(preprocessing, "convert_bigwigs_to_mmap", side_effect=fake), \
+             mock.patch.object(pre_cli, "require_extra"):
+            rc = pre_cli.run(args)
+
+        assert rc == 0
+        assert seen["workers"] == 7, "--workers must be forwarded to the impl"
+        assert seen["chromosomes"] == ["chr1", "chr2"]
+        assert seen["files"] == ["a.bw", "b.bw"]
+
+    def test_json_schema_preserved(self, tmp_path):
+        """Assert on the payload handed to emit_json.
+
+        Not via capsys/capfd: emit_json takes `file=sys.stdout` as a default
+        argument, bound at import time, so the write lands in whatever stdout
+        object existed then — neither fixture's buffer sees it.
+        """
+        from alphagenome_pytorch.cli import preprocess as pre_cli
+        from alphagenome_pytorch.extensions.finetuning import preprocessing
+
+        def fake(files, output_dir, **kw):
+            return [{"input": "a.bw", "output": "out/a", "elapsed_s": 0.5, "size_mb": 12.345}]
+
+        parser = build_parser()
+        args = parser.parse_args([
+            "--json", "preprocess", "bigwig-to-mmap", "--input", "a.bw", "--output", str(tmp_path),
+        ])
+        with mock.patch.object(preprocessing, "convert_bigwigs_to_mmap", side_effect=fake), \
+             mock.patch.object(pre_cli, "require_extra"), \
+             mock.patch.object(pre_cli, "emit_json") as emitted:
+            rc = pre_cli.run(args)
+
+        assert rc == 0
+        payload = emitted.call_args[0][0]
+        assert payload["records_processed"] == 1
+        assert payload["output_files"] == [{"path": "out/a", "tracks": 1, "size_mb": 12.3}]
+        # Must stay JSON-serializable — the --json contract.
+        assert json.loads(json.dumps(payload, default=str)) == payload
+
+
+class TestConvertBigwigsToMmapBatch:
+    """The extracted batch helper: layout, ordering, and worker handling."""
+
+    def _fake_convert(self, monkeypatch, delays=None):
+        """Stub convert_single_bigwig so no real BigWig I/O is needed."""
+        from alphagenome_pytorch.extensions.finetuning import preprocessing
+
+        def stub(bigwig_path, output_dir, chromosomes=None, dtype=None):
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            if delays:
+                import time as _t
+                _t.sleep(delays.get(Path(bigwig_path).name, 0))
+            return Path(output_dir), 0.01, 1.0
+
+        monkeypatch.setattr(preprocessing, "convert_single_bigwig", stub)
+        return preprocessing
+
+    def test_single_file_writes_directly_to_output_dir(self, tmp_path, monkeypatch):
+        pre = self._fake_convert(monkeypatch)
+        out = tmp_path / "mm"
+        recs = pre.convert_bigwigs_to_mmap(["a.bw"], out)
+        assert len(recs) == 1
+        assert recs[0]["output"] == str(out), "single input must not create a subdir"
+
+    def test_multiple_files_get_stem_subdirs(self, tmp_path, monkeypatch):
+        pre = self._fake_convert(monkeypatch)
+        out = tmp_path / "mm"
+        recs = pre.convert_bigwigs_to_mmap(["x/a.bw", "y/b.bw"], out, workers=1)
+        assert [r["output"] for r in recs] == [str(out / "a"), str(out / "b")]
+
+    def test_results_stay_in_input_order_when_parallel(self, tmp_path, monkeypatch):
+        """Completion order varies with threads; the returned order must not."""
+        pre = self._fake_convert(monkeypatch, delays={"a.bw": 0.15, "b.bw": 0.0, "c.bw": 0.0})
+        recs = pre.convert_bigwigs_to_mmap(
+            ["a.bw", "b.bw", "c.bw"], tmp_path / "mm", workers=3
+        )
+        assert [r["input"] for r in recs] == ["a.bw", "b.bw", "c.bw"]
+
+    def test_on_result_fires_once_per_file(self, tmp_path, monkeypatch):
+        pre = self._fake_convert(monkeypatch)
+        seen = []
+        pre.convert_bigwigs_to_mmap(
+            ["a.bw", "b.bw"], tmp_path / "mm", workers=2, on_result=seen.append
+        )
+        assert len(seen) == 2
+        assert {Path(r["input"]).name for r in seen} == {"a.bw", "b.bw"}
+
+    def test_exported_from_package(self):
+        """datasets.py's docstring points at convert_bigwigs_to_mmap()."""
+        import alphagenome_pytorch.extensions.finetuning as ft
+        assert callable(ft.convert_bigwigs_to_mmap)
+
+
+class TestPredictCheckpointTrackNames:
+    """--checkpoint + --tracks must label the *selected* tracks.
+
+    Checkpoint metadata names every track in the head. Selecting a subset with
+    --tracks narrows the prediction array but not the name list, so writers that
+    zip names against columns (write_bigwig does) index past the end. The
+    standalone predict_full_chromosome.py subset the names; agt predict did not.
+    """
+
+    class _FakeModel:
+        def __init__(self):
+            self.heads = {"rna_seq": object()}
+
+        def eval(self):
+            return self
+
+    def _captured_track_names(self, tmp_path, ckpt_names, extra):
+        from alphagenome_pytorch.cli import predict as predict_cli
+        from alphagenome_pytorch.extensions import inference as inf
+
+        model = tmp_path / "m.pth"; model.write_text("")
+        fasta = tmp_path / "g.fa"; fasta.write_text("")
+        ckpt = tmp_path / "ft.pth"; ckpt.write_text("")
+        parser = build_parser()
+        args = parser.parse_args([
+            "predict", "--model", str(model), "--output", str(tmp_path),
+            "--head", "rna_seq", "--chromosomes", "chr1", "--fasta", str(fasta),
+            "--checkpoint", str(ckpt), "--device", "cpu", *extra,
+        ])
+        seen = {}
+        with mock.patch.object(predict_cli, "_load_model",
+                               return_value=(self._FakeModel(), ckpt_names)), \
+             mock.patch.object(inf, "predict_full_chromosomes_to_bigwig",
+                               side_effect=lambda **kw: seen.update(kw) or {}):
+            rc = predict_cli.run(args)
+        assert rc == 0
+        return seen
+
+    def test_names_subset_to_selected_tracks(self, tmp_path):
+        names = [f"track_{i}" for i in range(768)]
+        seen = self._captured_track_names(tmp_path, names, ["--tracks", "0,5,9"])
+        assert seen["track_indices"] == [0, 5, 9]
+        assert seen["track_names"] == ["track_0", "track_5", "track_9"], (
+            "checkpoint names must be subset to --tracks, or the writer "
+            "indexes past the narrowed prediction array"
+        )
+        assert len(seen["track_names"]) == len(seen["track_indices"])
+
+    def test_full_names_kept_without_track_selection(self, tmp_path):
+        names = [f"track_{i}" for i in range(4)]
+        seen = self._captured_track_names(tmp_path, names, [])
+        assert seen["track_names"] == names
+
+    def test_explicit_track_names_win_and_are_not_resubset(self, tmp_path):
+        """--track-names already describes only the selected tracks."""
+        names = [f"ckpt_{i}" for i in range(768)]
+        seen = self._captured_track_names(
+            tmp_path, names, ["--tracks", "0,5,9", "--track-names", "a,b,c"]
+        )
+        assert seen["track_names"] == ["a", "b", "c"]
+
+
+class TestPredictStrandFlags:
+    """--gene-strand / --track-strands must reach the anndata aggregator."""
+
+    class _FakeModel:
+        def __init__(self):
+            self.heads = {"rna_seq": object()}
+
+        def eval(self):
+            return self
+
+    def _run(self, tmp_path, *extra):
+        from alphagenome_pytorch.cli import predict as predict_cli
+        from alphagenome_pytorch.extensions import inference as inf
+
+        model = tmp_path / "m.pth"; model.write_text("")
+        fasta = tmp_path / "g.fa"; fasta.write_text("")
+        ann = tmp_path / "genes.parquet"; ann.write_text("")
+        parser = build_parser()
+        args = parser.parse_args([
+            "predict", "--model", str(model), "--output", str(tmp_path),
+            "--head", "rna_seq", "--chromosomes", "chr1", "--fasta", str(fasta),
+            "--anndata", "c.h5ad", "--annotation", str(ann), "--device", "cpu", *extra,
+        ])
+        captured = {}
+        with mock.patch.object(predict_cli, "_load_model",
+                               return_value=(self._FakeModel(), None)), \
+             mock.patch.object(inf, "predict_full_chromosomes_to_anndata",
+                               side_effect=lambda **kw: captured.update(kw)):
+            rc = predict_cli.run(args)
+        assert rc == 0
+        return captured
+
+    def test_default_is_all_strands(self, tmp_path):
+        kw = self._run(tmp_path)
+        assert kw["strand"] is None, "'all' means no strand filtering"
+        assert kw["track_strands"] is None
+
+    def test_match_forwards_strand_and_tracks(self, tmp_path):
+        kw = self._run(tmp_path, "--gene-strand", "match", "--track-strands", "+-+.")
+        assert kw["strand"] == "match"
+        assert kw["track_strands"] == ["+", "-", "+", "."]
+
+    def test_separated_strand_form_accepted(self, tmp_path):
+        kw = self._run(tmp_path, "--gene-strand", "match", "--track-strands", "+,-,+,.")
+        assert kw["track_strands"] == ["+", "-", "+", "."]
+
+    def test_match_requires_track_strands(self, tmp_path):
+        with pytest.raises(ValueError, match="--gene-strand match requires --track-strands"):
+            self._run(tmp_path, "--gene-strand", "match")
+
+    def test_invalid_strand_chars_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="invalid characters"):
+            self._run(tmp_path, "--gene-strand", "match", "--track-strands", "+-x")
+
+    def test_owns_flags_the_script_used_to_declare(self):
+        """These lived only in predict_full_chromosome.py before it became a shim."""
+        parser = build_parser()
+        sub = parser._subparsers._group_actions[0].choices["predict"]
+        flags = {o for a in sub._actions for o in a.option_strings}
+        for flag in ("--gene-strand", "--track-strands", "--anndata", "--annotation",
+                     "--aggregate-over", "--aggregate-func"):
+            assert flag in flags
+
+
+class TestPredictFullChromosomeShim:
+    """scripts/predict_full_chromosome.py delegates to agt predict.
+
+    Omitting --chromosomes has always meant chr1-22,chrX for this script, while
+    agt predict wants an explicit input selector; the shim restores that default
+    rather than letting a previously-valid command start erroring.
+    """
+
+    def _shim(self):
+        import importlib.util
+        path = Path(__file__).resolve().parents[2] / "scripts" / "predict_full_chromosome.py"
+        spec = importlib.util.spec_from_file_location("pfc_shim", path)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+    def test_targets_agt_predict(self):
+        assert self._shim().to_predict_argv(["--model", "m"])[0] == "predict"
+
+    def test_injects_historical_chromosome_default(self):
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            DEFAULT_CHROMOSOMES,
+        )
+        out = self._shim().to_predict_argv(["--model", "m", "--fasta", "g", "--head", "atac"])
+        assert out[-2:] == ["--chromosomes", ",".join(DEFAULT_CHROMOSOMES)]
+
+    @pytest.mark.parametrize("selector", [
+        ["--chromosomes", "chr1"],
+        ["--chromosomes=chr1"],
+        ["--locus", "chr1:1-100"],
+        ["--bed", "r.bed"],
+        ["--sequences", "s.fa"],
+    ])
+    def test_explicit_selector_not_overridden(self, selector):
+        out = self._shim().to_predict_argv(["--model", "m", *selector])
+        assert out[-len(selector):] == selector
+        assert out.count("--chromosomes") <= 1
+
+    def test_default_comes_from_the_package(self):
+        """The list must not be re-hardcoded here, or it drifts from the impl."""
+        src = (Path(__file__).resolve().parents[2] / "scripts"
+               / "predict_full_chromosome.py").read_text()
+        assert "DEFAULT_CHROMOSOMES" in src
+        assert "chr22" not in src, "chromosome list should come from the package"
+
+    def test_is_thin(self):
+        src = (Path(__file__).resolve().parents[2] / "scripts"
+               / "predict_full_chromosome.py").read_text()
+        assert "add_argument" not in src, "shim must not re-declare flags"
