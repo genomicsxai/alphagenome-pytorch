@@ -5,13 +5,12 @@ from typing import TYPE_CHECKING
 from alphagenome_pytorch.extensions.finetuning.adapters import (
     LoRA, Locon, IA3, IA3_FF, AdapterHoulsby
 )
-from alphagenome_pytorch.extensions.finetuning.training import (
-    ModalityConfig, collate_genomic, MODALITY_CONFIGS,
-    create_lr_scheduler, compute_finetuning_loss,
-    train_epoch, validate,
-    ProfilingStats, train_epoch_ddp, validate_ddp,
-    train_epoch_multihead, validate_multihead,
-    train_epoch_sequence_parallel,
+# The modality registry is dependency-light (dataclasses only). Import it eagerly
+# so the flag layer (extensions.finetuning.args) reads it without pulling in the
+# training module (torch/tqdm); the rest of training's API is exposed lazily via
+# __getattr__ below.
+from alphagenome_pytorch.extensions.finetuning.modalities import (
+    ModalityConfig, MODALITY_CONFIGS,
 )
 from alphagenome_pytorch.extensions.finetuning.transfer import TransferConfig
 
@@ -55,7 +54,27 @@ if TYPE_CHECKING:
 
 
 def __getattr__(name):
-    """Lazy import for datasets to avoid pyfaidx/pyBigWig dependency at import time."""
+    """Lazily load heavier submodules so `import ...finetuning` stays cheap.
+
+    Keeps the training module (and its torch/tqdm imports) and the dataset
+    readers (pyfaidx/pyBigWig) out of `sys.modules` until a symbol from them is
+    actually used — e.g. building the finetune argument parser touches neither.
+    """
+    if name in (
+        "collate_genomic",
+        "create_lr_scheduler",
+        "compute_finetuning_loss",
+        "train_epoch",
+        "validate",
+        "ProfilingStats",
+        "train_epoch_ddp",
+        "validate_ddp",
+        "train_epoch_multihead",
+        "validate_multihead",
+        "train_epoch_sequence_parallel",
+    ):
+        from alphagenome_pytorch.extensions.finetuning import training
+        return getattr(training, name)
     if name in ("ATACDataset", "RNASeqDataset", "GenomicDataset", "CachedGenome",
                 "compute_track_means", "MultimodalDataset", "collate_multimodal"):
         from alphagenome_pytorch.extensions.finetuning import datasets

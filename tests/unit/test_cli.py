@@ -1298,3 +1298,102 @@ class TestPredictFullChromosomeShim:
         src = (Path(__file__).resolve().parents[2] / "scripts"
                / "predict_full_chromosome.py").read_text()
         assert "add_argument" not in src, "shim must not re-declare flags"
+
+
+class TestFinetuneParserImportBoundary:
+    """The flag layer must not drag in the training module (torch/tqdm).
+
+    args.py reads MODALITY_CONFIGS from the dependency-light `modalities` module,
+    and finetuning/__init__.py exposes the rest of training lazily. Building the
+    finetune parser should therefore leave `finetuning.training` out of
+    sys.modules. Checked in a fresh interpreter, since once any earlier test
+    imports training it would show up process-wide.
+    """
+
+    TRAINING_MOD = "alphagenome_pytorch.extensions.finetuning.training"
+
+    def _training_loaded_after(self, snippet: str) -> bool:
+        code = (
+            "import sys\n"
+            f"{snippet}\n"
+            f"print('LOADED' if {self.TRAINING_MOD!r} in sys.modules else 'ABSENT')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=180
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert proc.stdout.strip().endswith(("LOADED", "ABSENT")), proc.stdout + proc.stderr
+        return proc.stdout.strip().endswith("LOADED")
+
+    def test_building_finetune_parser_does_not_import_training(self):
+        loaded = self._training_loaded_after(
+            "from alphagenome_pytorch.extensions.finetuning.args import build_parser\n"
+            "build_parser()"
+        )
+        assert not loaded, "building the finetune parser imported finetuning.training"
+
+    def test_building_agt_parser_does_not_import_training(self):
+        loaded = self._training_loaded_after(
+            "from alphagenome_pytorch.cli._main import build_parser\n"
+            "build_parser()"
+        )
+        assert not loaded, "agt help registration imported finetuning.training"
+
+    def test_control_accessing_a_training_symbol_does_import_it(self):
+        """Sanity: the module isn't simply unimportable — using it still loads it."""
+        loaded = self._training_loaded_after(
+            "from alphagenome_pytorch.extensions.finetuning import train_epoch\n"
+            "assert callable(train_epoch)"
+        )
+        assert loaded, "accessing a lazy training symbol should import the module"
+
+
+class TestHelpWorksWithCoreDepsOnly:
+    """Every --help path must work on a bare install (core deps only).
+
+    A bare `pip install alphagenome-pytorch` has torch/numpy/safetensors but none
+    of the optional extras (tqdm, pyBigWig, pandas, ...). Building any subparser
+    must not import them, or `agt --help` breaks before it can even tell the user
+    which extra to install. Two things kept this honest: the finetune flag layer
+    reads MODALITY_CONFIGS from the light `modalities` module (training stays
+    lazy), and `full_chromosome` imports tqdm lazily so `info` can read
+    HEAD_CONFIGS without it. Runs in a subprocess with those modules blocked.
+    """
+
+    # Optional deps a bare install lacks — the union of the pyproject extras.
+    OPTIONAL = [
+        "tqdm", "pyBigWig", "pyfaidx", "pandas", "pyranges", "pyarrow",
+        "anndata", "grpc", "jax", "jaxlib", "haiku", "orbax", "alphagenome",
+        "chex", "einshape", "tensorflow", "kagglehub", "aiohttp", "requests",
+        "logomaker", "yaml",
+    ]
+
+    def test_all_help_paths_work_without_optional_deps(self):
+        code = (
+            "import builtins, io, contextlib\n"
+            f"BLOCKED = set({self.OPTIONAL!r})\n"
+            "real = builtins.__import__\n"
+            "def fake(name, *a, **k):\n"
+            "    if name.split('.')[0] in BLOCKED:\n"
+            "        raise ModuleNotFoundError(name)\n"
+            "    return real(name, *a, **k)\n"
+            "builtins.__import__ = fake\n"
+            "from alphagenome_pytorch.cli._main import main\n"
+            "cmds = ([], ['--help'], ['finetune','--help'], ['predict','--help'],\n"
+            "        ['info','--help'], ['score','--help'], ['convert','--help'],\n"
+            "        ['preprocess','--help'], ['serve','--help'])\n"
+            "buf = io.StringIO()\n"
+            "with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):\n"
+            "    for argv in cmds:\n"
+            "        try:\n"
+            "            rc = main(argv)\n"
+            "            assert rc == 0, (argv, rc)\n"
+            "        except SystemExit as e:\n"
+            "            assert e.code in (0, None), (argv, e.code)\n"
+            "print('OK')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=180
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert proc.stdout.strip().endswith("OK"), proc.stdout + proc.stderr

@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from alphagenome_pytorch.extensions.finetuning.training import MODALITY_CONFIGS
+from alphagenome_pytorch.extensions.finetuning.modalities import MODALITY_CONFIGS
 
 
 DEFAULTS = {
