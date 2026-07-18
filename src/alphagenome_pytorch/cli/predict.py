@@ -101,11 +101,14 @@ def register(subparsers: argparse._SubParsersAction) -> None:
                                "gene scored only by tracks on its strand; unstranded ('.') "
                                "tracks match everything. NaN rather than 0 so the cells drop out "
                                "of downstream means and correlations instead of averaging in as "
-                               "zeros. Needs --track-strands.")
+                               "zeros. Track strands are taken from metadata (built-in for "
+                               "pretrained heads, the checkpoint for finetuned ones); override "
+                               "with --track-strands when metadata is unavailable.")
     gene_out.add_argument("--track-strands", type=str, default=None,
-                          help="Per-track strand chars ('+','-','.') for --gene-strand match, "
-                               "one per output track. Accepts compact ('+-+-') or separated "
-                               "('+,-,+,-') form.")
+                          help="Override per-track strands for --gene-strand match: strand "
+                               "chars ('+','-','.'), one per output track, compact ('+-+-') or "
+                               "separated ('+,-,+,-'). Normally inferred from metadata; needed "
+                               "only for custom/legacy heads without embedded strand info.")
 
     # Finetuned model options
     ft = p.add_argument_group("Finetuned model (optional)")
@@ -143,6 +146,62 @@ def _parse_track_strands(s: str | None) -> list[str] | None:
     return strands
 
 
+def _strands_from_builtin(head: str, organism: int) -> list[str] | None:
+    """Per-track strands for a native head from the bundled metadata catalog.
+
+    Returns a full-head list in track order, or None if the head is absent from
+    the built-in catalog or any track lacks a strand.
+    """
+    from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
+    try:
+        catalog = TrackMetadataCatalog.load_builtin(organism)
+        tracks = catalog.get_tracks(head, organism=organism, strict=True)
+    except (KeyError, FileNotFoundError):
+        return None
+    strands = [t.get("strand") for t in tracks]
+    if not strands or any(s is None for s in strands):
+        return None
+    return [str(s) for s in strands]
+
+
+def _strands_from_checkpoint(track_metadata, head: str) -> list[str] | None:
+    """Per-track strands for *head* from a checkpoint's embedded track_metadata.
+
+    Embedded rows come from ``TrackMetadataCatalog.to_rows()``, which keys the
+    head as ``output_name``; ``output_type`` is accepted as a fallback for rows
+    written in the parquet's column naming.
+    """
+    if not track_metadata:
+        return None
+
+    def _head_of(row) -> str:
+        return str(row.get("output_name") or row.get("output_type") or "")
+
+    rows = [r for r in track_metadata if _head_of(r).lower() == head.lower()]
+    if not rows or any(r.get("strand") is None for r in rows):
+        return None
+    rows = sorted(rows, key=lambda r: r.get("track_index", 0))
+    return [str(r["strand"]) for r in rows]
+
+
+def _resolve_track_strands(head, organism, track_indices, *,
+                           checkpoint_meta=None, from_checkpoint=False):
+    """Infer per-output-track strands from metadata, narrowed by --tracks.
+
+    Full-head strands come from the checkpoint (finetuned) or the built-in
+    catalog (pretrained), then are subset to the selected tracks so they line up
+    with the aggregated prediction columns. Returns None when no strand metadata
+    is available (caller then requires an explicit --track-strands).
+    """
+    full = (_strands_from_checkpoint(checkpoint_meta, head) if from_checkpoint
+            else _strands_from_builtin(head, organism))
+    if full is None:
+        return None
+    if track_indices is not None:
+        full = [full[i] for i in track_indices]
+    return full
+
+
 def _load_model(args, dtype_policy, json_mode):
     import torch
     from alphagenome_pytorch import AlphaGenome
@@ -176,14 +235,14 @@ def _load_model(args, dtype_policy, json_mode):
             track_names_from_ckpt = (
                 ckpt_names.get(args.head) if isinstance(ckpt_names, dict) else ckpt_names
             )
-        return model, track_names_from_ckpt
+        return model, track_names_from_ckpt, meta.get("track_metadata")
 
     if not json_mode:
         print(f"Loading model from {args.model}...")
     model = AlphaGenome.from_pretrained(
         args.model, device=args.device, dtype_policy=dtype_policy,
     )
-    return model, None
+    return model, None, None
 
 
 def _describe_handling(info, json_mode: bool, quiet: bool) -> None:
@@ -283,8 +342,6 @@ def run(args: argparse.Namespace) -> int:
             raise ValueError("--anndata requires --annotation (a GTF/parquet with exon rows)")
         if not Path(args.annotation).exists():
             raise FileNotFoundError(f"Annotation not found: {args.annotation}")
-        if args.gene_strand == "match" and not args.track_strands:
-            raise ValueError("--gene-strand match requires --track-strands")
         import importlib.util
         engine = (
             "pyranges"
@@ -303,13 +360,28 @@ def run(args: argparse.Namespace) -> int:
     track_names = _parse_csv_strs(args.track_names)
     track_strands = _parse_track_strands(args.track_strands)
 
+    # --gene-strand match needs a strand per track. An explicit --track-strands
+    # wins; otherwise infer from metadata. For a pretrained model that's the
+    # built-in catalog, resolvable now so we can fail fast before loading
+    # weights; a finetuned checkpoint's strands are resolved after it loads.
+    strands_needed = bool(args.anndata) and args.gene_strand == "match"
+    if strands_needed and track_strands is None and not args.checkpoint:
+        track_strands = _resolve_track_strands(args.head, args.organism, track_indices)
+        if track_strands is None:
+            raise ValueError(
+                f"--gene-strand match needs per-track strands for head '{args.head}', "
+                "but the built-in metadata has none; pass --track-strands."
+            )
+
     dtype_policy = (
         DtypePolicy.mixed_precision()
         if args.dtype_policy == "mixed_precision"
         else DtypePolicy.full_float32()
     )
 
-    model, track_names_from_ckpt = _load_model(args, dtype_policy, json_mode)
+    model, track_names_from_ckpt, track_metadata_from_ckpt = _load_model(
+        args, dtype_policy, json_mode
+    )
     if track_names is None and track_names_from_ckpt is not None:
         track_names = track_names_from_ckpt
         # Checkpoint names cover the full head; subset to the selected tracks.
@@ -318,6 +390,19 @@ def run(args: argparse.Namespace) -> int:
         # prediction array and index past its end.
         if track_indices is not None:
             track_names = [track_names[i] for i in track_indices]
+
+    # Finetuned checkpoint strands are only known now that meta is loaded.
+    if strands_needed and track_strands is None and args.checkpoint:
+        track_strands = _resolve_track_strands(
+            args.head, args.organism, track_indices,
+            checkpoint_meta=track_metadata_from_ckpt, from_checkpoint=True,
+        )
+        if track_strands is None:
+            raise ValueError(
+                f"--gene-strand match needs per-track strands for head '{args.head}', "
+                "but the checkpoint embeds no strand metadata; pass --track-strands "
+                "(or retrain so the checkpoint records strands)."
+            )
     model.eval()
 
     inner_model = getattr(model, "_orig_mod", model)

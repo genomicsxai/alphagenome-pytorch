@@ -915,7 +915,7 @@ class TestPredictAnnDataWiring:
         ])
         captured = {}
         with mock.patch.object(predict_cli, "_load_model",
-                               return_value=(self._FakeModel(), None)), \
+                               return_value=(self._FakeModel(), None, None)), \
              mock.patch.object(inf, "predict_full_chromosomes_to_anndata",
                                side_effect=lambda **kw: captured.update(kw)):
             rc = predict_cli.run(args)
@@ -1154,7 +1154,7 @@ class TestPredictCheckpointTrackNames:
         ])
         seen = {}
         with mock.patch.object(predict_cli, "_load_model",
-                               return_value=(self._FakeModel(), ckpt_names)), \
+                               return_value=(self._FakeModel(), ckpt_names, None)), \
              mock.patch.object(inf, "predict_full_chromosomes_to_bigwig",
                                side_effect=lambda **kw: seen.update(kw) or {}):
             rc = predict_cli.run(args)
@@ -1210,7 +1210,7 @@ class TestPredictStrandFlags:
         ])
         captured = {}
         with mock.patch.object(predict_cli, "_load_model",
-                               return_value=(self._FakeModel(), None)), \
+                               return_value=(self._FakeModel(), None, None)), \
              mock.patch.object(inf, "predict_full_chromosomes_to_anndata",
                                side_effect=lambda **kw: captured.update(kw)):
             rc = predict_cli.run(args)
@@ -1231,9 +1231,46 @@ class TestPredictStrandFlags:
         kw = self._run(tmp_path, "--gene-strand", "match", "--track-strands", "+,-,+,.")
         assert kw["track_strands"] == ["+", "-", "+", "."]
 
-    def test_match_requires_track_strands(self, tmp_path):
-        with pytest.raises(ValueError, match="--gene-strand match requires --track-strands"):
-            self._run(tmp_path, "--gene-strand", "match")
+    def test_match_auto_resolves_strands_from_builtin(self, tmp_path):
+        """No --track-strands needed for a native head — inferred from metadata."""
+        kw = self._run(tmp_path, "--gene-strand", "match")
+        assert kw["strand"] == "match"
+        assert kw["track_strands"] is not None
+        # rna_seq: 768 tracks, strands from the bundled catalog.
+        assert len(kw["track_strands"]) == 768
+        assert set(kw["track_strands"]) <= {"+", "-", "."}
+
+    def test_match_auto_strands_subset_by_tracks(self, tmp_path):
+        kw = self._run(tmp_path, "--gene-strand", "match", "--tracks", "0,5,9")
+        assert kw["track_indices"] == [0, 5, 9]
+        assert kw["track_strands"] is not None
+        assert len(kw["track_strands"]) == 3
+
+    def test_explicit_track_strands_override_metadata(self, tmp_path):
+        kw = self._run(tmp_path, "--gene-strand", "match",
+                       "--tracks", "0,1,2,3", "--track-strands", "+-+.")
+        assert kw["track_strands"] == ["+", "-", "+", "."]
+
+    def test_match_errors_when_no_strand_metadata(self, tmp_path):
+        """A head absent from the catalog (and no --track-strands) fails fast."""
+        from alphagenome_pytorch.cli import predict as predict_cli
+        from alphagenome_pytorch.extensions import inference as inf
+
+        model = tmp_path / "m.pth"; model.write_text("")
+        fasta = tmp_path / "g.fa"; fasta.write_text("")
+        ann = tmp_path / "genes.parquet"; ann.write_text("")
+        parser = build_parser()
+        args = parser.parse_args([
+            "predict", "--model", str(model), "--output", str(tmp_path),
+            "--head", "not_a_real_head", "--chromosomes", "chr1", "--fasta", str(fasta),
+            "--anndata", "c.h5ad", "--annotation", str(ann), "--device", "cpu",
+            "--gene-strand", "match",
+        ])
+        # Errors before the model even loads, so _load_model must not be reached.
+        with mock.patch.object(predict_cli, "_load_model",
+                               side_effect=AssertionError("should fail before load")):
+            with pytest.raises(ValueError, match="built-in metadata has none"):
+                predict_cli.run(args)
 
     def test_invalid_strand_chars_rejected(self, tmp_path):
         with pytest.raises(ValueError, match="invalid characters"):
@@ -1397,3 +1434,86 @@ class TestHelpWorksWithCoreDepsOnly:
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert proc.stdout.strip().endswith("OK"), proc.stdout + proc.stderr
+
+
+class TestPredictStrandFromCheckpoint:
+    """--gene-strand match infers strands from a finetuned checkpoint's metadata."""
+
+    class _Model:
+        def __init__(self, head):
+            self.heads = {head: object()}
+
+        def eval(self):
+            return self
+
+    def _run(self, tmp_path, meta_rows, head="my_rna", extra=()):
+        from alphagenome_pytorch.cli import predict as predict_cli
+        from alphagenome_pytorch.extensions import inference as inf
+
+        for n in ("m.pth", "g.fa", "genes.parquet", "ft.pth"):
+            (tmp_path / n).write_text("")
+        parser = build_parser()
+        args = parser.parse_args([
+            "predict", "--model", str(tmp_path / "m.pth"), "--output", str(tmp_path),
+            "--head", head, "--chromosomes", "chr1", "--fasta", str(tmp_path / "g.fa"),
+            "--anndata", "c.h5ad", "--annotation", str(tmp_path / "genes.parquet"),
+            "--device", "cpu", "--checkpoint", str(tmp_path / "ft.pth"),
+            "--gene-strand", "match", *extra,
+        ])
+        captured = {}
+        with mock.patch.object(predict_cli, "_load_model",
+                               return_value=(self._Model(head), None, meta_rows)), \
+             mock.patch.object(inf, "predict_full_chromosomes_to_anndata",
+                               side_effect=lambda **kw: captured.update(kw)):
+            rc = predict_cli.run(args)
+        assert rc == 0
+        return captured
+
+    def test_resolves_from_checkpoint_metadata(self, tmp_path):
+        from alphagenome_pytorch.extensions.finetuning.runner import strand_only_track_metadata
+        rows = strand_only_track_metadata(
+            {"my_rna": ["+", "-", "."]}, {"my_rna": ["a", "b", "c"]}, "human"
+        )
+        kw = self._run(tmp_path, rows)
+        assert kw["track_strands"] == ["+", "-", "."]
+
+    def test_subset_by_tracks(self, tmp_path):
+        from alphagenome_pytorch.extensions.finetuning.runner import strand_only_track_metadata
+        rows = strand_only_track_metadata(
+            {"my_rna": ["+", "-", ".", "+"]}, {"my_rna": ["a", "b", "c", "d"]}, "human"
+        )
+        kw = self._run(tmp_path, rows, extra=("--tracks", "0,3"))
+        assert kw["track_strands"] == ["+", "+"]
+
+    def test_errors_when_checkpoint_has_no_strands(self, tmp_path):
+        # Custom head, no builtin fallback (never for a checkpoint), no embedded strands.
+        with pytest.raises(ValueError, match="checkpoint embeds no strand metadata"):
+            self._run(tmp_path, meta_rows=None)
+
+
+class TestStrandOnlyTrackMetadata:
+    """runner.strand_only_track_metadata — self-describing checkpoints (point 3)."""
+
+    def test_rows_keyed_like_to_rows(self):
+        from alphagenome_pytorch.extensions.finetuning.runner import strand_only_track_metadata
+        rows = strand_only_track_metadata(
+            {"rna_seq": ["+", "-"]}, {"rna_seq": ["t0", "t1"]}, "human"
+        )
+        assert rows == [
+            {"output_name": "rna_seq", "track_index": 0, "organism": 0,
+             "strand": "+", "track_name": "t0"},
+            {"output_name": "rna_seq", "track_index": 1, "organism": 0,
+             "strand": "-", "track_name": "t1"},
+        ]
+
+    def test_mouse_organism_and_missing_names(self):
+        from alphagenome_pytorch.extensions.finetuning.runner import strand_only_track_metadata
+        rows = strand_only_track_metadata({"rna_seq": ["+"]}, {}, "mouse")
+        assert rows[0]["organism"] == 1
+        assert "track_name" not in rows[0]
+
+    def test_roundtrips_through_the_predict_reader(self):
+        from alphagenome_pytorch.extensions.finetuning.runner import strand_only_track_metadata
+        from alphagenome_pytorch.cli.predict import _strands_from_checkpoint
+        rows = strand_only_track_metadata({"h": ["+", "-", "+"]}, {}, "human")
+        assert _strands_from_checkpoint(rows, "h") == ["+", "-", "+"]

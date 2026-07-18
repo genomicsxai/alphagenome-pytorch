@@ -367,6 +367,36 @@ def load_track_metadata_for_finetune(
     return updated_names, metadata_rows
 
 
+def strand_only_track_metadata(
+    modality_strands: dict[str, list[str]],
+    modality_track_names: dict[str, list[str]],
+    organism: str | None = None,
+) -> list[dict[str, Any]]:
+    """Minimal metadata rows recording just per-track strand, for embedding.
+
+    When a fine-tune is given ``--track-strands`` but no ``--track-metadata``,
+    the strands are still known — embed them so the resulting checkpoint is
+    self-describing and ``agt predict --gene-strand match`` can infer strands
+    without the user re-supplying them. Keyed as ``TrackMetadataCatalog.to_rows``
+    does (``output_name``), so a downstream reader treats these like real rows.
+    """
+    organism_index = ORGANISM_NAME_TO_INDEX.get(organism or "human", 0)
+    rows: list[dict[str, Any]] = []
+    for modality, strands in modality_strands.items():
+        names = modality_track_names.get(modality)
+        for i, strand in enumerate(strands):
+            row: dict[str, Any] = {
+                "output_name": modality,
+                "track_index": i,
+                "organism": organism_index,
+                "strand": str(strand),
+            }
+            if names is not None and i < len(names):
+                row["track_name"] = names[i]
+            rows.append(row)
+    return rows
+
+
 def create_dataloaders(
     train_dataset,
     val_dataset,
@@ -714,6 +744,13 @@ def main(args: argparse.Namespace | None = None) -> None:
     modality_track_names, track_metadata_rows = load_track_metadata_for_finetune(
         args.track_metadata, modality_track_names, rank, organism=args.organism,
     )
+    # Even without --track-metadata, record known strands (from --track-strands)
+    # so the checkpoint is self-describing for downstream strand-matched
+    # aggregation (agt predict --gene-strand match).
+    if track_metadata_rows is None and getattr(args, "modality_strands", None):
+        track_metadata_rows = strand_only_track_metadata(
+            args.modality_strands, modality_track_names, organism=args.organism,
+        )
 
     # Track identity embedded into every checkpoint/delta save below. Defined
     # once and spread as **metadata_kwargs so a new save site cannot silently
