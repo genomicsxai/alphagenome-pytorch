@@ -34,7 +34,6 @@ from typing import Literal
 
 import numpy as np
 import torch
-from tqdm import tqdm
 
 from alphagenome_pytorch.genome import GenomeSequenceSource
 from alphagenome_pytorch.utils.sequence import sequence_to_onehot
@@ -294,6 +293,10 @@ def _iter_tile_predictions(
     n_batches = (len(tiles) + config.batch_size - 1) // config.batch_size
     iterator = range(0, len(tiles), config.batch_size)
     if show_progress:
+        # Local import so this module stays importable with only core deps
+        # (e.g. for HEAD_CONFIGS during CLI parser build). tqdm ships with the
+        # inference extra, which is present whenever predictions actually run.
+        from tqdm import tqdm
         iterator = tqdm(iterator, total=n_batches, desc=f"Predicting {chrom}")
 
     for batch_start in iterator:

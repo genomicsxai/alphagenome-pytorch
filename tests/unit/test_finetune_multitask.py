@@ -231,6 +231,48 @@ class TestParseArgsStrandPairs:
         assert args.modality_strand_pairs["rna_seq"] == [(0, 1), (2, 3)]
         assert args.modality_strand_pairs["atac"] is None
 
+    def test_config_strand_accepts_string_and_list_forms(self, monkeypatch, tmp_path):
+        """modalities.<head>.strand may be a compact/separated string or a YAML list."""
+        yaml = pytest.importorskip("yaml")
+
+        def _strands_for(strand_spec):
+            config = {
+                "modalities": {
+                    "rna_seq": {
+                        "bigwig": ["rp1.bw", "rm1.bw", "rp2.bw", "rm2.bw"],
+                        "strand": strand_spec,
+                    },
+                }
+            }
+            config_path = tmp_path / "train.yaml"
+            config_path.write_text(yaml.safe_dump(config))
+            monkeypatch.setattr(
+                sys, "argv", _required_cli_args() + ["--config", str(config_path)]
+            )
+            return parse_args().modality_strands["rna_seq"]
+
+        assert _strands_for("+-+-") == "+-+-"                    # compact string
+        assert _strands_for("+,-,+,-") == "+-+-"                 # separated string
+        assert _strands_for(["+", "-", "+", "-"]) == "+-+-"      # YAML list
+
+    def test_config_strand_list_wrong_length_rejected(self, monkeypatch, tmp_path):
+        yaml = pytest.importorskip("yaml")
+        config = {
+            "modalities": {
+                "rna_seq": {
+                    "bigwig": ["rp1.bw", "rm1.bw", "rp2.bw", "rm2.bw"],
+                    "strand": ["+", "-"],  # 2 chars, 4 bigwigs
+                },
+            }
+        }
+        config_path = tmp_path / "train.yaml"
+        config_path.write_text(yaml.safe_dump(config))
+        monkeypatch.setattr(
+            sys, "argv", _required_cli_args() + ["--config", str(config_path)]
+        )
+        with pytest.raises(SystemExit):
+            parse_args()
+
     def test_cli_overrides_config_strand_pairs(self, monkeypatch, tmp_path):
         yaml = pytest.importorskip("yaml")
         config = {
