@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -724,7 +725,8 @@ def postprocess_args(
         args.modality_resolutions[modality] = spec.get("resolutions", args.global_resolutions)
         args.modality_weight_dict[modality] = float(spec.get("task_weight", 1.0))
         if spec.get("strand"):
-            args.modality_strands[modality] = str(spec["strand"])
+            # str ('+-+-') or a YAML list (['+','-',...]); normalized below.
+            args.modality_strands[modality] = spec["strand"]
         # CLI --strand-pairs overrides per-modality config 'strand_pairs'.
         raw_pairs = cli_strand_pairs.get(modality, spec.get("strand_pairs"))
         args.modality_strand_pairs[modality] = _normalize_strand_pairs(
@@ -740,11 +742,13 @@ def postprocess_args(
             )
         args.modality_strands["rna_seq"] = args.track_strands
 
-    # Normalize and validate strand strings: accept both compact form
-    # ('+-+-.-') and comma/whitespace-separated form ('+,-,+,-,.,-' or
-    # '+ - + - . -'). After stripping separators, exactly one char per
-    # bigwig, each in {+, -, .}.
-    def _normalize_strand_string(s: str) -> str:
+    # Normalize and validate strand specs. Accept a compact string ('+-+-.-'),
+    # a comma/whitespace-separated string ('+,-,+,-,.,-' or '+ - + - . -'), or a
+    # YAML list of chars (['+','-','+','-']). After coercing to a bare string,
+    # exactly one char per bigwig, each in {+, -, .}.
+    def _normalize_strand_string(s: str | Sequence[str]) -> str:
+        if not isinstance(s, str):
+            s = "".join(str(c) for c in s)
         return "".join(c for c in s if c not in ", \t")
 
     for modality, strands in list(args.modality_strands.items()):

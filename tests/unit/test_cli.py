@@ -1470,17 +1470,17 @@ class TestPredictStrandFromCheckpoint:
         return captured
 
     def test_resolves_from_checkpoint_metadata(self, tmp_path):
-        from alphagenome_pytorch.extensions.finetuning.runner import strand_only_track_metadata
-        rows = strand_only_track_metadata(
-            {"my_rna": ["+", "-", "."]}, {"my_rna": ["a", "b", "c"]}, "human"
+        from alphagenome_pytorch.extensions.finetuning.runner import apply_training_strands
+        rows = apply_training_strands(
+            None, {"my_rna": ["+", "-", "."]}, {"my_rna": ["a", "b", "c"]}, "human"
         )
         kw = self._run(tmp_path, rows)
         assert kw["track_strands"] == ["+", "-", "."]
 
     def test_subset_by_tracks(self, tmp_path):
-        from alphagenome_pytorch.extensions.finetuning.runner import strand_only_track_metadata
-        rows = strand_only_track_metadata(
-            {"my_rna": ["+", "-", ".", "+"]}, {"my_rna": ["a", "b", "c", "d"]}, "human"
+        from alphagenome_pytorch.extensions.finetuning.runner import apply_training_strands
+        rows = apply_training_strands(
+            None, {"my_rna": ["+", "-", ".", "+"]}, {"my_rna": ["a", "b", "c", "d"]}, "human"
         )
         kw = self._run(tmp_path, rows, extra=("--tracks", "0,3"))
         assert kw["track_strands"] == ["+", "+"]
@@ -1491,29 +1491,52 @@ class TestPredictStrandFromCheckpoint:
             self._run(tmp_path, meta_rows=None)
 
 
-class TestStrandOnlyTrackMetadata:
-    """runner.strand_only_track_metadata — self-describing checkpoints (point 3)."""
+class TestApplyTrainingStrands:
+    """runner.apply_training_strands — self-describing, complete-catalog checkpoints."""
 
-    def test_rows_keyed_like_to_rows(self):
-        from alphagenome_pytorch.extensions.finetuning.runner import strand_only_track_metadata
-        rows = strand_only_track_metadata(
-            {"rna_seq": ["+", "-"]}, {"rna_seq": ["t0", "t1"]}, "human"
+    @staticmethod
+    def _fn():
+        from alphagenome_pytorch.extensions.finetuning.runner import apply_training_strands
+        return apply_training_strands
+
+    def test_skeleton_covers_all_heads_not_just_strand_bearing(self):
+        """Multimodal run, strands only for rna_seq: atac must still be in the catalog.
+
+        A partial catalog (rna_seq only) is treated as authoritative by serving
+        and blanks atac's metadata — the regression this guards against.
+        """
+        rows = self._fn()(
+            None,
+            {"rna_seq": ["+", "-"]},                       # strands for rna_seq only
+            {"rna_seq": ["r0", "r1"], "atac": ["a0", "a1", "a2"]},
+            "human",
         )
-        assert rows == [
-            {"output_name": "rna_seq", "track_index": 0, "organism": 0,
-             "strand": "+", "track_name": "t0"},
-            {"output_name": "rna_seq", "track_index": 1, "organism": 0,
-             "strand": "-", "track_name": "t1"},
-        ]
+        assert {r["output_name"] for r in rows} == {"rna_seq", "atac"}
+        rna = [r for r in rows if r["output_name"] == "rna_seq"]
+        atac = [r for r in rows if r["output_name"] == "atac"]
+        assert [r["strand"] for r in rna] == ["+", "-"]
+        assert [r["track_name"] for r in atac] == ["a0", "a1", "a2"]
+        assert all("strand" not in r for r in atac), "unspecified strand must stay absent"
 
-    def test_mouse_organism_and_missing_names(self):
-        from alphagenome_pytorch.extensions.finetuning.runner import strand_only_track_metadata
-        rows = strand_only_track_metadata({"rna_seq": ["+"]}, {}, "mouse")
+    def test_overlays_onto_rich_metadata_preserving_fields(self):
+        rich = [
+            {"output_name": "rna_seq", "track_index": 0, "track_name": "x", "biosample_name": "K562"},
+            {"output_name": "rna_seq", "track_index": 1, "track_name": "y", "biosample_name": "K562"},
+        ]
+        rows = self._fn()(rich, {"rna_seq": ["+", "-"]}, {"rna_seq": ["x", "y"]}, "human")
+        assert [r["strand"] for r in rows] == ["+", "-"]
+        assert all(r["biosample_name"] == "K562" for r in rows)  # rich fields kept
+
+    def test_training_strands_override_disagreeing_metadata(self):
+        rich = [{"output_name": "rna_seq", "track_index": 0, "strand": "+"}]
+        rows = self._fn()(rich, {"rna_seq": ["-"]}, {"rna_seq": ["x"]}, "human")
+        assert rows[0]["strand"] == "-"  # training strand wins
+
+    def test_mouse_organism_index(self):
+        rows = self._fn()(None, {"rna_seq": ["+"]}, {"rna_seq": ["t0"]}, "mouse")
         assert rows[0]["organism"] == 1
-        assert "track_name" not in rows[0]
 
     def test_roundtrips_through_the_predict_reader(self):
-        from alphagenome_pytorch.extensions.finetuning.runner import strand_only_track_metadata
         from alphagenome_pytorch.cli.predict import _strands_from_checkpoint
-        rows = strand_only_track_metadata({"h": ["+", "-", "+"]}, {}, "human")
+        rows = self._fn()(None, {"h": ["+", "-", "+"]}, {"h": ["a", "b", "c"]}, "human")
         assert _strands_from_checkpoint(rows, "h") == ["+", "-", "+"]

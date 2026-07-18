@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -297,7 +298,7 @@ def organism_index_from_args(args: argparse.Namespace) -> int:
 
 def load_track_metadata_for_finetune(
     path: str | None,
-    modality_track_names: dict[str, list[str]],
+    modality_track_names: Mapping[str, Sequence[str]],
     rank: int,
     organism: str | None = None,
 ) -> tuple[dict[str, list[str]], list[dict[str, Any]] | None]:
@@ -367,33 +368,65 @@ def load_track_metadata_for_finetune(
     return updated_names, metadata_rows
 
 
-def strand_only_track_metadata(
-    modality_strands: dict[str, list[str]],
-    modality_track_names: dict[str, list[str]],
+def apply_training_strands(
+    metadata_rows: list[dict[str, Any]] | None,
+    modality_strands: Mapping[str, Sequence[str]],
+    modality_track_names: Mapping[str, Sequence[str]],
     organism: str | None = None,
+    rank: int = 0,
 ) -> list[dict[str, Any]]:
-    """Minimal metadata rows recording just per-track strand, for embedding.
+    """Record the strands a fine-tune used into the embedded track metadata.
 
-    When a fine-tune is given ``--track-strands`` but no ``--track-metadata``,
-    the strands are still known — embed them so the resulting checkpoint is
-    self-describing and ``agt predict --gene-strand match`` can infer strands
-    without the user re-supplying them. Keyed as ``TrackMetadataCatalog.to_rows``
-    does (``output_name``), so a downstream reader treats these like real rows.
+    Keeps the catalog **complete** — one row per track of *every* head — so it
+    never shadows the per-head ``track_names`` fallback (a partial catalog is
+    treated as authoritative by serving, blanking heads it omits). Then overlays
+    the per-track strand for heads trained with ``--track-strands``.
+
+    Base rows are the rich ``--track-metadata`` catalog when present, else a
+    skeleton built from ``track_names``. Training strands fill missing values and
+    override any that disagree (with a warning), since they are what the run
+    actually used. Heads without a ``--track-strands`` entry keep their metadata
+    but get no strand — their strand was never specified. Rows are keyed as
+    ``TrackMetadataCatalog.to_rows`` emits (``output_name``).
     """
     organism_index = ORGANISM_NAME_TO_INDEX.get(organism or "human", 0)
-    rows: list[dict[str, Any]] = []
-    for modality, strands in modality_strands.items():
-        names = modality_track_names.get(modality)
+
+    if metadata_rows is None:
+        rows: list[dict[str, Any]] = [
+            {"output_name": head, "track_index": i,
+             "organism": organism_index, "track_name": name}
+            for head, names in modality_track_names.items()
+            for i, name in enumerate(names)
+        ]
+    else:
+        rows = [dict(r) for r in metadata_rows]
+
+    def _head(row: dict[str, Any]) -> str:
+        return str(row.get("output_name") or row.get("output_type") or "").lower()
+
+    by_track = {(_head(r), r.get("track_index")): r for r in rows}
+
+    for head, strands in modality_strands.items():
         for i, strand in enumerate(strands):
-            row: dict[str, Any] = {
-                "output_name": modality,
-                "track_index": i,
-                "organism": organism_index,
-                "strand": str(strand),
-            }
-            if names is not None and i < len(names):
-                row["track_name"] = names[i]
-            rows.append(row)
+            row = by_track.get((head.lower(), i))
+            if row is None:
+                # A track present in --track-strands but absent from the base
+                # rows (e.g. rich metadata missing a track): add it so the
+                # strand is still recorded.
+                row = {"output_name": head, "track_index": i, "organism": organism_index}
+                names = modality_track_names.get(head)
+                if names is not None and i < len(names):
+                    row["track_name"] = names[i]
+                rows.append(row)
+                by_track[(head.lower(), i)] = row
+            existing = row.get("strand")
+            if existing is not None and str(existing) != str(strand):
+                print_rank0(
+                    f"--track-strands overrides embedded strand for {head} "
+                    f"track {i}: metadata {existing!r} -> training {strand!r}.",
+                    rank,
+                )
+            row["strand"] = str(strand)
     return rows
 
 
@@ -744,12 +777,15 @@ def main(args: argparse.Namespace | None = None) -> None:
     modality_track_names, track_metadata_rows = load_track_metadata_for_finetune(
         args.track_metadata, modality_track_names, rank, organism=args.organism,
     )
-    # Even without --track-metadata, record known strands (from --track-strands)
-    # so the checkpoint is self-describing for downstream strand-matched
-    # aggregation (agt predict --gene-strand match).
-    if track_metadata_rows is None and getattr(args, "modality_strands", None):
-        track_metadata_rows = strand_only_track_metadata(
-            args.modality_strands, modality_track_names, organism=args.organism,
+    # Record the strands training used so the checkpoint is self-describing for
+    # downstream strand-matched aggregation (agt predict --gene-strand match).
+    # Overlays onto the rich catalog when present, or a complete skeleton built
+    # from track_names otherwise -- never a partial catalog that would blank the
+    # metadata of heads it omits.
+    if getattr(args, "modality_strands", None):
+        track_metadata_rows = apply_training_strands(
+            track_metadata_rows, args.modality_strands, modality_track_names,
+            organism=args.organism, rank=rank,
         )
 
     # Track identity embedded into every checkpoint/delta save below. Defined
