@@ -55,7 +55,7 @@ agt predict --model model.pth --output out/ --head atac --sequences seqs.fa
 agt predict --model model.pth --output out/ --head rna_seq \
     --chromosomes chr20 --fasta hg38.fa --resolution 1 --crop-bp 16384 \
     --anndata gene_counts.h5ad --annotation gencode.v46.parquet \
-    --aggregate-over exons --aggregate-func sum
+    --aggregate-over exons --aggregate-func sum --gene-strand match
 ```
 
 Notes:
@@ -64,9 +64,17 @@ Notes:
 - Short `--locus`/`--bed` regions are padded with real reference flanks; long ones are
   center-cut unless you pass `--tile`. FASTA `--sequences` must match the window size
   exactly, or need `--tile`.
-- `--anndata` aggregates signal per gene (over `exons` by default, or `gene-body`) into
-  a genes × tracks matrix. It requires `--annotation` (GTF/parquet), which needs exon
-  rows when aggregating over exons.
+- `--anndata` (only in `--chromosomes` mode) aggregates signal per gene (over `exons`
+  by default, or `gene-body`) into a genes × tracks matrix. It requires `--annotation`
+  (GTF/parquet), which needs exon rows when aggregating over exons. `--aggregate-func`
+  chooses the cell value: `sum` (raw counts, default), `mean` (per-base coverage), or
+  `log-mean` (log1p of it).
+- For RNA-seq count tables, add `--gene-strand match`. The default `all` also scores
+  each gene with opposite-strand tracks — that signal is antisense, not the gene's own
+  expression. `match` NaNs those cells so they drop out of downstream means/correlations
+  instead of averaging in as zeros. Track strands come from metadata (built-in for
+  pretrained heads, the checkpoint for finetuned ones); override with `--track-strands`
+  only for custom heads lacking strand info.
 - Finetuned models: pass the base weights as `--model` and the finetuned checkpoint as
   `--checkpoint` (plus `--transfer-config` if it isn't embedded).
 - Useful extras: `--tracks` / `--track-names`, `--resolution {1,128}`, `--organism {0,1}`,

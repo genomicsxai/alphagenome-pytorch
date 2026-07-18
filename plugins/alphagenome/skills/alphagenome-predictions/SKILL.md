@@ -38,7 +38,7 @@ does it — no Python needed. One head per run; output format follows the input 
 agt predict --model model.pth --output out/ --head rna_seq \
     --chromosomes chr20 --fasta hg38.fa --resolution 1 --crop-bp 16384 \
     --anndata gene_counts.h5ad --annotation gencode.v46.parquet \
-    --aggregate-over exons --aggregate-func sum
+    --aggregate-over exons --aggregate-func sum --gene-strand match
 ```
 
 `--locus`/`--bed`/`--sequences`/`--chromosomes` are mutually exclusive. For a

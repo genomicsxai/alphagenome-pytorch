@@ -24,7 +24,7 @@ agt predict --model model.pth --output out/ --head dnase \
 
 Input modes (mutually exclusive): `--locus` (one interval), `--bed` (many regions),
 `--chromosomes` (whole chromosomes, tiled), `--sequences` (raw FASTA → NPZ). Add
-`--anndata FILE --annotation GTF` for a per-gene count table (AnnData). `agt predict`
+`--anndata FILE --annotation GTF` for a per-gene count table (AnnData); add `--gene-strand match` for RNA-seq so antisense tracks don't inflate counts. `agt predict`
 is the same code path as the `scripts/predict_*.py` shims — prefer `agt`, which ships
 with the package. See `agt predict --help`.
 
