@@ -47,8 +47,9 @@ Use the Python API when you need tensors in-process or metadata-based selection:
 - Filter fields include `biosample_name`, `assay_title`, `biosample_type`,
   `histone_mark`, `transcription_factor`, `ontology_curie`, `strand`.
 
-Explore available tracks without weights via
-`TrackMetadataCatalog.load_builtin("human")`.
+Explore available tracks without weights: `agt info --heads`,
+`agt info --tracks dnase --filter biosample_name=K562` (prints track indices for
+`agt predict --tracks`), or in Python `TrackMetadataCatalog.load_builtin("human")`.
 
 For the deeper API reference see `docs/named_outputs.rst`; for package
 development conventions see `CLAUDE.md`.

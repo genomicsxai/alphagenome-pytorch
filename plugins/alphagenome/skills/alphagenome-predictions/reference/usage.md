@@ -65,7 +65,8 @@ Notes:
   center-cut unless you pass `--tile`. FASTA `--sequences` must match the window size
   exactly, or need `--tile`.
 - `--anndata` (only in `--chromosomes` mode) aggregates signal per gene (over `exons`
-  by default, or `gene-body`) into a genes × tracks matrix. It requires `--annotation`
+  by default, or `gene-body`) into a **tracks × genes** AnnData (tracks in `obs`, genes
+  in `var`; transpose if you want genes as observations). It requires `--annotation`
   (GTF/parquet), which needs exon rows when aggregating over exons. `--aggregate-func`
   chooses the cell value: `sum` (raw counts, default), `mean` (per-base coverage), or
   `log-mean` (log1p of it).
@@ -84,9 +85,9 @@ Install extras: `pip install 'alphagenome-pytorch[inference]'`, or
 `'alphagenome-pytorch[inference-anndata]'` for `--anndata`.
 
 **Relationship to the scripts.** `agt predict` is the same code path as the older
-`scripts/predict_locus.py` and `scripts/predict_full_chromosome.py`; those remain as
-thin shims for backwards compatibility. Prefer `agt` — the scripts are not part of the
-installed package and only work from a repo clone.
+`scripts/predict_full_chromosome.py`, kept as a thin shim for backwards compatibility.
+Prefer `agt` — the script is not part of the installed package and only works from a
+repo clone.
 
 ## Variant scoring: `agt score`
 
@@ -163,8 +164,7 @@ build wrappers for arbitrary queries.
   Use `sequence_to_onehot_tensor(seq)` (returns `(L, 4)`) and `.unsqueeze(0)`
   for the batch axis. `N`/unknown bases encode as all-zeros.
 - **Sequence length is fixed at 131,072 bp.** Shorter inputs must be padded;
-  longer loci must be tiled (see
-  [`scripts/predict_locus.py`](https://github.com/genomicsxai/alphagenome-pytorch/blob/main/scripts/predict_locus.py)).
+  longer loci must be tiled (the CLI does this for you with `agt predict --tile`).
 - **`organism_index`**: `0` = human, `1` = mouse. Pass an `int` (broadcast over
   the batch) or a `(B,)` long tensor. Metadata and head widths differ per
   organism, so this also selects which catalog is used for named outputs.
@@ -268,7 +268,21 @@ matches literally):
 - `biosample_name`: 714 distinct cell types/tissues (human; 179 for mouse),
   including `K562` (333 tracks) and `GM12878` (125 tracks)
 
-To explore what's available without running the model, load the catalog directly:
+To explore what's available without running the model — or even loading weights — the
+CLI is fastest:
+
+```bash
+agt info --heads                                    # every head: human/mouse counts + dims
+agt info --tracks dnase                             # the individual tracks for one head
+agt info --tracks dnase --filter biosample_name=K562  # → track index 118
+agt info --search GM12878                            # search all metadata by substring
+```
+
+`--filter FIELD=VALUE` is the CLI counterpart of `.select()`: it prints the matching
+track **indices**, which you then feed to `agt predict --tracks 118,...` to write just
+those tracks. That's the all-CLI path for "predict all K562 tracks" — no Python needed.
+
+For programmatic access, load the catalog directly:
 
 ```python
 from alphagenome_pytorch.named_outputs import TrackMetadataCatalog

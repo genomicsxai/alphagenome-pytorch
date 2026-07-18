@@ -44,8 +44,8 @@ agt predict --model model.pth --output out/ --head rna_seq \
 `--locus`/`--bed`/`--sequences`/`--chromosomes` are mutually exclusive. For a
 finetuned model pass base weights as `--model` and the checkpoint as `--checkpoint`.
 `agt predict --help` is the ground truth. `agt predict` is the same code path as the
-older `scripts/predict_locus.py` / `scripts/predict_full_chromosome.py` shims — prefer
-`agt`, since `scripts/` only exists in a repo clone.
+older `scripts/predict_full_chromosome.py` shim — prefer `agt`, since `scripts/` only
+exists in a repo clone.
 
 Use the Python API below when you need tensors in-process or metadata-based track
 selection beyond `--tracks`/`--track-names`.
@@ -80,7 +80,9 @@ dnase_gm = out.dnase.select(biosample_name="GM12878")[128].tensor  # (B, 1024, n
   `allow_empty=True` to get an empty tensor instead.
 - Restrict work with `heads=` / `resolutions=` to skip expensive unused heads.
 
-Explore the track catalog without loading weights:
+Explore the track catalog without weights — CLI first
+(`agt info --heads`, `agt info --tracks dnase --filter biosample_name=K562` prints
+matching track indices for `agt predict --tracks`), or in Python:
 
 ```python
 from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
