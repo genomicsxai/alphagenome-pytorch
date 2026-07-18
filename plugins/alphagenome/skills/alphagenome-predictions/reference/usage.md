@@ -21,6 +21,8 @@ when you need tensors in-process, or track selection richer than `--tracks` allo
 ## Contents
 
 - [Command line: `agt predict`](#command-line-agt-predict)
+- [Variant scoring: `agt score`](#variant-scoring-agt-score)
+- [Getting a checkpoint: `agt convert`](#getting-a-checkpoint-agt-convert)
 - [The 30-second version (Python)](#the-30-second-version-python)
 - [Step 1 — Inputs and shapes](#step-1--inputs-and-shapes)
 - [Step 2 — Output heads and resolutions](#step-2--output-heads-assays-and-resolutions)
@@ -77,6 +79,50 @@ Install extras: `pip install 'alphagenome-pytorch[inference]'`, or
 `scripts/predict_locus.py` and `scripts/predict_full_chromosome.py`; those remain as
 thin shims for backwards compatibility. Prefer `agt` — the scripts are not part of the
 installed package and only work from a repo clone.
+
+## Variant scoring: `agt score`
+
+To predict a variant's effect (rather than write raw tracks), use `agt score`. It
+centers a window on each variant, scores reference vs alternate alleles, and writes a
+TSV (or JSON with the top-level `--json` flag).
+
+```bash
+# One variant, recommended scorers
+agt score --model model.pth --fasta hg38.fa \
+    --variant "chr22:36201698:A>C" --output scores.tsv
+
+# A VCF, specific scorers
+agt score --model model.pth --fasta hg38.fa \
+    --vcf variants.vcf --scorer dnase,cage,rna_seq --output scores.tsv
+```
+
+Notes:
+
+- `--variant` (one, formatted `chrom:pos:REF>ALT`) and `--vcf` (batch, TAB-separated)
+  are mutually exclusive; one is required.
+- `--scorer` takes `recommended` (default) or a comma-separated subset of: `atac`,
+  `dnase`, `chip_tf`, `chip_histone`, `cage`, `procap`, `contact_maps`, `rna_seq`,
+  `rna_seq_active`, `splice_sites`, `splice_site_usage`, `splice_junctions`,
+  `polyadenylation`. `recommended` cannot be combined with named scorers.
+- Gene-centric scorers (e.g. splicing, RNA) need `--gtf`; `polyadenylation` also uses
+  `--polya` (a GENCODE polyA file).
+- `--organism {human,mouse}` (default human), `--width` (window bp, default 131072).
+
+## Getting a checkpoint: `agt convert`
+
+The `--model model.pth` used above is a PyTorch checkpoint. Download one from
+[Hugging Face](https://huggingface.co/gtca/alphagenome_pytorch), or convert a JAX
+AlphaGenome checkpoint yourself:
+
+```bash
+agt convert --input jax_checkpoint_dir --output model.pth
+# or a safetensors file:
+agt convert --input jax_checkpoint_dir --output model.safetensors --safetensors
+```
+
+This also bundles per-organism track means into the checkpoint. It is the same code
+path as `scripts/convert_weights.py` (which takes the checkpoint as a positional
+argument); prefer `agt convert`.
 
 ## The 30-second version (Python)
 

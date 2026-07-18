@@ -1,6 +1,6 @@
 ---
 name: alphagenome-predictions
-description: Run AlphaGenome-PyTorch to get genomic track predictions — via the `agt predict` CLI (single locus, BED regions, whole chromosomes, raw FASTA sequences, or per-gene count tables/AnnData) or the Python API. Covers picking a specific assay, cell type, or resolution, e.g. "get DNase predictions from GM12878 at 128bp", "write a wrapper for all K562 predictions", filtering tracks by metadata (biosample, assay, ontology, strand). Use when the task is about USING the model for inference/predictions, not developing the package.
+description: Run AlphaGenome-PyTorch to get genomic track predictions — via the `agt predict` CLI (single locus, BED regions, whole chromosomes, raw FASTA sequences, or per-gene count tables/AnnData), variant effect scoring (`agt score`), or the Python API. Covers picking a specific assay, cell type, or resolution, e.g. "get DNase predictions from GM12878 at 128bp", "write a wrapper for all K562 predictions", filtering tracks by metadata (biosample, assay, ontology, strand). Use when the task is about USING the model for inference/predictions, not developing the package.
 ---
 
 # Getting predictions from AlphaGenome-PyTorch
@@ -8,6 +8,8 @@ description: Run AlphaGenome-PyTorch to get genomic track predictions — via th
 `docs/alphagenome-usage.md` is the canonical guide. Read only the relevant sections:
 
 - Disk output: `Command line: agt predict`
+- Variant effect scoring (SNV/VCF): `Variant scoring: agt score`
+- Convert JAX weights / obtain a checkpoint: `Getting a checkpoint: agt convert`
 - Python tensors and input shapes: `The 30-second version` and `Step 1`
 - Assay/cell-type/resolution selection: `Step 2`, `Step 3`, and `Recipes`
 - Exact counts and metadata literals: `Step 2` and `Available metadata fields`
@@ -25,6 +27,15 @@ Input modes (mutually exclusive): `--locus` (one interval), `--bed` (many region
 `--anndata FILE --annotation GTF` for a per-gene count table (AnnData). `agt predict`
 is the same code path as the `scripts/predict_*.py` shims — prefer `agt`, which ships
 with the package. See `agt predict --help`.
+
+For **variant effect scoring**, use `agt score` (not `predict`):
+
+```bash
+agt score --model model.pth --fasta hg38.fa --variant "chr22:36201698:A>C" --output scores.tsv
+```
+
+`--vcf` for batches; `--scorer recommended` (default) or a comma-separated subset;
+gene-centric scorers need `--gtf`. See the guide's `Variant scoring: agt score`.
 
 Use the Python API when you need tensors in-process or metadata-based selection:
 

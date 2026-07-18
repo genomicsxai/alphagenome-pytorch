@@ -92,6 +92,17 @@ There is **no `--overlap-lowres` flag**; the low-res overlap is computed as
 
 **Tracking**: `--wandb` (`--wandb-project`, default `alphagenome-finetune`).
 
+**Preparing BigWig data** (`agt preprocess`) — optional prep before training:
+```bash
+# Normalize signal depth across tracks to a common total (e.g. 100M)
+agt preprocess scale-bigwig --input *.bw --output scaled/ --target 100M
+# (add --dry-run to just print the scale factor)
+
+# Convert BigWigs to a memory-mapped format for faster training I/O
+agt preprocess bigwig-to-mmap --input *.bw --output mmap/ --chromosomes chr1 chr2
+```
+Training reads `.bw` directly, so this is only for depth normalization or I/O speed.
+
 ## 6. Python API (when the CLI doesn't fit)
 
 ```python

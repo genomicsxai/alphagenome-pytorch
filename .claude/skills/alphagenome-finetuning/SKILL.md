@@ -40,6 +40,9 @@ For multi-GPU, `torchrun` needs a module target:
 Modalities: `rna_seq`, `atac`, `dnase`, `procap`, `cage` (1bp + 128bp);
 `chip_tf`, `chip_histone` (128bp only).
 
+Optional data prep: `agt preprocess scale-bigwig --input *.bw --target 100M`
+(depth-normalize) or `agt preprocess bigwig-to-mmap` (faster training I/O).
+
 Gotchas:
 - `--resolutions` defaults to `1` (1bp only); use `--resolutions 128` for
   `chip_tf`/`chip_histone`.

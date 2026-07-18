@@ -1,6 +1,6 @@
 ---
 name: alphagenome-predictions
-description: Run AlphaGenome-PyTorch to get genomic track predictions — via the `agt predict` CLI (single locus, BED regions, whole chromosomes, raw FASTA sequences, or per-gene count tables/AnnData) or the Python API. Covers picking a specific assay, cell type, or resolution, e.g. "get DNase predictions from GM12878 at 128bp", "write a wrapper for all K562 predictions", filtering tracks by metadata (biosample, assay, ontology, strand). Use when the task is about USING the model for inference/predictions, not developing the package.
+description: Run AlphaGenome-PyTorch to get genomic track predictions — via the `agt predict` CLI (single locus, BED regions, whole chromosomes, raw FASTA sequences, or per-gene count tables/AnnData), variant effect scoring (`agt score`), or the Python API. Covers picking a specific assay, cell type, or resolution, e.g. "get DNase predictions from GM12878 at 128bp", "write a wrapper for all K562 predictions", filtering tracks by metadata (biosample, assay, ontology, strand). Use when the task is about USING the model for inference/predictions, not developing the package.
 ---
 
 # Getting predictions from AlphaGenome-PyTorch
@@ -16,6 +16,8 @@ Read only the sections relevant to the task:
 | Task | Read in `$GUIDE` |
 |------|------------------|
 | Write predictions to disk | `Command line: agt predict` |
+| Score a variant's effect (SNV/VCF) | `Variant scoring: agt score` |
+| Convert JAX weights / get a checkpoint | `Getting a checkpoint: agt convert` |
 | Work with tensors in Python | `The 30-second version` and `Step 1` |
 | Select an assay, cell type, or resolution | `Step 2`, `Step 3`, and `Recipes` |
 | Look up exact track counts or metadata literals | `Step 2` and `Available metadata fields` |
