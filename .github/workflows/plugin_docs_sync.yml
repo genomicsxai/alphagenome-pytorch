@@ -4,10 +4,14 @@ on:
   pull_request:
     paths:
       - 'docs/alphagenome-usage.md'
-      - 'plugins/alphagenome/skills/alphagenome-predictions/reference/usage.md'
+      - 'docs/cli.rst'
+      - 'plugins/alphagenome/skills/**'
+      - '.claude/skills/**'
+      - '.claude-plugin/marketplace.json'
       - 'scripts/check_usage_metadata.py'
       - 'src/alphagenome_pytorch/data/track_metadata_human.parquet'
       - 'src/alphagenome_pytorch/data/track_metadata_mouse.parquet'
+      - '.github/workflows/plugin_docs_sync.yml'
   push:
     branches: [main]
 

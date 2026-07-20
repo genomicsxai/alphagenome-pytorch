@@ -142,25 +142,29 @@ model = prepare_for_transfer(model, TransferConfig(
 ))
 ```
 
-The easiest way to start with fine-tuning is to use [`scripts/finetune.py`](scripts/finetune.py) that implements a flexible CLI interface:
+The easiest way to start with fine-tuning is the `agt finetune` CLI (installed with the
+package):
 
 ```bash
 # LoRA fine-tuning
-python scripts/finetune.py --mode lora --lora-rank 8 \
+agt finetune --mode lora --lora-rank 8 \
     --genome hg38.fa --modality atac --bigwig *.bw \
     --train-bed train.bed --val-bed val.bed \
     --pretrained-weights alphagenome.pt
 
 # LoRA + Locon on the last 4 encoder convs before attention
-python scripts/finetune.py --mode lora+locon --lora-rank 8 \
+agt finetune --mode lora+locon --lora-rank 8 \
     --locon-rank 4 --locon-targets down_blocks.4,down_blocks.5 \
     --genome hg38.fa --modality atac --bigwig *.bw \
     --train-bed train.bed --val-bed val.bed \
     --pretrained-weights alphagenome.pt
 
-# Multi-GPU
-torchrun --nproc_per_node=4 scripts/finetune.py --mode lora ...
+# Multi-GPU (torchrun needs a module target)
+torchrun --nproc_per_node=4 -m alphagenome_pytorch.cli finetune --mode lora ...
 ```
+
+`agt finetune` and `python scripts/finetune.py` are the same code path with the same
+flags; the script is kept as a compatibility shim (it only works from a repo clone).
 
 Note that Locon targets are explicit by design. You can use the syntax 
 `down_blocks.3,down_blocks.4,down_blocks.5` to choose targets.
