@@ -53,18 +53,18 @@ Example output:
 
 .. code-block:: text
 
-   Head              Tracks (human)  Tracks (mouse)  Dimension  Resolutions
-   atac                         167             155        256  1bp, 128bp
-   dnase                        305             280        384  1bp, 128bp
-   procap                        12               8        128  1bp, 128bp
-   cage                         546             490        640  1bp, 128bp
-   rna_seq                      667             600        768  1bp, 128bp
-   chip_tf                     1617            1500       1664  128bp
-   chip_histone                1116            1000       1152  128bp
-   contact_maps                  28              28         28  64x64
-   splice_sites                   5               5          5  1bp
-   splice_junctions             734             734        734  pairwise
-   splice_site_usage            734             734        734  1bp
+   Head                   Tracks (human) Tracks (mouse) Dimension Resolutions
+   atac                              167             18       256 1bp, 128bp
+   dnase                             305             67       384 1bp, 128bp
+   procap                             12              0       128 1bp, 128bp
+   cage                              546            188       640 1bp, 128bp
+   rna_seq                           667            173       768 1bp, 128bp
+   chip_tf                          1617            127      1664 128bp
+   chip_histone                     1116            183      1152 128bp
+   contact_maps                       28              8        28 64x64
+   splice_sites                        4              4         5 1bp
+   splice_junctions                  367             90       734 pairwise
+   splice_site_usage                 734            180       734 1bp
 
 *Tracks* = real (non-padding) tracks per organism.
 *Dimension* = tensor channel size (includes padding).
@@ -127,8 +127,8 @@ JSON output
        {
          "name": "atac",
          "dimension": 256,
-         "tracks": {"human": 167, "mouse": 155},
-         "padding": {"human": 89, "mouse": 101},
+         "tracks": {"human": 167, "mouse": 18},
+         "padding": {"human": 89, "mouse": 238},
          "resolutions": ["1bp", "128bp"]
        }
      ]

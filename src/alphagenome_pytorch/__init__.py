@@ -16,6 +16,8 @@ Example usage:
     outputs = model.predict(dna_seq, organism_idx)
 """
 
+from typing import TYPE_CHECKING
+
 try:
     from ._version import __version__, __version_tuple__
 except ImportError:
@@ -24,28 +26,27 @@ except ImportError:
     __version_tuple__ = (0, 0, 0, "dev0")
 
 from .model import AlphaGenome
-from .aggregation import (
-    aggregate_intervals,
-    aggregate_genes,
-    gene_expression,
-    gene_expression_values,
-    combine_gene_expression,
-    normalize_expression,
-    gene_expression_correlations,
-    GeneCounts,
-    GeneCountAccumulator,
-)
+
+if TYPE_CHECKING:
+    from .extensions.finetuning.transfer import (
+        TransferConfig,
+        load_trunk,
+        prepare_for_transfer,
+    )
+
+
+def __getattr__(name):
+    """Lazily expose fine-tuning helpers without loading optional dependencies."""
+    if name in {'TransferConfig', 'load_trunk', 'prepare_for_transfer'}:
+        from .extensions.finetuning import transfer
+
+        return getattr(transfer, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     '__version__',
     'AlphaGenome',
-    'aggregate_intervals',
-    'aggregate_genes',
-    'gene_expression',
-    'gene_expression_values',
-    'combine_gene_expression',
-    'normalize_expression',
-    'gene_expression_correlations',
-    'GeneCounts',
-    'GeneCountAccumulator',
+    'TransferConfig',
+    'load_trunk',
+    'prepare_for_transfer',
 ]
