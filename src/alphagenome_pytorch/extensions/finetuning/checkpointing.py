@@ -1576,6 +1576,12 @@ def load_finetuned_model(
     if "delta_checkpoint_version" in ckpt:
         model = AlphaGenome(dtype_policy=dtype_policy)
         model = load_trunk(model, str(pretrained_weights), exclude_heads=True)
+        # Strip the base model's (untrained) pretrained heads before reconstructing,
+        # matching the exported-delta and full-checkpoint paths. Without this a
+        # .delta.pth reload keeps the randomly-initialised native heads (atac,
+        # dnase, ...) alongside the fine-tuned head, so a full forward or iterating
+        # ``model.heads`` yields garbage from heads that were never trained.
+        model = remove_all_heads(model)
         config, metadata = load_delta_checkpoint(
             ckpt_path, model, verify_hash=False, strict=False,
         )

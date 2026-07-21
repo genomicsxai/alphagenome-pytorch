@@ -1113,6 +1113,57 @@ class TestLoadFinetunedModelNullTransferConfig:
             )
 
 
+class TestLoadFinetunedModelDeltaStripsNativeHeads:
+    """A .delta.pth reload must drop the base model's untrained native heads."""
+
+    def test_delta_reload_strips_pretrained_native_heads(self, tmp_path, monkeypatch):
+        """Parity with the exported-delta and full-checkpoint paths: after reload
+        only the fine-tuned head remains, not the randomly-initialised native
+        heads that a fresh AlphaGenome starts with.
+        """
+        import alphagenome_pytorch as agp
+        from alphagenome_pytorch.extensions.finetuning import transfer as tr_mod
+        from alphagenome_pytorch.extensions.finetuning import checkpointing as ck_mod
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            load_finetuned_model,
+        )
+
+        class _StubWithNativeHeads(nn.Module):
+            num_organisms = 2
+
+            def __init__(self, *_, **__):
+                super().__init__()
+                # A fresh AlphaGenome ships with these pretrained heads.
+                self.heads = nn.ModuleDict({
+                    "atac": nn.Linear(1, 1),
+                    "dnase": nn.Linear(1, 1),
+                })
+
+        def _fake_load_delta(_ckpt_path, model, **_kwargs):
+            # Stand in for load_delta_checkpoint: reconstruct only the new head.
+            model.heads["my_head"] = nn.Linear(1, 1)
+            cfg = TransferConfig(
+                mode="lora",
+                new_heads={"my_head": {"modality": "atac", "num_tracks": 1}},
+            )
+            return cfg, {"modality": "atac", "organism": "mouse"}
+
+        monkeypatch.setattr(agp, "AlphaGenome", lambda **_: _StubWithNativeHeads())
+        monkeypatch.setattr(tr_mod, "load_trunk", lambda m, *_, **__: m)
+        monkeypatch.setattr(ck_mod, "load_delta_checkpoint", _fake_load_delta)
+        # remove_all_heads is intentionally left real — it is the code under test.
+
+        ckpt_path = tmp_path / "model.delta.pth"
+        torch.save({"delta_checkpoint_version": 1}, ckpt_path)
+
+        model, meta = load_finetuned_model(
+            ckpt_path, "unused.pth", device="cpu", merge=False,
+        )
+
+        assert set(model.heads.keys()) == {"my_head"}, set(model.heads.keys())
+        assert meta["default_organism_index"] == 1  # organism context still attached
+
+
 class TestLoadFinetunedModelExportedDelta:
     """End-to-end load_finetuned_model over the exported-delta sharing formats."""
 
