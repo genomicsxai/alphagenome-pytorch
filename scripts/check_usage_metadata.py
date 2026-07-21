@@ -138,7 +138,8 @@ def validate_guide(text: str, human: pd.DataFrame, mouse: pd.DataFrame) -> list[
     splice_summary = (
         f"`splice_sites` (raw {splice_sites}),\n"
         f"`splice_site_usage` ({splice_usage_human} human / {splice_usage_mouse} mouse), "
-        f"and `splice_junctions` ({splice_junctions})"
+        f"and `splice_junctions` ({splice_junctions} tissues → "
+        f"{2 * splice_junctions} stranded output tracks)"
     )
     if splice_summary not in text:
         errors.append(f"splice-head summary is stale; expected: {splice_summary!r}")

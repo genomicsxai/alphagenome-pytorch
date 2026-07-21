@@ -204,7 +204,7 @@ real mouse tracks, so mouse PRO-cap is entirely padding); query
 `TrackMetadataCatalog.load_builtin("mouse")` for exact mouse counts.
 
 The model also emits three **splice** heads — `splice_sites` (raw 5),
-`splice_site_usage` (734 human / 180 mouse), and `splice_junctions` (367) — valid
+`splice_site_usage` (734 human / 180 mouse), and `splice_junctions` (367 tissues → 734 stranded output tracks) — valid
 in the `heads=` filter but with a specialized per-tissue / junction-mask output
 structure that doesn't follow the simple `head.select(...)[res]` pattern below.
 See [`docs/named_outputs.rst`](https://github.com/genomicsxai/alphagenome-pytorch/blob/main/docs/named_outputs.rst)
