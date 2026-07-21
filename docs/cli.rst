@@ -127,8 +127,8 @@ JSON output
        {
          "name": "atac",
          "dimension": 256,
-         "tracks": {"human": 167, "mouse": 155},
-         "padding": {"human": 89, "mouse": 101},
+         "tracks": {"human": 167, "mouse": 18},
+         "padding": {"human": 89, "mouse": 238},
          "resolutions": ["1bp", "128bp"]
        }
      ]

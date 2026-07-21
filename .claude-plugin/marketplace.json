@@ -10,7 +10,6 @@
     {
       "name": "alphagenome",
       "description": "Run metadata-aware predictions and fine-tune AlphaGenome-PyTorch on custom genomic tracks.",
-      "version": "0.1.0",
       "category": "data-science",
       "tags": ["genomics", "alphagenome", "pytorch", "bioinformatics"],
       "source": "./plugins/alphagenome",

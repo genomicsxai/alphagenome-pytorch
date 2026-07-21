@@ -26,6 +26,17 @@ except ImportError:
     __version_tuple__ = (0, 0, 0, "dev0")
 
 from .model import AlphaGenome
+from .aggregation import (
+    aggregate_intervals,
+    aggregate_genes,
+    gene_expression,
+    gene_expression_values,
+    combine_gene_expression,
+    normalize_expression,
+    gene_expression_correlations,
+    GeneCounts,
+    GeneCountAccumulator,
+)
 
 if TYPE_CHECKING:
     from .extensions.finetuning.transfer import (
@@ -46,6 +57,15 @@ def __getattr__(name):
 __all__ = [
     '__version__',
     'AlphaGenome',
+    'aggregate_intervals',
+    'aggregate_genes',
+    'gene_expression',
+    'gene_expression_values',
+    'combine_gene_expression',
+    'normalize_expression',
+    'gene_expression_correlations',
+    'GeneCounts',
+    'GeneCountAccumulator',
     'TransferConfig',
     'load_trunk',
     'prepare_for_transfer',

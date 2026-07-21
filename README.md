@@ -189,8 +189,8 @@ See a compiled [ARCHITECTURE_COMPARISON.md](ARCHITECTURE_COMPARISON.md) for some
 | chip_tf | 1617 | 1664 | 128bp | TF binding |
 | chip_histone | 1116 | 1152 | 128bp | Histone modifications |
 | contact_maps | 28 | 28 | 64×64 | 3D chromatin contacts |
-| splice_sites | 5 | 5 | 1bp | Splice site classification (D+, A+, D−, A−, none) |
-| splice_junctions | 734 | 734 | pairwise | Junction read counts (367 tissues × 2 strands) |
+| splice_sites | 4 | 5 | 1bp | Splice site classification (D+, A+, D−, A−, none) |
+| splice_junctions | 367 | 734 | pairwise | Junction read counts (367 tissues × 2 strands) |
 | splice_site_usage | 734 | 734 | 1bp | Fraction of transcripts using splice site |
 
 Tracks column shows the number of real human tracks (without padding). Dimension is the raw output tensor size — padding fills the gap. When using `named_outputs=True`, padding is stripped by default. See [named outputs guide](docs/named_outputs.rst) for details.
