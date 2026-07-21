@@ -593,6 +593,7 @@ class TestExportAndLoadDeltaWeights:
         from alphagenome_pytorch.extensions.finetuning.adapters import LoRA
 
         model = nn.Module()
+        model.num_organisms = 2
         model.q_proj = LoRA(nn.Linear(64, 64), rank=4)
         model.heads = nn.ModuleDict({
             "my_head": nn.Linear(64, 10),
@@ -728,6 +729,32 @@ class TestExportAndLoadDeltaWeights:
             assert header["track_metadata"] == track_metadata
             assert header["organism"] == "mouse"
 
+    def test_export_organism_indices_roundtrip(self):
+        """organism_indices=[0, 1] survives both .pth and safetensors headers."""
+        model, config = self._make_lora_model_and_config()
+        for fmt, ext in [("pth", ".pth"), ("safetensors", ".safetensors")]:
+            if fmt == "safetensors":
+                pytest.importorskip("safetensors")
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir) / f"delta{ext}"
+                export_delta_weights(
+                    model, config, path, format=fmt, organism_indices=[0, 1],
+                )
+                header = _read_delta_export_header(path)
+                assert header["organism_indices"] == [0, 1]
+
+    def test_export_rejects_scalar_not_in_plural(self):
+        """A conflicting organism/organism_indices export fails before writing."""
+        model, config = self._make_lora_model_and_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "delta.pth"
+            with pytest.raises(ValueError):
+                export_delta_weights(
+                    model, config, path, format="pth",
+                    organism="mouse", organism_indices=[0],
+                )
+            assert not path.exists()
+
     def test_export_without_metadata_is_backwards_compatible(self):
         """Old call sites without track_names/track_metadata still work."""
         model, config = self._make_lora_model_and_config()
@@ -750,6 +777,7 @@ class TestIsDeltaWeightsExport:
     def _make_lora_model_and_config(self):
         from alphagenome_pytorch.extensions.finetuning.adapters import LoRA
         model = nn.Module()
+        model.num_organisms = 2
         model.q_proj = LoRA(nn.Linear(64, 64), rank=4)
         model.heads = nn.ModuleDict({"my_head": nn.Linear(64, 10)})
         config = TransferConfig(
@@ -847,6 +875,7 @@ class TestSaveDeltaCheckpointEmbedsTrackMetadata:
     def test_track_metadata_round_trips(self):
         from alphagenome_pytorch.extensions.finetuning.adapters import LoRA
         model = nn.Module()
+        model.num_organisms = 2
         model.q_proj = LoRA(nn.Linear(64, 64), rank=4)
         model.heads = nn.ModuleDict({"my_head": nn.Linear(64, 10)})
         config = TransferConfig(
@@ -1009,6 +1038,8 @@ class TestLoadFinetunedModelNullTransferConfig:
         from alphagenome_pytorch.extensions.finetuning import transfer as tr_mod
 
         class _Stub(nn.Module):
+            num_organisms = 2
+
             def __init__(self, *_, **__):
                 super().__init__()
                 self.heads = nn.ModuleDict()
@@ -1088,6 +1119,7 @@ class TestLoadFinetunedModelExportedDelta:
     def _make_lora_model_and_config(self):
         from alphagenome_pytorch.extensions.finetuning.adapters import LoRA
         model = nn.Module()
+        model.num_organisms = 2
         model.q_proj = LoRA(nn.Linear(64, 64), rank=4)
         model.heads = nn.ModuleDict({"my_head": nn.Linear(64, 10)})
         config = TransferConfig(

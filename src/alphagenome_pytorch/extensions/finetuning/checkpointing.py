@@ -9,9 +9,11 @@ import hashlib
 import os
 import signal
 import tempfile
+import warnings
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 import torch
 import torch.distributed as dist
@@ -20,6 +22,10 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from alphagenome_pytorch.extensions.finetuning.distributed import is_main_process
+from alphagenome_pytorch.organisms import (
+    normalize_organism_index,
+    normalize_organism_indices,
+)
 
 if TYPE_CHECKING:
     from alphagenome_pytorch.extensions.finetuning.transfer import TransferConfig
@@ -937,6 +943,7 @@ def export_delta_weights(
     track_names: dict[str, list[str]] | list[str] | None = None,
     track_metadata: list[dict[str, Any]] | None = None,
     organism: str | None = None,
+    organism_indices: list[int] | None = None,
 ) -> None:
     """Export only delta weights (adapters + new heads) for sharing.
 
@@ -958,6 +965,10 @@ def export_delta_weights(
         organism: Optional organism label (``"human"``/``"mouse"``) the tracks
             were trained on. Embedded so recipients know the provenance without
             inspecting per-track metadata.
+        organism_indices: Optional forward-facing set of trained organism indices
+            (e.g. ``[1]`` for mouse). Validated at export against the model's
+            ``num_organisms``; if both ``organism`` and ``organism_indices`` are
+            given, the scalar must be a member of the plural set.
 
     Example:
         >>> # Export just the LoRA weights + head for sharing
@@ -975,6 +986,26 @@ def export_delta_weights(
     import json
 
     path = Path(path)
+
+    # Validate + normalize organism provenance up front so a conflicting artifact
+    # (e.g. organism="mouse" + organism_indices=[0]) can never be written to disk.
+    # Only when an organism is actually supplied — otherwise there is nothing to
+    # embed and no need to require the model expose ``num_organisms``.
+    norm_organism_indices = None
+    norm_organism = None
+    if organism is not None or organism_indices is not None:
+        bound = model.num_organisms
+        norm_organism_indices = normalize_organism_indices(organism_indices, num_organisms=bound)
+        norm_organism = normalize_organism_index(organism, num_organisms=bound)
+        if (
+            norm_organism_indices is not None
+            and norm_organism is not None
+            and norm_organism not in norm_organism_indices
+        ):
+            raise ValueError(
+                f"organism {organism!r} (index {norm_organism}) is not in organism_indices "
+                f"{list(norm_organism_indices)}"
+            )
 
     # Get adapter, head, and trainable norm weights
     adapter_weights = get_adapter_state_dict(model)
@@ -1004,6 +1035,8 @@ def export_delta_weights(
             extras["track_metadata"] = track_metadata
         if organism is not None:
             extras["organism"] = organism
+        if norm_organism_indices is not None:
+            extras["organism_indices"] = list(norm_organism_indices)
         # safetensors metadata must be str -> str
         metadata = {k: json.dumps(v) for k, v in extras.items()}
         save_file({k: v.cpu() for k, v in weights.items()}, path, metadata=metadata)
@@ -1017,6 +1050,8 @@ def export_delta_weights(
             extras["track_metadata"] = track_metadata
         if organism is not None:
             extras["organism"] = organism
+        if norm_organism_indices is not None:
+            extras["organism_indices"] = list(norm_organism_indices)
         torch.save({"weights": weights, **extras}, path)
     else:
         raise ValueError(f"Unknown format: {format}. Use 'safetensors' or 'pth'.")
@@ -1056,6 +1091,8 @@ def _read_delta_export_header(path: Path | str) -> dict[str, Any]:
             header["track_metadata"] = json.loads(metadata["track_metadata"])
         if "organism" in metadata:
             header["organism"] = json.loads(metadata["organism"])
+        if "organism_indices" in metadata:
+            header["organism_indices"] = json.loads(metadata["organism_indices"])
     else:
         data = torch.load(path, map_location="cpu", weights_only=False)
         if not isinstance(data, dict) or "transfer_config" not in data:
@@ -1069,6 +1106,8 @@ def _read_delta_export_header(path: Path | str) -> dict[str, Any]:
             header["track_metadata"] = data["track_metadata"]
         if "organism" in data:
             header["organism"] = data["organism"]
+        if "organism_indices" in data:
+            header["organism_indices"] = data["organism_indices"]
 
     return header
 
@@ -1233,6 +1272,165 @@ def _has_adapter_keys(state_dict: dict[str, Any]) -> bool:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class FinetunedOrganismContext:
+    """What organism(s) a fine-tuned checkpoint was trained on, and the default to use.
+
+    ``organism_indices`` is the declared/inferred set (``None`` only when unknown).
+    ``default_organism_index`` is the single index to forward at when unambiguous, else
+    ``None`` (a mixed checkpoint requires an explicit per-request choice); a checkpoint with
+    no organism metadata gets the compatibility default ``0`` with ``source="fallback"``.
+    ``source`` records provenance; ``conflicts`` are human-readable notes the loader warns on.
+    """
+
+    organism_indices: tuple[int, ...] | None
+    default_organism_index: int | None
+    source: Literal["checkpoint", "track_metadata", "fallback"]
+    conflicts: tuple[str, ...] = ()
+
+
+def _organisms_from_track_metadata(
+    track_metadata: Any, *, num_organisms: int
+) -> tuple[int, ...] | None:
+    """Distinct, explicitly-present organism indices from metadata rows, or ``None``.
+
+    Organism-less rows provide no evidence — they are skipped, never treated as human.
+    """
+    if not track_metadata:
+        return None
+    present: set[int] = set()
+    for row in track_metadata:
+        if not isinstance(row, dict):
+            continue
+        value = row.get("organism")
+        if value is None:
+            continue
+        index = normalize_organism_index(value, num_organisms=num_organisms)
+        if index is not None:
+            present.add(index)
+    return tuple(sorted(present)) if present else None
+
+
+def resolve_finetuned_organism(
+    *,
+    organism_indices: Any = None,
+    checkpoint_organism: Any = None,
+    track_metadata: Any = None,
+    num_organisms: int,
+) -> FinetunedOrganismContext:
+    """Resolve checkpoint organism provenance into a :class:`FinetunedOrganismContext`.
+
+    Pure — never warns; returns ``.conflicts`` for the caller to emit. Precedence:
+    plural ``organism_indices`` > scalar ``organism`` > track-metadata evidence > fallback ``0``.
+    Checkpoint declarations are authoritative: track metadata may only *broaden* to a mixed
+    set when no checkpoint organism is present. Invalid values raise.
+    """
+    conflicts: list[str] = []
+
+    plural = normalize_organism_indices(organism_indices, num_organisms=num_organisms)
+    scalar = normalize_organism_index(checkpoint_organism, num_organisms=num_organisms)
+    catalog = _organisms_from_track_metadata(track_metadata, num_organisms=num_organisms)
+
+    declared: tuple[int, ...] | None = None
+    source: Literal["checkpoint", "track_metadata", "fallback"] = "fallback"
+
+    if plural is not None:
+        declared = plural
+        source = "checkpoint"
+        if scalar is not None and scalar not in plural:
+            conflicts.append(
+                f"Checkpoint scalar organism {scalar} is not in declared "
+                f"organism_indices {list(plural)}; using the plural set."
+            )
+    elif scalar is not None:
+        declared = (scalar,)
+        source = "checkpoint"
+
+    if declared is not None:
+        if catalog is not None and set(catalog) != set(declared):
+            conflicts.append(
+                f"Track metadata organisms {list(catalog)} differ from the checkpoint "
+                f"declaration {list(declared)}; using the checkpoint declaration."
+            )
+    elif catalog is not None:
+        declared = catalog
+        source = "track_metadata"
+
+    if declared is None:
+        return FinetunedOrganismContext(
+            organism_indices=None,
+            default_organism_index=0,
+            source="fallback",
+            conflicts=tuple(conflicts),
+        )
+
+    default = declared[0] if len(declared) == 1 else None
+    return FinetunedOrganismContext(
+        organism_indices=declared,
+        default_organism_index=default,
+        source=source,
+        conflicts=tuple(conflicts),
+    )
+
+
+def select_organism_index(
+    context: FinetunedOrganismContext,
+    explicit: Any = None,
+    *,
+    num_organisms: int,
+) -> int:
+    """Pick the single ``organism_index`` for one inference request.
+
+    Explicit request wins (validated + bounds-checked). Warn only when the explicit choice
+    is outside a *known* declared set — a fallback context (``organism_indices is None``) is
+    unknown provenance, not proof the organism was untrained, so it must not warn. Without an
+    explicit request, use the derived default; a mixed checkpoint with no default raises.
+    """
+    if explicit is not None:
+        index = normalize_organism_index(explicit, num_organisms=num_organisms)
+        if context.organism_indices is not None and index not in context.organism_indices:
+            warnings.warn(
+                f"Requested organism {index} is not in the checkpoint's declared organisms "
+                f"{list(context.organism_indices)}; forwarding at {index} anyway.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return index
+    if context.default_organism_index is not None:
+        return context.default_organism_index
+    raise ValueError(
+        "This checkpoint has no single default organism (declared: "
+        f"{list(context.organism_indices) if context.organism_indices else None}); "
+        "pass an explicit organism."
+    )
+
+
+def finalize_finetuned_organism_context(
+    model: nn.Module, meta: dict[str, Any]
+) -> FinetunedOrganismContext:
+    """Resolve + attach the organism context. **Mutates both ``meta`` and ``model``.**
+
+    Reads the raw ``organism_indices``/``organism``/``track_metadata`` already in ``meta``,
+    resolves them against ``model.num_organisms``, emits any conflict warnings once, overwrites
+    the metadata with the resolved values, and attaches ``model.finetuned_organism_context``.
+    Called by every fine-tuned loading path (``load_finetuned_model`` and
+    ``AlphaGenome.from_delta``) after each has reconstructed its own model.
+    """
+    ctx = resolve_finetuned_organism(
+        organism_indices=meta.get("organism_indices"),
+        checkpoint_organism=meta.get("organism"),
+        track_metadata=meta.get("track_metadata"),
+        num_organisms=model.num_organisms,
+    )
+    for message in ctx.conflicts:
+        warnings.warn(message, UserWarning, stacklevel=2)
+    meta["organism_indices"] = ctx.organism_indices
+    meta["default_organism_index"] = ctx.default_organism_index
+    meta["organism_resolution_source"] = ctx.source
+    model.finetuned_organism_context = ctx
+    return ctx
+
+
 def load_finetuned_model(
     checkpoint_path: str | Path,
     pretrained_weights: str | Path,
@@ -1317,6 +1515,17 @@ def load_finetuned_model(
 
     ckpt_path = Path(checkpoint_path)
 
+    def _finalize_and_return(model, meta):
+        """Resolve+attach the organism context, then move to device and eval.
+
+        The single exit for every branch. Does NOT freeze parameters: this loader is shared
+        by serving and by gradient-based ISM/DeepLIFT, which need gradients. Consumers that
+        want an inference-frozen model freeze at their own boundary.
+        """
+        finalize_finetuned_organism_context(model, meta)
+        model.eval()
+        return model.to(device), meta
+
     def _finalize_delta_export(header, weights):
         """Build an inference model from an exported delta header + weight dict.
 
@@ -1339,13 +1548,12 @@ def load_finetuned_model(
             "track_names": header.get("track_names"),
             "track_metadata": header.get("track_metadata"),
             "organism": header.get("organism"),
+            "organism_indices": header.get("organism_indices"),
             "epoch": -1,
             "val_loss": None,
             "head_names": list(config.new_heads.keys()),
         }
-        model = model.to(device)
-        model.eval()
-        return model, meta
+        return _finalize_and_return(model, meta)
 
     # --- Path A2 (safetensors): a .safetensors file is always an exported
     # delta-weights file, never a torch pickle — handle it by suffix BEFORE any
@@ -1380,13 +1588,12 @@ def load_finetuned_model(
             "track_names": metadata.get("track_names"),
             "track_metadata": metadata.get("track_metadata"),
             "organism": metadata.get("organism"),
+            "organism_indices": metadata.get("organism_indices"),
             "epoch": metadata.get("epoch", -1),
             "val_loss": metadata.get("val_loss"),
             "head_names": head_names,
         }
-        model = model.to(device)
-        model.eval()
-        return model, meta
+        return _finalize_and_return(model, meta)
 
     # --- Path A2 (.pth): Exported delta weights (transfer_config + weights) ---
     if "transfer_config" in ckpt and "weights" in ckpt:
@@ -1395,6 +1602,7 @@ def load_finetuned_model(
             "track_names": ckpt.get("track_names"),
             "track_metadata": ckpt.get("track_metadata"),
             "organism": ckpt.get("organism"),
+            "organism_indices": ckpt.get("organism_indices"),
         }
         return _finalize_delta_export(header, ckpt["weights"])
 
@@ -1466,13 +1674,12 @@ def load_finetuned_model(
         "track_names": ckpt.get("track_names"),
         "track_metadata": ckpt.get("track_metadata"),
         "organism": ckpt.get("organism"),
+        "organism_indices": ckpt.get("organism_indices"),
         "epoch": ckpt.get("epoch", -1),
         "val_loss": ckpt.get("val_loss"),
         "head_names": head_names,
     }
-    model = model.to(device)
-    model.eval()
-    return model, meta
+    return _finalize_and_return(model, meta)
 
 
 __all__ = [
@@ -1496,6 +1703,11 @@ __all__ = [
     "is_delta_weights_export",
     # Inference loading
     "load_finetuned_model",
+    # Organism provenance / selection
+    "FinetunedOrganismContext",
+    "resolve_finetuned_organism",
+    "select_organism_index",
+    "finalize_finetuned_organism_context",
     # Utilities
     "split_model_state_dict",
     "get_trunk_state_dict",

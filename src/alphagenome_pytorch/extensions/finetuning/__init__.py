@@ -33,6 +33,8 @@ from alphagenome_pytorch.extensions.finetuning.checkpointing import (
     export_model_weights, export_delta_weights,
     load_delta_config, load_delta_weights, is_delta_weights_export,
     load_finetuned_model,
+    FinetunedOrganismContext, resolve_finetuned_organism,
+    select_organism_index, finalize_finetuned_organism_context,
 )
 
 # Transfer config serialization
@@ -170,6 +172,11 @@ __all__ = [
     "is_delta_weights_export",
     # Inference loading
     "load_finetuned_model",
+    # Organism provenance / selection
+    "FinetunedOrganismContext",
+    "resolve_finetuned_organism",
+    "select_organism_index",
+    "finalize_finetuned_organism_context",
     # Data transforms (lazy-loaded)
     "apply_atac_transforms",
     "apply_rnaseq_transforms",

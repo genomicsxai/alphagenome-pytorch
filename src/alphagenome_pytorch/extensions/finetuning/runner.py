@@ -788,15 +788,25 @@ def main(args: argparse.Namespace | None = None) -> None:
             organism=args.organism, rank=rank,
         )
 
+    # The organism this fine-tune trains, resolved once here and reused for both
+    # checkpoint metadata and the training/validation forward pass so producer
+    # metadata can never drift from actual training routing. Note: args.organism
+    # is None for a default-human run, so we persist the *resolved* name/index
+    # (not args.organism) — otherwise a new human checkpoint records "unknown".
+    organism_index = organism_index_from_args(args)
+    organism_name = "mouse" if organism_index == 1 else "human"
+
     # Track identity embedded into every checkpoint/delta save below. Defined
     # once and spread as **metadata_kwargs so a new save site cannot silently
-    # drop the embedded metadata.
+    # drop the embedded metadata. ``organism`` is the compatibility scalar;
+    # ``organism_indices`` is the forward-facing plural form.
     metadata_kwargs = dict(
         track_names=modality_track_names,
         modality=args.modalities,
         resolutions=modality_resolutions,
         track_metadata=track_metadata_rows,
-        organism=args.organism,
+        organism=organism_name,
+        organism_indices=[organism_index],
     )
 
     # Build resolution weights per modality.
@@ -1067,11 +1077,11 @@ def main(args: argparse.Namespace | None = None) -> None:
         args.mode in ("lora", "locon", "lora+locon") and not has_active_adapters
     )
     encoder_only = args.mode == "encoder-only"
-    # Forward at the fine-tune's organism so mouse data uses the mouse trunk
-    # embedding. Fine-tuned heads are single-organism (num_organisms=1, see
-    # create_model) and organism-agnostic — they always use slot 0 — so the
-    # organism index only selects the trunk embedding, not a head weight slot.
-    organism_index = organism_index_from_args(args)
+    # ``organism_index`` was resolved once above (near metadata_kwargs) and is
+    # reused here: mouse data forwards the trunk at index 1 so it uses the mouse
+    # trunk embedding. Fine-tuned heads are single-organism (num_organisms=1) and
+    # organism-agnostic — they map any index to slot 0 — so the organism index
+    # only selects the trunk embedding, not a head weight slot.
 
     try:
         for epoch in range(start_epoch, args.epochs + 1):

@@ -493,23 +493,30 @@ class AlphaGenome(nn.Module):
             ... )
         """
         from alphagenome_pytorch.extensions.finetuning.checkpointing import (
-            load_delta_config,
+            _read_delta_export_header,
+            finalize_finetuned_organism_context,
             load_delta_weights,
         )
         from alphagenome_pytorch.extensions.finetuning.transfer import (
             load_trunk,
             prepare_for_transfer,
+            transfer_config_from_dict,
         )
 
         if dtype_policy is None:
             dtype_policy = DtypePolicy.default()
 
-        # 1. Create base model and load pretrained trunk
+        # 1. Create base model and load pretrained trunk. Note ``cls(**kwargs)`` is
+        #    built here (preserving subclass + constructor kwargs like num_organisms),
+        #    so from_delta must NOT delegate to the canonical loader — it only shares
+        #    the organism-context finalizer below.
         model = cls(dtype_policy=dtype_policy, **kwargs)
         model = load_trunk(model, base_path, exclude_heads=True)
 
-        # 2. Read config and set up adapters/heads
-        config = load_delta_config(delta_path)
+        # 2. Read the exported header once (config + organism provenance) and set up
+        #    adapters/heads.
+        header = _read_delta_export_header(delta_path)
+        config = transfer_config_from_dict(header["transfer_config"])
         model = prepare_for_transfer(model, config)
 
         # 3. Load delta weights
@@ -518,6 +525,17 @@ class AlphaGenome(nn.Module):
         # 4. Move to target device
         if device:
             model.to(device)
+
+        # 5. Attach the fine-tune organism context (same helper the canonical loader
+        #    uses) so from_delta and load_finetuned_model behave consistently.
+        finalize_finetuned_organism_context(
+            model,
+            {
+                "organism": header.get("organism"),
+                "organism_indices": header.get("organism_indices"),
+                "track_metadata": header.get("track_metadata"),
+            },
+        )
 
         return model
 

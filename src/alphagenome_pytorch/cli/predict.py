@@ -66,8 +66,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
                    help="Batch size for inference")
     p.add_argument("--window-size", type=int, default=131072,
                    help="Model input window size (default: 131072)")
-    p.add_argument("--organism", type=int, default=0, choices=[0, 1],
-                   help="Organism: 0=human, 1=mouse")
+    p.add_argument("--organism", type=int, default=None, choices=[0, 1],
+                   help="Organism: 0=human, 1=mouse. Default: 0 for a pretrained model; "
+                        "for a fine-tuned checkpoint, the organism it was trained on "
+                        "(from checkpoint metadata). Pass explicitly to override.")
     p.add_argument("--device", type=str, default="cuda", help="PyTorch device")
     p.add_argument("--dtype-policy", type=str, default="full_float32",
                    choices=["full_float32", "mixed_precision"],
@@ -245,6 +247,28 @@ def _load_model(args, dtype_policy, json_mode):
     return model, None, None
 
 
+def _effective_organism(model, requested: int | None) -> tuple[int, str]:
+    """Resolve the organism index to forward at, plus its source, for logging.
+
+    For a fine-tuned checkpoint the model carries a ``finetuned_organism_context``:
+    an explicit ``--organism`` wins, else the checkpoint's default. For a pretrained
+    model there is no context, so an explicit value wins, else human (0).
+    """
+    context = getattr(model, "finetuned_organism_context", None)
+    if context is not None:
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            select_organism_index,
+        )
+        index = select_organism_index(
+            context, explicit=requested, num_organisms=model.num_organisms,
+        )
+        source = "explicit" if requested is not None else context.source
+        return index, source
+    return (requested if requested is not None else 0), (
+        "explicit" if requested is not None else "default"
+    )
+
+
 def _describe_handling(info, json_mode: bool, quiet: bool) -> None:
     """Print a per-region status line and any warnings.
 
@@ -366,7 +390,10 @@ def run(args: argparse.Namespace) -> int:
     # weights; a finetuned checkpoint's strands are resolved after it loads.
     strands_needed = bool(args.anndata) and args.gene_strand == "match"
     if strands_needed and track_strands is None and not args.checkpoint:
-        track_strands = _resolve_track_strands(args.head, args.organism, track_indices)
+        # Pre-load (pretrained/native) strand lookup: no model yet, so an omitted
+        # --organism means human here.
+        native_default = args.organism if args.organism is not None else 0
+        track_strands = _resolve_track_strands(args.head, native_default, track_indices)
         if track_strands is None:
             raise ValueError(
                 f"--gene-strand match needs per-track strands for head '{args.head}', "
@@ -391,10 +418,17 @@ def run(args: argparse.Namespace) -> int:
         if track_indices is not None:
             track_names = [track_names[i] for i in track_indices]
 
+    # Resolve the organism to forward at now that the model (and its fine-tune
+    # organism context, if any) is loaded. Used for all forwards and metadata below.
+    organism_index, organism_source = _effective_organism(model, args.organism)
+    if not json_mode and not getattr(args, "quiet", False):
+        _org_name = "mouse" if organism_index == 1 else "human"
+        print(f"  Organism: {_org_name} ({organism_index}), source: {organism_source}")
+
     # Finetuned checkpoint strands are only known now that meta is loaded.
     if strands_needed and track_strands is None and args.checkpoint:
         track_strands = _resolve_track_strands(
-            args.head, args.organism, track_indices,
+            args.head, organism_index, track_indices,
             checkpoint_meta=track_metadata_from_ckpt, from_checkpoint=True,
         )
         if track_strands is None:
@@ -446,7 +480,7 @@ def run(args: argparse.Namespace) -> int:
                 reduce="sum" if args.aggregate_func == "sum" else "mean",
                 log=args.aggregate_func == "log-mean",
                 strand=None if args.gene_strand == "all" else args.gene_strand,
-                organism_index=args.organism,
+                organism_index=organism_index,
                 device=args.device,
                 show_progress=show_progress,
             )
@@ -476,7 +510,7 @@ def run(args: argparse.Namespace) -> int:
             config=config,
             track_indices=track_indices,
             track_names=track_names,
-            organism_index=args.organism,
+            organism_index=organism_index,
             device=args.device,
             show_progress=show_progress,
         )
@@ -509,7 +543,7 @@ def run(args: argparse.Namespace) -> int:
             head=args.head, config=config,
             tile=args.tile,
             track_indices=track_indices,
-            organism_index=args.organism,
+            organism_index=organism_index,
             device=args.device,
         )
         _describe_handling(info, json_mode, args.quiet)
@@ -565,7 +599,7 @@ def run(args: argparse.Namespace) -> int:
                 tile=args.tile,
                 name=r.name,
                 track_indices=track_indices,
-                organism_index=args.organism,
+                organism_index=organism_index,
                 device=args.device,
             )
             _describe_handling(info, json_mode, args.quiet)
@@ -626,7 +660,7 @@ def run(args: argparse.Namespace) -> int:
                 head=args.head, config=config,
                 tile=args.tile,
                 track_indices=track_indices,
-                organism_index=args.organism,
+                organism_index=organism_index,
                 device=args.device,
             )
             _describe_handling(info, json_mode, args.quiet)

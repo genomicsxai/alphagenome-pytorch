@@ -212,29 +212,22 @@ def _resolve_finetuned_metadata_catalog(
     return None
 
 
-def _finetuned_default_organism(
-    metadata_catalog: "TrackMetadataCatalog | None",
-    meta: dict | None = None,
-) -> str | int:
-    """Default organism for a fine-tuned model.
+def _finetuned_default_organism(meta: dict) -> int:
+    """Default organism index for a fine-tuned model, from the resolved metadata.
 
-    When the embedded catalog labels a single organism (e.g. a mouse fine-tune),
-    default to it so a request that omits organism still resolves to the
-    organism the tracks belong to and is labelled correctly. The runtime maps
-    that organism onto the head's single trained slot.
-
-    When no single-organism catalog is available, fall back to the top-level
-    ``organism`` recorded in the checkpoint metadata (``finetune.py --organism``),
-    which labels a mouse fine-tune correctly even without ``--track-metadata``.
-    Falls back to human when neither source resolves a single organism.
+    Consumes the ``default_organism_index`` the canonical loader already resolved
+    (checkpoint provenance + embedded catalog) — this must not re-run resolution.
+    A mixed checkpoint has no single default (``None``); since mixed-organism serving
+    is not yet supported, that fails at server construction rather than silently
+    defaulting to human.
     """
-    if metadata_catalog is not None and not metadata_catalog.is_empty():
-        present = sorted(set(metadata_catalog.organisms))
-        if len(present) == 1:
-            return present[0]
-    if meta is not None and meta.get("organism"):
-        return meta["organism"]
-    return "human"
+    default = meta.get("default_organism_index")
+    if default is None:
+        raise ValueError(
+            "This checkpoint has no single default organism. "
+            "Mixed-organism serving is not yet supported."
+        )
+    return default
 
 
 def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
@@ -266,7 +259,7 @@ def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
         metadata_catalog=metadata_catalog,
         track_names=meta.get('track_names'),
         device=args.device,
-        default_organism=_finetuned_default_organism(metadata_catalog, meta),
+        default_organism=_finetuned_default_organism(meta),
     )
     scorer = _make_variant_scorer(
         runtime=runtime,

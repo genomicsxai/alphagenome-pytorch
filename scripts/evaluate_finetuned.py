@@ -57,18 +57,16 @@ from scipy import stats
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.extensions.finetuning.checkpointing import (
     is_delta_checkpoint,
     load_delta_checkpoint,
     load_finetuned_model as _load_finetuned_model,
+    select_organism_index,
 )
+from alphagenome_pytorch.extensions.finetuning.evaluation import load_native_model
 from alphagenome_pytorch.extensions.finetuning.datasets import GenomicDataset
-from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head
 from alphagenome_pytorch.extensions.finetuning.training import collate_genomic
-from alphagenome_pytorch.extensions.finetuning.transfer import load_trunk
 from alphagenome_pytorch.losses import multinomial_loss
-from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
 
 log = logging.getLogger(__name__)
 
@@ -102,73 +100,6 @@ def load_finetuned_model(
     return model, meta
 
 
-def load_native_model(
-    pretrained_weights: str,
-    native_biosample: str | None,
-    native_track_index: int | None,
-    modality: str,
-    device: torch.device,
-) -> tuple[nn.Module, int, str]:
-    """Load pretrained model with all native heads and find matching track.
-
-    Returns (model, track_index, display_name).
-    """
-    log.info("Loading native model for comparison...")
-    model = AlphaGenome.from_pretrained(pretrained_weights, device=device)
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad = False
-
-    catalog = TrackMetadataCatalog.load_builtin("human")
-    model.set_track_metadata_catalog(catalog)
-
-    if native_track_index is not None:
-        # Direct index — validate it exists
-        tracks = catalog.get_tracks(modality, organism=0)
-        if native_track_index >= len(tracks):
-            raise ValueError(
-                f"Track index {native_track_index} out of range for "
-                f"{modality} ({len(tracks)} tracks)"
-            )
-        track = tracks[native_track_index]
-        display_name = track.get("biosample_name") or track.track_name
-        log.info(
-            "Native track: index=%d, name=%s", native_track_index, display_name
-        )
-        return model, native_track_index, display_name
-
-    # Search by biosample name (substring, case-insensitive)
-    tracks = catalog.get_tracks(modality, organism=0)
-    query = native_biosample.lower()
-    matches = [
-        t for t in tracks
-        if not t.is_padding and query in (t.get("biosample_name") or "").lower()
-    ]
-
-    if not matches:
-        available = sorted({
-            t.get("biosample_name")
-            for t in tracks
-            if not t.is_padding and t.get("biosample_name")
-        })
-        raise ValueError(
-            f"No {modality} track found matching biosample '{native_biosample}'. "
-            f"Available biosamples ({len(available)}): {available[:20]}"
-        )
-
-    if len(matches) > 1:
-        log.warning(
-            "Multiple tracks match '%s': %s. Using first.",
-            native_biosample,
-            [(m.track_index, m.get("biosample_name")) for m in matches[:5]],
-        )
-
-    track = matches[0]
-    display_name = track.get("biosample_name") or track.track_name
-    log.info("Native track: index=%d, name=%s", track.track_index, display_name)
-    return model, track.track_index, display_name
-
-
 # =============================================================================
 # Inference
 # =============================================================================
@@ -181,9 +112,11 @@ def evaluate_split(
     loader: DataLoader,
     device: torch.device,
     resolutions: tuple[int, ...],
+    *,
+    organism_index: int,
     positional_weight: float = 5.0,
 ) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], float]:
-    """Run finetuned model inference. Returns (preds, targets, avg_loss).
+    """Run finetuned model inference at ``organism_index``. Returns (preds, targets, avg_loss).
 
     Predictions are in experimental space (unscaled).
     """
@@ -197,8 +130,8 @@ def evaluate_split(
 
     for sequences, targets_dict in tqdm(loader, desc="Evaluating (finetuned)"):
         sequences = sequences.to(device)
-        organism_idx = torch.zeros(
-            sequences.shape[0], dtype=torch.long, device=device
+        organism_idx = torch.full(
+            (sequences.shape[0],), organism_index, dtype=torch.long, device=device,
         )
 
         with torch.autocast(
@@ -266,8 +199,10 @@ def evaluate_native_split(
     loader: DataLoader,
     device: torch.device,
     resolutions: tuple[int, ...],
+    *,
+    organism_index: int,
 ) -> dict[int, np.ndarray]:
-    """Run native model on same data, extract a single track.
+    """Run native model on same data at ``organism_index``, extract a single track.
 
     Returns dict[resolution -> (N, seq_len, 1)] predictions.
     """
@@ -277,8 +212,8 @@ def evaluate_native_split(
 
     for sequences, _ in tqdm(loader, desc="Evaluating (native)"):
         sequences = sequences.to(device)
-        organism_idx = torch.zeros(
-            sequences.shape[0], dtype=torch.long, device=device,
+        organism_idx = torch.full(
+            (sequences.shape[0],), organism_index, dtype=torch.long, device=device,
         )
 
         with torch.autocast(
@@ -816,6 +751,11 @@ def parse_args() -> argparse.Namespace:
         "--native-track-index", type=int,
         help="Direct track index for native head (alternative to --native-biosample)",
     )
+    p.add_argument(
+        "--organism", type=int, default=None, choices=[0, 1],
+        help="Organism index to evaluate at. Default: the organism the checkpoint "
+             "was trained on (from its metadata). Override for a mixed/legacy checkpoint.",
+    )
 
     # Options
     p.add_argument("--sequence-length", type=int, default=131072)
@@ -872,6 +812,12 @@ def main() -> None:
     model, ckpt_meta = load_finetuned_model(
         args.checkpoint, args.pretrained_weights, device,
     )
+    # Evaluate at the organism the checkpoint was trained on (explicit --organism
+    # overrides). The native comparison below uses the same organism.
+    organism_index = select_organism_index(
+        model.finetuned_organism_context, explicit=args.organism,
+        num_organisms=model.num_organisms,
+    )
     modality = ckpt_meta["modality"]
     if isinstance(modality, list):
         modality = modality[0]  # single-task evaluation
@@ -895,6 +841,7 @@ def main() -> None:
         native_model, native_track_idx, native_display_name = load_native_model(
             args.pretrained_weights, args.native_biosample,
             args.native_track_index, modality, device,
+            organism_index=organism_index,
         )
 
     # ---- Feature: metrics ----
@@ -939,6 +886,7 @@ def main() -> None:
         # Finetuned evaluation
         ft_preds, targets, loss = evaluate_split(
             model, modality, loader, device, resolutions,
+            organism_index=organism_index,
         )
         log.info("Loss: %.4f", loss)
 
@@ -976,6 +924,7 @@ def main() -> None:
             native_preds = evaluate_native_split(
                 native_model, modality, native_track_idx,
                 loader, device, resolutions,
+                organism_index=organism_index,
             )
 
             for res in resolutions:
@@ -1065,6 +1014,7 @@ def main() -> None:
         # Finetuned predictions on regions
         ft_region_preds, region_targets, _ = evaluate_split(
             model, modality, region_loader, device, resolutions,
+            organism_index=organism_index,
         )
 
         # Native predictions on regions
@@ -1075,6 +1025,7 @@ def main() -> None:
             native_region_preds = evaluate_native_split(
                 native_model, modality, native_track_idx,
                 region_loader, device, resolutions,
+                organism_index=organism_index,
             )
             native_model.cpu()
             model = model.to(device)

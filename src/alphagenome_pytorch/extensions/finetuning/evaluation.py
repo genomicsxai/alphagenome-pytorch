@@ -21,16 +21,11 @@ from tqdm import tqdm
 
 from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.extensions.finetuning.checkpointing import (
-    is_delta_checkpoint,
-    load_delta_checkpoint,
+    load_finetuned_model as _canonical_load_finetuned_model,
+    select_organism_index,
 )
-from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head
 from alphagenome_pytorch.extensions.finetuning.training import NUM_SEGMENTS
 from alphagenome_pytorch.extensions.finetuning.transfer import (
-    TransferConfig,
-    add_head,
-    prepare_for_transfer,
-    remove_all_heads,
     transfer_config_from_dict,
 )
 from alphagenome_pytorch.losses import multinomial_loss
@@ -73,98 +68,45 @@ def _normalize_metadata(meta: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _apply_transfer_config_from_json(
-    model: nn.Module, config_path: str | Path,
-) -> nn.Module:
-    with open(config_path) as f:
-        cfg_dict = json.load(f)
-    config = transfer_config_from_dict(cfg_dict)
-    return prepare_for_transfer(model, config)
-
-
-def _apply_heads_from_metadata(
-    model: nn.Module, modality: str, track_names: list[str], resolutions: tuple[int, ...],
-) -> nn.Module:
-    """Attach a fresh finetuning head matching a full-checkpoint's head shapes.
-
-    For linear-probe / full finetuning, no adapters are needed — only the new
-    head must exist before ``load_state_dict``. We remove the pretrained heads
-    and add the finetuning head named after ``modality``.
-    """
-    model = remove_all_heads(model)
-    head = create_finetuning_head(
-        modality=modality,
-        n_tracks=len(track_names),
-        resolutions=resolutions,
-    )
-    add_head(model, modality, head)
-    return model
-
-
 def load_finetuned_model(
     checkpoint_path: str | Path,
     pretrained_weights: str | Path,
     device: torch.device,
     transfer_config_json: str | Path | None = None,
 ) -> tuple[nn.Module, dict]:
-    """Load a finetuned model regardless of checkpoint format.
+    """Load a finetuned model for evaluation, delegating to the canonical loader.
 
-    Supports:
-    - ``best_model.delta.pth`` (delta; TransferConfig embedded).
-    - ``best_model.pth`` (full) with adapter modes, if ``transfer_config_json``
-      is supplied (dumped alongside training).
-    - ``best_model.pth`` (full) without adapters (linear-probe / full mode)
-      — architecture is reconstructed from metadata.
+    Thin wrapper over ``checkpointing.load_finetuned_model`` that preserves this
+    module's historical signature (``transfer_config_json`` is a path to a JSON dump
+    of a ``TransferConfig``). Freezes parameters for the eval-only workflow — the
+    canonical loader deliberately leaves them trainable so gradient-based uses keep
+    working.
 
-    Returns (model, normalized_metadata_dict) with keys: modality, resolutions,
-    track_names, epoch, val_loss. Parameters are frozen.
+    Returns ``(model, metadata)``. ``metadata`` carries the organism provenance the
+    canonical loader resolved (``organism_indices``, ``default_organism_index``,
+    ``organism_resolution_source``) plus back-compat coerced ``modality``,
+    ``resolutions``, ``track_names``, ``epoch``, ``val_loss``.
     """
-    checkpoint_path = Path(checkpoint_path)
+    transfer_config = None
+    if transfer_config_json is not None:
+        with open(transfer_config_json) as f:
+            transfer_config = transfer_config_from_dict(json.load(f))
+
     log.info("Loading checkpoint: %s", checkpoint_path)
+    model, meta = _canonical_load_finetuned_model(
+        checkpoint_path=checkpoint_path,
+        pretrained_weights=pretrained_weights,
+        device=device,
+        transfer_config=transfer_config,
+    )
 
-    model = AlphaGenome.from_pretrained(str(pretrained_weights), device=device)
-
-    if is_delta_checkpoint(checkpoint_path):
-        config, metadata = load_delta_checkpoint(
-            checkpoint_path, model, verify_hash=False,
-        )
-        model.to(device)
-    else:
-        raw = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        metadata = {
-            k: raw[k] for k in
-            ("modality", "resolutions", "track_names", "epoch", "val_loss")
-            if k in raw
-        }
-        norm = _normalize_metadata(metadata)
-
-        if transfer_config_json is not None:
-            model = _apply_transfer_config_from_json(model, transfer_config_json)
-        else:
-            has_adapter_keys = any(
-                ".lora_" in k or ".locon_" in k or ".scale" in k
-                or ".adapter." in k
-                for k in raw["model_state_dict"].keys()
-            )
-            if has_adapter_keys:
-                raise RuntimeError(
-                    f"Full checkpoint {checkpoint_path.name} contains adapter "
-                    "weights but no transfer_config.json was supplied. Pass "
-                    "--transfer-config (a JSON dumped from TransferConfig) or "
-                    "re-train with --save-delta for a self-describing checkpoint."
-                )
-            model = _apply_heads_from_metadata(
-                model, norm["modality"], norm["track_names"], norm["resolutions"],
-            )
-
-        model.load_state_dict(raw["model_state_dict"], strict=False)
-        model.to(device)
-
-    model.eval()
+    # Eval-only workflow: freeze parameters (the canonical loader does not).
     for p in model.parameters():
         p.requires_grad = False
 
-    return model, _normalize_metadata(metadata)
+    # Overlay back-compat coerced shapes without dropping any canonical keys.
+    meta.update(_normalize_metadata(meta))
+    return model, meta
 
 
 def load_native_model(
@@ -173,24 +115,31 @@ def load_native_model(
     native_track_index: int | None,
     modality: str,
     device: torch.device,
+    *,
+    organism_index: int = 0,
 ) -> tuple[nn.Module, int, str]:
     """Load pretrained model with native heads and resolve the comparison track.
 
     Pass either ``native_biosample`` (substring match, case-insensitive) or
     ``native_track_index``. Returns (model, track_index, display_name).
+
+    ``organism_index`` selects which organism's built-in catalog and tracks to
+    compare against — a mouse fine-tune (index 1) must compare against the mouse
+    native head/track, not the human default.
     """
     model = AlphaGenome.from_pretrained(str(pretrained_weights), device=device)
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
 
-    catalog = TrackMetadataCatalog.load_builtin("human")
+    organism_name = "mouse" if organism_index == 1 else "human"
+    catalog = TrackMetadataCatalog.load_builtin(organism_name)
     model.set_track_metadata_catalog(catalog)
 
-    tracks = catalog.get_tracks(modality, organism=0)
+    tracks = catalog.get_tracks(modality, organism=organism_index)
 
     if native_track_index is not None:
-        if native_track_index >= len(tracks):
+        if not 0 <= native_track_index < len(tracks):
             raise ValueError(
                 f"Track index {native_track_index} out of range for "
                 f"{modality} ({len(tracks)} tracks)"
@@ -238,13 +187,19 @@ def evaluate_split(
     loader: DataLoader,
     device: torch.device,
     resolutions: tuple[int, ...],
+    *,
+    organism_index: int,
     positional_weight: float = 5.0,
     progress_desc: str = "Evaluating (finetuned)",
 ) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], float]:
-    """Run finetuned model inference.
+    """Run finetuned model inference at ``organism_index``.
 
     Returns (preds, targets, avg_loss). Predictions are in experimental
     (unscaled) space so they can be compared directly to BigWig values.
+
+    ``organism_index`` selects the trunk organism embedding; it must match what the
+    checkpoint was trained on (resolve it once via ``select_organism_index`` at the
+    call boundary — do not default to 0 for a mouse fine-tune).
     """
     model.eval()
     head = model.heads[modality]
@@ -256,8 +211,8 @@ def evaluate_split(
 
     for sequences, targets_dict in tqdm(loader, desc=progress_desc):
         sequences = sequences.to(device)
-        organism_idx = torch.zeros(
-            sequences.shape[0], dtype=torch.long, device=device,
+        organism_idx = torch.full(
+            (sequences.shape[0],), organism_index, dtype=torch.long, device=device,
         )
 
         with torch.autocast(
@@ -330,19 +285,23 @@ def evaluate_native_split(
     loader: DataLoader,
     device: torch.device,
     resolutions: tuple[int, ...],
+    *,
+    organism_index: int,
     progress_desc: str = "Evaluating (native)",
 ) -> dict[int, np.ndarray]:
-    """Run native model on the same loader, extract a single track.
+    """Run native model on the same loader at ``organism_index``, extract a single track.
 
-    Returns dict[resolution -> (N, seq_len, 1)].
+    Returns dict[resolution -> (N, seq_len, 1)]. ``organism_index`` must match the
+    fine-tuned comparison's organism (and the track selected in ``load_native_model``),
+    otherwise the native baseline is computed for the wrong species.
     """
     model.eval()
     preds_by_res: dict[int, list[np.ndarray]] = {r: [] for r in resolutions}
 
     for sequences, _ in tqdm(loader, desc=progress_desc):
         sequences = sequences.to(device)
-        organism_idx = torch.zeros(
-            sequences.shape[0], dtype=torch.long, device=device,
+        organism_idx = torch.full(
+            (sequences.shape[0],), organism_index, dtype=torch.long, device=device,
         )
 
         with torch.autocast(
