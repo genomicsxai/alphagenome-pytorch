@@ -1,16 +1,21 @@
 """Fine-tuning heads for AlphaGenome.
 
-Provides a factory function to create GenomeTracksHead instances
-configured for fine-tuning on specific assay types.
+Provides a factory function to create GenomeTracksHead instances configured
+for fine-tuning on specific assay types. Splice modalities return the
+original heads from alphagenome_pytorch.heads directly (no adapter).
 """
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 from typing import Literal
 
-from alphagenome_pytorch.heads import GenomeTracksHead
-
-
+from alphagenome_pytorch.heads import (
+    GenomeTracksHead,
+    SpliceSitesClassificationHead,
+    SpliceSitesUsageHead,
+    SpliceSitesJunctionHead,
+)
 # All supported assay types and their squashing behavior
 # Only RNA-seq uses squashing (power law expansion)
 ASSAY_TYPES = {
@@ -21,51 +26,44 @@ ASSAY_TYPES = {
     'cage': {'apply_squashing': False, 'default_resolutions': (1, 128)},
     'chip_tf': {'apply_squashing': False, 'default_resolutions': (128,)},
     'chip_histone': {'apply_squashing': False, 'default_resolutions': (128,)},
+    'splice_site': {'apply_squashing': False, 'default_resolutions': (1,)},
+    'splice_usage': {'apply_squashing': False, 'default_resolutions': (1,)},
+    'splice_junctions': {'apply_squashing': False, 'default_resolutions': (1,)},
 }
 
 
 def create_finetuning_head(
-    assay_type: Literal['rna_seq', 'atac', 'dnase', 'procap', 'cage', 'chip_tf', 'chip_histone'],
+    assay_type: Literal['rna_seq', 'atac', 'dnase', 'procap', 'cage', 'chip_tf', 'chip_histone', 'splice_site', 'splice_usage', 'splice_junctions'],
     n_tracks: int,
     resolutions: list[int] | tuple[int, ...] | None = None,
     num_organisms: int = 1,
     track_means: torch.Tensor | None = None,
     init_scheme: Literal['truncated_normal', 'uniform'] = 'truncated_normal',
     encoder_only: bool = False,
-) -> GenomeTracksHead:
-    """Create a GenomeTracksHead configured for fine-tuning.
+    rope_init: str = "truncated_normal",
+) -> nn.Module:
+    """Create a finetuning head configured for the given assay type.
 
     Args:
-        assay_type: Type of assay. Controls whether squashing is applied.
-            'rna_seq' applies power law expansion.
-            All other types do not apply squashing.
-        n_tracks: Number of output tracks (e.g., number of cell types).
+        assay_type: Type of assay. Splice modalities ('splice_site', 'splice_usage',
+            'splice_junctions') return original head instances from alphagenome_pytorch.heads.
+            All others return GenomeTracksHead.
+        n_tracks: Number of output tracks.
+            - For 'splice_site': ignored (always 5 classes).
+            - For 'splice_usage' or 'splice_junctions': number of junction samples.
+            - For others: varies by assay type.
         resolutions: Output resolutions. Valid values are 1 and/or 128.
-            If None, uses default resolutions for the assay type:
-            - (1, 128) for atac, dnase, procap, cage, rna_seq
-            - (128,) for chip_tf, chip_histone
+            If None, uses default resolutions for the assay type.
         num_organisms: Number of organisms. Default: 1 for fine-tuning.
-        track_means: Optional track means tensor for scaling.
-            Shape: (num_organisms, n_tracks). Defaults to ones.
-        init_scheme: Weight initialization scheme for head parameters.
-            'truncated_normal' (default): Match JAX - truncated normal for
-                weights (std=1/sqrt(fan_in)), zeros for biases.
-            'uniform': Legacy PyTorch-style uniform initialization for both
-                weights and biases.
-        encoder_only: If True, create a head that accepts raw CNN encoder output
-            (B, S//128, 1536) instead of full transformer embeddings. Automatically
-            restricts resolutions to (128,). Use with ``model.forward(encoder_only=True)``
-            for short-sequence fine-tuning (e.g. MPRA assays).
+        track_means: Optional track means tensor for scaling (ignored for splice modalities).
+        init_scheme: Weight initialization scheme ('truncated_normal' or 'uniform').
+        encoder_only: If True, restrict to 128bp resolution only.
 
     Returns:
-        Configured GenomeTracksHead instance.
-
-    Example:
-        >>> head = create_finetuning_head('atac', n_tracks=10)
-        >>> head = create_finetuning_head('rna_seq', n_tracks=5, resolutions=(1, 128))
-        >>> head = create_finetuning_head('chip_tf', n_tracks=100, resolutions=(128,))
-        >>> # Encoder-only head for short sequences
-        >>> head = create_finetuning_head('atac', n_tracks=10, encoder_only=True)
+        For splice_site: SpliceSitesClassificationHead.
+        For splice_usage: SpliceSitesUsageHead.
+        For splice_junctions: SpliceSitesJunctionHead.
+        For others: GenomeTracksHead.
 
     Raises:
         ValueError: If an invalid assay type or resolution is provided.
@@ -73,6 +71,15 @@ def create_finetuning_head(
     if assay_type not in ASSAY_TYPES:
         valid_types = ', '.join(sorted(ASSAY_TYPES.keys()))
         raise ValueError(f"Invalid assay type '{assay_type}'. Must be one of: {valid_types}")
+
+    # Handle splice modalities: return original heads directly (no adapter)
+    if assay_type == 'splice_site':
+        return SpliceSitesClassificationHead(in_channels=1536, num_organisms=1)
+    if assay_type == 'splice_usage':
+        return SpliceSitesUsageHead(in_channels=1536, num_output_tracks=n_tracks, num_organisms=1)
+    if assay_type == 'splice_junctions':
+        return SpliceSitesJunctionHead(in_channels=1536, num_tissues=n_tracks, num_organisms=1,
+                                       rope_init=rope_init)
 
     assay_config = ASSAY_TYPES[assay_type]
 
@@ -122,4 +129,9 @@ def create_finetuning_head(
 # Embedding dimension of the raw CNN encoder output (before transformer/decoder).
 ENCODER_EMBEDDING_DIM = 1536
 
-__all__ = ['ASSAY_TYPES', 'ENCODER_EMBEDDING_DIM', 'create_finetuning_head']
+
+__all__ = [
+    'ASSAY_TYPES',
+    'ENCODER_EMBEDDING_DIM',
+    'create_finetuning_head',
+]

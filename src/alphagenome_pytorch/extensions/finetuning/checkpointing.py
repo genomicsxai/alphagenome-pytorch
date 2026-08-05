@@ -11,6 +11,7 @@ import signal
 import struct
 import sys
 import tempfile
+import threading
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -242,11 +243,12 @@ def load_checkpoint(
 
 
 class PreemptionHandler:
-    """Handler for graceful preemption via signals (e.g., SIGUSR1 from SLURM).
+    """Handler for graceful preemption via signals.
 
-    When the signal is received, sets a flag. The training loop should check
-    `handler.preempted` and call `handler.save_and_exit()` to save a checkpoint
-    before exiting gracefully.
+    Listens for SIGUSR1 (SLURM preemption), SIGTERM (scancel / kill),
+    and SIGINT (Ctrl+C). When any signal is received, sets a flag. The
+    training loop should check `handler.preempted` and call
+    `handler.save_and_exit()` to save a checkpoint before exiting gracefully.
 
     Note:
         The save function is NOT called inside the signal handler to avoid
@@ -255,7 +257,7 @@ class PreemptionHandler:
         Instead, the training loop should check the flag and save explicitly.
 
     Attributes:
-        preempted: Whether preemption signal was received.
+        preempted: Whether a preemption signal was received.
 
     Example:
         >>> handler = PreemptionHandler(
@@ -271,12 +273,14 @@ class PreemptionHandler:
         ...     # ... training loop ...
     """
 
+    _SIGNALS = (signal.SIGUSR1, signal.SIGTERM, signal.SIGINT)
+
     def __init__(
         self,
         save_fn: Callable[[], None] | None = None,
         rank: int = 0,
         world_size: int = 1,
-        signal_num: int = signal.SIGUSR1,
+        signal_num: int = signal.SIGUSR1,  # kept for backward compatibility, ignored
     ) -> None:
         """Initialize the preemption handler.
 
@@ -284,20 +288,21 @@ class PreemptionHandler:
             save_fn: Function to call to save checkpoint (called from training loop, not signal handler).
             rank: Process rank for distributed training.
             world_size: Total number of processes.
-            signal_num: Signal to handle (default: SIGUSR1, used by SLURM).
+            signal_num: Ignored; all of SIGUSR1, SIGTERM, and SIGINT are always registered.
         """
         self.save_fn = save_fn
         self.rank = rank
         self.world_size = world_size
-        self.signal_num = signal_num
         self.preempted = False
-        self._original_handler = None
+        self._original_handlers: dict[int, Any] = {}
+        self._save_thread: threading.Thread | None = None
 
     def _handler(self, signum: int, frame) -> None:
-        """Signal handler that sets preempted flag.
+        """Signal handler that sets preempted flag and triggers an immediate save.
 
-        Note: Does NOT perform I/O to avoid deadlocks. The training loop
-        should check `self.preempted` and call `save_and_exit()` explicitly.
+        The save is dispatched to a background thread so that file I/O does not
+        run inside the signal handler (which would risk deadlocks on locks held
+        by the interrupted thread).
         """
         self.preempted = True
 
@@ -306,15 +311,28 @@ class PreemptionHandler:
             print(f"SIGNAL {signum} received — will save checkpoint and exit.")
             print(f"{'='*60}")
 
+        # Dispatch save to a background thread so we don't do I/O inside the
+        # signal handler. Guard against double-saving if the signal fires twice.
+        if self.save_fn is not None and (
+            self._save_thread is None or not self._save_thread.is_alive()
+        ):
+            self._save_thread = threading.Thread(target=self.save_fn, daemon=True)
+            self._save_thread.start()
+
     def save_and_exit(self) -> None:
         """Save checkpoint and synchronize processes.
 
         Call this from the training loop when `preempted` is True.
-        This is safe to call because it runs in the main thread, not
-        inside a signal handler.
+        If the signal handler already dispatched a save thread, this waits
+        for it to finish rather than saving twice.
         """
         if is_main_process(self.rank):
-            if self.save_fn is not None:
+            if self._save_thread is not None and self._save_thread.is_alive():
+                print("Waiting for preemption checkpoint to finish saving...")
+                self._save_thread.join()
+                print("Preemption checkpoint saved.")
+            elif self.save_fn is not None and self._save_thread is None:
+                # Signal was not received (e.g. called directly); save now.
                 print("Saving preemption checkpoint...")
                 self.save_fn()
                 print("Preemption checkpoint saved.")
@@ -325,14 +343,15 @@ class PreemptionHandler:
             dist.barrier()
 
     def register(self) -> None:
-        """Register the signal handler."""
-        self._original_handler = signal.signal(self.signal_num, self._handler)
+        """Register handlers for SIGUSR1, SIGTERM, and SIGINT."""
+        for sig in self._SIGNALS:
+            self._original_handlers[sig] = signal.signal(sig, self._handler)
 
     def unregister(self) -> None:
-        """Restore the original signal handler."""
-        if self._original_handler is not None:
-            signal.signal(self.signal_num, self._original_handler)
-            self._original_handler = None
+        """Restore original signal handlers."""
+        for sig, original in self._original_handlers.items():
+            signal.signal(sig, original)
+        self._original_handlers.clear()
 
 
 def setup_preemption_handler(

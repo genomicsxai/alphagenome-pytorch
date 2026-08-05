@@ -70,6 +70,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -99,6 +100,7 @@ from alphagenome_pytorch.extensions.finetuning import (
     CachedGenome,
     GenomicDataset,
     MultimodalDataset,
+    SplicingDataset,
     compute_track_means,
     collate_genomic,
     collate_multimodal,
@@ -137,9 +139,10 @@ from alphagenome_pytorch.extensions.finetuning.transfer import (
     prepare_for_transfer,
     validate_locon_targets,
     transfer_config_to_dict,
+    load_pretrained_head_weights,
 )
 
-from alphagenome_pytorch.extensions.finetuning.args import parse_args
+from alphagenome_pytorch.extensions.finetuning.args import parse_args, SPLICE_MODALITIES
 
 # =============================================================================
 # Utilities
@@ -191,13 +194,39 @@ def create_datasets(
 
     # Build per-modality track names
     modality_track_names: dict[str, list[str]] = {}
-    for modality, bigwigs in args.modality_to_bigwigs.items():
-        modality_track_names[modality] = [Path(bw).stem for bw in bigwigs]
-        print_rank0(
-            f"  {modality}: {len(bigwigs)} tracks, resolutions={args.modality_resolutions[modality]} - "
-            f"{modality_track_names[modality]}",
-            rank,
-        )
+    for modality in args.modalities:
+        if modality in SPLICE_MODALITIES:
+            junc_files = args.modality_to_star_junctions.get(modality, [])
+            ssu_files = args.modality_to_ssu_files.get(modality) or []
+            junc_stems = [Path(p).stem for p in junc_files]
+            ssu_stems = [Path(p).stem for p in ssu_files]
+            usage_stems = ssu_stems if ssu_stems else junc_stems  # fallback to junction stems
+            if modality == "splice_site":
+                modality_track_names[modality] = [
+                    "cls_donor_pos", "cls_acceptor_pos", "cls_donor_neg", "cls_acceptor_neg", "cls_none"
+                ]
+            elif modality == "splice_usage":
+                modality_track_names[modality] = (
+                    [f"{stem}_pos" for stem in usage_stems] + [f"{stem}_neg" for stem in usage_stems]
+                )
+            elif modality == "splice_junctions":
+                modality_track_names[modality] = (
+                    [f"{stem}_pos" for stem in junc_stems] + [f"{stem}_neg" for stem in junc_stems]
+                )
+            print_rank0(
+                f"  {modality}: {len(junc_files)} junction files, {len(ssu_files)} SSU files, "
+                f"resolutions={args.modality_resolutions[modality]}, "
+                f"tracks={len(modality_track_names[modality])}",
+                rank,
+            )
+        else:
+            bigwigs = args.modality_to_bigwigs.get(modality, [])
+            modality_track_names[modality] = [Path(bw).stem for bw in bigwigs]
+            print_rank0(
+                f"  {modality}: {len(bigwigs)} tracks, resolutions={args.modality_resolutions[modality]} - "
+                f"{modality_track_names[modality]}",
+                rank,
+            )
 
     # Optional gene-mask extractor for the gene LFC training loss (B3.2).
     # Only attached to the rna_seq dataset; gene_mask is sample-level so
@@ -214,8 +243,8 @@ def create_datasets(
             _load_intervals_from_bed,
         )
 
-        print_rank0(f"Loading GTF for gene LFC loss: {args.gtf}", rank)
-        gene_table = cached_load_gene_table(args.gtf, filter_protein_coding=True)
+        print_rank0(f"Loading GTF for gene LFC loss: {args.gene_gtf}", rank)
+        gene_table = cached_load_gene_table(args.gene_gtf, filter_protein_coding=True)
         gene_mask_extractor = GeneMaskExtractor(gene_table)
 
         # Project the BED windows used by the dataset (after centering/expansion
@@ -240,8 +269,41 @@ def create_datasets(
     train_datasets = {}
     val_datasets = {}
 
-    for modality, bigwigs in args.modality_to_bigwigs.items():
+    _splice_dataset_cache: dict[tuple, tuple] = {}  # shares datasets across co-expanded sub-modalities
+
+    for modality in args.modalities:
         resolutions = args.modality_resolutions[modality]
+        if modality in SPLICE_MODALITIES:
+            junc_files = args.modality_to_star_junctions.get(modality, [])
+            ssu_files = args.modality_to_ssu_files.get(modality) or []
+            junc_key = (tuple(sorted(junc_files)), tuple(sorted(ssu_files)))
+            if junc_key not in _splice_dataset_cache:
+                _splice_dataset_cache[junc_key] = (
+                    SplicingDataset(
+                        genome_fasta=genome,
+                        bed_file=args.train_bed,
+                        star_junction_files=junc_files,
+                        ssu_files=ssu_files,
+                        sequence_length=args.sequence_length,
+                        filter_to_junctions=False,
+                        gtf_file=args.gtf,
+                        max_splice_sites=args.junction_top_k,
+                    ),
+                    SplicingDataset(
+                        genome_fasta=genome,
+                        bed_file=args.val_bed,
+                        star_junction_files=junc_files,
+                        ssu_files=ssu_files,
+                        sequence_length=args.sequence_length,
+                        filter_to_junctions=False,
+                        gtf_file=args.gtf,
+                        max_splice_sites=args.junction_top_k,
+                    ),
+                )
+            train_datasets[modality], val_datasets[modality] = _splice_dataset_cache[junc_key]
+            continue
+
+        bigwigs = args.modality_to_bigwigs.get(modality, [])
         # Attach the gene-mask extractor only to the modality that consumes
         # the gene LFC loss (rna_seq today).
         attach_gene_mask = (
@@ -546,14 +608,19 @@ def create_model(
     new_heads_config: dict[str, dict] = {}
     for modality, track_names in modality_track_names.items():
         head_res = (128,) if is_encoder_only else modality_resolutions[modality]
+        n_tracks = len(track_names)
+        # splice_junctions' track_names cover both strands (2 per sample), but
+        # the head's n_tracks is num_tissues (samples) -- halve it here.
+        n_tracks_for_head = n_tracks // 2 if modality == "splice_junctions" else n_tracks
         new_heads_config[modality] = {
             "modality": modality,
-            "num_tracks": len(track_names),
+            "num_tracks": n_tracks_for_head,
             "resolutions": list(head_res),
             "encoder_only": is_encoder_only,
             "track_means": modality_track_means.get(modality),
             "num_organisms": 1,
             "init_scheme": args.head_init_scheme,
+            "rope_init": args.rope_init,
         }
 
     # Create heads directly except in active adapter modes, where
@@ -569,12 +636,13 @@ def create_model(
         for modality, track_names in modality_track_names.items():
             head = create_finetuning_head(
                 assay_type=modality,
-                n_tracks=len(track_names),
+                n_tracks=new_heads_config[modality]["num_tracks"],
                 resolutions=tuple(new_heads_config[modality]["resolutions"]),
                 num_organisms=1,
                 track_means=modality_track_means.get(modality),
                 init_scheme=args.head_init_scheme,
                 encoder_only=is_encoder_only,
+                rope_init=args.rope_init,
             )
             add_head(model, modality, head)
             heads[modality] = head
@@ -583,6 +651,16 @@ def create_model(
                 f"at resolutions {tuple(new_heads_config[modality]['resolutions'])}",
                 rank,
             )
+
+    # Optionally initialize head weights from pretrained organism slice.
+    if getattr(args, "pretrained_head_sample_dict", None) and rank == 0:
+        print_rank0("Loading pretrained head weights:", rank)
+        loaded = load_pretrained_head_weights(
+            model, args.pretrained_weights, args.pretrained_head_sample_dict,
+            organism_idx=organism_index_from_args(args),
+        )
+        if not loaded:
+            print_rank0("  Warning: no pretrained head weights were loaded.", rank)
 
     # Configure trainable params based on mode
     trainable_params: list[torch.nn.Parameter] = []
@@ -757,7 +835,7 @@ def main(args: argparse.Namespace | None = None) -> None:
     if getattr(args, "gene_expr_eval", False):
         from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
 
-        ann_path = args.gene_expr_annotation or args.gtf
+        ann_path = args.gene_expr_annotation or args.gene_gtf
         print_rank0(f"Loading annotation for gene-expression eval: {ann_path}", rank)
         gene_expr_annotation = GeneAnnotation(ann_path)
         # The metric aggregates over exons, but --gtf may legitimately be a
@@ -850,6 +928,10 @@ def main(args: argparse.Namespace | None = None) -> None:
     if is_main_process(rank):
         print("Computing track means...")
         for modality, bigwigs in args.modality_to_bigwigs.items():
+            if not bigwigs:
+                modality_track_means[modality] = None
+                print(f"  {modality}: no bigwig tracks, skipping track means")
+                continue
             modality_track_means[modality] = compute_track_means(
                 bigwigs,
                 args.train_bed,
@@ -940,6 +1022,7 @@ def main(args: argparse.Namespace | None = None) -> None:
     start_epoch = 1
     best_val_loss = float("inf")
     wandb_run_id = None
+    skip_batches = 0
 
     if resume_path and resume_path.exists():
         print_rank0(f"Resuming from: {resume_path}", rank)
@@ -969,9 +1052,14 @@ def main(args: argparse.Namespace | None = None) -> None:
                 device="cpu",
             )
             start_epoch = ckpt["epoch"] + 1
+            skip_batches = ckpt.get("batch_idx", 0)
             best_val_loss = ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf")))
             wandb_run_id = ckpt.get("wandb_run_id")
             print_rank0(f"  Resumed at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}", rank)
+            # ckpt holds a full CPU copy of model_state_dict/optimizer_state_dict;
+            # its values have already been loaded into model/optimizer, so drop it
+            # before DataLoader workers fork to avoid duplicating it across workers.
+            del ckpt
 
     # Config for logging
     config = {
@@ -1019,6 +1107,8 @@ def main(args: argparse.Namespace | None = None) -> None:
     }
 
     # Logger (rank 0 only)
+    steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
+    resume_step = (start_epoch - 1) * steps_per_epoch + skip_batches // args.gradient_accumulation_steps
     logger = TrainingLogger(
         output_dir=output_dir,
         rank=rank,
@@ -1028,12 +1118,14 @@ def main(args: argparse.Namespace | None = None) -> None:
         run_name=run_name,
         config=config,
         resume_id=wandb_run_id if resume_path else None,
+        initial_step=resume_step,
     )
 
     use_amp = not args.no_amp
 
     # Preemption handler state
     current_epoch = start_epoch
+    _save_state: dict = {"batch_idx": 0}
 
     def _save_preempt():
         """Save preemption checkpoint, honoring --save-delta / --no-full-checkpoint."""
@@ -1051,6 +1143,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 scheduler=scheduler,
                 best_val_loss=best_val_loss,
                 wandb_run_id=logger.wandb_run_id,
+                batch_idx=_save_state["batch_idx"],
                 **transfer_config_kwargs,
             )
             print(f"Preemption checkpoint saved to {output_dir / 'checkpoint_preempt.pth'}")
@@ -1070,6 +1163,54 @@ def main(args: argparse.Namespace | None = None) -> None:
             print(f"Preemption delta checkpoint saved to {output_dir / 'checkpoint_preempt.delta.pth'}")
 
     handler = setup_preemption_handler(_save_preempt, rank, world_size)
+
+    # Eval-only mode: load checkpoint and run validation, then exit.
+    if args.eval_only:
+        import json
+        if resume_path is None or not resume_path.exists():
+            print_rank0("ERROR: --eval-only requires a checkpoint via --resume; none found", rank)
+            sys.exit(1)
+        print_rank0(f"\n{'=' * 60}", rank)
+        print_rank0(f"Eval-only mode: loaded checkpoint from {resume_path}", rank)
+        print_rank0(f"{'=' * 60}", rank)
+
+        _eval_encoder_only = args.mode == "encoder-only"
+        _eval_validate_kwargs = dict(
+            model=model, heads=heads, device=device,
+            modality_weights=args.modality_weight_dict,
+            resolution_weights=resolution_weights_per_modality,
+            positional_weight=args.positional_weight,
+            count_weight=args.count_weight,
+            compute_pearson=True,  # eval-only mode always computes Pearson
+            num_segments=args.num_segments,
+            min_segment_size=args.min_segment_size,
+            rank=rank, world_size=world_size,
+            encoder_only=_eval_encoder_only,
+            organism_idx=organism_index,
+            junction_top_k=args.junction_top_k,
+            junction_loss=args.junction_loss,
+            compute_per_sample=args.metrics_per_sample,
+            min_alpha_juncs=args.min_alpha_juncs,
+            gene_annotation=gene_expr_annotation,
+            gene_expr_track_strands=gene_expr_track_strands,
+            gene_expr_window_cache=gene_expr_window_cache,
+        )
+
+        val_loss, val_metrics = validate_multihead(val_loader=val_loader, **_eval_validate_kwargs)
+
+        train_metrics = {}
+        if args.eval_train_pearson:
+            _, train_metrics = validate_multihead(val_loader=train_loader, **_eval_validate_kwargs)
+            train_metrics = {f"train_{k}": v for k, v in train_metrics.items()}
+
+        all_metrics = {**val_metrics, **train_metrics}
+        metrics_file = output_dir / "eval_only_metrics.json"
+        metrics_file.parent.mkdir(parents=True, exist_ok=True)
+        if is_main_process(rank):
+            with open(metrics_file, "w") as f:
+                json.dump(all_metrics, f, indent=2)
+            print(f"\nEval metrics saved to {metrics_file}")
+        sys.exit(0)
 
     # Training loop
     print_rank0("\n" + "=" * 60, rank)
@@ -1103,6 +1244,8 @@ def main(args: argparse.Namespace | None = None) -> None:
                 break
 
             current_epoch = epoch
+            epoch_skip = skip_batches if epoch == start_epoch else 0
+            global_step_offset = (epoch - 1) * steps_per_epoch + epoch_skip // args.gradient_accumulation_steps
 
             # Clear GPU cache between epochs for robustness
             if torch.cuda.is_available():
@@ -1140,7 +1283,16 @@ def main(args: argparse.Namespace | None = None) -> None:
                     gene_loss_weights=gene_loss_weights,
                     gene_cross_track_weight=args.gene_cross_track_weight,
                     strand_channel_masks=gene_strand_channel_masks,
-                    organism=organism_index,
+                    organism_idx=organism_index,
+                    junction_top_k=args.junction_top_k,
+                    junction_loss=args.junction_loss,
+                    min_alpha_juncs=args.min_alpha_juncs,
+                    handler=handler,
+                    save_every_steps=args.save_every_steps,
+                    save_fn=_save_preempt if not args.no_save_checkpoints else None,
+                    global_step_offset=global_step_offset,
+                    skip_batches=epoch_skip,
+                    save_state=_save_state,
                 )
             else:
                 # Standard multimodal training (uses multihead functions)
@@ -1172,7 +1324,16 @@ def main(args: argparse.Namespace | None = None) -> None:
                     gene_loss_weights=gene_loss_weights,
                     gene_cross_track_weight=args.gene_cross_track_weight,
                     strand_channel_masks=gene_strand_channel_masks,
-                    organism=organism_index,
+                    organism_idx=organism_index,
+                    junction_top_k=args.junction_top_k,
+                    junction_loss=args.junction_loss,
+                    min_alpha_juncs=args.min_alpha_juncs,
+                    handler=handler,
+                    save_every_steps=args.save_every_steps,
+                    save_fn=_save_preempt if not args.no_save_checkpoints else None,
+                    global_step_offset=global_step_offset,
+                    skip_batches=epoch_skip,
+                    save_state=_save_state,
                 )
 
             if handler.preempted:
@@ -1193,11 +1354,15 @@ def main(args: argparse.Namespace | None = None) -> None:
                 use_amp=use_amp,
                 num_segments=args.num_segments,
                 min_segment_size=args.min_segment_size,
-                compute_pearson=True,
+                compute_pearson=not args.no_val_pearson,
                 rank=rank,
                 world_size=world_size,
                 encoder_only=encoder_only,
-                organism=organism_index,
+                organism_idx=organism_index,
+                junction_top_k=args.junction_top_k,
+                junction_loss=args.junction_loss,
+                compute_per_sample=args.metrics_per_sample,
+                min_alpha_juncs=args.min_alpha_juncs,
                 gene_annotation=gene_expr_annotation,
                 gene_expr_track_strands=gene_expr_track_strands,
                 gene_expr_window_cache=gene_expr_window_cache,
@@ -1274,6 +1439,12 @@ def main(args: argparse.Namespace | None = None) -> None:
                             wandb_run_id=logger.wandb_run_id,
                         )
                         print(f"  Saved best delta checkpoint (val_loss={val_loss:.4f})")
+
+                # Epoch complete: reset mid-epoch batch tracking so a preemption
+                # signal firing between epochs (before any batch of the next
+                # epoch has run) doesn't report a stale non-zero batch_idx that
+                # would cause the next resume to skip into the wrong epoch.
+                _save_state["batch_idx"] = 0
 
                 if epoch % args.save_every == 0:
                     if write_full:

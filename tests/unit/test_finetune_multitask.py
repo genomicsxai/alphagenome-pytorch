@@ -480,9 +480,9 @@ class TestParseArgsGeneExprEval:
 
     def test_falls_back_to_gtf_annotation(self, monkeypatch):
         self._rna_cli(monkeypatch, [
-            "--gene-expr-eval", "--gtf", "genes.gtf", "--track-strands", "+",
+            "--gene-expr-eval", "--gene-gtf", "genes.gtf", "--track-strands", "+",
         ])
-        args = parse_args()  # --gtf satisfies the annotation requirement
+        args = parse_args()  # --gene-gtf satisfies the annotation requirement
         assert args.gene_expr_eval is True
 
     def test_requires_annotation(self, monkeypatch):

@@ -279,7 +279,10 @@ class TestModalityConfigs:
 
     def test_all_modalities_present(self):
         """Test all expected modalities are defined."""
-        expected = {'rna_seq', 'atac', 'dnase', 'procap', 'cage', 'chip_tf', 'chip_histone'}
+        expected = {
+            'rna_seq', 'atac', 'dnase', 'procap', 'cage', 'chip_tf', 'chip_histone',
+            'splice', 'splice_junction',
+        }
         assert set(MODALITY_CONFIGS.keys()) == expected
 
     def test_all_configs_are_modality_config(self):

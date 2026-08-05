@@ -198,9 +198,9 @@ class SequenceParallelism:
         mask = (global_indices >= region_start) & (global_indices < region_end)
 
         if not mask.any():
-            # No relevant positions on this rank → return empty slice
-            B, C = x_local.shape[:2]
-            return x_local.new_zeros(B, C, 0)
+            # Empty slice — preserves requires_grad so concat_across_ranks
+            # uses the differentiable path consistently across all ranks.
+            return x_local[..., :0]
 
         positions_here = global_indices[mask]
 
@@ -242,12 +242,24 @@ class SequenceParallelism:
         K_max = max(counts)
         B, C = x_local.shape[:2]
 
-        padded = torch.zeros(B, C, K_max, device=device)
-        padded[..., :K_local] = x_local
-
-        # Gather padded tensors
-        gathered = [torch.zeros_like(padded) for _ in range(world)]
-        dist.all_gather(gathered, padded)
+        # Use differentiable all_gather when gradient is needed (e.g. junction head
+        # conv logits under sequence parallelism); fall back to non-differentiable
+        # dist.all_gather otherwise to avoid the overhead of dist_fn.
+        #
+        # IMPORTANT: use torch.cat (not in-place assignment) so that padded.requires_grad
+        # mirrors x_local.requires_grad even when K_local=0. In-place assignment of an
+        # empty tensor is a no-op and leaves padded disconnected from the autograd graph,
+        # which would cause NCCL reduce_scatter asymmetry across ranks.
+        if torch.is_grad_enabled() and x_local.requires_grad:
+            pad = torch.zeros(B, C, K_max - K_local, device=device, dtype=x_local.dtype)
+            padded = torch.cat([x_local, pad], dim=-1)
+            gathered = list(dist_fn.all_gather(padded))
+        else:
+            padded = torch.zeros(B, C, K_max, device=device, dtype=x_local.dtype)
+            if K_local > 0:
+                padded[..., :K_local] = x_local
+            gathered = [torch.zeros_like(padded) for _ in range(world)]
+            dist.all_gather(gathered, padded)
 
         # Remove padding and concatenate
         out = []

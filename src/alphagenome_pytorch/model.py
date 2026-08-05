@@ -232,6 +232,7 @@ class AlphaGenome(nn.Module):
         dtype_policy: Optional[DtypePolicy] = None,
         track_means_dict: Optional[dict] = None,
         gradient_checkpointing: bool = False,
+        rope_init: str = "truncated_normal",
     ):
         """Initialize AlphaGenome model."""
         super().__init__()
@@ -350,6 +351,7 @@ class AlphaGenome(nn.Module):
             num_tissues=max(splice_junction_tracks_per_organism),
             num_organisms=num_organisms,
             num_tracks_per_organism=splice_junction_tracks_per_organism,
+            rope_init=rope_init,
         )
 
         self._track_metadata_catalog: TrackMetadataCatalog | None = None
@@ -813,7 +815,7 @@ class AlphaGenome(nn.Module):
             if self.splice_sites_usage_head is not None:
                 valid_heads.add('splice_site_usage')
             if self.splice_sites_junction_head is not None:
-                valid_heads.add('splice_junctions')
+                valid_heads.add('splice_sites_junction')
 
             # Check for unknown heads
             unknown_heads = set(heads) - valid_heads
@@ -857,7 +859,7 @@ class AlphaGenome(nn.Module):
 
             # Splice predictions (require 1bp embeddings)
             need_splice = head_set is None or any(
-                k in head_set for k in ('splice_sites', 'splice_site_usage', 'splice_junctions')
+                k in head_set for k in ('splice_sites', 'splice_site_usage', 'splice_sites_junction')
             )
             if need_1bp and need_splice:
                 # Also compute classification when junction needs it for position generation
@@ -866,7 +868,7 @@ class AlphaGenome(nn.Module):
                     head_set is None
                     or 'splice_sites' in head_set
                     or (
-                        'splice_junctions' in head_set
+                        'splice_sites_junction' in head_set
                         and splice_site_positions is None
                     )
                 )
@@ -883,14 +885,14 @@ class AlphaGenome(nn.Module):
                         )
 
                 if self.splice_sites_junction_head is not None:
-                    if head_set is None or 'splice_junctions' in head_set:
+                    if head_set is None or 'splice_sites_junction' in head_set:
                         # Use provided positions if given, otherwise generate from classification
                         if splice_site_positions is not None:
                             top_k_positions = splice_site_positions
                         else:
                             if classification_output is None:
                                 raise ValueError(
-                                    "splice_junctions requires either splice_site_positions "
+                                    "splice_sites_junction requires either splice_site_positions "
                                     "or an available splice_sites classification head"
                                 )
                             # probs: (B, S, 5) NLC - already correct format for generate_splice_site_positions
@@ -908,10 +910,15 @@ class AlphaGenome(nn.Module):
                                 pad_to_length=512,
                                 threshold=0.1,
                             )
-                        outputs['splice_junctions'] = self.splice_sites_junction_head(
+                        # embeddings_1bp is always NCL from _compute_embeddings_ncl, regardless
+                        # of the outer channels_last flag — unlike its sibling heads,
+                        # SpliceSitesJunctionHead.forward's channels_last also gates an input
+                        # transpose, so this must stay hardcoded False to avoid corrupting
+                        # already-NCL data.
+                        outputs['splice_sites_junction'] = self.splice_sites_junction_head(
                             embeddings_1bp,
                             organism_index,
-                            channels_last=channels_last,
+                            channels_last=False,
                             splice_site_positions=top_k_positions,
                         )
 
@@ -931,8 +938,10 @@ class AlphaGenome(nn.Module):
         return self._cast_outputs(outputs)
 
     def _cast_outputs(self, outputs):
-        """Recursively cast all output tensors to output_dtype."""
+        """Recursively cast floating-point output tensors to output_dtype (integers left unchanged)."""
         if torch.is_tensor(outputs):
+            if not outputs.is_floating_point():
+                return outputs
             return self.dtype_policy.cast_to_output(outputs)
         if isinstance(outputs, dict):
             return {k: self._cast_outputs(v) for k, v in outputs.items()}

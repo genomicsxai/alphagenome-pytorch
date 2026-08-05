@@ -78,6 +78,8 @@ GenomeTracksHead for each assay type
 - `src/alphagenome_pytorch/heads.py` - GenomeTracksHead, ContactMapsHead, predictions_scaling
 - `src/alphagenome_pytorch/embeddings.py` - OutputEmbedder, OutputPair
 - `src/alphagenome_pytorch/sequence_parallel.py` - SequenceParallelism for multi-GPU inference and training
+- `src/alphagenome_pytorch/extensions/finetuning/args.py` - CLI flag definitions for `agt finetune` / `scripts/finetune.py` (dependency-light: no torch import, so `--help` works without a full install)
+- `src/alphagenome_pytorch/extensions/finetuning/runner.py` - finetuning orchestration: dataset/model construction, training loop dispatch, checkpointing. `scripts/finetune.py` is a thin shim over `runner.main()`
 
 ### Output Heads
 
@@ -91,6 +93,9 @@ GenomeTracksHead for each assay type
 | ChIP-TF | 1664 | 128bp only | |
 | ChIP-Histone | 1152 | 128bp only | |
 | Contact Maps | 28 | pair (S×S) | 3D chromatin |
+| Splice Site | 5 classes | 1bp only | Donor+/Acceptor+/Donor-/Acceptor-/none |
+| Splice Usage | 2×samples | 1bp only | proportion of RNA using each site |
+| Splice Junctions | 2×tissues | pair (P×P) | junction read counts; RoPE over splice-site positions |
 
 ## Technical Notes
 
@@ -127,6 +132,31 @@ torchrun --nproc_per_node=2 -m alphagenome_pytorch.cli finetune \
     --genome hg38.fa --modality atac --bigwig *.bw \
     --train-bed train.bed --val-bed val.bed --pretrained-weights model.pth
 ```
+
+### Splice Fine-tuning
+- Splice modalities (`splice_site`, `splice_usage`, `splice_junctions`) are handled
+  separately from the generic bigwig-backed modalities: no `--bigwig` is required,
+  they use `--star-junctions`/`--ssu` instead. A single `--modality` entry can
+  comma-separate them (e.g. `--modality splice_site,splice_usage,splice_junctions`)
+  to share one `--star-junctions`/`--ssu` group.
+- `--gtf` is splice-site annotation (canonical splice sites, annotation-only, zero
+  usage) — **distinct** from `--gene-gtf`, which feeds the unrelated gene-LFC-loss
+  and gene-expression-eval features (`--gene-loss-weight`, `--gene-expr-eval`).
+  Don't confuse the two; they're read by different code paths.
+- Key finetuning flags: `--rope-init` (`truncated_normal` default matches the JAX
+  pretrained distribution; `zeros` replicates the original buggy JAX init, for
+  ablation only), `--junction-loss` (`original`/`normalized`/`sparse` cross-entropy
+  variants), `--junction-position-source` (`annotated` uses STAR-derived positions;
+  `predicted` derives them from the `splice_site` classification head's top-k sites,
+  see `--junction-top-k`), `--pretrained-head-samples` (initialize head weights from
+  specific pretrained output tracks), `--min-alpha-juncs` (junction depth threshold
+  for the SSU loss).
+- `scripts/compute_ssu.py` / `scripts/get_star_junctions.py`: standalone
+  preprocessing scripts that derive splice site usage (SSU) and junction counts
+  from STAR alignment output, upstream of `--ssu`/`--star-junctions`.
+- LoCon (Conv1d LoRA, `--locon-rank`/`--locon-alpha`/`--locon-targets`) targets the
+  CNN encoder's `down_blocks`, orthogonal to LoRA's transformer `q_proj`/`v_proj`
+  targets — combine both via `--mode lora+locon`.
 
 ### Test Strategy
 - Unit tests (`tests/unit/`): Fast, no JAX required, verify PyTorch components

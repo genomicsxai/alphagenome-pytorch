@@ -49,6 +49,7 @@ class TrainingLogger:
         run_name: str | None = None,
         config: dict | None = None,
         resume_id: str | None = None,
+        initial_step: int = 0,
     ) -> None:
         """Initialize the training logger.
 
@@ -65,7 +66,7 @@ class TrainingLogger:
         self.output_dir = Path(output_dir)
         self.rank = rank
         self.use_wandb = use_wandb and is_main_process(rank)
-        self.step = 0
+        self.step = initial_step
         self.resume_id = resume_id
 
         # Only main process handles logging
@@ -188,7 +189,7 @@ class TrainingLogger:
         if not is_main_process(self.rank):
             return
 
-        metrics: dict[str, Any] = {
+        scalar_metrics: dict[str, Any] = {
             "epoch": epoch,
             "train_loss": train_loss,
             "val_loss": val_loss,
@@ -196,17 +197,27 @@ class TrainingLogger:
             "is_best": is_best,
             "timestamp": datetime.now().isoformat(),
         }
-        if extra:
-            metrics.update(extra)
+        extra_copy = dict(extra) if extra else {}
+        per_sample: list[dict] = extra_copy.pop("_per_sample", None) or []
+        scalar_metrics.update(extra_copy)
 
-        # Append to epoch log (scalars only)
+        # Build all rows: aggregate row (sample=NaN) + optional per-sample rows
+        agg_row = {"sample": float("nan"), **scalar_metrics}
+        rows = [agg_row]
+        for s, ps_metrics in enumerate(per_sample):
+            rows.append({"sample": s, **ps_metrics})
+
+        # Fieldnames = union of all row keys (insertion-order preserved)
+        all_fields = list(dict.fromkeys(k for row in rows for k in row))
+
+        # Append to epoch log
         epoch_log_path = self.output_dir / "epoch_log.csv"
         file_exists = epoch_log_path.exists()
         with open(epoch_log_path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(metrics.keys()))
+            writer = csv.DictWriter(f, fieldnames=all_fields, restval="", extrasaction="ignore")
             if not file_exists:
                 writer.writeheader()
-            writer.writerow(metrics)
+            writer.writerows(rows)
 
         # W&B logging
         if self.use_wandb:

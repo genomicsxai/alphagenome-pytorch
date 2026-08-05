@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
@@ -1061,10 +1062,24 @@ def collate_multimodal(
     first_item = batch[0][1]
     for modality in first_item.keys():
         modality_targets[modality] = {}
-        for res in first_item[modality].keys():
-            modality_targets[modality][res] = torch.stack([
-                item[1][modality][res] for item in batch
-            ])
+        for key in first_item[modality].keys():
+            # Handle both integer keys (resolutions) and string keys (junction metadata)
+            if isinstance(key, int):
+                # Resolution-based targets: stack across batch
+                modality_targets[modality][key] = torch.stack([
+                    item[1][modality][key] for item in batch
+                ])
+            elif isinstance(key, str):
+                first_value = batch[0][1][modality][key]
+                if isinstance(first_value, list):
+                    # List values (e.g. all_junctions): collect per-batch-item lists
+                    modality_targets[modality][key] = [
+                        item[1][modality][key] for item in batch
+                    ]
+                else:
+                    modality_targets[modality][key] = torch.stack([
+                        item[1][modality][key] for item in batch
+                    ])
 
     # Collate optional trailing extras. Each item carries the same schema, so we
     # sniff types from the first item: a Tensor is the gene_mask, anything else
@@ -1082,6 +1097,440 @@ def collate_multimodal(
     return sequences, modality_targets
 
 
+class SplicingDataset(Dataset):
+    """Dataset for fine-tuning on splicing data from SSU parquets and STAR junction files.
+
+    Combines three data sources to produce targets at 1 bp resolution:
+
+    1. **SSU files** (optional): per-sample splice site usage parquets from
+       ``compute_ssu.py``.  When provided, drive classification labels and usage
+       targets from SSU values.  When absent, classification is derived from
+       junction sites and usage is computed as SSU approximation on-the-fly.
+    2. **Junction files** (required): STAR SJ.out.tab files.  Always drive the
+       junction-matrix and junction-position targets; also drive classification
+       and usage when SSU files are not provided.
+    3. **GTF file** (optional): annotated splice sites added to the
+       classification labels only.
+
+    Returns ``(sequence, targets_dict)`` with string keys:
+
+    * ``"probs"`` (seq_len, 5) — 5-class one-hot per base:
+      Donor+, Acceptor+, Donor−, Acceptor−, None.
+    * ``"usage"`` (seq_len, 2*n_samples) — SSU values per sample
+      (from SSU parquets, or computed as SSU approx from junctions).
+      Two channels per sample (positive strand, negative strand).
+    * ``"junction_positions"`` (4, max_splice_sites) — 0-based relative
+      positions for [pos_donors, pos_acceptors, neg_donors, neg_acceptors].
+    * ``"junction_matrix"`` (max_splice_sites, max_splice_sites, 2*n_samples)
+      — donor×acceptor read-count matrix from junction files.
+
+    Args:
+        genome_fasta: Path to reference genome FASTA or a :class:`CachedGenome`.
+        bed_file: Path to BED file with intervals (chrom, start, end).
+        star_junction_files: List of paths to STAR SJ.out.tab files.
+        ssu_files: Optional list of SSU parquet paths (one per sample, same
+            order as ``star_junction_files``).  If ``None``, SSU approximation
+            is computed on-the-fly from junction data.
+        sequence_length: Desired sequence length; intervals are expanded /
+            truncated to this size from their centre.
+        min_unique_reads: Minimum uniquely-mapped reads for a junction to be
+            kept (default: 1).
+        filter_to_junctions: If True (default), discard intervals that contain
+            no complete splice junction across all provided junction files.
+        gtf_file: Optional GTF / parquet file; annotated splice sites are added
+            to the classification labels (``"probs"``).
+    """
+
+    N_CLASSIFICATION_CLASSES = 5
+
+    def __init__(
+        self,
+        genome_fasta: "str | CachedGenome",
+        bed_file: str,
+        star_junction_files: list,
+        ssu_files: "list | None" = None,
+        sequence_length: int = 131_072,
+        min_unique_reads: int = 1,
+        filter_to_junctions: bool = True,
+        gtf_file: "str | None" = None,
+        max_splice_sites: int = 256,
+    ):
+        super().__init__()
+        _ensure_genomic_deps()
+
+        from alphagenome_pytorch.extensions.finetuning.star_junctions import (
+            read_star_junctions,
+            filter_intervals_with_junctions,
+            splice_sites_to_classification_array,
+            junctions_to_classification_array,
+            ssu_to_arrays_by_strand,
+            junctions_to_ssu_approx_arrays_by_strand,
+            junctions_to_junction_matrix,
+            normalize_junctions_per_sample,
+            gtf_splice_sites_to_junctions,
+        )
+        self._filter_intervals_with_junctions = filter_intervals_with_junctions
+        self._splice_sites_to_classification_array = splice_sites_to_classification_array
+        self._junctions_to_classification_array = junctions_to_classification_array
+        self._ssu_to_arrays_by_strand = ssu_to_arrays_by_strand
+        self._junctions_to_ssu_approx_arrays_by_strand = junctions_to_ssu_approx_arrays_by_strand
+        self._junctions_to_junction_matrix = junctions_to_junction_matrix
+
+        self.star_junction_files = [str(p) for p in star_junction_files]
+        self.ssu_files = [str(p) for p in ssu_files] if ssu_files is not None else None
+        self.sequence_length = sequence_length
+        self.min_unique_reads = min_unique_reads
+        self.max_splice_sites = max_splice_sites
+
+        # Read intervals
+        intervals = pd.read_csv(
+            bed_file, sep="\t", header=None, usecols=[0, 1, 2],
+            names=["chrom", "start", "end"],
+        )
+
+        # Read and preprocess all junction files (for matrix/position targets)
+        self._all_juncs: list = []
+        for path in self.star_junction_files:
+            junc = read_star_junctions(path)
+            junc = junc.loc[junc["n_uniquely_mapped_reads"] >= min_unique_reads].copy()
+            junc = junc.loc[
+                junc["chrom"].str.contains("chr", na=False)
+                & junc["strand"].isin(["+", "-"])
+            ].drop_duplicates()
+            junc["exon_start"] = junc["intron_start"] - 1  # 1-based donor exon end
+            junc["exon_end"] = junc["intron_end"] + 1      # 1-based acceptor exon start
+            junc["count"] = junc["n_uniquely_mapped_reads"]
+            junc = normalize_junctions_per_sample(junc)
+            self._all_juncs.append(junc)
+
+        # Optional GTF annotation — stored in both formats for SSU and fallback paths
+        self._gtf_sites: "pd.DataFrame | None" = None   # [chrom, position, strand, role] for SSU path
+        self._gtf_juncs: "pd.DataFrame | None" = None   # junction pairs for fallback path
+        if gtf_file is not None:
+            gtf_juncs = gtf_splice_sites_to_junctions(gtf_file)
+            self._gtf_juncs = gtf_juncs
+            donors = gtf_juncs[["chrom", "strand"]].copy()
+            donors["position"] = gtf_juncs["exon_start"].values
+            donors["role"] = "donor"
+            acceptors = gtf_juncs[["chrom", "strand"]].copy()
+            acceptors["position"] = gtf_juncs["exon_end"].values
+            acceptors["role"] = "acceptor"
+            self._gtf_sites = pd.concat([donors, acceptors], ignore_index=True).drop_duplicates(
+                subset=["chrom", "position", "strand", "role"]
+            ).reset_index(drop=True)
+
+        # Union of all junctions (for interval filtering)
+        if self._all_juncs:
+            union_juncs = pd.concat(
+                [j[["chrom", "exon_start", "exon_end", "strand"]] for j in self._all_juncs],
+                ignore_index=True,
+            ).drop_duplicates()
+        else:
+            union_juncs = pd.DataFrame(columns=["chrom", "exon_start", "exon_end", "strand"])
+
+        # Optionally filter intervals to those overlapping at least one junction
+        if filter_to_junctions and not union_juncs.empty:
+            intervals, _ = filter_intervals_with_junctions(intervals, union_juncs)
+
+        # Expand / truncate intervals to sequence_length from centre
+        positions = []
+        for _, row in intervals.iterrows():
+            chrom, start, end = row["chrom"], int(row["start"]), int(row["end"])
+            if (end - start) != sequence_length:
+                center = (start + end) // 2
+                start = center - sequence_length // 2
+                end = center + sequence_length // 2
+            positions.append((chrom, start, end))
+        self._positions_list = positions
+
+        # Genome access
+        if isinstance(genome_fasta, CachedGenome):
+            self._genome_cache = genome_fasta
+            self._fasta_path = genome_fasta.fasta_path
+        else:
+            self._genome_cache = None
+            self._fasta_path = str(genome_fasta)
+        self._fasta = None
+        self._worker_pid = None
+
+    def _ensure_handles(self) -> None:
+        import os
+        pid = os.getpid()
+        if self._worker_pid != pid:
+            self._worker_pid = pid
+            if self._genome_cache is None:
+                self._fasta = pyfaidx.Fasta(self._fasta_path)
+
+    def _get_sequence(self, chrom: str, start: int, end: int) -> np.ndarray:
+        if self._genome_cache is not None:
+            seq = self._genome_cache.fetch(chrom, max(0, start), end)
+            if start < 0:
+                pad = np.zeros((-start, 4), dtype=np.uint8)
+                seq = np.concatenate([pad, seq], axis=0)
+            return seq
+        from alphagenome_pytorch.utils.sequence import sequence_to_onehot
+        seq_str = str(self._fasta[chrom][max(0, start):end])
+        if start < 0:
+            seq_str = "N" * (-start) + seq_str
+        return sequence_to_onehot(seq_str)
+
+    def __len__(self) -> int:
+        return len(self._positions_list)
+
+    def __getitem__(self, idx: int):
+        self._ensure_handles()
+        chrom, start, end = self._positions_list[idx]
+        seq_len = end - start
+
+        sequence = torch.from_numpy(self._get_sequence(chrom, start, end)).float()
+
+        if self.ssu_files is not None:
+            # SSU path: classification from SSU sites + optional GTF; usage from SSU values
+            from alphagenome_pytorch.extensions.finetuning.star_junctions import read_ssu_parquet
+            ssu_dfs = [read_ssu_parquet(p, chrom, start, end) for p in self.ssu_files]
+
+            cls_sources = []
+            for _ssu_df in ssu_dfs:
+                if "ssu_spliser" not in _ssu_df.columns:
+                    raise ValueError("ssu_df is missing required column ssu_spliser")
+                cls_sources.append(_ssu_df[_ssu_df["ssu_spliser"].notna()])
+            if self._gtf_sites is not None:
+                cls_sources.append(self._gtf_sites)
+            cls_arr = self._splice_sites_to_classification_array(cls_sources, chrom, start, seq_len)
+
+            usage_tracks = []
+            alpha_tracks = []
+            for ssu_df in ssu_dfs:
+                pos_arr, neg_arr, pos_alpha, neg_alpha = self._ssu_to_arrays_by_strand(
+                    ssu_df, chrom, start, seq_len
+                )
+                usage_tracks.append(pos_arr)
+                usage_tracks.append(neg_arr)
+                alpha_tracks.append(pos_alpha)
+                alpha_tracks.append(neg_alpha)
+        else:
+            # Fallback: classification from junction sites + optional GTF; usage as SSU approx
+            cls_juncs = self._all_juncs + ([self._gtf_juncs] if self._gtf_juncs is not None else [])
+            cls_arr = self._junctions_to_classification_array(cls_juncs, chrom, start, seq_len)
+
+            usage_tracks = []
+            alpha_tracks = []
+            for junc_df in self._all_juncs:
+                pos_arr, neg_arr = self._junctions_to_ssu_approx_arrays_by_strand(junc_df, chrom, start, seq_len)
+                usage_tracks.append(pos_arr)
+                usage_tracks.append(neg_arr)
+                # No alpha available in the junction-only fallback path; -1 = background
+                alpha_tracks.append(np.full(seq_len, -1.0, dtype=np.float32))
+                alpha_tracks.append(np.full(seq_len, -1.0, dtype=np.float32))
+        usage_arr = np.stack(usage_tracks, axis=-1)  # (seq_len, 2*n_ssu_files)
+        usage_alpha_arr = np.stack(alpha_tracks, axis=-1)  # (seq_len, 2*n_ssu_files)
+
+        # Junction matrix targets (from STAR junction files)
+        junc_positions, junc_matrix = self._junctions_to_junction_matrix(
+            self._all_juncs,
+            max_splice_sites=self.max_splice_sites,
+            cls_arr=cls_arr,
+            chrom=chrom,
+            start=start,
+            seq_len=seq_len,
+        )
+
+        # Pre-filtered per-sample junctions for predicted-mode target building
+        end = start + seq_len
+        all_junctions = []
+        for junc_df in self._all_juncs:
+            mask = (
+                (junc_df["chrom"] == chrom)
+                & (junc_df["exon_start"] > start)
+                & (junc_df["exon_start"] <= end)
+                & (junc_df["exon_end"] > start)
+                & (junc_df["exon_end"] <= end)
+            )
+            local = junc_df.loc[mask].copy()
+            if not local.empty:
+                local["d_rel"] = local["exon_start"].astype(int) - 1 - start
+                local["a_rel"] = local["exon_end"].astype(int) - 1 - start
+            all_junctions.append(local)
+
+        targets_dict = {
+            "probs": torch.from_numpy(cls_arr).float(),
+            "usage": torch.from_numpy(usage_arr).float(),
+            "usage_alpha": torch.from_numpy(usage_alpha_arr).float(),
+            "junction_positions": torch.from_numpy(junc_positions),
+            "junction_matrix": torch.from_numpy(junc_matrix),
+            "all_junctions": all_junctions,
+        }
+        return sequence, targets_dict
+
+    @property
+    def n_classification_tracks(self) -> int:
+        """Number of classification channels (always 5)."""
+        return self.N_CLASSIFICATION_CLASSES
+
+    @property
+    def n_usage_tracks(self) -> int:
+        """Number of usage channels (2 per sample: positive and negative strand)."""
+        n = len(self.ssu_files) if self.ssu_files is not None else len(self.star_junction_files)
+        return 2 * n
+
+
+class DistillationDataset(Dataset):
+    """Dataset that serves pretrained model outputs as finetuning targets.
+
+    Loads raw model output tensors saved by generate_oracle_targets.py as .npz
+    files.  The interface mirrors MultimodalDataset so it can be dropped in
+    anywhere collate_multimodal is used.
+
+    Supported modalities (controlled by the ``modalities`` argument):
+        - ``rna_seq``           — shape (seq_len, 2): HepG2 fwd/rev tracks
+        - ``splice_site``       — shape (seq_len, 5): continuous donor/acceptor probs
+        - ``splice_usage``      — shape (seq_len, 2): HepG2 fwd/rev usage
+        - ``splice_junctions``  — junction_positions + junction_counts tensors
+
+    For sequence-based modalities the targets_dict follows the same
+    ``{resolution: tensor}`` convention as GenomicDataset.  For the junction
+    modality it follows the same string-key dict as SplicingDataset.
+
+    Args:
+        manifest_path: Path to ``distillation_manifest.parquet`` written by
+            generate_oracle_targets.py.
+        genome_fasta: Reference genome FASTA (path or CachedGenome) used to
+            load one-hot sequences.
+        sequence_length: Must match the sequence length used during oracle
+            generation.
+        modalities: Subset of modalities to return.  Defaults to all present.
+        rna_seq_hepg2_indices: ``(fwd_idx, rev_idx)`` within-head track
+            indices for the HepG2 rna_seq tracks to slice from the full
+            rna_seq array.  Defaults to ``(0, 1)`` which works when the npz
+            was written with only fwd/rev already sliced.
+        usage_hepg2_indices: ``(fwd_idx, rev_idx)`` for splice_usage.
+        junction_hepg2_tissue_idx: tissue index for splice_junctions.
+        resolutions: Output resolutions for sequence-based modalities (rna_seq,
+            splice_usage).  Each resolution > 1 sums adjacent 1-bp bins, matching
+            GenomicDataset behaviour.  Defaults to ``[1]``.  splice_site and
+            splice_junctions are always returned at 1-bp resolution regardless.
+    """
+
+    _SEQUENCE_MODALITIES = {"rna_seq", "splice_site", "splice_usage"}
+    _JUNCTION_MODALITY = "splice_junctions"
+    _ALL_MODALITIES = _SEQUENCE_MODALITIES | {_JUNCTION_MODALITY}
+
+    def __init__(
+        self,
+        manifest_path: str,
+        genome_fasta,
+        sequence_length: int = 1_048_576,
+        modalities: list[str] | None = None,
+        rna_seq_hepg2_indices: tuple[int, int] = (0, 1),
+        usage_hepg2_indices: tuple[int, int] = (0, 1),
+        junction_hepg2_tissue_idx: int = 0,
+        resolutions: list[int] | tuple[int, ...] | None = None,
+    ):
+        import pandas as pd
+        manifest = pd.read_parquet(manifest_path)
+        self._npz_dir = Path(manifest_path).parent
+        self._records = manifest.to_dict("records")
+        self._sequence_length = sequence_length
+        self._modalities = list(modalities) if modalities is not None else list(self._ALL_MODALITIES)
+        self._rna_fwd_idx, self._rna_rev_idx = rna_seq_hepg2_indices
+        self._usg_fwd_idx, self._usg_rev_idx = usage_hepg2_indices
+        self._junc_t = junction_hepg2_tissue_idx
+        self._resolutions = list(resolutions) if resolutions is not None else [1]
+
+        if isinstance(genome_fasta, str):
+            _ensure_genomic_deps()
+            self._fasta_path = genome_fasta
+            self._fasta = None  # lazy open per worker
+        else:
+            self._fasta_path = None
+            self._fasta = genome_fasta  # CachedGenome
+
+    def _ensure_fasta(self):
+        if self._fasta is None:
+            import pyfaidx
+            self._fasta = pyfaidx.Fasta(self._fasta_path)
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def _bin_to_resolutions(self, arr: np.ndarray) -> dict[int, torch.Tensor]:
+        """Return {resolution: tensor} for each requested resolution.
+
+        Resolution 1 is returned as-is; higher resolutions are produced by
+        summing adjacent bins, matching the GenomicDataset convention.
+        """
+        result = {}
+        for res in self._resolutions:
+            if res == 1:
+                result[res] = torch.from_numpy(arr)
+            else:
+                out_len = self._sequence_length // res
+                binned = arr.reshape(out_len, res, arr.shape[-1]).sum(axis=1)
+                result[res] = torch.from_numpy(binned)
+        return result
+
+    def __getitem__(
+        self, idx: int
+    ) -> tuple[torch.Tensor, dict[str, dict]]:
+        """Return (sequence, modality_targets) matching MultimodalDataset output."""
+        self._ensure_fasta()
+        rec = self._records[idx]
+        chrom    = rec["chrom"]
+        seq_start = int(rec["seq_start"])
+        seq_end   = int(rec["seq_end"])
+
+        # One-hot sequence
+        seq_str = str(self._fasta[chrom][max(0, seq_start):seq_end]).upper()
+        if seq_start < 0:
+            seq_str = "N" * (-seq_start) + seq_str
+        from alphagenome_pytorch.utils.sequence import sequence_to_onehot
+        sequence = torch.from_numpy(sequence_to_onehot(seq_str)).float()  # (S, 4)
+
+        # Load npz
+        npz_path = self._npz_dir / rec["npz"]
+        data = np.load(npz_path, allow_pickle=False)
+
+        modality_targets: dict[str, dict] = {}
+
+        for mod in self._modalities:
+            if mod == "rna_seq" and "rna_seq" in data:
+                rna = data["rna_seq"]  # (S, n_tracks)
+                fwd = rna[:, self._rna_fwd_idx]
+                rev = rna[:, self._rna_rev_idx]
+                arr1 = np.stack([fwd, rev], axis=-1).astype(np.float32)  # (S, 2)
+                modality_targets["rna_seq"] = self._bin_to_resolutions(arr1)
+
+            elif mod == "splice_site" and "splice_sites_classification" in data:
+                cls_arr = data["splice_sites_classification"]  # (S, 5)
+                modality_targets["splice_site"] = {"probs": torch.from_numpy(cls_arr.astype(np.float32))}
+
+            elif mod == "splice_usage" and "splice_sites_usage" in data:
+                usg = data["splice_sites_usage"]  # (S, n_tracks)
+                fwd = usg[:, self._usg_fwd_idx]
+                rev = usg[:, self._usg_rev_idx]
+                arr1 = np.stack([fwd, rev], axis=-1).astype(np.float32)  # (S, 2)
+                modality_targets["splice_usage"] = {"usage": torch.from_numpy(arr1)}
+
+            elif mod == "splice_junctions" and "junction_positions" in data:
+                pssp = data["junction_positions"]         # (4, P)  int32
+                counts = data["junction_counts"]          # (P, P, 2T)  float32
+                n_tissues = counts.shape[2] // 2
+                t = min(self._junc_t, n_tissues - 1)
+                # Slice to HepG2 tissue: fwd strand = index t, rev = t + n_tissues
+                junc_matrix = np.stack(
+                    [counts[:, :, t], counts[:, :, t + n_tissues]], axis=-1
+                ).astype(np.float32)  # (P, P, 2)
+                modality_targets["splice_junctions"] = {
+                    "junction_positions": torch.from_numpy(pssp),
+                    "junction_matrix":    torch.from_numpy(junc_matrix),
+                    # Provide dummy probs/usage to satisfy any downstream checks
+                    "probs": torch.zeros(self._sequence_length, 5),
+                    "usage": torch.zeros(self._sequence_length, 2),
+                }
+
+        return sequence, modality_targets
+
+
 # Backward-compatible aliases
 ATACDataset = GenomicDataset
 RNASeqDataset = GenomicDataset
@@ -1090,6 +1539,8 @@ RNASeqDataset = GenomicDataset
 __all__ = [
     "GenomicDataset",
     "MultimodalDataset",
+    "SplicingDataset",
+    "DistillationDataset",
     "collate_multimodal",
     "ATACDataset",
     "RNASeqDataset",
