@@ -251,6 +251,25 @@ def create_datasets(
         )
         gme = gene_mask_extractor if attach_gene_mask else None
         gme_g_max = g_max if attach_gene_mask else None
+        # Augmentation is TRAIN-ONLY. Reverse-complement is strand-aware: sequence is RC'd, targets
+        # reverse along length and swap the declared +/- strand pairs (same --strand-pairs info
+        # track-means uses); unstranded tracks reverse only. Shift slides the window for all tracks
+        # identically. Val/test datasets below get neither.
+        strand_pairs = None
+        if getattr(args, "modality_strand_pairs", None):
+            strand_pairs = args.modality_strand_pairs.get(modality)
+        if args.augment_rc or args.augment_shift_bp:
+            n_pairs = len(strand_pairs) if strand_pairs else 0
+            n_unstranded = len(bigwigs) - 2 * n_pairs
+            rc_note = (
+                f"rc=on ({n_pairs} strand-pair(s) swapped, {n_unstranded} unstranded reversed-only)"
+                if args.augment_rc else "rc=off"
+            )
+            print_rank0(
+                f"Augment[{modality}] (train only): shift=+/-{args.augment_shift_bp}bp (all tracks); "
+                f"{rc_note}",
+                rank,
+            )
         train_datasets[modality] = GenomicDataset(
             genome_fasta=genome,
             bigwig_files=bigwigs,
@@ -262,6 +281,9 @@ def create_datasets(
             max_io_workers=max_io_workers,
             gene_mask_extractor=gme,
             g_max=gme_g_max,
+            augment_rc=args.augment_rc,
+            augment_shift_bp=args.augment_shift_bp,
+            strand_pairs=strand_pairs,
         )
         val_datasets[modality] = GenomicDataset(
             genome_fasta=genome,
@@ -929,7 +951,11 @@ def main(args: argparse.Namespace | None = None) -> None:
 
     # Scheduler
     total_steps = (args.epochs * len(train_loader)) // args.gradient_accumulation_steps
-    scheduler = create_lr_scheduler(optimizer, args.warmup_steps, total_steps, schedule=args.lr_schedule)
+    scheduler = create_lr_scheduler(
+        optimizer, args.warmup_steps, total_steps, schedule=args.lr_schedule,
+        plateau_factor=args.plateau_factor, plateau_patience=args.plateau_patience,
+        plateau_min_lr=args.plateau_min_lr,
+    )
     effective_batch_size = args.batch_size * args.gradient_accumulation_steps * world_size
     print_rank0(f"Gradient accumulation: {args.gradient_accumulation_steps}", rank)
     print_rank0(f"Effective batch size: {effective_batch_size}", rank)
@@ -1208,6 +1234,10 @@ def main(args: argparse.Namespace | None = None) -> None:
                 torch.cuda.synchronize()
 
             current_lr = scheduler.get_last_lr()[0]
+            # Plateau schedule: reduce LR (for the NEXT epoch) when val loss stalls. The per-step
+            # scheduler.step() inside train_epoch only drives warmup; the reduction is metric-driven.
+            if hasattr(scheduler, "step_metric"):
+                scheduler.step_metric(val_loss)
             is_best = val_loss < best_val_loss
 
             # Print epoch summary

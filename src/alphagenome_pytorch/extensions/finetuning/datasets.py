@@ -459,6 +459,9 @@ class GenomicDataset(Dataset):
         use_mmap: bool = False,
         gene_mask_extractor: "Any | None" = None,
         g_max: int | None = None,
+        augment_rc: bool = False,
+        augment_shift_bp: int = 0,
+        strand_pairs: "list[tuple[int, int]] | None" = None,
     ):
         _ensure_genomic_deps()
 
@@ -468,6 +471,23 @@ class GenomicDataset(Dataset):
         self.cache_signals = cache_signals
         self.max_io_workers = max_io_workers
         self.use_mmap = use_mmap
+        # Training-time augmentation (leave off for val/test); RNG is created per worker on first use.
+        # Random shift slides the window within the chromosome. Reverse-complement is applied jointly
+        # to sequence and targets: sequence is reverse-complemented, targets are reversed along length
+        # AND their strand-paired channels are swapped -- a '+' track becomes its '-' partner under RC.
+        # `strand_pairs` is the declared list of (plus_idx, minus_idx) track indices (from
+        # --strand-pairs / --track-strands, the same info track-means uses); tracks not in any pair are
+        # treated as UNSTRANDED (reversed only). With no pairs, RC is a plain length reversal.
+        self.augment_rc = augment_rc
+        self.augment_shift_bp = max(0, int(augment_shift_bp))
+        self._aug_rng = None
+        # Build the RC channel permutation over the track axis: identity, then swap each strand pair.
+        self._rc_perm = None
+        if strand_pairs:
+            perm = list(range(len(bigwig_files)))
+            for plus_idx, minus_idx in strand_pairs:
+                perm[plus_idx], perm[minus_idx] = minus_idx, plus_idx
+            self._rc_perm = np.asarray(perm, dtype=np.int64)
 
         # Optional gene-mask plumbing for the gene LFC training loss.
         # When `gene_mask_extractor` is set, __getitem__ returns a 3-tuple
@@ -717,6 +737,22 @@ class GenomicDataset(Dataset):
         self._ensure_handles()
         chrom, start, end = self._positions_list[idx]
 
+        # Training augmentation (off for val/test). Random shift slides the window within the
+        # chromosome; reverse-complement is decided here and applied jointly to sequence and targets
+        # below so they stay aligned. RNG is per worker (created on first use).
+        do_rc = False
+        if self.augment_shift_bp or self.augment_rc:
+            if self._aug_rng is None:
+                self._aug_rng = np.random.default_rng()
+            if self.augment_shift_bp:
+                lo = max(-self.augment_shift_bp, -start)
+                hi = min(self.augment_shift_bp, self._chrom_sizes[chrom] - end)
+                if hi >= lo:
+                    shift = int(self._aug_rng.integers(lo, hi + 1))
+                    start += shift
+                    end += shift
+            do_rc = self.augment_rc and bool(self._aug_rng.random() < 0.5)
+
         # Get one-hot sequence
         sequence = self._get_sequence(chrom, start, end)
 
@@ -750,6 +786,19 @@ class GenomicDataset(Dataset):
                 binned = raw_signals.reshape(output_len, res, self.n_tracks).sum(axis=1)
                 targets_dict[res] = torch.from_numpy(binned).float()
 
+        if do_rc:
+            # Reverse-complement. Sequence: one-hot is ACGT, so complementing == reversing the
+            # channel order; with length reversal that is seq[::-1, ::-1]. Targets: reverse along
+            # length for EVERY track (stranded or not), then swap strand-paired +/- channels so a
+            # '+' track takes its '-' partner under RC. Unstranded tracks have no pair -> reversed
+            # only. Shift (applied above) is track-type-agnostic: it slides seq + all targets together.
+            sequence = sequence[::-1, ::-1].copy()
+            for res in targets_dict:
+                t = torch.flip(targets_dict[res], dims=[0])
+                if self._rc_perm is not None:
+                    t = t[:, self._rc_perm]
+                targets_dict[res] = t
+
         seq_tensor = torch.from_numpy(sequence).float()
 
         if self.gene_mask_extractor is None:
@@ -767,6 +816,10 @@ class GenomicDataset(Dataset):
         padded = np.zeros((self.sequence_length, 2, self.g_max), dtype=bool)
         if num_genes > 0:
             padded[:, :, :num_genes] = gene_mask_np
+        if do_rc:
+            # Gene mask is (S, 2, g_max) with axis 1 = [plus_strand, minus_strand]; under RC reverse
+            # along the sequence axis and swap the two strand slots.
+            padded = padded[::-1, ::-1, :].copy()
         return (seq_tensor, targets_dict, torch.from_numpy(padded))
 
     def __del__(self) -> None:
