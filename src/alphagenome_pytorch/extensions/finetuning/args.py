@@ -330,6 +330,11 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
     # Model arguments
     model = parser.add_argument_group("Model")
     model.add_argument("--pretrained-weights", type=str, required=False, help="Pretrained weights .pth")
+    model.add_argument("--init-weights", type=str, default=None,
+                       help="Warm-start: load model weights (backbone + heads) from a prior "
+                            "finetuned checkpoint at init, WITHOUT restoring optimizer/epoch -- the "
+                            "two-phase pattern (probe head -> unfreeze + full FT). Ignored when "
+                            "--resume finds a checkpoint (that already carries weights).")
     model.add_argument(
         "--modality",
         type=str,
@@ -591,6 +596,7 @@ def postprocess_args(
         "cache_signals",
         "max_io_workers",
         "pretrained_weights",
+        "init_weights",
         "lora_rank",
         "lora_alpha",
         "lora_targets",

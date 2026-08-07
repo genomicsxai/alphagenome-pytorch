@@ -895,6 +895,18 @@ def main(args: argparse.Namespace | None = None) -> None:
     )
     model_module = unwrap_training_model(model)
 
+    # Warm-start (two-phase): initialise weights from a prior finetuned checkpoint (e.g. a
+    # linear-probe best_model.pth) WITHOUT restoring optimizer/epoch, so full FT starts from the
+    # trained head + trunk instead of a fresh random head. Skipped when resuming (the resume
+    # checkpoint already carries the weights).
+    if getattr(args, "init_weights", None) and not (resume_path and Path(resume_path).exists()):
+        print_rank0(f"Warm-start: loading model weights from {args.init_weights}", rank)
+        init_ckpt = torch.load(args.init_weights, map_location="cpu", weights_only=False)
+        init_sd = init_ckpt.get("model_state_dict", init_ckpt)
+        missing, unexpected = model_module.load_state_dict(init_sd, strict=False)
+        print_rank0(f"  warm-start: {len(missing)} missing, {len(unexpected)} unexpected keys "
+                    f"(both should be ~0 for a same-architecture probe checkpoint)", rank)
+
     # Build per-modality strand-channel masks for the gene LFC loss (B3.2).
     # Empty dict when gene_loss_weight is 0; populated only for modalities
     # whose strand info was supplied (today: rna_seq via --track-strands or
