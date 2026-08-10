@@ -697,8 +697,19 @@ def create_model(
 
     # Wrap with DDP if multi-GPU
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-        print_rank0("Model wrapped with DistributedDataParallel", rank)
+        ddp_kwargs = {"device_ids": [local_rank], "output_device": local_rank}
+        # Full/LoRA/Locon unfreeze the trunk, but training only a subset of the model's outputs
+        # (e.g. the 1 bp RNA head while the 128 bp output embedder is unused) leaves some trainable
+        # params with no gradient, which plain DDP aborts on. find_unused_parameters=True handles
+        # that; it is compatible with the model's use_reentrant=False activation checkpointing
+        # (static_graph is not -- the used set is not identical every iteration). Frozen-trunk modes
+        # (linear-probe/encoder-only) never have unused trainable params, so keep the fast path.
+        if args.mode not in ("linear-probe", "encoder-only"):
+            ddp_kwargs["find_unused_parameters"] = True
+        model = DDP(model, **ddp_kwargs)
+        print_rank0("Model wrapped with DistributedDataParallel"
+                    + (" (find_unused_parameters=True)" if ddp_kwargs.get("find_unused_parameters") else ""),
+                    rank)
 
     # Get head references from the underlying model before optional compile.
     model_module = unwrap_training_model(model)
