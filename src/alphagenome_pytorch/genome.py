@@ -306,8 +306,10 @@ class GenomeSequenceSource:
             fasta.close()
 
         if verbose and cache:
+            n_chroms = len(self._cache)
             cached_mb = sum(arr.nbytes for arr in self._cache.values()) / 1e6
-            print(f"Cached genome: loaded {len(self._cache)} chromosomes ({cached_mb:.1f} MB)")
+            print(f"Cached genome: loaded {n_chroms} "
+                  f"chromosome{'s' if n_chroms != 1 else ''} ({cached_mb:.1f} MB)")
 
     @property
     def fasta(self) -> "pyfaidx.Fasta":

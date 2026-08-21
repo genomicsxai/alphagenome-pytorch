@@ -537,11 +537,13 @@ class ProfilingStats:
             lines.append(
                 f"\n{name}:\n"
                 f"  Mean:  {arr.mean()*1000:.2f} ms (+/- {arr.std()*1000:.2f} ms)\n"
-                f"  Total: {arr.sum():.2f} s ({len(times)} samples)"
+                f"  Total: {arr.sum():.2f} s ({len(times)} "
+                f"sample{'s' if len(times) != 1 else ''})"
             )
 
         lines.append(f"\n{'=' * 70}")
-        lines.append(f"TOTAL TIME: {total_time:.2f} s for {n_batches} batches")
+        lines.append(f"TOTAL TIME: {total_time:.2f} s for {n_batches} "
+                     f"batch{'es' if n_batches != 1 else ''}")
         lines.append(f"AVG TIME PER BATCH: {total_time/n_batches*1000:.2f} ms")
 
         # Breakdown percentages
@@ -775,7 +777,8 @@ def train_epoch_ddp(
     profile_stats = ProfilingStats() if do_profile else None
 
     if do_profile:
-        print(f"\n*** PROFILING ENABLED for first {profile_batches} batches ***\n")
+        print(f"\n*** PROFILING ENABLED for first {profile_batches} "
+              f"batch{'es' if profile_batches != 1 else ''} ***\n")
 
     # Only show progress bar on rank 0
     if is_main_process(rank):
@@ -1315,7 +1318,8 @@ def train_epoch_multihead(
     profile_stats = ProfilingStats() if do_profile else None
 
     if do_profile:
-        print(f"\n*** PROFILING ENABLED for first {profile_batches} batches ***\n")
+        print(f"\n*** PROFILING ENABLED for first {profile_batches} "
+              f"batch{'es' if profile_batches != 1 else ''} ***\n")
 
     if is_main_process(rank):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
