@@ -13,6 +13,7 @@ description: Run AlphaGenome-PyTorch to get genomic track predictions — via th
 - Python tensors and input shapes: `The 30-second version` and `Step 1`
 - Assay/cell-type/resolution selection: `Step 2`, `Step 3`, and `Recipes`
 - Exact counts and metadata literals: `Step 2` and `Available metadata fields`
+- Per-gene counts / gene expression matrices: `Gene-level aggregation`
 - Padding, custom metadata, precision, or raw outputs: `Gotchas`
 
 **Try the CLI first** — `agt predict` writes predictions to disk without any Python:
@@ -46,6 +47,9 @@ Use the Python API when you need tensors in-process or metadata-based selection:
   `out.dnase.select(biosample_name="GM12878")[128].tensor`.
 - Filter fields include `biosample_name`, `assay_title`, `biosample_type`,
   `histone_mark`, `transcription_factor`, `ontology_curie`, `strand`.
+- Gene × track expression matrices: `alphagenome_pytorch.aggregation` (submodule
+  import, not the package root) — `gene_expression` (exons, log) or
+  `aggregate_genes` (gene body, linear), then `.to_anndata()` / `.to_dataframe()`.
 
 Explore available tracks without weights: `agt info --heads`,
 `agt info --tracks dnase --filter biosample_name=K562` (prints track indices for

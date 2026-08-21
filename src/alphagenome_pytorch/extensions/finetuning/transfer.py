@@ -26,6 +26,8 @@ Example:
     model = prepare_for_transfer(model, config)
 """
 
+from __future__ import annotations
+
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any

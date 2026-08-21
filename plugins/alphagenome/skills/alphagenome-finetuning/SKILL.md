@@ -96,6 +96,33 @@ There is **no `--overlap-lowres` flag**; the low-res overlap is computed as
 
 **Tracking**: `--wandb` (`--wandb-project`, default `alphagenome-finetune`).
 
+**Gene-level RNA-seq** — two independent features, both **off by default**:
+
+```bash
+# Cross-track gene LFC loss over gene bodies (paper weight: 0.1)
+--gene-loss-weight 0.1 --gene-cross-track-weight 5.0 \
+    --gtf gencode.v46.annotation.gtf --track-strands '+-'
+
+# Exon-based gene-expression correlations, reported each validation epoch
+--gene-expr-eval --gene-expr-annotation gencode.v46.parquet --track-strands '+-'
+```
+
+The loss aggregates over **gene bodies** (exons + introns) and needs `--gtf`,
+`rna_seq` in `--modality`, and `--track-strands`. Leaving `--gene-loss-weight` at
+`0.0` keeps loss values bit-identical to a run without it.
+
+The eval metric aggregates over **annotated exons** (log mean coverage,
+strand-matched, genes with ≥50% of exons in-window) and emits
+`rna_seq_gene_log_expr_pearson_{across_genes,across_genes_norm,across_tracks_norm}`
+plus `rna_seq_gene_log_expr_n_genes`. It needs an annotation that actually
+contains **exon rows**, so a gene-only `--gtf` is not enough on its own.
+
+Both `--gtf` and `--gene-expr-annotation` accept parquet or GTF/GFF. Convert
+once (`python scripts/convert_gtf_to_parquet.py --input x.gtf --output
+x.parquet`) and point `--gtf` at the parquet: it loads in seconds instead of
+minutes on every run's startup path, and since the converter keeps every
+feature, that single file drives both the gene-body masks and the exon metric.
+
 **Preparing BigWig data** (`agt preprocess`) — optional prep before training:
 ```bash
 # Normalize signal depth across tracks to a common total (e.g. 100M)
