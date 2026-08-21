@@ -111,6 +111,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
                                "chars ('+','-','.'), one per output track, compact ('+-+-') or "
                                "separated ('+,-,+,-'). Normally inferred from metadata; needed "
                                "only for custom/legacy heads without embedded strand info.")
+    gene_out.add_argument("--keep-padding", action="store_true",
+                          help="Keep placeholder padding tracks in the --anndata output. Off by "
+                               "default: padding channels carry no signal (scaled to 0.0), so "
+                               "they only dilute summaries taken across tracks. Turn on when obs "
+                               "rows must line up positionally with the raw head channels, e.g. "
+                               "for JAX parity checks.")
 
     # Finetuned model options
     ft = p.add_argument_group("Finetuned model (optional)")
@@ -184,6 +190,54 @@ def _strands_from_checkpoint(track_metadata, head: str) -> list[str] | None:
         return None
     rows = sorted(rows, key=lambda r: r.get("track_index", 0))
     return [str(r["strand"]) for r in rows]
+
+
+def _metadata_from_builtin(head: str, organism: int, track_indices):
+    """Full ``TrackMetadata`` for a native head, narrowed by --tracks."""
+    from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
+    try:
+        catalog = TrackMetadataCatalog.load_builtin(organism)
+        tracks = list(catalog.get_tracks(head, organism=organism, strict=True))
+    except (KeyError, FileNotFoundError):
+        return None
+    if not tracks:
+        return None
+    if track_indices is not None:
+        if any(i >= len(tracks) for i in track_indices):
+            return None
+        tracks = [tracks[i] for i in track_indices]
+    return tracks
+
+
+def _metadata_from_checkpoint(checkpoint_meta, head: str, track_indices):
+    """Embedded per-track rows for *head* from a checkpoint, narrowed by --tracks."""
+    if not checkpoint_meta:
+        return None
+
+    def _head_of(row) -> str:
+        return str(row.get("output_name") or row.get("output_type") or "")
+
+    rows = [dict(r) for r in checkpoint_meta if _head_of(r).lower() == head.lower()]
+    if not rows:
+        return None
+    rows = sorted(rows, key=lambda r: r.get("track_index", 0))
+    if track_indices is not None:
+        if any(i >= len(rows) for i in track_indices):
+            return None
+        rows = [rows[i] for i in track_indices]
+    return rows
+
+
+def _resolve_track_metadata(args, head, organism, track_indices, checkpoint_meta):
+    """Per-track metadata for the AnnData ``obs`` table, or None if unavailable.
+
+    A fine-tuned checkpoint's embedded rows win; otherwise the built-in catalog.
+    Returning None is not an error — ``obs`` simply falls back to ``track_index``
+    only, and no padding can be identified.
+    """
+    if args.checkpoint:
+        return _metadata_from_checkpoint(checkpoint_meta, head, track_indices)
+    return _metadata_from_builtin(head, organism, track_indices)
 
 
 def _resolve_track_strands(head, organism, track_indices, *,
@@ -447,6 +501,19 @@ def run(args: argparse.Namespace) -> int:
                 "but the checkpoint embeds no strand metadata; pass --track-strands "
                 "(or retrain so the checkpoint records strands)."
             )
+
+    # Per-track metadata for the AnnData obs table, and for identifying padding.
+    # Unavailable metadata is not fatal: obs falls back to track_index only and
+    # nothing is stripped.
+    track_metadata_for_obs = None
+    if args.anndata:
+        track_metadata_for_obs = _resolve_track_metadata(
+            args, args.head, organism_index, track_indices, track_metadata_from_ckpt,
+        )
+        if track_metadata_for_obs is None and not json_mode and not args.quiet:
+            print("  Note: no per-track metadata for this head — obs will carry "
+                  "track_index only, and padding tracks cannot be identified.")
+
     model.eval()
 
     inner_model = getattr(model, "_orig_mod", model)
@@ -486,6 +553,8 @@ def run(args: argparse.Namespace) -> int:
                 track_indices=track_indices,
                 track_names=track_names,
                 track_strands=track_strands,
+                track_metadata=track_metadata_for_obs,
+                strip_padding=not args.keep_padding,
                 over="exons" if args.aggregate_over == "exons" else "gene_body",
                 reduce="sum" if args.aggregate_func == "sum" else "mean",
                 log=args.aggregate_func == "log-mean",
@@ -600,7 +669,8 @@ def run(args: argparse.Namespace) -> int:
         entries: list[tuple] = []  # for merged BigWig
         region_meta: list = []
         if not args.quiet and not json_mode:
-            print(f"Predicting {len(regions)} regions from {args.bed}...")
+            n = len(regions)
+            print(f"Predicting {n} region{'s' if n != 1 else ''} from {args.bed}...")
         for r in regions:
             preds, info = predict_region_auto(
                 model, genome,

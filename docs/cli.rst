@@ -169,6 +169,10 @@ Input mode          What it does                                    Output
 ``--bed`` is given, ``--chromosomes`` can additionally be passed as a
 chromosome filter over the BED rows (see below).
 
+In ``--chromosomes`` mode, ``--anndata`` swaps the BigWig output for a
+per-gene × per-track count table — see
+:ref:`per-gene-anndata` below.
+
 Requires: ``pip install alphagenome-pytorch[inference]``
 
 How size mismatches are handled
@@ -347,6 +351,52 @@ Errors you'll see:
 
    Error: Sequence 'seq1' (500000bp) is longer than the model window
    (131072bp); pass --tile to enable tiling.
+
+.. _per-gene-anndata:
+
+Per-gene counts (AnnData)
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+In ``--chromosomes`` mode, ``--anndata`` aggregates the tiled signal into a
+per-gene × per-track matrix and writes it as ``.h5ad`` instead of BigWigs.
+Mostly used with the ``rna_seq`` head to produce a gene expression count table.
+
+.. code-block:: bash
+
+   agt predict \
+       --model model.pth --fasta hg38.fa --output out/ \
+       --head rna_seq --chromosomes chr20 \
+       --resolution 1 --crop-bp 16384 \
+       --anndata gene_counts.h5ad \
+       --annotation gencode.v46.parquet \
+       --aggregate-over exons --aggregate-func sum --gene-strand match
+
+======================== =================================================================
+Flag                     Meaning
+======================== =================================================================
+``--anndata NAME``       Write ``{output}/NAME`` (a ``.h5ad``) instead of BigWigs
+``--annotation PATH``    GTF/GFF or parquet annotation (required with ``--anndata``)
+``--aggregate-over``     ``exons`` (default) or ``gene-body`` (exons + introns)
+``--aggregate-func``     ``sum`` (default) / ``mean`` (per-base) / ``log-mean``
+``--gene-strand``        ``all`` (default) or ``match`` (NaN antisense cells)
+``--track-strands``      Per-track strands (``+-+-`` or ``+,-,+,-``) when metadata lacks them
+``--keep-padding``       Keep placeholder padding tracks (dropped by default)
+======================== =================================================================
+
+Requires ``pip install 'alphagenome-pytorch[inference-anndata]'``. Combining
+``--anndata`` with ``--locus``, ``--bed``, or ``--sequences`` is an error, and
+``--aggregate-over exons`` needs an annotation that actually contains exon rows.
+
+The output has ``X`` of shape ``[n_tracks, n_genes]``, tracks in ``obs`` and
+genes in ``var``; transpose for genes as observations. ``obs`` carries the full
+track metadata (``track_name``, ``biosample_name``, ``assay_title``, ``strand``,
+...), and placeholder padding tracks are dropped unless you pass
+``--keep-padding``. For stranded assays pass ``--gene-strand match``, otherwise
+each gene is also scored by opposite-strand tracks — antisense signal, not the
+gene's own expression.
+
+See :ref:`per-gene-counts` for the aggregation modes, the unit caveat at 128bp,
+annotation preparation, and the equivalent Python API.
 
 Common options
 ^^^^^^^^^^^^^^
