@@ -53,6 +53,18 @@ Gene-level RNA-seq (both off by default, see `docs/finetuning/cli.rst`):
   parquet (`scripts/convert_gtf_to_parquet.py`): seconds vs minutes on startup,
   and one file with exon rows covers both features.
 
+What a run writes: `<output-dir>/<run-name>` (default
+`finetuning_output/<timestamp>`) gets `best_model.pth`, `checkpoint_epoch{N}.pth`
+(every epoch), `config.json` and the CSV logs. **`--save-delta` is off by
+default**, so a default run produces nothing shareable. `--no-full-checkpoint`
+selects deltas-only; `--no-save-checkpoints` writes no weights at all.
+
+Loading: full checkpoints and full exports are self-contained
+(`agt predict --checkpoint X`); delta checkpoints, exported deltas and adapter
+bundles also need `--model <base weights>`. `agt info <file>` or
+`describe_checkpoint(path)` says which you have. See
+[`docs/finetuning/checkpoints.rst`](../../../docs/finetuning/checkpoints.rst).
+
 Gotchas:
 - `--resolutions` defaults to `1` (1bp only); use `--resolutions 128` for
   `chip_tf`/`chip_histone`.

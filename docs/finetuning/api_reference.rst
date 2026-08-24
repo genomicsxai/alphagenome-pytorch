@@ -41,6 +41,18 @@ Adapters
    :members:
    :undoc-members:
 
+Loading and classification
+--------------------------
+
+.. autofunction:: alphagenome_pytorch.extensions.finetuning.checkpointing.load_finetuned_model
+
+.. autofunction:: alphagenome_pytorch.extensions.finetuning.checkpointing.describe_checkpoint
+
+.. autoclass:: alphagenome_pytorch.extensions.finetuning.checkpointing.CheckpointInfo
+   :members:
+
+.. autofunction:: alphagenome_pytorch.extensions.finetuning.checkpointing.export_model_weights
+
 Checkpointing
 -------------
 

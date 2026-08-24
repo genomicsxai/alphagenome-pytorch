@@ -415,11 +415,63 @@ Flag                     Meaning
 ``--device STR``         PyTorch device (``cuda``, ``cpu``, ``mps``)
 ``--dtype-policy``       ``full_float32`` (default) or ``mixed_precision``
 ``--compile``            Wrap model with ``torch.compile``
-``--checkpoint PATH``    Finetuned checkpoint (LoRA, full, etc.)
+``--checkpoint SRC``     Finetuned model: a checkpoint file, a bundle directory, or an ``hf://`` URI
 ``--transfer-config``    TransferConfig JSON for adapter models
 ``--no-merge-adapters``  Keep LoRA/adapter modules separate from base weights
 ``--quiet``              Suppress progress bars and per-region status lines
 ======================== =================================================================
+
+.. _predict-with-a-finetuned-model:
+
+Predicting with a fine-tuned model
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``--model`` is the **base** model; ``--checkpoint`` is the fine-tune layered on
+top. Whether you need both depends on what kind of file you were given.
+
+Most shared fine-tunes — delta checkpoints, exported deltas and adapter bundles
+— contain only the *difference* from a base model, so they need both:
+
+.. code-block:: bash
+
+   agt predict \
+       --model model.pth \
+       --checkpoint k562-atac.delta.pth \
+       --head atac \
+       --locus chr1:1000000-1131072 \
+       --fasta hg38.fa \
+       --output preds/
+
+A full checkpoint or an exported full model contains everything, so
+``--model`` can be omitted:
+
+.. code-block:: bash
+
+   agt predict --checkpoint best_model.pth --head atac ...
+
+Not sure which you have? ``agt info <file>`` reports the kind and whether base
+weights are needed. :doc:`finetuning/checkpoints` covers every artifact kind.
+
+**Adapter bundles** are accepted directly, including straight from the Hub:
+
+.. code-block:: bash
+
+   agt predict \
+       --model model.pth \
+       --checkpoint hf://your-org/k562-atac-lora \
+       --head atac --locus chr1:1000000-1131072 \
+       --fasta hg38.fa --output preds/
+
+A bundle records the base model it was trained against, so pairing it with the
+wrong ``--model`` fails with a hash mismatch rather than silently producing
+meaningless predictions. A bare ``.delta.pth`` carries no such guarantee — if it
+came from someone else, check which base weights they used.
+
+.. note::
+
+   ``agt score`` does not accept bundle directories or URIs. For variant scoring
+   with a fine-tune, point ``--checkpoint`` at the checkpoint file itself
+   (``agt adapters pull`` will resolve a published bundle to a local path).
 
 JSON output
 ^^^^^^^^^^^
@@ -512,8 +564,13 @@ Requires: ``pip install alphagenome-pytorch[finetuning]``
        --train-bed train.bed --val-bed val.bed \
        --pretrained-weights model.pth
 
-``agt finetune`` forwards arguments to the training script and currently emits
-the script's normal console logs.
+``agt finetune`` is the training entry point; ``scripts/finetune.py`` is a thin
+shim that calls into it and takes the same arguments. Training progress is
+written to the console as it runs.
+
+By default a run writes only full checkpoints (~1GB). Add ``--save-delta`` for a
+small, shareable artifact. See :doc:`finetuning/cli` for the full output layout
+and :doc:`finetuning/checkpoints` for how to load or publish the result.
 
 
 ``agt score``

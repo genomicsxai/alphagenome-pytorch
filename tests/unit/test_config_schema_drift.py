@@ -6,8 +6,8 @@ and ``no_full_checkpoint`` were documented for months while the merge silently
 ignored them, so a run the user believed was writing shareable delta
 checkpoints wrote none.
 
-This test fails if a documented key is not merged, or if a key is listed as
-CLI-only below but has quietly become mergeable.
+This test fails if a documented key is not merged, or if a key listed below as
+deliberately non-scalar has quietly become a plain scalar merge.
 """
 
 import re
@@ -31,8 +31,9 @@ NON_SCALAR_KEYS = {
     "no_amp": "alias handled next to use_amp",
     "no_cache": "expands to cache_genome + cache_signals",
     "gene_expr_eval": "coerced to bool explicitly",
-    # CLI-only: overrides a per-modality config field rather than a scalar.
-    "strand_pairs": "CLI override of modalities.<name>.strand_pairs",
+    # Config-settable, but per-modality rather than top-level; --strand-pairs
+    # overrides the per-modality value.
+    "strand_pairs": "set as modalities.<name>.strand_pairs, not a top-level scalar",
 }
 
 
