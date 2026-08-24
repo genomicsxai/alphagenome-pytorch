@@ -486,17 +486,6 @@ def postprocess_args(
     passed explicitly, since those take precedence over the YAML config.
     *parser* is used to report errors against the parser the user invoked.
     """
-    if args.no_full_checkpoint and not args.save_delta:
-        parser.error(
-            "--no-full-checkpoint requires --save-delta (otherwise the run "
-            "would produce no loadable checkpoints)."
-        )
-    if args.save_delta and args.mode == "full":
-        parser.error(
-            "--save-delta cannot be used with --mode full: delta checkpoints "
-            "only store adapter/head/norm weights, so they would omit all "
-            "fine-tuning updates to the trunk."
-        )
     cli_flags = {
         token.split("=", 1)[0]
         for token in tokens
@@ -608,6 +597,10 @@ def postprocess_args(
         "run_name",
         "save_every",
         "resume",
+        "save_delta",
+        "no_full_checkpoint",
+        "no_save_checkpoints",
+        "export_transfer_config",
         "modality_weights",
         "track_metadata",
         "gtf",
@@ -615,11 +608,30 @@ def postprocess_args(
         "gene_loss_weight",
         "gene_cross_track_weight",
         "gene_expr_annotation",
+        "organism",
+        "sequence_parallel",
+        "overlap_highres",
     ):
         _apply_config_scalar(attr, config_data)
 
     if "--gene-expr-eval" not in cli_flags and "gene_expr_eval" in config_data:
         args.gene_expr_eval = bool(config_data["gene_expr_eval"])
+
+    # Checkpoint-shape validation runs *after* the merge: `save_delta`,
+    # `no_full_checkpoint` and `mode` can all arrive from the YAML config, so
+    # validating earlier would inspect pre-merge values and let an invalid
+    # config through.
+    if args.no_full_checkpoint and not args.save_delta:
+        parser.error(
+            "--no-full-checkpoint requires --save-delta (otherwise the run "
+            "would produce no loadable checkpoints)."
+        )
+    if args.save_delta and args.mode == "full":
+        parser.error(
+            "--save-delta cannot be used with --mode full: delta checkpoints "
+            "only store adapter/head/norm weights, so they would omit all "
+            "fine-tuning updates to the trunk."
+        )
 
     # Boolean aliases / migration-friendly keys
     if "--no-amp" not in cli_flags:
