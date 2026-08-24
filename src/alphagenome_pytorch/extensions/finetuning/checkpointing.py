@@ -1318,6 +1318,224 @@ def is_delta_weights_export(path: Path | str) -> bool:
     return "transfer_config" in data and "weights" in data
 
 
+#: Artifact kinds recognised by :func:`describe_checkpoint`. These names are the
+#: shared vocabulary between the loader, ``agt info`` and the documentation, so
+#: the routing table users read matches what the tools print.
+CHECKPOINT_KINDS = (
+    "full_checkpoint",
+    "delta_checkpoint",
+    "delta_export",
+    "full_export",
+    "bundle",
+)
+
+#: Kinds that carry only the difference from a base model and therefore cannot
+#: be loaded without the pretrained weights they were trained against.
+DELTA_SHAPED_KINDS = frozenset({"delta_checkpoint", "delta_export", "bundle"})
+
+_KIND_DESCRIPTIONS = {
+    "full_checkpoint": "a full training checkpoint (contains the complete model)",
+    "delta_checkpoint": (
+        "a delta checkpoint — it contains only the difference from a base model "
+        "(adapter, head and norm weights)"
+    ),
+    "delta_export": (
+        "an exported delta — it contains only the difference from a base model "
+        "(adapter, head and norm weights)"
+    ),
+    "full_export": "an exported full model (contains the complete model)",
+    "bundle": (
+        "an adapter bundle — it contains only the difference from a base model "
+        "(adapter, head and norm weights) plus a manifest"
+    ),
+}
+
+
+@dataclass
+class CheckpointInfo:
+    """What kind of artifact a path holds, and what is needed to load it.
+
+    Attributes:
+        kind: One of :data:`CHECKPOINT_KINDS`.
+        requires_base_weights: True when the artifact stores only a delta and
+            must be loaded alongside the base weights it was trained against.
+        base_model_weights_hash: SHA-256 of the base checkpoint this artifact
+            was trained against, when the artifact recorded one. ``None`` for
+            older artifacts and for self-contained ones.
+        path: The path that was inspected.
+    """
+
+    kind: str
+    requires_base_weights: bool
+    base_model_weights_hash: str | None
+    path: Path
+
+    @property
+    def description(self) -> str:
+        """One-line human-readable summary of :attr:`kind`."""
+        return _KIND_DESCRIPTIONS[self.kind]
+
+
+def describe_checkpoint(path: Path | str) -> CheckpointInfo:
+    """Classify a fine-tuning artifact without loading the model.
+
+    This is the single classifier behind :func:`load_finetuned_model`'s
+    dispatch, ``agt info``, and the documentation's routing table. It reads only
+    what it needs: safetensors are classified from their header, so no tensor
+    data is touched.
+
+    Args:
+        path: Path to a checkpoint, exported weights file, or bundle directory.
+
+    Returns:
+        A :class:`CheckpointInfo`.
+
+    Raises:
+        FileNotFoundError: If *path* does not exist.
+        ValueError: If the file is not a recognised artifact.
+
+    Example:
+        >>> info = describe_checkpoint("best_model.delta.pth")
+        >>> info.kind, info.requires_base_weights
+        ('delta_checkpoint', True)
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {p}")
+
+    def _info(kind: str, base_hash: str | None = None) -> CheckpointInfo:
+        return CheckpointInfo(
+            kind=kind,
+            requires_base_weights=kind in DELTA_SHAPED_KINDS,
+            base_model_weights_hash=base_hash,
+            path=p,
+        )
+
+    # Bundles are directories carrying a manifest sidecar.
+    if p.is_dir():
+        from alphagenome_pytorch.extensions.serving.bundle import (
+            MANIFEST_FILENAME,
+            Manifest,
+        )
+
+        manifest_path = p / MANIFEST_FILENAME
+        if not manifest_path.is_file():
+            raise ValueError(
+                f"{p} is a directory but does not contain {MANIFEST_FILENAME}, "
+                "so it is not an adapter bundle."
+            )
+        manifest = Manifest.load(manifest_path)
+        return _info("bundle", manifest.base_model_weights_hash)
+
+    # safetensors: classify from the header alone, no tensors read.
+    if p.suffix == ".safetensors":
+        try:
+            from safetensors import safe_open
+        except ImportError as exc:  # pragma: no cover - depends on env
+            raise ImportError(
+                "safetensors not installed. Install with: pip install safetensors"
+            ) from exc
+        with safe_open(p, framework="pt") as f:
+            metadata = f.metadata() or {}
+        if "transfer_config" in metadata:
+            return _info("delta_export", metadata.get("base_model_weights_hash"))
+        return _info("full_export")
+
+    try:
+        obj = torch.load(p, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        raise ValueError(
+            f"Could not read {p} as a checkpoint: {exc}. Expected a PyTorch "
+            "checkpoint (.pth), an exported weights file (.safetensors), or an "
+            "adapter bundle directory."
+        ) from exc
+    if not isinstance(obj, dict):
+        raise ValueError(
+            f"Unrecognized checkpoint format at {p}: expected a dict, got "
+            f"{type(obj).__name__}."
+        )
+    if "delta_checkpoint_version" in obj:
+        return _info("delta_checkpoint", obj.get("base_model_weights_hash"))
+    if "transfer_config" in obj and "weights" in obj:
+        return _info("delta_export", obj.get("base_model_weights_hash"))
+    if "model_state_dict" in obj:
+        return _info("full_checkpoint", obj.get("base_model_weights_hash"))
+    # A bare state_dict, as written by export_model_weights(format="pth").
+    if obj and all(isinstance(v, torch.Tensor) for v in obj.values()):
+        return _info("full_export")
+    raise ValueError(
+        f"Unrecognized checkpoint format at {p}. Keys: {list(obj.keys())[:10]}"
+    )
+
+
+def _load_full_state_dict(
+    model: nn.Module,
+    state_dict: dict[str, Any],
+    *,
+    strict: bool,
+) -> None:
+    """Load a complete model state dict, optionally insisting it be complete.
+
+    ``strict`` is True when no base weights were loaded first. In that case
+    nothing has seeded the trunk, so a missing key would silently leave a
+    randomly-initialised tensor in the model; we raise instead. ``track_means``
+    buffers stay tolerated, mirroring ``AlphaGenome.from_pretrained`` — older
+    weight files predate them and they are re-derivable.
+
+    Unexpected keys are never fatal: they mean the checkpoint carries extra
+    state this build does not use, which is forward-compatible.
+    """
+    result = model.load_state_dict(state_dict, strict=False)
+    if not strict:
+        return
+
+    missing = [k for k in result.missing_keys if "track_means" not in k]
+    if not missing:
+        return
+
+    shown = ", ".join(missing[:10])
+    if len(missing) > 10:
+        shown += f", ... ({len(missing) - 10} more)"
+    raise ValueError(
+        f"Checkpoint is missing {len(missing)} parameter(s) and no base weights "
+        f"were provided to fill them in: {shown}\n\n"
+        "Pass the base weights this checkpoint was fine-tuned from:\n"
+        "    Python: load_finetuned_model(checkpoint, pretrained_weights=<base weights>)\n"
+        "    CLI:    agt predict --model <base weights> --checkpoint <checkpoint>"
+    )
+
+
+def _require_base_weights(
+    pretrained_weights: Path | str | None,
+    kind: str,
+    base_model_weights_hash: str | None = None,
+) -> None:
+    """Fail fast when a delta-shaped artifact was given no base weights.
+
+    Called the moment the artifact kind is known and before any tensor work, so
+    the user does not wait on a load that cannot succeed. The message carries
+    the whole lesson: what the file is, that base weights are required, how to
+    supply them, and — when recorded — which base checkpoint to use.
+    """
+    if pretrained_weights is not None:
+        return
+    hint = ""
+    if base_model_weights_hash:
+        hint = (
+            f"\n\nIt was trained against the base weights with SHA-256 "
+            f"{base_model_weights_hash}. Check a candidate file with:\n"
+            f"    agt info <base-weights> --validate"
+        )
+    raise ValueError(
+        f"This checkpoint is {_KIND_DESCRIPTIONS[kind]}, so it cannot be loaded "
+        f"on its own — the base model weights it was trained against are "
+        f"required too.\n\n"
+        f"    Python: load_finetuned_model(checkpoint, pretrained_weights=<base weights>)\n"
+        f"    CLI:    agt predict --model <base weights> --checkpoint <checkpoint>"
+        f"{hint}"
+    )
+
+
 def load_delta_weights(
     model: nn.Module,
     path: Path | str,
@@ -1579,7 +1797,7 @@ def finalize_finetuned_organism_context(
 
 def load_finetuned_model(
     checkpoint_path: str | Path,
-    pretrained_weights: str | Path,
+    pretrained_weights: str | Path | None = None,
     device: str | torch.device = "cpu",
     dtype_policy: "DtypePolicy | None" = None,
     transfer_config: "TransferConfig | None" = None,
@@ -1600,7 +1818,13 @@ def load_finetuned_model(
 
     Args:
         checkpoint_path: Path to finetuned checkpoint (.pth or .delta.pth).
-        pretrained_weights: Path to base pretrained weights.
+        pretrained_weights: Path to base pretrained weights. Required for
+            delta-shaped artifacts (delta checkpoints, exported deltas and
+            adapter bundles), which store only the difference from a base
+            model. Optional for full checkpoints, which carry the complete
+            model; passing it anyway is harmless and preserves the historical
+            behaviour of seeding the trunk before the checkpoint overwrites it.
+            Use :func:`describe_checkpoint` to check which kind you have.
         device: Target device.
         dtype_policy: Precision policy. Default: ``full_float32()``.
         transfer_config: Optional externally-provided ``TransferConfig``
@@ -1709,7 +1933,12 @@ def load_finetuned_model(
     # torch.load (torch.load on a safetensors file raises UnpicklingError).
     if ckpt_path.suffix == ".safetensors":
         from safetensors.torch import load_file
+        # Read the header first: it identifies the artifact and carries the base
+        # weights hash, so a missing --model fails before any tensor is read.
         header = _read_delta_export_header(ckpt_path)
+        _require_base_weights(
+            pretrained_weights, "delta_export", header.get("base_model_weights_hash")
+        )
         return _finalize_delta_export(header, load_file(ckpt_path))
 
     # Every other format is a torch pickle: deserialize ONCE and dispatch on the
@@ -1723,6 +1952,9 @@ def load_finetuned_model(
 
     # --- Path A: Delta checkpoint (self-describing, carries a version tag) ---
     if "delta_checkpoint_version" in ckpt:
+        _require_base_weights(
+            pretrained_weights, "delta_checkpoint", ckpt.get("base_model_weights_hash")
+        )
         model = AlphaGenome(dtype_policy=dtype_policy)
         model = load_trunk(model, str(pretrained_weights), exclude_heads=True)
         # Strip the base model's (untrained) pretrained heads before reconstructing,
@@ -1753,6 +1985,9 @@ def load_finetuned_model(
 
     # --- Path A2 (.pth): Exported delta weights (transfer_config + weights) ---
     if "transfer_config" in ckpt and "weights" in ckpt:
+        _require_base_weights(
+            pretrained_weights, "delta_export", ckpt.get("base_model_weights_hash")
+        )
         header = {
             "transfer_config": ckpt["transfer_config"],
             "track_names": ckpt.get("track_names"),
@@ -1780,13 +2015,22 @@ def load_finetuned_model(
             effective_config = transfer_config_from_dict(embedded)
 
     model = AlphaGenome(dtype_policy=dtype_policy)
-    model = load_trunk(model, str(pretrained_weights), exclude_heads=True)
+    # A full checkpoint stores the complete ``model.state_dict()`` (trunk, heads
+    # and the persistent track_means buffers), so seeding the trunk from the base
+    # weights is optional: every key it supplies is overwritten below. When base
+    # weights are given we still load them, preserving the historical tolerance
+    # for partial checkpoints; when they are not, the state dict must stand on
+    # its own and is loaded strictly so gaps surface instead of leaving
+    # randomly-initialised tensors in place.
+    have_base_weights = pretrained_weights is not None
+    if have_base_weights:
+        model = load_trunk(model, str(pretrained_weights), exclude_heads=True)
     model = remove_all_heads(model)
 
     if effective_config is not None:
         # Path B: Reconstruct adapter architecture, then load full state dict
         model = prepare_for_transfer(model, effective_config)
-        model.load_state_dict(state_dict, strict=False)
+        _load_full_state_dict(model, state_dict, strict=not have_base_weights)
         if merge:
             model = merge_adapters(model)
         head_names = list(effective_config.new_heads.keys())
@@ -1823,7 +2067,7 @@ def load_finetuned_model(
             head = create_finetuning_head(assay_type=modality, n_tracks=n_tracks, resolutions=res)
             model.heads[modality] = head
 
-        model.load_state_dict(state_dict, strict=False)
+        _load_full_state_dict(model, state_dict, strict=not have_base_weights)
 
     meta = {
         "modality": ckpt.get("modality"),
@@ -1861,6 +2105,11 @@ __all__ = [
     "is_delta_weights_export",
     # Inference loading
     "load_finetuned_model",
+    # Artifact classification
+    "describe_checkpoint",
+    "CheckpointInfo",
+    "CHECKPOINT_KINDS",
+    "DELTA_SHAPED_KINDS",
     # Organism provenance / selection
     "FinetunedOrganismContext",
     "resolve_finetuned_organism",
