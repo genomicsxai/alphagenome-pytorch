@@ -452,6 +452,80 @@ class TestStitchingWithMockModel:
         assert float(adata.X[0, 0]) == pytest.approx(3.0)  # track 0: 3 exon bins x 1.0
         assert float(adata.X[1, 0]) == pytest.approx(0.0)  # track 1: mock is 0
 
+    def test_gene_counts_anndata_progress_never_reaches_stdout(self, capsys):
+        """`agt predict --json` reads stdout as JSON, so prose must not land there.
+
+        show_progress=False must be silent on both streams; show_progress=True
+        must report on stderr only.
+        """
+        import pandas as pd
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            predict_full_chromosomes_to_anndata,
+            GenomeSequenceProvider,
+        )
+        from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+
+        chrom_len = 131072
+        config = TilingConfig(crop_bp=0, resolution=128, batch_size=1)
+        model = self._MockModel(resolution=128, n_tracks=1)
+        ann = GeneAnnotation(pd.DataFrame([
+            dict(Feature="gene", Chromosome="chr1", Start=256, End=640, Strand="+",
+                 gene_id="ENSX", gene_name="X", gene_type="protein_coding"),
+            dict(Feature="exon", Chromosome="chr1", Start=256, End=640, Strand="+",
+                 gene_id="ENSX", gene_name="X", gene_type="protein_coding"),
+        ]))
+
+        def aggregate(show_progress):
+            provider = self._build_in_memory_provider(GenomeSequenceProvider, chrom_len)
+            predict_full_chromosomes_to_anndata(
+                model, provider, ann, "atac",
+                chromosomes=["chr1"], config=config, track_indices=[0],
+                over="exons", reduce="sum", device="cpu",
+                show_progress=show_progress,
+            )
+            return capsys.readouterr()
+
+        quiet = aggregate(False)
+        assert quiet.out == ""
+        assert quiet.err == ""
+
+        loud = aggregate(True)
+        assert loud.out == ""
+        assert "Aggregating" in loud.err
+
+    def test_gene_counts_anndata_log_flag_survives_the_progress_helper(self):
+        """The progress helper must not shadow this function's `log` (log1p) flag."""
+        import pandas as pd
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            predict_full_chromosomes_to_anndata,
+            GenomeSequenceProvider,
+        )
+        from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+
+        chrom_len = 131072
+        config = TilingConfig(crop_bp=0, resolution=128, batch_size=1)
+        model = self._MockModel(resolution=128, n_tracks=1)
+        ann = GeneAnnotation(pd.DataFrame([
+            dict(Feature="gene", Chromosome="chr1", Start=256, End=640, Strand="+",
+                 gene_id="ENSX", gene_name="X", gene_type="protein_coding"),
+            dict(Feature="exon", Chromosome="chr1", Start=256, End=640, Strand="+",
+                 gene_id="ENSX", gene_name="X", gene_type="protein_coding"),
+        ]))
+
+        def aggregate(log):
+            provider = self._build_in_memory_provider(GenomeSequenceProvider, chrom_len)
+            gc = predict_full_chromosomes_to_anndata(
+                model, provider, ann, "atac",
+                chromosomes=["chr1"], config=config, track_indices=[0],
+                over="exons", reduce="sum", device="cpu", show_progress=False,
+                log=log,
+            )
+            return gc.counts[0, 0, 0].item()
+
+        raw = aggregate(False)
+        assert raw == pytest.approx(3.0)             # 3 exon bins x 1.0
+        assert aggregate(True) == pytest.approx(np.log1p(raw))
+
 
 @pytest.mark.unit
 class TestHeadConfigs:
@@ -720,3 +794,49 @@ class TestFullChromosomeBigwigApi:
         out = BigwigOutput(Path("dnase.bw"), ["chr20", "chr21"])
         assert out.path.name == "dnase.bw"
         assert out.chromosomes == ["chr20", "chr21"]
+
+
+@pytest.mark.unit
+class TestProgressStreamDiscipline:
+    """Progress prose must never reach stdout, which carries the JSON payload."""
+
+    @staticmethod
+    def _tiny_fasta(tmp_path):
+        fa = tmp_path / "tiny.fa"
+        fa.write_text(">chr1\n" + "ACGT" * 16 + "\n>chr2\n" + "ACGT" * 8 + "\n")
+        return fa
+
+    def test_provider_is_silent_when_progress_is_off(self, tmp_path, capsys):
+        pytest.importorskip("pyfaidx")
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            GenomeSequenceProvider,
+        )
+
+        provider = GenomeSequenceProvider(
+            self._tiny_fasta(tmp_path), chromosomes={"chr1"}, show_progress=False,
+        )
+        try:
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            assert captured.err == ""
+        finally:
+            provider.close()
+
+    def test_provider_reports_on_stderr_not_stdout(self, tmp_path, capsys):
+        """Both messages -- the provider's own and GenomeSequenceSource's."""
+        pytest.importorskip("pyfaidx")
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            GenomeSequenceProvider,
+        )
+
+        provider = GenomeSequenceProvider(
+            self._tiny_fasta(tmp_path), chromosomes={"chr1"}, show_progress=True,
+        )
+        try:
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            assert "Loading genome from" in captured.err
+            assert "Cached genome" in captured.err
+        finally:
+            provider.close()
+

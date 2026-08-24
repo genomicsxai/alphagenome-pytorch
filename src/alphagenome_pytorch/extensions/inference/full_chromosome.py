@@ -28,6 +28,8 @@ Example:
 
 from __future__ import annotations
 
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -41,6 +43,25 @@ from alphagenome_pytorch.utils.sequence import sequence_to_onehot
 #: Chromosomes predicted when none are named: the main assembly, chr1..22 + chrX.
 #: Excludes chrY, chrM and scaffolds. Names not present in the FASTA are dropped.
 DEFAULT_CHROMOSOMES = [f"chr{i}" for i in range(1, 23)] + ["chrX"]
+
+
+def _progress_logger(show_progress: bool) -> Callable[[str], None]:
+    """Return a callable that reports progress on stderr when it is wanted.
+
+    Progress is a diagnostic, not a result. ``agt predict --json`` must leave
+    stdout holding its payload alone, and ``--quiet`` must silence the prose
+    altogether, so every message passes this gate. stderr is also where the
+    tqdm bars these lines interleave with already go.
+
+    Bind the result as ``progress``, not ``log``:
+    :func:`predict_full_chromosomes_to_anndata` already takes a ``log`` flag.
+    """
+    def progress(message: str) -> None:
+        if show_progress:
+            print(message, file=sys.stderr)
+
+    return progress
+
 
 # Lazy imports
 pyBigWig = None
@@ -136,6 +157,7 @@ class GenomeSequenceProvider:
         source: str | Path,
         chromosomes: set[str] | None = None,
         cache: bool = True,
+        show_progress: bool = True,
     ):
         """Initialize sequence provider.
 
@@ -143,14 +165,15 @@ class GenomeSequenceProvider:
             source: Path to FASTA file or existing CachedGenome.
             chromosomes: Optional set of chromosomes to load. If None, loads all.
             cache: Whether to cache chromosomes in memory. Default: True.
+            show_progress: Report loading progress on stderr. Default: True.
         """
         self.chrom_sizes: dict[str, int] = {}
-        print(f"Loading genome from {source}...")
+        _progress_logger(show_progress)(f"Loading genome from {source}...")
         self._source = GenomeSequenceSource(
             source,
             chromosomes=chromosomes,
             cache=cache,
-            verbose=True,
+            verbose=show_progress,
         )
         self.chrom_sizes = self._source.chrom_sizes
 
@@ -366,7 +389,9 @@ def predict_full_chromosome(
 
     # Setup genome provider
     if isinstance(genome, (str, Path)):
-        genome = GenomeSequenceProvider(genome, chromosomes={chrom})
+        genome = GenomeSequenceProvider(
+            genome, chromosomes={chrom}, show_progress=show_progress,
+        )
 
     if chrom not in genome.chrom_sizes:
         raise ValueError(f"Chromosome {chrom} not found in genome")
@@ -387,11 +412,11 @@ def predict_full_chromosome(
     if len(tiles) == 0:
         return predictions
 
-    if show_progress:
-        n_batches = (len(tiles) + config.batch_size - 1) // config.batch_size
-        print(f"  Tiles: {len(tiles)}, Batches: {n_batches}")
-        print(f"  Output array: {predictions.nbytes / 1e6:.1f} MB "
-              f"({output_length:,} x {n_output_tracks} float32)")
+    progress = _progress_logger(show_progress)
+    n_batches = (len(tiles) + config.batch_size - 1) // config.batch_size
+    progress(f"  Tiles: {len(tiles)}, Batches: {n_batches}")
+    progress(f"  Output array: {predictions.nbytes / 1e6:.1f} MB "
+             f"({output_length:,} x {n_output_tracks} float32)")
 
     # Stitch each tile's kept region into the full-chromosome array.
     for out_start, kept in _iter_tile_predictions(
@@ -639,6 +664,7 @@ def predict_full_chromosomes_to_bigwig(
         fasta_path,
         chromosomes=set(chromosomes),
         cache=True,
+        show_progress=show_progress,
     )
 
     # Filter to available chromosomes
@@ -647,18 +673,14 @@ def predict_full_chromosomes_to_bigwig(
     if not chromosomes:
         raise ValueError("No valid chromosomes found in genome")
 
-    # Progress goes through show_progress so that a caller reading stdout as
-    # JSON (``agt predict --json``) is not handed prose alongside its payload.
-    def log(message: str) -> None:
-        if show_progress:
-            print(message)
+    progress = _progress_logger(show_progress)
 
     n_chroms = len(chromosomes)
-    log(f"Will predict {n_chroms} "
-        f"chromosome{'s' if n_chroms != 1 else ''}: {chromosomes}")
+    progress(f"Will predict {n_chroms} "
+             f"chromosome{'s' if n_chroms != 1 else ''}: {chromosomes}")
 
     def predict(chrom: str) -> np.ndarray:
-        log(f"\nProcessing {chrom}...")
+        progress(f"\nProcessing {chrom}...")
         return predict_full_chromosome(
             model=model,
             genome=genome,
@@ -682,7 +704,7 @@ def predict_full_chromosomes_to_bigwig(
                 resolution=config.resolution,
                 track_names=track_names,
             )
-            log(f"  Wrote {len(written)} file(s): {[p.name for p in written]}")
+            progress(f"  Wrote {len(written)} file(s): {[p.name for p in written]}")
             outputs.extend(BigwigOutput(path, [chrom]) for path in written)
         return outputs
 
@@ -696,7 +718,7 @@ def predict_full_chromosomes_to_bigwig(
         track_names=track_names,
         chromosome_order=chromosomes,
     )
-    log(f"\nWrote {len(written)} file(s): {[p.name for p in written]}")
+    progress(f"\nWrote {len(written)} file(s): {[p.name for p in written]}")
     return [BigwigOutput(path, list(chromosomes)) for path in written]
 
 
@@ -815,6 +837,7 @@ def predict_full_chromosomes_to_anndata(
     from ...variant_scoring.annotations import GeneAnnotation
 
     config = config or TilingConfig()
+    progress = _progress_logger(show_progress)
     if chromosomes is None:
         chromosomes = list(DEFAULT_CHROMOSOMES)
 
@@ -823,7 +846,12 @@ def predict_full_chromosomes_to_anndata(
     if isinstance(fasta_path, GenomeSequenceProvider):
         genome = fasta_path
     else:
-        genome = GenomeSequenceProvider(fasta_path, chromosomes=set(chromosomes), cache=True)
+        genome = GenomeSequenceProvider(
+            fasta_path,
+            chromosomes=set(chromosomes),
+            cache=True,
+            show_progress=show_progress,
+        )
     chromosomes = [c for c in chromosomes if c in genome.chrom_sizes]
     if not chromosomes:
         raise ValueError("No valid chromosomes found in genome")
@@ -850,11 +878,10 @@ def predict_full_chromosomes_to_anndata(
                 track_names = [track_names[i] for i in keep]
             if track_strands is not None:
                 track_strands = [track_strands[i] for i in keep]
-            if show_progress:
-                n_kept = len(track_indices)
-                print(f"Dropped {n_dropped} padding "
-                      f"track{'s' if n_dropped != 1 else ''}; {n_kept} "
-                      f"track{'s' if n_kept != 1 else ''} remain")
+            n_kept = len(track_indices)
+            progress(f"Dropped {n_dropped} padding "
+                     f"track{'s' if n_dropped != 1 else ''}; {n_kept} "
+                     f"track{'s' if n_kept != 1 else ''} remain")
         if not track_indices:
             raise ValueError(
                 f"Every track for head '{head}' is padding; nothing to aggregate. "
@@ -879,9 +906,9 @@ def predict_full_chromosomes_to_anndata(
         annotation, resolution=config.resolution, over=over, reduce=reduce,
     )
 
-    print(f"Aggregating {head} over {over} for {len(chromosomes)} chromosomes: {chromosomes}")
+    progress(f"Aggregating {head} over {over} for {len(chromosomes)} chromosomes: {chromosomes}")
     for chrom in chromosomes:
-        print(f"\nProcessing {chrom}...")
+        progress(f"\nProcessing {chrom}...")
         output_length = genome.chrom_sizes[chrom] // config.resolution
         for out_start, kept in _iter_tile_predictions(
             model, genome, chrom, head, config, track_indices, output_length,
@@ -890,13 +917,13 @@ def predict_full_chromosomes_to_anndata(
             start_bp = out_start * config.resolution
             end_bp = start_bp + kept.shape[0] * config.resolution
             accumulator.add_tile(kept, chrom, start_bp, end_bp)
-        print(f"  Genes so far: {accumulator.n_genes}")
+        progress(f"  Genes so far: {accumulator.n_genes}")
 
     gene_counts = accumulator.to_gene_counts(track_metadata=track_frame, log=log, strand=strand)
 
     if output_path is not None:
         adata = gene_counts.to_anndata()
         adata.write_h5ad(str(output_path))
-        print(f"\nWrote AnnData ({adata.shape[0]} tracks x {adata.shape[1]} genes) to {output_path}")
+        progress(f"\nWrote AnnData ({adata.shape[0]} tracks x {adata.shape[1]} genes) to {output_path}")
 
     return gene_counts

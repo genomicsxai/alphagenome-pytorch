@@ -315,6 +315,10 @@ def _load_model(args, dtype_policy, json_mode):
     import torch
     from alphagenome_pytorch import AlphaGenome
 
+    # Same gate as run(): loading a model is progress, so --quiet silences it
+    # as well as --json.
+    show_progress = not args.quiet and not json_mode
+
     if args.checkpoint:
         from alphagenome_pytorch.extensions.finetuning.checkpointing import load_finetuned_model
         from alphagenome_pytorch.extensions.serving.bundle import (
@@ -337,12 +341,13 @@ def _load_model(args, dtype_policy, json_mode):
         if manifest is not None and args.model:
             verify_bundle_base_weights_hash(args.model, manifest)
 
-        if not json_mode:
-            print("Loading finetuned model...")
-            print(f"  Base: {args.model or '(not needed — self-contained checkpoint)'}")
-            print(f"  Checkpoint: {args.checkpoint}")
+        if show_progress:
+            print("Loading finetuned model...", file=sys.stderr)
+            print(f"  Base: {args.model or '(not needed — self-contained checkpoint)'}",
+                  file=sys.stderr)
+            print(f"  Checkpoint: {args.checkpoint}", file=sys.stderr)
             if checkpoint_path != args.checkpoint:
-                print(f"  Resolved to: {checkpoint_path}")
+                print(f"  Resolved to: {checkpoint_path}", file=sys.stderr)
 
         model, meta = load_finetuned_model(
             checkpoint_path=checkpoint_path,
@@ -364,8 +369,8 @@ def _load_model(args, dtype_policy, json_mode):
             )
         return model, track_names_from_ckpt, meta.get("track_metadata")
 
-    if not json_mode:
-        print(f"Loading model from {args.model}...")
+    if show_progress:
+        print(f"Loading model from {args.model}...", file=sys.stderr)
     model = AlphaGenome.from_pretrained(
         args.model, device=args.device, dtype_policy=dtype_policy,
     )
@@ -409,7 +414,7 @@ def _describe_handling(info, json_mode: bool, quiet: bool) -> None:
         line = f"  {coord} ({info.length_bp}bp) → {info.handling}"
         if info.tile_count > 1:
             line += f" ({info.tile_count} tiles)"
-        print(line)
+        print(line, file=sys.stderr)
     if not json_mode:
         for w in info.warnings:
             print(f"    WARNING: {w}", file=sys.stderr)
@@ -577,7 +582,8 @@ def run(args: argparse.Namespace) -> int:
     organism_index, organism_source = _effective_organism(model, args.organism)
     if not json_mode and not getattr(args, "quiet", False):
         _org_name = "mouse" if organism_index == 1 else "human"
-        print(f"  Organism: {_org_name} ({organism_index}), source: {organism_source}")
+        print(f"  Organism: {_org_name} ({organism_index}), source: {organism_source}",
+              file=sys.stderr)
 
     # Finetuned checkpoint strands are only known now that meta is loaded.
     if strands_needed and track_strands is None and args.checkpoint:
@@ -602,7 +608,8 @@ def run(args: argparse.Namespace) -> int:
         )
         if track_metadata_for_obs is None and not json_mode and not args.quiet:
             print("  Note: no per-track metadata for this head — obs will carry "
-                  "track_index only, and padding tracks cannot be identified.")
+                  "track_index only, and padding tracks cannot be identified.",
+                  file=sys.stderr)
 
     model.eval()
 
@@ -613,7 +620,7 @@ def run(args: argparse.Namespace) -> int:
 
     if args.compile:
         if not json_mode:
-            print("Compiling model...")
+            print("Compiling model...", file=sys.stderr)
         model = torch.compile(model)
 
     config = TilingConfig(
@@ -704,7 +711,9 @@ def run(args: argparse.Namespace) -> int:
 
     if effective_mode == "locus":
         chrom, start, end = parse_locus(args.locus)
-        genome = GenomeSequenceProvider(args.fasta, chromosomes={chrom})
+        genome = GenomeSequenceProvider(
+            args.fasta, chromosomes={chrom}, show_progress=show_progress,
+        )
         if chrom not in genome.chrom_sizes:
             raise ValueError(f"Chromosome {chrom!r} not found in {args.fasta}")
 
@@ -749,9 +758,11 @@ def run(args: argparse.Namespace) -> int:
                 )
             if not args.quiet and not json_mode:
                 print(f"Filtered {before} BED rows → {len(regions)} "
-                      f"(kept chromosomes: {sorted(keep)})")
+                      f"(kept chromosomes: {sorted(keep)})", file=sys.stderr)
         needed_chroms = {r.chrom for r in regions}
-        genome = GenomeSequenceProvider(args.fasta, chromosomes=needed_chroms)
+        genome = GenomeSequenceProvider(
+            args.fasta, chromosomes=needed_chroms, show_progress=show_progress,
+        )
         missing = needed_chroms - set(genome.chrom_sizes)
         if missing:
             raise ValueError(
@@ -762,7 +773,8 @@ def run(args: argparse.Namespace) -> int:
         region_meta: list = []
         if not args.quiet and not json_mode:
             n = len(regions)
-            print(f"Predicting {n} region{'s' if n != 1 else ''} from {args.bed}...")
+            print(f"Predicting {n} region{'s' if n != 1 else ''} from {args.bed}...",
+                  file=sys.stderr)
         for r in regions:
             preds, info = predict_region_auto(
                 model, genome,
@@ -822,7 +834,8 @@ def run(args: argparse.Namespace) -> int:
             raise FileNotFoundError(f"FASTA file not found: {args.sequences}")
         pairs = read_fasta_sequences(args.sequences)
         if not args.quiet and not json_mode:
-            print(f"Predicting {len(pairs)} sequence(s) from {args.sequences}...")
+            print(f"Predicting {len(pairs)} sequence(s) from {args.sequences}...",
+                  file=sys.stderr)
 
         output_files = []
         for seq_name, seq in pairs:

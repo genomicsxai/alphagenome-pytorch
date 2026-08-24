@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
@@ -309,7 +310,8 @@ class GenomeSequenceSource:
             n_chroms = len(self._cache)
             cached_mb = sum(arr.nbytes for arr in self._cache.values()) / 1e6
             print(f"Cached genome: loaded {n_chroms} "
-                  f"chromosome{'s' if n_chroms != 1 else ''} ({cached_mb:.1f} MB)")
+                  f"chromosome{'s' if n_chroms != 1 else ''} ({cached_mb:.1f} MB)",
+                  file=sys.stderr)
 
     @property
     def fasta(self) -> "pyfaidx.Fasta":
