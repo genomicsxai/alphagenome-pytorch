@@ -552,6 +552,7 @@ class AlphaGenome(nn.Module):
         from alphagenome_pytorch.extensions.finetuning.transfer import (
             load_trunk,
             prepare_for_transfer,
+            remove_all_heads,
             transfer_config_from_dict,
         )
 
@@ -564,6 +565,15 @@ class AlphaGenome(nn.Module):
         #    the organism-context finalizer below.
         model = cls(dtype_policy=dtype_policy, **kwargs)
         model = load_trunk(model, base_path, exclude_heads=True)
+        # ``exclude_heads=True`` means the native heads (atac, dnase, ...) were
+        # never populated from the base file — they still hold the constructor's
+        # random init. ``prepare_for_transfer`` only drops heads the config names
+        # in remove_heads/keep_heads, and configs written by ``agt finetune``
+        # leave both empty, so without this the returned model carries
+        # randomly-initialised heads beside the fine-tuned one and a full forward
+        # yields garbage from every head that was never trained. Matches the
+        # canonical loader (``load_finetuned_model``).
+        model = remove_all_heads(model)
 
         # 2. Read the exported header once (config + organism provenance) and set up
         #    adapters/heads.

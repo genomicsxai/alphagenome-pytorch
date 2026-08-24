@@ -261,21 +261,17 @@ checkpoint for you — prefer it over calling this function by hand.
        "adapter.safetensors", pretrained_weights="model.pth",
    )
 
-.. warning::
+.. note::
 
-   ``AlphaGenome.from_delta()`` loads this format too, but **prefer**
-   ``load_finetuned_model``.
+   ``AlphaGenome.from_delta()`` loads this format too. Both drop the base
+   model's native heads, so ``model.heads`` holds only the heads you fine-tuned.
+   One difference remains: ``from_delta`` leaves adapters **unmerged**, while
+   ``load_finetuned_model`` merges them by default for zero-overhead inference.
+   Pass ``merge=False`` to the latter if you want the adapters kept separate.
 
-   ``from_delta`` loads the trunk with ``exclude_heads=True``, so the base
-   model's native heads (``atac``, ``dnase``, ``cage``, …) are never populated
-   from the pretrained file — they keep the random values the constructor gave
-   them — and nothing removes them afterwards. The returned model therefore
-   carries randomly-initialised heads alongside your fine-tuned one, so a full
-   forward pass or iterating ``model.heads`` yields garbage from every head
-   except the one you trained. ``from_delta`` also leaves adapters unmerged.
-
-   ``load_finetuned_model`` strips those heads first and merges adapters by
-   default, which is why it is the recommended entry point.
+   ``from_delta`` builds the model with ``cls(**kwargs)``, so it is the one to
+   use when you need constructor arguments — a subclass, or a non-default
+   ``num_organisms``.
 
 Adapter bundle
 --------------
