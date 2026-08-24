@@ -3,7 +3,7 @@
 from typing import TYPE_CHECKING
 
 from alphagenome_pytorch.extensions.finetuning.adapters import (
-    LoRA, Locon, IA3, IA3_FF, AdapterHoulsby
+    LoRA, Locon, IA3, IA3_FF, AdapterHoulsby, merge_adapters
 )
 # The modality registry is dependency-light (dataclasses only). Import it eagerly
 # so the flag layer (extensions.finetuning.args) reads it without pulling in the
@@ -35,6 +35,7 @@ from alphagenome_pytorch.extensions.finetuning.checkpointing import (
     export_model_weights, export_delta_weights,
     load_delta_config, load_delta_weights, is_delta_weights_export,
     load_finetuned_model,
+    describe_checkpoint, CheckpointInfo, CHECKPOINT_KINDS, DELTA_SHAPED_KINDS,
     FinetunedOrganismContext, resolve_finetuned_organism,
     select_organism_index, finalize_finetuned_organism_context,
 )
@@ -123,6 +124,7 @@ __all__ = [
     "IA3",
     "IA3_FF",
     "AdapterHoulsby",
+    "merge_adapters",
     # Training
     "ModalityConfig",
     "MODALITY_CONFIGS",
@@ -177,6 +179,10 @@ __all__ = [
     "is_delta_weights_export",
     # Inference loading
     "load_finetuned_model",
+    "describe_checkpoint",
+    "CheckpointInfo",
+    "CHECKPOINT_KINDS",
+    "DELTA_SHAPED_KINDS",
     # Organism provenance / selection
     "FinetunedOrganismContext",
     "resolve_finetuned_organism",

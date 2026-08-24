@@ -1,28 +1,24 @@
 Command-Line Interface
 ======================
 
-The unified training script ``scripts/finetune.py`` supports all training modes
-and can be configured via CLI arguments or YAML config files.
+``agt finetune`` is the entry point for fine-tuning using the CLI,
+and it can be configured with CLI flags, a YAML config file, or both.
 
-Multi-GPU Training
-------------------
+.. note::
 
-Use ``torchrun`` for distributed training:
+   ``agt finetune`` is analogous to running ``python scripts/finetune.py``
+   but it works system-wide and ships with the installed package.
 
-.. code-block:: bash
-
-   torchrun --nproc_per_node=4 scripts/finetune.py --mode lora ...
 
 YAML Configuration
 ------------------
 
-For reproducible experiments, use ``--config config.yaml``. CLI arguments
-override YAML values when both are provided.
+For reproducible experiments, use ``--config config.yaml``.
 
 .. code-block:: bash
 
    pip install pyyaml
-   python scripts/finetune.py --config config.yaml
+   agt finetune --config config.yaml
 
 .. dropdown:: Full Config Schema
    :icon: code-square
@@ -54,7 +50,6 @@ override YAML values when both are provided.
       pretrained_weights: /path/to/model.pth  # Pretrained weights file (required)
 
       # Training mode: 'linear-probe', 'lora', 'locon', 'lora+locon', or 'full'
-      # Baskerville-style Locon parity uses 'lora+locon'
       mode: lora
 
       # LoRA configuration (used when mode includes LoRA)
@@ -65,7 +60,7 @@ override YAML values when both are provided.
       # Locon configuration (used when mode includes Locon)
       locon_rank: 4
       locon_alpha: 1
-      locon_targets: "down_blocks.4,down_blocks.5"  # Required; Locon4 on encoder blocks
+      locon_targets: "down_blocks.4,down_blocks.5"  # Required when Locon is enabled
 
       # Model precision
       dtype: bfloat16                    # 'bfloat16' or 'float32'
@@ -91,9 +86,22 @@ override YAML values when both are provided.
 
         rna_seq:
           bigwig:
-            - /path/to/sample1_rna.bw
+            - /path/to/sample1_rna_plus.bw
+            - /path/to/sample1_rna_minus.bw
           resolutions: "128"             # RNA-seq at 128bp only
           task_weight: 0.5               # Lower weight for RNA-seq
+
+          # Per-track strand, one entry per bigwig above, '+' / '-' / '.'.
+          # Required when gene_loss_weight > 0. CLI: --track-strands
+          strand: "+-"
+
+          # Average +/- track means so paired strands share a scaling factor
+          # (recommended for stranded RNA-seq / CAGE / PRO-cap).
+          # 'auto' pairs consecutive bigwigs: (0,1), (2,3), ...
+          # Explicit form is a list of [plus, minus] index pairs:
+          #   strand_pairs: [[0, 1], [2, 3]]
+          # CLI: --strand-pairs 'rna_seq:auto'  (overrides this value)
+          strand_pairs: auto
 
       # Alternative: global modality weights (same as task_weight per modality)
       # modality_weights: "atac:1.0,rna_seq:0.5,chip_tf:1.0"
@@ -167,6 +175,107 @@ override YAML values when both are provided.
       resume: null                       # Checkpoint path or 'auto' to find latest
       save_delta: false                  # Save delta checkpoints (adapter + head weights only)
       no_full_checkpoint: false          # With save_delta, skip full checkpoint files
+      no_save_checkpoints: false         # Write no weights at all (keeps logs)
+
+Combining a config file with CLI flags
+---------------------------------------
+
+The two can be mixed freely. **A flag you pass explicitly always wins**;
+everything else falls back to the config file. This is decided per key, so you
+can keep the stable parts of an experiment in YAML and vary one thing on the
+command line:
+
+.. code-block:: bash
+
+   # config.yaml holds the data paths, model and mode; sweep the learning rate
+   agt finetune --config config.yaml --lr 3e-5 --run-name lr3e5
+   agt finetune --config config.yaml --lr 1e-4 --run-name lr1e4
+
+Every key in the schema above can also be given as its CLI flag, with
+underscores becoming dashes: ``lora_rank`` is ``--lora-rank``, ``output_dir`` is
+``--output-dir``.
+
+A few keys behave slightly differently:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Key
+     - Behaviour
+   * - ``use_amp: true``
+     - The inverse of ``--no-amp``. ``no_amp`` is also accepted.
+   * - ``no_cache: true``
+     - Shorthand that turns off both ``cache_genome`` and ``cache_signals``.
+   * - ``modalities``
+     - A nested mapping, not a scalar — see below.
+   * - ``strand_pairs``
+     - Set per modality as ``modalities.<name>.strand_pairs``, not at the top
+       level. ``--strand-pairs`` overrides it for the modalities it names.
+
+**Modalities.** Passing ``--modality``/``--bigwig`` pairs on the command line
+*replaces* the BigWig list for those modalities, and adds any modality the
+config did not mention. Modalities defined only in the config are left alone.
+Per-modality settings such as ``resolutions`` and ``task_weight`` come from the
+config either way, so a command line can override the file list while keeping
+the config's per-modality tuning.
+
+.. _what-a-run-produces:
+
+What a training run produces
+-----------------------------
+
+Output goes to ``<output-dir>/<run-name>``, defaulting to
+``finetuning_output/<timestamp>``. A **default run** writes:
+
+.. code-block:: text
+
+   finetuning_output/20260821_143022/
+   ├── best_model.pth          # full checkpoint, rewritten whenever val loss improves
+   ├── checkpoint_epoch1.pth   # full checkpoint, one per epoch (--save-every)
+   ├── checkpoint_epoch2.pth
+   ├── config.json             # the training hyperparameters for this run
+   ├── training_log.csv        # per-step metrics
+   └── epoch_log.csv           # per-epoch metrics
+
+Two things about this are worth knowing before you start a long run:
+
+- **Delta checkpoints are off by default.** A default run produces only full
+  checkpoints (~1GB each). ``agt adapters export`` needs a *delta* checkpoint and
+  rejects ``best_model.pth``, so if you intend to share the model, pass
+  ``--save-delta``. See :doc:`checkpoints`.
+- **No** ``transfer_config.json`` **is written.** The ``TransferConfig`` is embedded
+  inside every checkpoint, so you do not normally need a separate copy.
+  ``--export-transfer-config PATH`` writes one after training finishes.
+
+Flags that change what is written:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Flag
+     - Effect
+   * - ``--save-delta``
+     - Also write ``best_model.delta.pth`` and ``checkpoint_epoch{N}.delta.pth``.
+       Not available with ``--mode full``.
+   * - ``--no-full-checkpoint``
+     - Write **only** deltas. Requires ``--save-delta``.
+   * - ``--no-save-checkpoints``
+     - Write **no weights at all** — logs and ``config.json`` only. For
+       benchmarking or sweeps where the artifacts are not wanted. This also
+       disables the preemption checkpoint.
+   * - ``--save-every N``
+     - Write a per-epoch checkpoint every N epochs instead of every epoch.
+
+.. note::
+
+   ``--no-full-checkpoint`` and ``--no-save-checkpoints`` differ in scope:
+   the first is an off switch for saving full checkpoints when delta checkpoints are saved,
+   the second is an off switch for weight-saving entirely.
+
+If the job is preempted (SIGUSR1), a ``checkpoint_preempt.pth`` is written so the
+run can be resumed with ``--resume auto``.
 
 Delta Checkpoints
 -----------------
@@ -177,7 +286,7 @@ smaller than full checkpoints:
 
 .. code-block:: bash
 
-   python scripts/finetune.py --mode lora --save-delta \
+   agt finetune --mode lora --save-delta \
        --genome hg38.fa \
        --modality atac --bigwig *.bw \
        --train-bed train.bed --val-bed val.bed \
@@ -240,7 +349,7 @@ or repeating ``--modality`` and ``--bigwig`` pairs on the CLI:
 
 .. code-block:: bash
 
-   python scripts/finetune.py --mode lora \
+   agt finetune --mode lora \
        --genome hg38.fa \
        --pretrained-weights model.pth \
        --train-bed train.bed --val-bed val.bed \
@@ -264,6 +373,16 @@ Alternatively, use the matching YAML config:
          - samplel1_rna.bw
        task_weight: 0.5
 
+Multi-GPU Training
+------------------
+
+Use ``torchrun`` for distributed training. It needs a module target, so invoke
+the CLI with ``-m``:
+
+.. code-block:: bash
+
+   torchrun --nproc_per_node=4 -m alphagenome_pytorch.cli finetune --mode lora ...
+
 .. _gene-level-rna-seq:
 
 Gene-Level RNA-seq
@@ -272,9 +391,6 @@ Gene-Level RNA-seq
 Two optional, independent features aggregate the ``rna_seq`` head over genes:
 a **cross-track gene LFC loss** during training, and a **gene-expression
 correlation metric** during validation. Both are off by default.
-
-The commands below use ``agt finetune``; it is the installed entry point for the
-same code as ``python scripts/finetune.py`` used elsewhere on this page.
 
 Gene LFC loss
 ^^^^^^^^^^^^^
@@ -331,10 +447,8 @@ window — not the gene-body aggregation the LFC loss uses.
        --gene-expr-eval --gene-expr-annotation gencode.v46.parquet
 
 Emitted metric keys. The three ``*_pearson_*`` keys appear in the per-epoch
-console summary and are logged verbatim to Weights & Biases; ``n_genes`` takes
-the generic path and is logged as
-``val_loss_rna_seq_gene_log_expr_n_genes`` (a naming artifact — it is a count,
-not a loss):
+console summary and are logged verbatim; ``n_genes`` is logged as
+``val_loss_rna_seq_gene_log_expr_n_genes``:
 
 ======================================================= =====================================================
 Key                                                     Meaning
@@ -346,9 +460,9 @@ Key                                                     Meaning
 ``rna_seq_gene_log_expr_n_genes``                       Genes contributing, deduplicated across windows
 ======================================================= =====================================================
 
-Requirements, all checked before training starts:
+Requirements that are checked before training starts:
 
-- an annotation **with exon rows**. ``--gene-expr-annotation`` takes it, falling
+- the annotation has **exon rows**. ``--gene-expr-annotation`` takes it, falling
   back to ``--gtf``. A stock GENCODE annotation has exon rows, so the fallback
   normally works; pass ``--gene-expr-annotation`` only when your ``--gtf`` is a
   gene-only file, which is all the LFC loss needs. An annotation without exon
@@ -356,8 +470,8 @@ Requirements, all checked before training starts:
 
   Both flags take parquet or GTF/GFF, and both are much faster on parquet.
   Convert once with ``scripts/convert_gtf_to_parquet.py`` and point ``--gtf`` at
-  the result: it preserves every feature, so a single file drives the gene-body
-  masks and the exon metric, and ``--gene-expr-annotation`` becomes unnecessary.
+  the result: it preserves all the features, so a single file will work for the gene-body
+  masks and the exon metric (no extra ``--gene-expr-annotation`` necessary).
 - ``rna_seq`` in ``--modality`` / config
 - per-track strands via ``--track-strands`` or ``modalities.rna_seq.strand``
 
@@ -454,14 +568,14 @@ Example Configurations
 Generating Predictions (BigWig)
 -------------------------------
 
-After training, generate chromosome-wide predictions using
-``scripts/predict_full_chromosome.py``. Pass your base pretrained weights
-as ``--model`` and the finetuned checkpoint as ``--checkpoint``:
+After training, generate chromosome-wide predictions with ``agt predict``.
+
+A **delta checkpoint** holds only the difference from the base model, so pass
+both — the base weights as ``--model`` and the fine-tune as ``--checkpoint``:
 
 .. code-block:: bash
 
-   # Delta checkpoint
-   python scripts/predict_full_chromosome.py \
+   agt predict \
        --model pretrained.pth \
        --checkpoint best_model.delta.pth \
        --fasta hg38.fa \
@@ -469,17 +583,24 @@ as ``--model`` and the finetuned checkpoint as ``--checkpoint``:
        --head my_atac \
        --chromosomes chr21
 
-   # Full checkpoint (with embedded TransferConfig)
-   python scripts/predict_full_chromosome.py \
-       --model pretrained.pth \
+A **full checkpoint** contains the whole model, so ``--model`` is optional:
+
+.. code-block:: bash
+
+   agt predict \
        --checkpoint best_model.pth \
        --fasta hg38.fa \
        --output predictions/ \
        --head my_atac \
        --chromosomes chr21
 
-   # Full checkpoint (with external TransferConfig)
-   python scripts/predict_full_chromosome.py \
+``--checkpoint`` also accepts an adapter bundle directory or an ``hf://`` URI.
+See :doc:`checkpoints` for every artifact kind and how to load it.
+
+.. code-block:: bash
+
+   # Legacy full checkpoint whose TransferConfig was not embedded
+   agt predict \
        --model pretrained.pth \
        --checkpoint best_model.pth \
        --transfer-config transfer_config.json \
@@ -487,9 +608,9 @@ as ``--model`` and the finetuned checkpoint as ``--checkpoint``:
        --output predictions/ \
        --head my_atac
 
-The transfer config is embedded in checkpoints but you can 
+The transfer config is embedded in checkpoints but you can
 also export it from a training run as a separate file:
 
 .. code-block:: bash
 
-   python scripts/finetune.py ... --export-transfer-config transfer_config.json
+   agt finetune ... --export-transfer-config transfer_config.json

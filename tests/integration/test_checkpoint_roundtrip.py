@@ -317,3 +317,67 @@ class TestFromDelta:
                     )
                     matched += 1
             assert matched > 0, "Should have matched at least some trunk params"
+
+    def test_from_delta_drops_native_heads_without_remove_heads(self):
+        """Native heads must go even when the config does not name them.
+
+        Regression: ``test_from_delta_reconstructs_model`` hand-builds a config
+        with ``remove_heads=list(base.heads)``, which no real run produces —
+        ``agt finetune`` leaves ``remove_heads``/``keep_heads`` empty. With an
+        empty config ``prepare_for_transfer`` removes nothing, so before the fix
+        ``from_delta`` returned the constructor's randomly-initialised ``atac``,
+        ``dnase``, ... heads alongside the fine-tuned one, and a full forward
+        emitted garbage from every head that was never trained.
+        """
+        from alphagenome_pytorch.extensions.finetuning.transfer import (
+            TransferConfig,
+            prepare_for_transfer,
+            remove_all_heads,
+        )
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            export_delta_weights,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = Path(tmpdir) / "base.pth"
+            delta_path = Path(tmpdir) / "delta.pth"
+
+            base_model = _make_model()
+            torch.save(base_model.state_dict(), base_path)
+            native_heads = set(base_model.heads.keys())
+            assert native_heads, "base model should ship native heads"
+
+            # A config shaped like the ones agt finetune writes: no remove_heads,
+            # no keep_heads.
+            config = TransferConfig(
+                mode="lora",
+                lora_rank=2,
+                lora_alpha=4,
+                lora_targets=["q_proj"],
+                new_heads={
+                    "my_atac": {
+                        "modality": "atac",
+                        "num_tracks": 4,
+                        "resolutions": [128],
+                    }
+                },
+            )
+            assert config.remove_heads == [] and config.keep_heads == []
+
+            adapted = prepare_for_transfer(remove_all_heads(base_model), config)
+            export_delta_weights(adapted, config, delta_path, format="pth")
+            del adapted, base_model
+            gc.collect()
+
+            loaded = AlphaGenome.from_delta(
+                delta_path,
+                base_path,
+                dtype_policy=DtypePolicy.full_float32(),
+                num_organisms=2,
+            )
+
+            assert "my_atac" in loaded.heads
+            leaked = native_heads & set(loaded.heads.keys())
+            assert not leaked, (
+                f"from_delta leaked untrained native heads: {sorted(leaked)}"
+            )

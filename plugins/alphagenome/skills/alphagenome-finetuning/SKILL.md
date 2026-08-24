@@ -70,6 +70,26 @@ Training: `--epochs 10`, `--batch-size 1`, `--lr 1e-4`, `--weight-decay 0.1`,
 `--warmup-steps 500`, `--lr-schedule cosine`, `--sequence-length 131072`,
 `--output-dir finetuning_output`.
 
+**What a run writes.** Output goes to `<output-dir>/<run-name>`, defaulting to
+`finetuning_output/<timestamp>`. A default run produces `best_model.pth` (on val
+improvement), `checkpoint_epoch{N}.pth` (every epoch — `--save-every` defaults to
+1), plus `config.json`, `training_log.csv`, `epoch_log.csv`. **`--save-delta` is
+off by default**, so a default run yields nothing shareable — `agt adapters
+export` needs a delta and rejects `best_model.pth`. No `transfer_config.json` is
+written; the config is embedded in each checkpoint.
+
+`--no-full-checkpoint` (deltas only, requires `--save-delta`) and
+`--no-save-checkpoints` (no weights at all, logs only) sound alike but differ:
+the first picks a format, the second turns saving off.
+
+**Loading: one file or two?** Full checkpoints and full exports are
+self-contained (`agt predict --checkpoint X`). Delta checkpoints, exported
+deltas and adapter bundles hold only the difference from a base model and need
+it too (`agt predict --model base.pth --checkpoint X`). `agt info <file>` reports
+which you have; in Python, `describe_checkpoint(path)` returns `.kind` and
+`.requires_base_weights`. Full reference:
+https://alphagenome-pytorch.readthedocs.io/en/latest/finetuning/checkpoints.html
+
 ## 5. Common variations
 
 **Delta checkpoints** (adapters + heads only, ~5–10MB vs ~1GB):
