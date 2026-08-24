@@ -213,24 +213,41 @@ from this project's fine-tuning machinery.
 
 .. warning::
 
-   A full export keeps **no metadata** — no track names, no organism, no
-   provenance. Record your track names separately, or you will have unlabeled
-   output channels. Every other format carries them for you.
+   ``export_model_weights`` writes tensors and nothing else — it has no
+   parameters for track names, organism or provenance, so there is no way to
+   embed them. Record your track names alongside the file, or you will have
+   unlabeled output channels.
+
+   Checkpoints written by ``agt finetune`` and bundles built by
+   ``agt adapters export`` carry this metadata automatically.
+   ``export_delta_weights`` *can* carry it, but only if you pass it — see below.
 
 Exported delta weights
 ----------------------
 
 The sharing format for a delta: adapters, new heads and trainable norms in a
-single ``.safetensors`` file, with the ``TransferConfig`` and track metadata
-embedded in the header.
+single ``.safetensors`` file, with the ``TransferConfig`` embedded in the header.
 
-**Produce.**
+**Produce.** The ``TransferConfig`` is always written, but the *descriptive*
+metadata is opt-in — every one of these keyword arguments defaults to ``None``,
+and omitting them produces a file whose track names and organism are simply
+absent:
 
 .. code-block:: python
 
    from alphagenome_pytorch.extensions.finetuning import export_delta_weights
 
-   export_delta_weights(model, config, "adapter.safetensors")
+   export_delta_weights(
+       model, config, "adapter.safetensors",
+       track_names={"my_atac": ["K562_rep1", "K562_rep2"]},
+       organism="human",
+       base_model_weights_hash=base_hash,   # lets loaders detect a wrong base
+   )
+
+Passing them matters: they are what ``load_finetuned_model`` returns in ``meta``,
+so a recipient of a bare export gets unlabeled output channels. If the delta came
+from a training run, ``agt adapters export`` copies this metadata across from the
+checkpoint for you — prefer it over calling this function by hand.
 
 **Load.**
 
@@ -244,13 +261,21 @@ embedded in the header.
        "adapter.safetensors", pretrained_weights="model.pth",
    )
 
-.. note::
+.. warning::
 
-   ``AlphaGenome.from_delta()`` also loads this format, but it is **not**
-   equivalent: it keeps the base model's untrained native heads and does not
-   merge adapters, whereas ``load_finetuned_model`` removes those heads and
-   merges by default. Use ``load_finetuned_model`` unless you specifically want
-   the base heads retained.
+   ``AlphaGenome.from_delta()`` loads this format too, but **prefer**
+   ``load_finetuned_model``.
+
+   ``from_delta`` loads the trunk with ``exclude_heads=True``, so the base
+   model's native heads (``atac``, ``dnase``, ``cage``, …) are never populated
+   from the pretrained file — they keep the random values the constructor gave
+   them — and nothing removes them afterwards. The returned model therefore
+   carries randomly-initialised heads alongside your fine-tuned one, so a full
+   forward pass or iterating ``model.heads`` yields garbage from every head
+   except the one you trained. ``from_delta`` also leaves adapters unmerged.
+
+   ``load_finetuned_model`` strips those heads first and merges adapters by
+   default, which is why it is the recommended entry point.
 
 Adapter bundle
 --------------
@@ -309,8 +334,10 @@ what your output channels mean:
    meta["organism"]        # 'human' or 'mouse'
    meta["epoch"], meta["val_loss"]
 
-Everything except an exported *full* model carries this. See the warning under
-`Exported full weights`_.
+Checkpoints from ``agt finetune`` and bundles from ``agt adapters export`` carry
+all of this. A hand-rolled ``export_delta_weights`` call carries only what you
+passed it, and an ``export_model_weights`` file carries none of it — see the
+warnings under `Exported full weights`_ and `Exported delta weights`_.
 
 .. _sharing-walkthrough:
 
