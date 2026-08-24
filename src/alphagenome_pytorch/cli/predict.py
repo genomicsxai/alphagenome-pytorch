@@ -27,7 +27,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    p.add_argument("--model", required=True, help="Path to model weights (.pth)")
+    p.add_argument("--model", default=None,
+                   help="Path to base model weights (.pth). Required, except "
+                        "with a self-contained --checkpoint (a full checkpoint "
+                        "or exported full weights)")
     p.add_argument("--output", required=True, help="Output directory")
     p.add_argument("--head", required=True, help="Prediction head (e.g. atac, dnase)")
 
@@ -121,13 +124,59 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     # Finetuned model options
     ft = p.add_argument_group("Finetuned model (optional)")
     ft.add_argument("--checkpoint", type=str, default=None,
-                    help="Path to finetuned checkpoint")
+                    help="Finetuned model: a checkpoint file (.pth / .delta.pth "
+                         "/ .safetensors), an adapter bundle directory, or a "
+                         "local:/file:/hf:// bundle URI")
     ft.add_argument("--transfer-config", type=str, default=None,
                     help="Path to TransferConfig JSON file")
     ft.add_argument("--no-merge-adapters", action="store_true",
                     help="Keep adapter modules separate instead of merging")
 
     p.add_argument("--quiet", action="store_true", help="Suppress progress bars and per-region logs")
+
+
+def _validate_checkpoint_arg(args: argparse.Namespace) -> None:
+    """Check ``--checkpoint`` exists and that ``--model`` is present if needed.
+
+    ``--checkpoint`` accepts a plain path, a bundle directory, or a
+    ``local:``/``file:``/``hf://`` URI, so a bare ``Path.exists()`` is not a
+    sufficient test. Delta-shaped artifacts additionally need ``--model``; that
+    is checked here so the failure arrives before the model is built rather than
+    after a slow load.
+    """
+    from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+        describe_checkpoint,
+    )
+
+    is_uri = "://" in args.checkpoint or args.checkpoint.startswith(
+        ("local:", "file:", "hf:")
+    )
+    if not is_uri and not Path(args.checkpoint).exists():
+        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+
+    # Remote URIs are classified after download, by the loader itself.
+    if is_uri:
+        return
+
+    # Base weights already supplied: every artifact kind is loadable from here,
+    # so skip classification rather than read the checkpoint a second time.
+    if args.model:
+        return
+
+    info = describe_checkpoint(args.checkpoint)
+    if info.requires_base_weights and not args.model:
+        hint = ""
+        if info.base_model_weights_hash:
+            hint = (
+                f"\nIt was trained against the base weights with SHA-256 "
+                f"{info.base_model_weights_hash}."
+            )
+        raise ValueError(
+            f"--model is required: {args.checkpoint} is {info.description}, so "
+            f"it cannot be used on its own.{hint}\n"
+            f"Pass the base weights it was fine-tuned from:\n"
+            f"    agt predict --model <base weights> --checkpoint {args.checkpoint} ..."
+        )
 
 
 def _parse_csv_ints(s: str | None) -> list[int] | None:
@@ -264,6 +313,11 @@ def _load_model(args, dtype_policy, json_mode):
 
     if args.checkpoint:
         from alphagenome_pytorch.extensions.finetuning.checkpointing import load_finetuned_model
+        from alphagenome_pytorch.extensions.serving.bundle import (
+            resolve_checkpoint_and_manifest,
+            verify_bundle_base_hash,
+            verify_bundle_base_weights_hash,
+        )
 
         ext_config = None
         if args.transfer_config:
@@ -272,19 +326,32 @@ def _load_model(args, dtype_policy, json_mode):
             with open(args.transfer_config) as f:
                 ext_config = transfer_config_from_dict(json_mod.load(f))
 
+        # Accept the same forms as ``agt serve``: a plain checkpoint path, a
+        # bundle directory, or a local:/file:/hf:// URI.
+        checkpoint_path, manifest = resolve_checkpoint_and_manifest(args.checkpoint)
+
+        if manifest is not None and args.model:
+            verify_bundle_base_weights_hash(args.model, manifest)
+
         if not json_mode:
             print("Loading finetuned model...")
-            print(f"  Base: {args.model}")
+            print(f"  Base: {args.model or '(not needed — self-contained checkpoint)'}")
             print(f"  Checkpoint: {args.checkpoint}")
+            if checkpoint_path != args.checkpoint:
+                print(f"  Resolved to: {checkpoint_path}")
 
         model, meta = load_finetuned_model(
-            checkpoint_path=args.checkpoint,
+            checkpoint_path=checkpoint_path,
             pretrained_weights=args.model,
             device=args.device,
             dtype_policy=dtype_policy,
             transfer_config=ext_config,
             merge=not args.no_merge_adapters,
         )
+        # A bundle records the trunk structure it was trained against; refuse to
+        # predict on an incompatible base rather than emitting quiet nonsense.
+        if manifest is not None:
+            verify_bundle_base_hash(model, manifest)
         track_names_from_ckpt = None
         if meta.get("track_names"):
             ckpt_names = meta["track_names"]
@@ -368,10 +435,15 @@ def run(args: argparse.Namespace) -> int:
     )
 
     # Validate paths
-    if not Path(args.model).exists():
+    if args.model and not Path(args.model).exists():
         raise FileNotFoundError(f"Model file not found: {args.model}")
-    if args.checkpoint and not Path(args.checkpoint).exists():
-        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+    if args.checkpoint:
+        _validate_checkpoint_arg(args)
+    elif not args.model:
+        raise ValueError(
+            "--model is required. Pass the base model weights, or pass a "
+            "self-contained fine-tuned checkpoint with --checkpoint."
+        )
     if args.transfer_config and not Path(args.transfer_config).exists():
         raise FileNotFoundError(f"Transfer config not found: {args.transfer_config}")
 
