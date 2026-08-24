@@ -5,6 +5,8 @@ _sequence_to_onehot() encoding, and stitching logic with a mock model.
 All pure-logic tests -- no pyBigWig, pyfaidx, GPU, or model weights needed.
 """
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -532,3 +534,189 @@ class TestAnnDataTrackMetadata:
         tracks = self._catalog_tracks()
         assert len(tracks) == 768
         assert sum(1 for t in tracks if _is_padding(t)) == 101
+
+
+@pytest.mark.unit
+class TestWriteChromosomesBigwig:
+    """One BigWig per track, streamed across chromosomes.
+
+    A BigWig holds one signal for a whole genome, so chromosomes are appended
+    to a single open handle per track instead of each getting its own file.
+    """
+
+    CHROM_SIZES = {"chr1": 1280, "chr2": 640}  # 10 and 5 bins at 128bp
+
+    @staticmethod
+    def _write(*args, **kwargs):
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            write_chromosomes_bigwig,
+        )
+        return write_chromosomes_bigwig(*args, **kwargs)
+
+    def test_single_track_writes_one_file_for_all_chromosomes(self, tmp_path):
+        pyBigWig = pytest.importorskip("pyBigWig")
+        out = tmp_path / "dnase.bw"
+
+        written = self._write(
+            [(np.arange(1, 11, dtype=float).reshape(10, 1), "chr1"),
+             (np.arange(1, 6, dtype=float).reshape(5, 1), "chr2")],
+            output_path=out,
+            chrom_sizes=self.CHROM_SIZES,
+            resolution=128,
+            chromosome_order=["chr1", "chr2"],
+        )
+
+        # One track means no track suffix, and one file rather than one per chromosome.
+        assert written == [out]
+        assert [p.name for p in tmp_path.iterdir()] == ["dnase.bw"]
+
+        bw = pyBigWig.open(str(out))
+        try:
+            assert bw.chroms() == self.CHROM_SIZES
+            assert len(bw.intervals("chr1")) == 10
+            assert len(bw.intervals("chr2")) == 5
+        finally:
+            bw.close()
+
+    def test_values_cover_resolution_sized_spans(self, tmp_path):
+        """Each value spans one bin -- ranges, not one entry per base."""
+        pyBigWig = pytest.importorskip("pyBigWig")
+        out = tmp_path / "atac.bw"
+
+        # Distinct values, so adjacent bins cannot merge into a single interval.
+        self._write(
+            [(np.arange(1, 11, dtype=float).reshape(10, 1), "chr1")],
+            output_path=out,
+            chrom_sizes=self.CHROM_SIZES,
+            resolution=128,
+            chromosome_order=["chr1"],
+        )
+
+        bw = pyBigWig.open(str(out))
+        try:
+            intervals = bw.intervals("chr1")
+        finally:
+            bw.close()
+
+        assert list(intervals) == [
+            (i * 128, (i + 1) * 128, float(i + 1)) for i in range(10)
+        ]
+
+    def test_multiple_tracks_write_one_file_each(self, tmp_path):
+        pyBigWig = pytest.importorskip("pyBigWig")
+        out = tmp_path / "dnase.bw"
+
+        written = self._write(
+            [(np.ones((10, 3)), "chr1"), (np.ones((5, 3)), "chr2")],
+            output_path=out,
+            chrom_sizes=self.CHROM_SIZES,
+            resolution=128,
+            track_names=["k562", "gm12878", "hepg2"],
+            chromosome_order=["chr1", "chr2"],
+        )
+
+        assert [p.name for p in written] == [
+            "dnase_k562.bw", "dnase_gm12878.bw", "dnase_hepg2.bw",
+        ]
+        # Each track file spans both chromosomes, so the output is one file per
+        # track -- not one per (track, chromosome) as the per-chromosome writer gives.
+        for path in written:
+            bw = pyBigWig.open(str(path))
+            try:
+                assert bw.intervals("chr1") and bw.intervals("chr2")
+            finally:
+                bw.close()
+
+    def test_header_declares_only_the_chromosomes_written(self, tmp_path):
+        pyBigWig = pytest.importorskip("pyBigWig")
+        out = tmp_path / "atac.bw"
+
+        self._write(
+            [(np.ones((10, 1)), "chr1")],
+            output_path=out,
+            chrom_sizes=self.CHROM_SIZES,
+            resolution=128,
+            chromosome_order=["chr1"],
+        )
+
+        bw = pyBigWig.open(str(out))
+        try:
+            assert bw.chroms() == {"chr1": 1280}
+        finally:
+            bw.close()
+
+    def test_trailing_partial_bin_is_dropped(self, tmp_path):
+        """chr2 holds 5 whole bins, so a 6th value has nowhere valid to go."""
+        pyBigWig = pytest.importorskip("pyBigWig")
+        out = tmp_path / "atac.bw"
+
+        self._write(
+            [(np.arange(1, 7, dtype=float).reshape(6, 1), "chr2")],
+            output_path=out,
+            chrom_sizes=self.CHROM_SIZES,
+            resolution=128,
+            chromosome_order=["chr2"],
+        )
+
+        bw = pyBigWig.open(str(out))
+        try:
+            intervals = bw.intervals("chr2")
+        finally:
+            bw.close()
+
+        assert len(intervals) == 5
+        assert intervals[-1] == (512, 640, 5.0)
+
+    def test_out_of_order_chromosome_rejected(self, tmp_path):
+        pytest.importorskip("pyBigWig")
+
+        with pytest.raises(ValueError, match="header order"):
+            self._write(
+                [(np.ones((5, 1)), "chr2"), (np.ones((10, 1)), "chr1")],
+                output_path=tmp_path / "atac.bw",
+                chrom_sizes=self.CHROM_SIZES,
+                resolution=128,
+                chromosome_order=["chr1", "chr2"],
+            )
+
+    def test_chromosomes_are_flushed_before_the_next_arrives(self, tmp_path):
+        """Laziness: an eager writer would drain the input before opening a file."""
+        pytest.importorskip("pyBigWig")
+        out = tmp_path / "atac.bw"
+
+        def chrom_arrays():
+            yield np.ones((10, 1)), "chr1"
+            raise RuntimeError("second chromosome failed")
+
+        with pytest.raises(RuntimeError, match="second chromosome failed"):
+            self._write(
+                chrom_arrays(),
+                output_path=out,
+                chrom_sizes=self.CHROM_SIZES,
+                resolution=128,
+                chromosome_order=["chr1", "chr2"],
+            )
+
+        # chr1 reached an open handle, which the finally block then closed.
+        assert out.exists()
+
+
+@pytest.mark.unit
+class TestFullChromosomeBigwigApi:
+    """The genome-wide default, and the flag that restores per-chromosome files."""
+
+    def test_split_by_chrom_defaults_to_one_file_per_track(self):
+        import inspect
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            predict_full_chromosomes_to_bigwig,
+        )
+
+        parameter = inspect.signature(predict_full_chromosomes_to_bigwig).parameters
+        assert parameter["split_by_chrom"].default is False
+
+    def test_bigwig_output_records_the_chromosomes_covered(self):
+        from alphagenome_pytorch.extensions.inference.full_chromosome import BigwigOutput
+
+        out = BigwigOutput(Path("dnase.bw"), ["chr20", "chr21"])
+        assert out.path.name == "dnase.bw"
+        assert out.chromosomes == ["chr20", "chr21"]

@@ -61,6 +61,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
                    help="Track indices (comma-separated). Default: all")
     p.add_argument("--track-names", type=str, default=None,
                    help="Names for output tracks (comma-separated)")
+    p.add_argument("--split-by-chrom", action="store_true",
+                   help="Full-chromosome mode: write one BigWig per chromosome "
+                        "({head}_{chrom}.bw) instead of a single genome-wide file "
+                        "per track. Use it to resume or parallelise a large run.")
     p.add_argument("--resolution", type=int, default=128, choices=[1, 128],
                    help="Output resolution in bp (default: 128)")
     p.add_argument("--crop-bp", type=int, default=0,
@@ -490,6 +494,20 @@ def run(args: argparse.Namespace) -> int:
         if not Path(args.fasta).exists():
             raise FileNotFoundError(f"FASTA file not found: {args.fasta}")
 
+    # --split-by-chrom only shapes full-chromosome BigWig output, so reject the
+    # combinations where it would silently do nothing.
+    if args.split_by_chrom:
+        if effective_mode != "chromosomes":
+            raise ValueError(
+                f"--split-by-chrom cannot be combined with --{effective_mode}; it "
+                "splits full-chromosome BigWig output, so use it with --chromosomes."
+            )
+        if args.anndata:
+            raise ValueError(
+                "--split-by-chrom cannot be combined with --anndata, which writes a "
+                "single gene-count table rather than per-chromosome BigWigs."
+            )
+
     # Gene-count AnnData output. Validated before the model load so a missing
     # annotation or extra fails in seconds rather than after loading weights.
     if args.anndata:
@@ -664,22 +682,24 @@ def run(args: argparse.Namespace) -> int:
             organism_index=organism_index,
             device=args.device,
             show_progress=show_progress,
+            split_by_chrom=args.split_by_chrom,
         )
         if json_mode:
-            entries = []
-            for chrom, paths in results.items():
-                for pth in paths:
-                    entries.append({
-                        "path": str(pth),
+            emit_json({
+                "output_files": [
+                    {
+                        "path": str(out.path),
                         "head": args.head,
-                        "chromosome": chrom,
+                        "chromosomes": out.chromosomes,
                         "resolution_bp": args.resolution,
                         "handling": "tiled",
-                    })
-            emit_json({"output_files": entries, "warnings": []})
+                    }
+                    for out in results
+                ],
+                "warnings": [],
+            })
         else:
-            total = sum(len(ps) for ps in results.values())
-            print(f"\nDone! Wrote {total} BigWig file(s) to {args.output}")
+            print(f"\nDone! Wrote {len(results)} BigWig file(s) to {args.output}")
         return 0
 
     if effective_mode == "locus":
