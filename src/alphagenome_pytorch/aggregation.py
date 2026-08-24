@@ -36,7 +36,7 @@ region must divide by *bases*, not by elements, or it comes out ``resolution``×
 too large. That is what ``bin_size`` is for.
 
 This buys **unit consistency**, not exact agreement between resolutions. Region
-means at 128bp remain an approximation: :meth:`GeneAnnotation.get_exon_bin_ranges`
+means at 128bp remain an approximation: :meth:`alphagenome_pytorch.variant_scoring.annotations.GeneAnnotation.get_exon_bin_ranges`
 includes every bin an exon *touches*, and such a boundary bin is an already-summed
 total that mixes exonic and non-exonic bases. No choice of divisor can separate
 them after the fact. Only regions whose boundaries land on bin edges agree exactly
@@ -488,7 +488,7 @@ def aggregate_genes(
     """Aggregate predictions over gene **bodies** (exons + introns).
 
     Loss-style per-gene counts, using the same gene-body masks as the training
-    gene-LFC loss (via :class:`GeneMaskExtractor`). Linear space.
+    gene-LFC loss (via :class:`~alphagenome_pytorch.extensions.finetuning.gene_annotation.GeneMaskExtractor`). Linear space.
 
     Args:
         predictions: ``[B, S, C]`` (or ``[S, C]``) RNA-seq tensor. ``S`` must span
@@ -552,7 +552,7 @@ def gene_expression(
     Args:
         predictions: ``[B, S, C]`` (or ``[S, C]``) RNA-seq tensor in experimental
             (linear) space.
-        annotation: a :class:`GeneAnnotation` built from a GTF/parquet that
+        annotation: a :class:`~alphagenome_pytorch.variant_scoring.annotations.GeneAnnotation` built from a GTF/parquet that
             includes exon rows.
         interval: ``(chrom, start, end)`` (0-based half-open).
         track_metadata: per-track metadata (for labels + strand matching).
@@ -637,7 +637,7 @@ def _build_exon_window(
 ) -> _ExonWindow:
     """Select genes in ``interval`` (≥``min_exon_fraction`` exon rule) + exon ranges.
 
-    This is the only pandas-heavy step in the metric; :func:`_get_exon_window`
+    This is the only pandas-heavy step in the metric; ``_get_exon_window``
     memoizes it so it runs once per unique window across the whole run.
     """
     import pandas as pd
@@ -807,13 +807,13 @@ def gene_expression_values(
 
     Args:
         predictions: ``[S, C]`` or ``[1, S, C]`` predictions for one window.
-        annotation: a :class:`GeneAnnotation` with exon rows.
+        annotation: a :class:`~alphagenome_pytorch.variant_scoring.annotations.GeneAnnotation` with exon rows.
         interval: ``(chrom, start, end)`` of this window.
         track_strands: per-track strand chars for strand matching (optional).
         window_cache: optional dict memoizing the per-window annotation lookup
             (the only pandas-heavy step). Pass the same dict for the pred and obs
             calls of a window, and reuse it across epochs, to build each window's
-            exon selection exactly once. See :func:`_get_exon_window`.
+            exon selection exactly once. See ``_get_exon_window``.
     """
     if predictions.dim() == 2:
         predictions = predictions.unsqueeze(0)
@@ -902,7 +902,7 @@ class GeneCountAccumulator:
     :class:`GeneCounts` (``.to_anndata()`` for an AnnData).
 
     Args:
-        annotation: a :class:`GeneAnnotation`; exon rows required for
+        annotation: a :class:`~alphagenome_pytorch.variant_scoring.annotations.GeneAnnotation`; exon rows required for
             ``over="exons"``.
         resolution: bp per prediction bin (1 or 128).
         over: ``"exons"`` (default) or ``"gene_body"``.

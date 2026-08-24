@@ -264,6 +264,130 @@ Alternatively, use the matching YAML config:
          - samplel1_rna.bw
        task_weight: 0.5
 
+.. _gene-level-rna-seq:
+
+Gene-Level RNA-seq
+------------------
+
+Two optional, independent features aggregate the ``rna_seq`` head over genes:
+a **cross-track gene LFC loss** during training, and a **gene-expression
+correlation metric** during validation. Both are off by default.
+
+The commands below use ``agt finetune``; it is the installed entry point for the
+same code as ``python scripts/finetune.py`` used elsewhere on this page.
+
+Gene LFC loss
+^^^^^^^^^^^^^
+
+A Decima-style cross-track log-fold-change term over gene bodies (exons +
+introns), added to the per-position loss for the ``rna_seq`` head.
+
+.. code-block:: bash
+
+   agt finetune --mode lora \
+       --genome hg38.fa --pretrained-weights model.pth \
+       --train-bed train.bed --val-bed val.bed \
+       --modality rna_seq --bigwig rna_plus.bw rna_minus.bw \
+       --track-strands '+-' \
+       --gtf gencode.v46.annotation.gtf \
+       --gene-loss-weight 0.1
+
+======================================= =========== ==================================================
+Flag                                    Default     Meaning
+======================================= =========== ==================================================
+``--gene-loss-weight W``                ``0.0``     Outer weight on the gene LFC term (paper: ``0.1``).
+                                                    ``0.0`` disables the term entirely.
+``--gene-cross-track-weight W``         ``5.0``     Inner multinomial weight (paper default). Only
+                                                    used when ``--gene-loss-weight > 0``.
+``--gtf PATH``                          *(none)*    Annotation, parquet or GTF/GFF;
+                                                    ``protein_coding`` **gene** rows build the
+                                                    per-window gene-body masks. Prefer parquet —
+                                                    it loads in seconds where a GENCODE GTF takes
+                                                    minutes, on every run's startup path.
+``--track-strands STR``                 *(none)*    One char per ``rna_seq`` BigWig: ``+-+-`` or
+                                                    ``+,-,+,-``. YAML: ``modalities.rna_seq.strand``.
+======================================= =========== ==================================================
+
+Enabling it requires all three of ``--gtf``, ``rna_seq`` in ``--modality``, and
+``--track-strands``. Leaving ``--gene-loss-weight`` at ``0.0`` keeps loss values
+bit-identical to a run without the feature.
+
+Gene-expression validation metric
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``--gene-expr-eval`` reports how well predicted gene expression correlates with
+the observed tracks each validation epoch. The quantity is the AlphaGenome
+definition — log-transformed mean coverage over a gene's **annotated exons**,
+strand-matched, keeping genes with at least 50% of their exons inside the
+window — not the gene-body aggregation the LFC loss uses.
+
+.. code-block:: bash
+
+   agt finetune --mode lora \
+       --genome hg38.fa --pretrained-weights model.pth \
+       --train-bed train.bed --val-bed val.bed \
+       --modality rna_seq --bigwig rna_plus.bw rna_minus.bw \
+       --track-strands '+-' \
+       --gene-expr-eval --gene-expr-annotation gencode.v46.parquet
+
+Emitted metric keys. The three ``*_pearson_*`` keys appear in the per-epoch
+console summary and are logged verbatim to Weights & Biases; ``n_genes`` takes
+the generic path and is logged as
+``val_loss_rna_seq_gene_log_expr_n_genes`` (a naming artifact — it is a count,
+not a loss):
+
+======================================================= =====================================================
+Key                                                     Meaning
+======================================================= =====================================================
+``rna_seq_gene_log_expr_pearson_across_genes``          Raw Pearson over genes, one per track, averaged
+``rna_seq_gene_log_expr_pearson_across_genes_norm``     Same after quantile normalization + gene-mean
+                                                        centering (specificity view)
+``rna_seq_gene_log_expr_pearson_across_tracks_norm``    Normalized data correlated per gene across tracks
+``rna_seq_gene_log_expr_n_genes``                       Genes contributing, deduplicated across windows
+======================================================= =====================================================
+
+Requirements, all checked before training starts:
+
+- an annotation **with exon rows**. ``--gene-expr-annotation`` takes it, falling
+  back to ``--gtf``. A stock GENCODE annotation has exon rows, so the fallback
+  normally works; pass ``--gene-expr-annotation`` only when your ``--gtf`` is a
+  gene-only file, which is all the LFC loss needs. An annotation without exon
+  rows is rejected.
+
+  Both flags take parquet or GTF/GFF, and both are much faster on parquet.
+  Convert once with ``scripts/convert_gtf_to_parquet.py`` and point ``--gtf`` at
+  the result: it preserves every feature, so a single file drives the gene-body
+  masks and the exon metric, and ``--gene-expr-annotation`` becomes unnecessary.
+- ``rna_seq`` in ``--modality`` / config
+- per-track strands via ``--track-strands`` or ``modalities.rna_seq.strand``
+
+Genes are deduplicated by id across validation windows, so overlapping windows
+do not double-count. Under DDP the per-window values are gathered across ranks
+before the correlations are computed.
+
+YAML equivalents:
+
+.. code-block:: yaml
+
+   # One parquet with exon rows drives both features; gene_expr_annotation is
+   # only needed when this file is gene-only.
+   gtf: /data/annotation/gencode.v46.parquet
+   gene_loss_weight: 0.1
+   gene_cross_track_weight: 5.0
+
+   gene_expr_eval: true
+
+   modalities:
+     rna_seq:
+       bigwig:
+         - rna_plus.bw
+         - rna_minus.bw
+       strand: "+-"
+
+The same exon aggregation is available outside training — for a per-gene count
+table from a finetuned checkpoint, see :ref:`per-gene-counts`; for the
+underlying functions, :doc:`/api/aggregation`.
+
 Example Configurations
 ----------------------
 

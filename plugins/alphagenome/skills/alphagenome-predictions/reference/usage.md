@@ -28,6 +28,7 @@ when you need tensors in-process, or track selection richer than `--tracks` allo
 - [Step 2 — Output heads and resolutions](#step-2--output-heads-assays-and-resolutions)
 - [Step 3 — Selecting tracks by metadata](#step-3--selecting-tracks-by-metadata)
 - [Recipes](#recipes-the-users-actual-asks)
+- [Gene-level aggregation](#gene-level-aggregation-expression-tables)
 - [Gotchas](#gotchas)
 
 ## Command line: `agt predict`
@@ -334,6 +335,82 @@ ntt = out.dnase.select(biosample_name="GM12878")[128]
 for t in ntt.tracks:
     print(t.track_index, t.track_name, t.assay_title, t.ontology_curie)
 ```
+
+## Gene-level aggregation (expression tables)
+
+Track predictions are per-position. To get a **gene × track expression matrix**
+instead, aggregate the signal over each gene's exons (or gene body). Two entry
+points, depending on scale.
+
+**Whole chromosomes → `.h5ad` on disk.** `agt predict --anndata` (see the
+`agt predict` section above). No Python needed.
+
+**One window (or arbitrary intervals) → tensors in-process.** Use
+`alphagenome_pytorch.aggregation`. These names are *not* on the package root —
+import them from the submodule.
+
+```python
+from alphagenome_pytorch.aggregation import gene_expression
+from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+
+annotation = GeneAnnotation("gencode.v46.parquet")   # needs exon rows
+interval = ("chr20", 30_000_000, 30_131_072)         # 0-based half-open
+
+out = model.predict(dna, 0, named_outputs=True, heads=("rna_seq",), resolutions=(1,))
+ntt = out.rna_seq[1]
+
+gc = gene_expression(
+    ntt.tensor,                     # [B, S, C]
+    annotation,
+    interval,
+    track_metadata=ntt.tracks,      # labels the track axis + supplies strands
+    log="log1p",
+    strand="match",                 # NaN out antisense (gene, track) cells
+)
+
+gc.counts.shape        # [B, n_genes, n_tracks]
+adata = gc.to_anndata()   # obs=tracks, var=genes, X=[tracks, genes]
+tidy = gc.to_dataframe()  # long: one row per (interval, gene, track)
+```
+
+Pick the aggregation that matches your question:
+
+| Function | Region | Space | Use it for |
+|---|---|---|---|
+| `gene_expression` | annotated **exons** | log (default) | AlphaGenome gene expression; comparing against RNA-seq quantification |
+| `aggregate_genes` | **gene body** (exons + introns) | linear | matching the training gene-LFC loss; annotations without exon rows |
+
+`aggregate_genes` takes a gene table from
+`extensions.finetuning.gene_annotation.cached_load_gene_table(path)` (parquet or
+GTF) rather than a `GeneAnnotation`.
+
+Other useful pieces:
+
+- `aggregate_intervals(preds, mask, reduce=..., bin_size=...)` — the positional
+  primitive, for arbitrary interval masks. Pure tensor, no pandas/anndata import.
+- `GeneCountAccumulator` — stream tiles and keep a running `[gene, track]` matrix,
+  so a gene spanning tiles is summed once.
+- `gene_expression_correlations(pred, obs)` — the three correlation flavors
+  (`across_genes`, `across_genes_norm`, `across_tracks_norm`) that
+  `agt finetune --gene-expr-eval` reports each validation epoch.
+
+Three things that bite:
+
+- **Gene ids are version-stripped.** `gene_id` / AnnData `var_names` hold
+  `ENSG00000141510`, not `ENSG00000141510.16` — genes are keyed on the base id so
+  they accumulate across windows. Strip the version before joining against GENCODE.
+- **Strand.** Default `strand="match"` on `gene_expression` is what you want for
+  RNA-seq. `aggregate_genes` defaults to no strand logic, so every gene is also
+  scored by opposite-strand tracks — antisense signal, not the gene's expression.
+  `"merge"` sums `+`/`-` track pairs into single unstranded columns.
+- **Resolution.** 128bp predictions are bin *sums*, so `reduce="mean"` divides by
+  bases, not elements — values stay comparable across resolutions. They are still
+  approximate at 128bp: a bin an exon only partly covers is summed whole. Use
+  `--resolution 1` / 1bp predictions when exon boundaries matter.
+
+`to_anndata()` / `to_tables()` need a single interval (`B == 1`) and raise
+otherwise; `to_dataframe()` handles any batch. Needs
+`pip install 'alphagenome-pytorch[inference-anndata]'`.
 
 ## Gotchas
 

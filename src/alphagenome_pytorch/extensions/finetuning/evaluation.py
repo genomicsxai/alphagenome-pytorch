@@ -140,9 +140,10 @@ def load_native_model(
 
     if native_track_index is not None:
         if not 0 <= native_track_index < len(tracks):
+            n_tracks = len(tracks)
             raise ValueError(
                 f"Track index {native_track_index} out of range for "
-                f"{modality} ({len(tracks)} tracks)"
+                f"{modality} ({n_tracks} track{'s' if n_tracks != 1 else ''})"
             )
         track = tracks[native_track_index]
         display_name = track.get("biosample_name") or track.track_name

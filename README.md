@@ -197,6 +197,13 @@ Tracks column shows the number of real human tracks (without padding). Dimension
 
 See more information about model outputs [in the official AlphaGenome documentation](https://www.alphagenomedocs.com/exploring_model_metadata.html).
 
+Track predictions can also be aggregated into a **per-gene × per-track matrix** —
+over annotated exons (gene expression) or gene bodies — and exported as AnnData
+for scanpy. Use `agt predict --chromosomes ... --anndata` for whole chromosomes,
+or `alphagenome_pytorch.aggregation` for individual windows. See the
+[per-gene counts guide](docs/full_chromosome_prediction.rst) and
+[aggregation API](docs/api/aggregation.rst).
+
 ## Example Notebooks
 
 - [Demo](examples/notebooks/alphagenome_pytorch_demo.ipynb) — Basic inference and JAX comparison

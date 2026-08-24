@@ -238,9 +238,11 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
         type=str,
         default=None,
         help=(
-            "Path to a GTF annotation file (Gencode-compatible). Required when "
-            "--gene-loss-weight > 0. The GTF is parsed via pyranges and the "
-            "protein_coding gene rows are used to build per-window gene masks."
+            "Path to a Gencode-compatible annotation: a parquet (fast, "
+            "recommended) or a GTF/GFF (parsed via pyranges, minutes for hg38). "
+            "Required when --gene-loss-weight > 0. The protein_coding gene rows "
+            "are used to build per-window gene masks. A parquet with exon rows "
+            "also serves --gene-expr-eval, so one file can cover both."
         ),
     )
     data.add_argument(

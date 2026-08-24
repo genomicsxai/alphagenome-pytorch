@@ -522,7 +522,9 @@ def predict_full_chromosomes_to_bigwig(
     if not chromosomes:
         raise ValueError("No valid chromosomes found in genome")
 
-    print(f"Will predict {len(chromosomes)} chromosomes: {chromosomes}")
+    n_chroms = len(chromosomes)
+    print(f"Will predict {n_chroms} "
+          f"chromosome{'s' if n_chroms != 1 else ''}: {chromosomes}")
 
     # Predict and write each chromosome
     results: dict[str, list[Path]] = {}
@@ -559,25 +561,56 @@ def predict_full_chromosomes_to_bigwig(
     return results
 
 
-def _build_track_frame(track_indices, track_names=None, track_strands=None):
-    """A ``[C]``-row track-metadata DataFrame for the AnnData ``obs`` table."""
+def _metadata_row(entry) -> dict:
+    """Normalize a ``TrackMetadata`` or an already-flat row dict to a dict."""
+    return dict(entry) if isinstance(entry, dict) else entry.to_dict()
+
+
+def _is_padding(entry) -> bool:
+    """Whether a metadata entry describes a placeholder padding channel.
+
+    Mirrors :attr:`TrackMetadata.is_padding` but also accepts the flat row dicts
+    a fine-tuned checkpoint embeds.
+    """
+    name = entry.get("track_name") if isinstance(entry, dict) else getattr(entry, "track_name", None)
+    return name is not None and str(name).lower() == "padding"
+
+
+def _build_track_frame(track_indices, track_names=None, track_strands=None, metadata=None):
+    """A ``[C]``-row track-metadata DataFrame for the AnnData ``obs`` table.
+
+    With ``metadata`` (a ``TrackMetadata`` sequence, or the flat row dicts a
+    checkpoint embeds) the frame carries every field the catalog knows —
+    ``biosample_name``, ``assay_title``, ``ontology_curie``, and the rest. Without
+    it only ``track_index`` is available, plus whatever ``track_names`` /
+    ``track_strands`` supply.
+    """
     import pandas as pd
 
     n = len(track_indices)
-    data: dict = {"track_index": list(track_indices)}
+    if metadata is not None:
+        if len(metadata) != n:
+            raise ValueError(f"metadata has {len(metadata)} entries but "
+                             f"{n} tracks are being aggregated.")
+        frame = pd.DataFrame([_metadata_row(m) for m in metadata])
+        # `track_indices` is authoritative for which head channel each row is.
+        frame["track_index"] = list(track_indices)
+    else:
+        frame = pd.DataFrame({"track_index": list(track_indices)})
+
     if track_names is not None:
         if len(track_names) != n:
             raise ValueError(f"track_names has {len(track_names)} entries but "
                              f"{n} tracks are being aggregated.")
-        data["track_name"] = list(track_names)
+        frame["track_name"] = list(track_names)
     if track_strands is not None:
         if len(track_strands) != n:
             raise ValueError(f"track_strands has {len(track_strands)} entries but "
                              f"{n} tracks are being aggregated.")
         from ...aggregation import _validate_track_strands
         _validate_track_strands(track_strands)
-        data["strand"] = [str(s) for s in track_strands]
-    return pd.DataFrame(data)
+        frame["strand"] = [str(s) for s in track_strands]
+    return frame
 
 
 def predict_full_chromosomes_to_anndata(
@@ -592,6 +625,8 @@ def predict_full_chromosomes_to_anndata(
     track_indices: list[int] | None = None,
     track_names: list[str] | None = None,
     track_strands: list[str] | None = None,
+    track_metadata=None,
+    strip_padding: bool = True,
     over: str = "exons",
     reduce: str = "sum",
     log: bool = False,
@@ -618,13 +653,24 @@ def predict_full_chromosomes_to_anndata(
         config: :class:`TilingConfig` (use ``crop_bp`` to trim edge artifacts).
         track_indices / track_names / track_strands: track subset + labels; strands
             are required for ``strand="match"``.
+        track_metadata: per-track metadata aligned with ``track_indices`` — either
+            ``TrackMetadata`` objects or the flat row dicts a checkpoint embeds.
+            Populates ``obs`` with the full catalog fields (``biosample_name``,
+            ``assay_title``, ...) instead of just ``track_index``, and is what
+            makes ``strip_padding`` able to identify padding channels.
+        strip_padding: drop placeholder padding channels (default True). They
+            carry no signal — PyTorch scales them to 0.0 — so keeping them
+            dilutes any summary taken across tracks. Requires ``track_metadata``
+            to identify them; without it nothing is dropped. Pass False to keep
+            ``obs`` rows aligned positionally with the raw head channels (JAX
+            parity checks).
         over: ``"exons"`` (default) or ``"gene_body"``.
         reduce: ``"sum"`` (default, count-like) or ``"mean"``.
         log: if True, apply ``log1p`` after the reduce.
         strand: ``None``/``"match"``/``"merge"`` post-processing.
 
     Returns:
-        A :class:`GeneCounts` with ``B == 1`` (whole run collapsed to one table).
+        A :class:`~alphagenome_pytorch.aggregation.GeneCounts` with ``B == 1`` (whole run collapsed to one table).
     """
     from ...aggregation import GeneCountAccumulator
     from ...variant_scoring.annotations import GeneAnnotation
@@ -647,9 +693,38 @@ def predict_full_chromosomes_to_anndata(
     if track_indices is None:
         track_indices = list(range(head_config['num_tracks']))
 
+    # Drop padding channels before anything else, so they cost no inference and
+    # never reach the accumulator. Folding the removal into `track_indices` means
+    # the existing subsetting path handles it end to end.
+    if strip_padding and track_metadata is not None:
+        if len(track_metadata) != len(track_indices):
+            raise ValueError(
+                f"track_metadata has {len(track_metadata)} entries but "
+                f"{len(track_indices)} tracks are being aggregated."
+            )
+        keep = [i for i, m in enumerate(track_metadata) if not _is_padding(m)]
+        n_dropped = len(track_indices) - len(keep)
+        if n_dropped:
+            track_indices = [track_indices[i] for i in keep]
+            track_metadata = [track_metadata[i] for i in keep]
+            if track_names is not None:
+                track_names = [track_names[i] for i in keep]
+            if track_strands is not None:
+                track_strands = [track_strands[i] for i in keep]
+            if show_progress:
+                n_kept = len(track_indices)
+                print(f"Dropped {n_dropped} padding "
+                      f"track{'s' if n_dropped != 1 else ''}; {n_kept} "
+                      f"track{'s' if n_kept != 1 else ''} remain")
+        if not track_indices:
+            raise ValueError(
+                f"Every track for head '{head}' is padding; nothing to aggregate. "
+                "Pass strip_padding=False if you meant to keep them."
+            )
+
     # Build (and length-validate) the track-metadata frame up front, so a
     # track_names / track_strands mismatch fails now instead of after inference.
-    track_frame = _build_track_frame(track_indices, track_names, track_strands)
+    track_frame = _build_track_frame(track_indices, track_names, track_strands, track_metadata)
 
     annotation = (
         annotation_path if isinstance(annotation_path, GeneAnnotation)

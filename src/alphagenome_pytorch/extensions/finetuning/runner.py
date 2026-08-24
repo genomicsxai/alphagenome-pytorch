@@ -193,8 +193,10 @@ def create_datasets(
     modality_track_names: dict[str, list[str]] = {}
     for modality, bigwigs in args.modality_to_bigwigs.items():
         modality_track_names[modality] = [Path(bw).stem for bw in bigwigs]
+        n_tracks = len(bigwigs)
         print_rank0(
-            f"  {modality}: {len(bigwigs)} tracks, resolutions={args.modality_resolutions[modality]} - "
+            f"  {modality}: {n_tracks} track{'s' if n_tracks != 1 else ''}, "
+            f"resolutions={args.modality_resolutions[modality]} - "
             f"{modality_track_names[modality]}",
             rank,
         )
@@ -214,7 +216,7 @@ def create_datasets(
             _load_intervals_from_bed,
         )
 
-        print_rank0(f"Loading GTF for gene LFC loss: {args.gtf}", rank)
+        print_rank0(f"Loading annotation for gene LFC loss: {args.gtf}", rank)
         gene_table = cached_load_gene_table(args.gtf, filter_protein_coding=True)
         gene_mask_extractor = GeneMaskExtractor(gene_table)
 
@@ -229,8 +231,10 @@ def create_datasets(
                 center = (s + e) // 2
                 all_intervals.append((chrom, center - half_len, center + half_len))
         g_max = derive_g_max(gene_mask_extractor, all_intervals)
+        n_intervals = len(all_intervals)
         print_rank0(
-            f"Gene LFC: scanned {len(all_intervals)} intervals, g_max={g_max}",
+            f"Gene LFC: scanned {n_intervals} "
+            f"interval{'s' if n_intervals != 1 else ''}, g_max={g_max}",
             rank,
         )
 

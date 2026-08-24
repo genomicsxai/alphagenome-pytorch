@@ -43,6 +43,16 @@ Modalities: `rna_seq`, `atac`, `dnase`, `procap`, `cage` (1bp + 128bp);
 Optional data prep: `agt preprocess scale-bigwig --input *.bw --target 100M`
 (depth-normalize) or `agt preprocess bigwig-to-mmap` (faster training I/O).
 
+Gene-level RNA-seq (both off by default, see `docs/finetuning/cli.rst`):
+- `--gene-loss-weight 0.1` adds the cross-track gene-LFC loss over gene bodies.
+  Needs `--gtf`, `rna_seq` in `--modality`, and `--track-strands`.
+- `--gene-expr-eval` reports exon-based gene-expression correlations each
+  validation epoch (`rna_seq_gene_log_expr_pearson_*`). Needs an annotation
+  **with exon rows** — `--gene-expr-annotation`, falling back to `--gtf`.
+- Both `--gtf` and `--gene-expr-annotation` take parquet or GTF/GFF. Prefer
+  parquet (`scripts/convert_gtf_to_parquet.py`): seconds vs minutes on startup,
+  and one file with exon rows covers both features.
+
 Gotchas:
 - `--resolutions` defaults to `1` (1bp only); use `--resolutions 128` for
   `chip_tf`/`chip_histone`.

@@ -4,10 +4,13 @@ Builds per-interval gene-body boolean masks from a user-supplied GTF, for use
 in the cross-track gene LFC training loss (mirrors AlphaGenome's upstream
 `_GeneBodyAnnotationExtractor`).
 
-The user MUST supply their own GTF — this module never downloads or relies on
-hosted reference data. Reads GTFs via `pyranges.read_gtf`, which produces a
+The user MUST supply their own annotation — this module never downloads or relies
+on hosted reference data. Reads GTFs via `pyranges.read_gtf`, which produces a
 DataFrame with the columns the extractor expects (`Chromosome`, `Start`, `End`,
-`Strand`, `Feature`, `gene_id`, `gene_type`, ...).
+`Strand`, `Feature`, `gene_id`, `gene_type`, ...). Parquet files written by
+`scripts/convert_gtf_to_parquet.py` hold that same frame and are read directly,
+which is far faster — parsing a GENCODE GTF takes minutes against seconds for
+the parquet, and this sits on the startup path of every gene-LFC training run.
 """
 
 from __future__ import annotations
@@ -26,57 +29,89 @@ import pandas as pd
 PAD_NUM_GENES_CEILING = 256
 
 
+_PARQUET_SUFFIXES = (".parquet", ".pq")
+
+# Everything `_GeneBodyAnnotationExtractor` needs, plus `Feature` to select gene
+# rows. Read only these from parquet; a GENCODE frame carries ~25 more columns.
+_REQUIRED_COLUMNS = frozenset({"Chromosome", "Start", "End", "Strand", "Feature", "gene_id"})
+_OPTIONAL_COLUMNS = ("gene_name", "gene_type")
+
+
+def _read_annotation_frame(path: str) -> pd.DataFrame:
+    """Read a GTF/GFF (via pyranges) or a parquet into a GTF-layout DataFrame."""
+    if not str(path).lower().endswith(_PARQUET_SUFFIXES):
+        import pyranges  # local import: heavy dep, only needed for GTF input
+
+        pr = pyranges.read_gtf(path)
+        return pr.df if hasattr(pr, "df") else pr  # pyranges 0.x → .df, 1.x → DataFrame
+
+    # Project to the columns we actually use. Falling back to a full read keeps
+    # this working for parquets written with a different engine or schema.
+    try:
+        import pyarrow.parquet as pq
+
+        available = set(pq.ParquetFile(path).schema_arrow.names)
+        if _REQUIRED_COLUMNS <= available:
+            columns = sorted(_REQUIRED_COLUMNS) + [
+                c for c in _OPTIONAL_COLUMNS if c in available
+            ]
+            return pd.read_parquet(path, columns=columns)
+    except Exception:
+        pass
+    return pd.read_parquet(path)
+
+
 def load_gene_table(
-    gtf_path: str,
+    annotation_path: str,
     *,
     filter_protein_coding: bool = True,
 ) -> pd.DataFrame:
-    """Load a GTF as a gene-body DataFrame.
+    """Load a GTF or parquet annotation as a gene-body DataFrame.
 
     Returns rows with `Feature == "gene"` and the seven columns
     `_GeneBodyAnnotationExtractor` requires.
 
     Args:
-        gtf_path: Path to a GTF file readable by `pyranges.read_gtf`.
+        annotation_path: Path to a GTF/GFF readable by `pyranges.read_gtf`, or a
+            `.parquet` written by `scripts/convert_gtf_to_parquet.py`. Prefer the
+            parquet: it loads in seconds where a GENCODE GTF takes minutes, and
+            the same file also serves `GeneAnnotation` for the exon-based
+            gene-expression metric.
         filter_protein_coding: If True (default), keep only rows with
-            `gene_type == "protein_coding"`. Set False for assemblies / GTFs
-            that don't have or use that biotype.
+            `gene_type == "protein_coding"`. Set False for assemblies /
+            annotations that don't have or use that biotype.
     """
-    import pyranges  # local import: heavy dep, only needed when GTF is supplied
+    df = _read_annotation_frame(annotation_path)
 
-    pr = pyranges.read_gtf(gtf_path)
-    df = pr.df if hasattr(pr, "df") else pr  # pyranges 0.x → .df, 1.x → DataFrame
-
-    required = {"Chromosome", "Start", "End", "Strand", "Feature", "gene_id"}
-    missing = required - set(df.columns)
+    missing = _REQUIRED_COLUMNS - set(df.columns)
     if missing:
         raise ValueError(
-            f"GTF at {gtf_path} is missing required columns: {sorted(missing)}. "
-            f"Got columns: {sorted(df.columns)}"
+            f"Annotation at {annotation_path} is missing required columns: "
+            f"{sorted(missing)}. Got columns: {sorted(df.columns)}"
         )
 
     gene_rows = df[df["Feature"] == "gene"]
     if gene_rows.empty:
         raise ValueError(
-            f"GTF at {gtf_path} contains no `Feature == 'gene'` rows. "
+            f"Annotation at {annotation_path} contains no `Feature == 'gene'` rows. "
             "AlphaGenome gene LFC loss requires gene-level features; "
-            "transcript-only or exon-only GTFs are not supported."
+            "transcript-only or exon-only annotations are not supported."
         )
 
     if filter_protein_coding:
         if "gene_type" not in gene_rows.columns:
             raise ValueError(
-                f"filter_protein_coding=True requires a 'gene_type' column "
-                f"in the GTF, but it was not found. Pass "
-                f"filter_protein_coding=False to disable, or use a GTF with "
-                f"biotype annotations."
+                "filter_protein_coding=True requires a 'gene_type' column "
+                "in the annotation, but it was not found. Pass "
+                "filter_protein_coding=False to disable, or use an annotation "
+                "with biotype annotations."
             )
         gene_rows = gene_rows[gene_rows["gene_type"] == "protein_coding"]
         if gene_rows.empty:
             raise ValueError(
-                f"No protein_coding genes found in {gtf_path}. "
-                "Pass filter_protein_coding=False if your GTF uses different "
-                "biotype labels."
+                f"No protein_coding genes found in {annotation_path}. "
+                "Pass filter_protein_coding=False if your annotation uses "
+                "different biotype labels."
             )
 
     keep_cols = ["Chromosome", "Start", "End", "Strand", "gene_id"]
@@ -232,14 +267,17 @@ def derive_g_max(
 
 
 @functools.lru_cache(maxsize=4)
-def cached_load_gene_table(gtf_path: str, filter_protein_coding: bool = True) -> pd.DataFrame:
+def cached_load_gene_table(
+    annotation_path: str, filter_protein_coding: bool = True
+) -> pd.DataFrame:
     """Module-level cache for `load_gene_table`.
 
-    GTF parsing is expensive (~seconds for hg38). When the same script
-    constructs train + val datasets back-to-back from the same GTF, this
-    avoids re-parsing.
+    GTF parsing is expensive (minutes for a GENCODE hg38 GTF). When the same
+    script constructs train + val datasets back-to-back from the same
+    annotation, this avoids re-parsing. Passing a parquet avoids most of the
+    cost outright.
     """
-    return load_gene_table(gtf_path, filter_protein_coding=filter_protein_coding)
+    return load_gene_table(annotation_path, filter_protein_coding=filter_protein_coding)
 
 
 __all__ = [

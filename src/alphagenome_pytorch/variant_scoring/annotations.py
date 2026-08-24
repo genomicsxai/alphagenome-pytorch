@@ -91,6 +91,7 @@ class GeneAnnotation:
 
         Args:
             annotation: One of:
+
                 - Parquet file path (.parquet)
                 - GTF/GFF file path (.gtf, .gff, .gff3), requires pyranges
                 - A pandas DataFrame in GTF layout (see the class docstring).

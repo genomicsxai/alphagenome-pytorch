@@ -308,6 +308,7 @@ def run(args: argparse.Namespace) -> int:
             suffix = ", ..." if len(flat) > 5 else ""
             gene = f" gene={rec['gene_name']}" if rec["gene_name"] else ""
             print(f"{rec['variant']} | {rec['scorer']} | {rec['output_type']}{gene}")
-            print(f"  scores ({len(flat)} tracks): [{preview}{suffix}]")
+            n = len(flat)
+            print(f"  scores ({n} track{'s' if n != 1 else ''}): [{preview}{suffix}]")
 
     return 0

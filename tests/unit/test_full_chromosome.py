@@ -464,3 +464,71 @@ class TestHeadConfigs:
         expected_heads = ['atac', 'dnase', 'procap', 'cage', 'rna_seq', 'chip_tf', 'chip_histone']
         for head in expected_heads:
             assert head in HEAD_CONFIGS, f"{head} missing from HEAD_CONFIGS"
+
+
+class TestAnnDataTrackMetadata:
+    """obs should carry full catalog metadata, and padding should be dropped.
+
+    Before this, `predict_full_chromosomes_to_anndata` built obs from three
+    parallel lists and emitted `track_index` only, including the 101 padding
+    channels of the rna_seq head.
+    """
+
+    @staticmethod
+    def _catalog_tracks():
+        from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
+        catalog = TrackMetadataCatalog.load_builtin(0)
+        return list(catalog.get_tracks("rna_seq", organism=0, strict=True))
+
+    def test_is_padding_accepts_objects_and_row_dicts(self):
+        from alphagenome_pytorch.extensions.inference.full_chromosome import _is_padding
+
+        tracks = self._catalog_tracks()
+        pad = next(t for t in tracks if t.track_name.lower() == "padding")
+        real = next(t for t in tracks if t.track_name.lower() != "padding")
+        assert _is_padding(pad) and not _is_padding(real)
+        # checkpoints embed flat dicts rather than TrackMetadata
+        assert _is_padding({"track_name": "padding"})
+        assert _is_padding({"track_name": "PADDING"})
+        assert not _is_padding({"track_name": "CL:0000047 polyA plus RNA-seq"})
+        assert not _is_padding({})
+
+    def test_metadata_populates_obs(self):
+        from alphagenome_pytorch.extensions.inference.full_chromosome import _build_track_frame
+
+        tracks = self._catalog_tracks()[:4]
+        frame = _build_track_frame(list(range(4)), metadata=tracks)
+        assert len(frame) == 4
+        for col in ("track_index", "track_name", "biosample_name", "assay_title", "strand"):
+            assert col in frame.columns, col
+        assert list(frame["track_index"]) == [0, 1, 2, 3]
+
+    def test_without_metadata_falls_back_to_track_index(self):
+        from alphagenome_pytorch.extensions.inference.full_chromosome import _build_track_frame
+
+        frame = _build_track_frame([0, 1, 2])
+        assert list(frame.columns) == ["track_index"]
+
+    def test_track_index_follows_the_subset(self):
+        """obs.track_index must record the head channel, not the row position."""
+        from alphagenome_pytorch.extensions.inference.full_chromosome import _build_track_frame
+
+        tracks = self._catalog_tracks()
+        picked = [5, 9, 30]
+        frame = _build_track_frame(picked, metadata=[tracks[i] for i in picked])
+        assert list(frame["track_index"]) == picked
+
+    def test_metadata_length_mismatch_rejected(self):
+        from alphagenome_pytorch.extensions.inference.full_chromosome import _build_track_frame
+
+        tracks = self._catalog_tracks()[:3]
+        with pytest.raises(ValueError, match="metadata has 3 entries"):
+            _build_track_frame([0, 1], metadata=tracks)
+
+    def test_rna_seq_head_has_padding_to_strip(self):
+        """Guards the premise: the human rna_seq head really is padded 667 -> 768."""
+        from alphagenome_pytorch.extensions.inference.full_chromosome import _is_padding
+
+        tracks = self._catalog_tracks()
+        assert len(tracks) == 768
+        assert sum(1 for t in tracks if _is_padding(t)) == 101
