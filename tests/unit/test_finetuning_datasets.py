@@ -261,3 +261,81 @@ class TestGenomicDatasetMultiprocessing:
                 break
 
         assert batch_count > 0
+
+
+@pytest.mark.unit
+class TestAugmentation:
+    """Train-time reverse-complement (strand-aware) and random-shift augmentation."""
+
+    class _FakeRng:
+        """Deterministic stand-in for the per-worker RNG so tests can force rc/shift."""
+        def __init__(self, do_rc: bool, shift: int = 0):
+            self._rc = do_rc
+            self._shift = shift
+
+        def random(self):
+            return 0.0 if self._rc else 0.9          # < 0.5 -> rc applied
+
+        def integers(self, lo, hi):                  # __getitem__ calls integers(lo, hi+1)
+            return max(lo, min(self._shift, hi - 1))
+
+    def _dataset(self, mock_data_dir, tracks, **kw):
+        from alphagenome_pytorch.extensions.finetuning.datasets import GenomicDataset
+        return GenomicDataset(
+            genome_fasta=str(mock_data_dir / "mock_genome.fa"),
+            bigwig_files=[str(mock_data_dir / t) for t in tracks],
+            bed_file=str(mock_data_dir / "mock_positions.bed"),
+            resolutions=(1,),
+            **kw,
+        )
+
+    def test_no_augment_matches_plain(self, mock_data_dir):
+        """augment off (val/test path) returns the un-transformed sample."""
+        ds = self._dataset(mock_data_dir, ["mock_rnaseq_track1.bw"])
+        aug = self._dataset(mock_data_dir, ["mock_rnaseq_track1.bw"],
+                            augment_rc=True, augment_shift_bp=100)
+        aug._aug_rng = self._FakeRng(do_rc=False, shift=0)   # no rc, no shift this draw
+        s0, t0 = ds[0]
+        s1, t1 = aug[0]
+        assert torch.equal(s0, s1)
+        assert torch.equal(t0[1], t1[1])
+
+    def test_rc_unstranded_reverses_seq_and_target(self, mock_data_dir):
+        """Unstranded RC: sequence reverse-complemented, target reversed along length only."""
+        ds = self._dataset(mock_data_dir, ["mock_rnaseq_track1.bw"])
+        aug = self._dataset(mock_data_dir, ["mock_rnaseq_track1.bw"], augment_rc=True)
+        aug._aug_rng = self._FakeRng(do_rc=True, shift=0)
+        s0, t0 = ds[0]
+        s1, t1 = aug[0]
+        assert torch.equal(s1, torch.flip(s0, dims=[0, 1]))          # reverse-complement
+        assert torch.equal(t1[1], torch.flip(t0[1], dims=[0]))       # length reverse, no swap
+
+    def test_rc_stranded_swaps_pairs(self, mock_data_dir):
+        """Stranded RC: target reversed along length AND +/- channels swapped."""
+        tracks = ["mock_rnaseq_track1.bw", "mock_rnaseq_track2.bw"]
+        ds = self._dataset(mock_data_dir, tracks)
+        aug = self._dataset(mock_data_dir, tracks, augment_rc=True, strand_pairs=[(0, 1)])
+        aug._aug_rng = self._FakeRng(do_rc=True, shift=0)
+        _, t0 = ds[0]
+        _, t1 = aug[0]
+        expected = torch.flip(t0[1], dims=[0])[:, [1, 0]]            # reverse + swap channels
+        assert torch.equal(t1[1], expected)
+
+    def test_shift_changes_crop_and_stays_in_bounds(self, mock_data_dir):
+        """A forced shift produces a different crop; large shifts are clamped, never erroring."""
+        base = self._dataset(mock_data_dir, ["mock_rnaseq_track1.bw"],
+                             augment_shift_bp=100)
+        base._aug_rng = self._FakeRng(do_rc=False, shift=0)
+        shifted = self._dataset(mock_data_dir, ["mock_rnaseq_track1.bw"],
+                               augment_shift_bp=100)
+        shifted._aug_rng = self._FakeRng(do_rc=False, shift=100)
+        s_base, _ = base[0]
+        s_shift, _ = shifted[0]
+        assert s_base.shape == s_shift.shape
+        assert not torch.equal(s_base, s_shift)                     # crop moved
+
+        huge = self._dataset(mock_data_dir, ["mock_rnaseq_track1.bw"],
+                            augment_shift_bp=10_000_000)
+        huge._aug_rng = self._FakeRng(do_rc=False, shift=10_000_000)
+        s_huge, _ = huge[0]                                          # clamped, no crash
+        assert s_huge.shape == s_base.shape

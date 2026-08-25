@@ -255,6 +255,25 @@ def create_datasets(
         )
         gme = gene_mask_extractor if attach_gene_mask else None
         gme_g_max = g_max if attach_gene_mask else None
+        # Augmentation is TRAIN-ONLY. Reverse-complement is strand-aware: sequence is RC'd, targets
+        # reverse along length and swap the declared +/- strand pairs (same --strand-pairs info
+        # track-means uses); unstranded tracks reverse only. Shift slides the window for all tracks
+        # identically. Val/test datasets below get neither.
+        strand_pairs = None
+        if getattr(args, "modality_strand_pairs", None):
+            strand_pairs = args.modality_strand_pairs.get(modality)
+        if args.augment_rc or args.augment_shift_bp:
+            n_pairs = len(strand_pairs) if strand_pairs else 0
+            n_unstranded = len(bigwigs) - 2 * n_pairs
+            rc_note = (
+                f"rc=on ({n_pairs} strand-pair(s) swapped, {n_unstranded} unstranded reversed-only)"
+                if args.augment_rc else "rc=off"
+            )
+            print_rank0(
+                f"Augment[{modality}] (train only): shift=+/-{args.augment_shift_bp}bp (all tracks); "
+                f"{rc_note}",
+                rank,
+            )
         train_datasets[modality] = GenomicDataset(
             genome_fasta=genome,
             bigwig_files=bigwigs,
@@ -266,6 +285,9 @@ def create_datasets(
             max_io_workers=max_io_workers,
             gene_mask_extractor=gme,
             g_max=gme_g_max,
+            augment_rc=args.augment_rc,
+            augment_shift_bp=args.augment_shift_bp,
+            strand_pairs=strand_pairs,
         )
         val_datasets[modality] = GenomicDataset(
             genome_fasta=genome,
@@ -679,8 +701,19 @@ def create_model(
 
     # Wrap with DDP if multi-GPU
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-        print_rank0("Model wrapped with DistributedDataParallel", rank)
+        ddp_kwargs = {"device_ids": [local_rank], "output_device": local_rank}
+        # Full/LoRA/Locon unfreeze the trunk, but training only a subset of the model's outputs
+        # (e.g. the 1 bp RNA head while the 128 bp output embedder is unused) leaves some trainable
+        # params with no gradient, which plain DDP aborts on. find_unused_parameters=True handles
+        # that; it is compatible with the model's use_reentrant=False activation checkpointing
+        # (static_graph is not -- the used set is not identical every iteration). Frozen-trunk modes
+        # (linear-probe/encoder-only) never have unused trainable params, so keep the fast path.
+        if args.mode not in ("linear-probe", "encoder-only"):
+            ddp_kwargs["find_unused_parameters"] = True
+        model = DDP(model, **ddp_kwargs)
+        print_rank0("Model wrapped with DistributedDataParallel"
+                    + (" (find_unused_parameters=True)" if ddp_kwargs.get("find_unused_parameters") else ""),
+                    rank)
 
     # Get head references from the underlying model before optional compile.
     model_module = unwrap_training_model(model)
@@ -877,6 +910,18 @@ def main(args: argparse.Namespace | None = None) -> None:
     )
     model_module = unwrap_training_model(model)
 
+    # Warm-start (two-phase): initialise weights from a prior finetuned checkpoint (e.g. a
+    # linear-probe best_model.pth) WITHOUT restoring optimizer/epoch, so full FT starts from the
+    # trained head + trunk instead of a fresh random head. Skipped when resuming (the resume
+    # checkpoint already carries the weights).
+    if getattr(args, "init_weights", None) and not (resume_path and Path(resume_path).exists()):
+        print_rank0(f"Warm-start: loading model weights from {args.init_weights}", rank)
+        init_ckpt = torch.load(args.init_weights, map_location="cpu", weights_only=False)
+        init_sd = init_ckpt.get("model_state_dict", init_ckpt)
+        missing, unexpected = model_module.load_state_dict(init_sd, strict=False)
+        print_rank0(f"  warm-start: {len(missing)} missing, {len(unexpected)} unexpected keys "
+                    f"(both should be ~0 for a same-architecture probe checkpoint)", rank)
+
     # Build per-modality strand-channel masks for the gene LFC loss (B3.2).
     # Empty dict when gene_loss_weight is 0; populated only for modalities
     # whose strand info was supplied (today: rna_seq via --track-strands or
@@ -933,7 +978,11 @@ def main(args: argparse.Namespace | None = None) -> None:
 
     # Scheduler
     total_steps = (args.epochs * len(train_loader)) // args.gradient_accumulation_steps
-    scheduler = create_lr_scheduler(optimizer, args.warmup_steps, total_steps, schedule=args.lr_schedule)
+    scheduler = create_lr_scheduler(
+        optimizer, args.warmup_steps, total_steps, schedule=args.lr_schedule,
+        plateau_factor=args.plateau_factor, plateau_patience=args.plateau_patience,
+        plateau_min_lr=args.plateau_min_lr,
+    )
     effective_batch_size = args.batch_size * args.gradient_accumulation_steps * world_size
     print_rank0(f"Gradient accumulation: {args.gradient_accumulation_steps}", rank)
     print_rank0(f"Effective batch size: {effective_batch_size}", rank)
@@ -1212,6 +1261,10 @@ def main(args: argparse.Namespace | None = None) -> None:
                 torch.cuda.synchronize()
 
             current_lr = scheduler.get_last_lr()[0]
+            # Plateau schedule: reduce LR (for the NEXT epoch) when val loss stalls. The per-step
+            # scheduler.step() inside train_epoch only drives warmup; the reduction is metric-driven.
+            if hasattr(scheduler, "step_metric"):
+                scheduler.step_metric(val_loss)
             is_best = val_loss < best_val_loss
 
             # Print epoch summary

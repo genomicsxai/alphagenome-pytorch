@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.amp import autocast
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
@@ -70,24 +70,90 @@ def collate_genomic(
     return sequences, targets_dict
 
 
+class WarmupPlateauLR:
+    """Linear warmup, then ReduceLROnPlateau on a validation metric.
+
+    Duck-types the ``LambdaLR`` surface the training loop already uses, so no ``train_epoch_*`` call
+    site changes: ``.step()`` is called once per optimizer step and drives the linear warmup (then
+    no-ops), ``.get_last_lr()`` reports the current LRs, and ``.state_dict()`` / ``.load_state_dict()``
+    round-trip for resume. The plateau reduction is driven separately by ``.step_metric(val_loss)``,
+    which the runner calls once per epoch after validation.
+
+    Unlike the cosine/constant ``LambdaLR`` schedules (which decay on a fixed step budget), this
+    lowers the LR by ``factor`` only when the validation loss stops improving for ``patience``
+    epochs -- the decay-on-plateau schedule wanted for full fine-tuning.
+    """
+
+    def __init__(self, optimizer, warmup_steps=0, factor=0.5, patience=2,
+                 min_lr=0.0, threshold=1e-4):
+        self.optimizer = optimizer
+        self.warmup_steps = max(0, int(warmup_steps))
+        self.base_lrs = [g["lr"] for g in optimizer.param_groups]
+        self._step = 0
+        if self.warmup_steps > 0:                       # start at 0, ramp to base over warmup
+            for g in optimizer.param_groups:
+                g["lr"] = 0.0
+        self.plateau = ReduceLROnPlateau(
+            optimizer, mode="min", factor=factor, patience=patience,
+            min_lr=min_lr, threshold=threshold,
+        )
+
+    def step(self):
+        """Per optimizer step: drive linear warmup, then leave the LR to the plateau schedule."""
+        self._step += 1
+        if self._step < self.warmup_steps:
+            scale = self._step / self.warmup_steps
+            for g, base in zip(self.optimizer.param_groups, self.base_lrs):
+                g["lr"] = base * scale
+        elif self._step == self.warmup_steps:           # pin exactly to base as warmup ends
+            for g, base in zip(self.optimizer.param_groups, self.base_lrs):
+                g["lr"] = base
+
+    def step_metric(self, metric):
+        """Per epoch after validation: reduce LR on plateau (only once past warmup)."""
+        if self._step >= self.warmup_steps:
+            self.plateau.step(metric)
+
+    def get_last_lr(self):
+        return [g["lr"] for g in self.optimizer.param_groups]
+
+    def state_dict(self):
+        return {"step": self._step, "base_lrs": self.base_lrs,
+                "plateau": self.plateau.state_dict()}
+
+    def load_state_dict(self, state):
+        self._step = state["step"]
+        self.base_lrs = state["base_lrs"]
+        self.plateau.load_state_dict(state["plateau"])
+
+
 def create_lr_scheduler(
     optimizer: Optimizer,
     warmup_steps: int,
     total_steps: int,
     schedule: str = "cosine",
-) -> LambdaLR:
+    *,
+    plateau_factor: float = 0.5,
+    plateau_patience: int = 2,
+    plateau_min_lr: float = 0.0,
+):
     """Create learning rate scheduler with optional warmup.
 
     Args:
         optimizer: Optimizer to schedule.
         warmup_steps: Number of warmup steps (linear ramp from 0 to lr).
-        total_steps: Total number of training steps.
+        total_steps: Total number of training steps (used by cosine).
         schedule: Schedule type after warmup. Options:
             - "cosine": Cosine decay to 0 (default)
             - "constant": Constant learning rate
+            - "plateau": ReduceLROnPlateau on the validation loss. The per-step ``.step()`` only
+              drives warmup; call ``scheduler.step_metric(val_loss)`` once per epoch after
+              validation to apply the plateau reductions.
+        plateau_factor / plateau_patience / plateau_min_lr: ReduceLROnPlateau parameters, used
+            only when ``schedule == "plateau"``.
 
     Returns:
-        LambdaLR scheduler.
+        A ``LambdaLR`` for cosine/constant, or a ``WarmupPlateauLR`` for plateau.
 
     Examples:
         # Warmup + cosine decay (default)
@@ -96,11 +162,18 @@ def create_lr_scheduler(
         # Constant learning rate (no warmup, no decay)
         scheduler = create_lr_scheduler(opt, warmup_steps=0, total_steps=10000, schedule="constant")
 
-        # Warmup then constant
-        scheduler = create_lr_scheduler(opt, warmup_steps=500, total_steps=10000, schedule="constant")
+        # Warmup then decay-on-plateau (step per epoch with the val loss)
+        scheduler = create_lr_scheduler(opt, warmup_steps=1000, total_steps=0, schedule="plateau")
     """
+    if schedule == "plateau":
+        return WarmupPlateauLR(
+            optimizer, warmup_steps=warmup_steps, factor=plateau_factor,
+            patience=plateau_patience, min_lr=plateau_min_lr,
+        )
     if schedule not in ("cosine", "constant"):
-        raise ValueError(f"Unknown schedule: {schedule}. Must be 'cosine' or 'constant'.")
+        raise ValueError(
+            f"Unknown schedule: {schedule}. Must be 'cosine', 'constant' or 'plateau'."
+        )
 
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:

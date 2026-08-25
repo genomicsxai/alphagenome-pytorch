@@ -40,6 +40,11 @@ DEFAULTS = {
     "weight_decay": 0.1,
     "warmup_steps": 500,
     "lr_schedule": "cosine",
+    "plateau_factor": 0.5,
+    "plateau_patience": 3,
+    "plateau_min_lr": 0.0,
+    "augment_rc": False,
+    "augment_shift_bp": 0,
     "positional_weight": 5.0,
     "count_weight": 1.0,
     "num_workers": 4,
@@ -327,6 +332,11 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
     # Model arguments
     model = parser.add_argument_group("Model")
     model.add_argument("--pretrained-weights", type=str, required=False, help="Pretrained weights .pth")
+    model.add_argument("--init-weights", type=str, default=None,
+                       help="Warm-start: load model weights (backbone + heads) from a prior "
+                            "finetuned checkpoint at init, WITHOUT restoring optimizer/epoch -- the "
+                            "two-phase pattern (probe head -> unfreeze + full FT). Ignored when "
+                            "--resume finds a checkpoint (that already carries weights).")
     model.add_argument(
         "--modality",
         type=str,
@@ -393,8 +403,22 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
         "--lr-schedule",
         type=str,
         default=DEFAULTS["lr_schedule"],
-        choices=["cosine", "constant"],
+        choices=["cosine", "constant", "plateau"],
     )
+    train.add_argument("--plateau-factor", type=float, default=DEFAULTS["plateau_factor"],
+                       help="ReduceLROnPlateau LR multiplier on plateau (lr-schedule=plateau)")
+    train.add_argument("--plateau-patience", type=int, default=DEFAULTS["plateau_patience"],
+                       help="ReduceLROnPlateau: epochs of no val improvement before reducing")
+    train.add_argument("--plateau-min-lr", type=float, default=DEFAULTS["plateau_min_lr"],
+                       help="ReduceLROnPlateau: lower bound on the learning rate")
+    train.add_argument("--augment-rc", action="store_true", default=DEFAULTS["augment_rc"],
+                       help="TRAIN-only reverse-complement augmentation (prob 0.5). Sequence is "
+                            "reverse-complemented; targets reverse along length and swap declared "
+                            "+/- strand pairs (--strand-pairs); unstranded tracks reverse only. "
+                            "Val/test are never augmented.")
+    train.add_argument("--augment-shift-bp", type=int, default=DEFAULTS["augment_shift_bp"],
+                       help="TRAIN-only max random genomic shift in bp (+/-), applied identically to "
+                            "all track types. 0 disables. Val/test are never shifted.")
     train.add_argument("--positional-weight", type=float, default=DEFAULTS["positional_weight"])
     train.add_argument("--count-weight", type=float, default=DEFAULTS["count_weight"])
     train.add_argument("--max-grad-norm", type=float, default=DEFAULTS["max_grad_norm"])
@@ -563,6 +587,7 @@ def postprocess_args(
         "cache_signals",
         "max_io_workers",
         "pretrained_weights",
+        "init_weights",
         "lora_rank",
         "lora_alpha",
         "lora_targets",
@@ -579,6 +604,11 @@ def postprocess_args(
         "weight_decay",
         "warmup_steps",
         "lr_schedule",
+        "plateau_factor",
+        "plateau_patience",
+        "plateau_min_lr",
+        "augment_rc",
+        "augment_shift_bp",
         "positional_weight",
         "count_weight",
         "max_grad_norm",
