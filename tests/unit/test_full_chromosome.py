@@ -5,6 +5,8 @@ _sequence_to_onehot() encoding, and stitching logic with a mock model.
 All pure-logic tests -- no pyBigWig, pyfaidx, GPU, or model weights needed.
 """
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -450,6 +452,80 @@ class TestStitchingWithMockModel:
         assert float(adata.X[0, 0]) == pytest.approx(3.0)  # track 0: 3 exon bins x 1.0
         assert float(adata.X[1, 0]) == pytest.approx(0.0)  # track 1: mock is 0
 
+    def test_gene_counts_anndata_progress_never_reaches_stdout(self, capsys):
+        """`agt predict --json` reads stdout as JSON, so prose must not land there.
+
+        show_progress=False must be silent on both streams; show_progress=True
+        must report on stderr only.
+        """
+        import pandas as pd
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            predict_full_chromosomes_to_anndata,
+            GenomeSequenceProvider,
+        )
+        from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+
+        chrom_len = 131072
+        config = TilingConfig(crop_bp=0, resolution=128, batch_size=1)
+        model = self._MockModel(resolution=128, n_tracks=1)
+        ann = GeneAnnotation(pd.DataFrame([
+            dict(Feature="gene", Chromosome="chr1", Start=256, End=640, Strand="+",
+                 gene_id="ENSX", gene_name="X", gene_type="protein_coding"),
+            dict(Feature="exon", Chromosome="chr1", Start=256, End=640, Strand="+",
+                 gene_id="ENSX", gene_name="X", gene_type="protein_coding"),
+        ]))
+
+        def aggregate(show_progress):
+            provider = self._build_in_memory_provider(GenomeSequenceProvider, chrom_len)
+            predict_full_chromosomes_to_anndata(
+                model, provider, ann, "atac",
+                chromosomes=["chr1"], config=config, track_indices=[0],
+                over="exons", reduce="sum", device="cpu",
+                show_progress=show_progress,
+            )
+            return capsys.readouterr()
+
+        quiet = aggregate(False)
+        assert quiet.out == ""
+        assert quiet.err == ""
+
+        loud = aggregate(True)
+        assert loud.out == ""
+        assert "Aggregating" in loud.err
+
+    def test_gene_counts_anndata_log_flag_survives_the_progress_helper(self):
+        """The progress helper must not shadow this function's `log` (log1p) flag."""
+        import pandas as pd
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            predict_full_chromosomes_to_anndata,
+            GenomeSequenceProvider,
+        )
+        from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+
+        chrom_len = 131072
+        config = TilingConfig(crop_bp=0, resolution=128, batch_size=1)
+        model = self._MockModel(resolution=128, n_tracks=1)
+        ann = GeneAnnotation(pd.DataFrame([
+            dict(Feature="gene", Chromosome="chr1", Start=256, End=640, Strand="+",
+                 gene_id="ENSX", gene_name="X", gene_type="protein_coding"),
+            dict(Feature="exon", Chromosome="chr1", Start=256, End=640, Strand="+",
+                 gene_id="ENSX", gene_name="X", gene_type="protein_coding"),
+        ]))
+
+        def aggregate(log):
+            provider = self._build_in_memory_provider(GenomeSequenceProvider, chrom_len)
+            gc = predict_full_chromosomes_to_anndata(
+                model, provider, ann, "atac",
+                chromosomes=["chr1"], config=config, track_indices=[0],
+                over="exons", reduce="sum", device="cpu", show_progress=False,
+                log=log,
+            )
+            return gc.counts[0, 0, 0].item()
+
+        raw = aggregate(False)
+        assert raw == pytest.approx(3.0)             # 3 exon bins x 1.0
+        assert aggregate(True) == pytest.approx(np.log1p(raw))
+
 
 @pytest.mark.unit
 class TestHeadConfigs:
@@ -532,3 +608,235 @@ class TestAnnDataTrackMetadata:
         tracks = self._catalog_tracks()
         assert len(tracks) == 768
         assert sum(1 for t in tracks if _is_padding(t)) == 101
+
+
+@pytest.mark.unit
+class TestWriteChromosomesBigwig:
+    """One BigWig per track, streamed across chromosomes.
+
+    A BigWig holds one signal for a whole genome, so chromosomes are appended
+    to a single open handle per track instead of each getting its own file.
+    """
+
+    CHROM_SIZES = {"chr1": 1280, "chr2": 640}  # 10 and 5 bins at 128bp
+
+    @staticmethod
+    def _write(*args, **kwargs):
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            write_chromosomes_bigwig,
+        )
+        return write_chromosomes_bigwig(*args, **kwargs)
+
+    def test_single_track_writes_one_file_for_all_chromosomes(self, tmp_path):
+        pyBigWig = pytest.importorskip("pyBigWig")
+        out = tmp_path / "dnase.bw"
+
+        written = self._write(
+            [(np.arange(1, 11, dtype=float).reshape(10, 1), "chr1"),
+             (np.arange(1, 6, dtype=float).reshape(5, 1), "chr2")],
+            output_path=out,
+            chrom_sizes=self.CHROM_SIZES,
+            resolution=128,
+            chromosome_order=["chr1", "chr2"],
+        )
+
+        # One track means no track suffix, and one file rather than one per chromosome.
+        assert written == [out]
+        assert [p.name for p in tmp_path.iterdir()] == ["dnase.bw"]
+
+        bw = pyBigWig.open(str(out))
+        try:
+            assert bw.chroms() == self.CHROM_SIZES
+            assert len(bw.intervals("chr1")) == 10
+            assert len(bw.intervals("chr2")) == 5
+        finally:
+            bw.close()
+
+    def test_values_cover_resolution_sized_spans(self, tmp_path):
+        """Each value spans one bin -- ranges, not one entry per base."""
+        pyBigWig = pytest.importorskip("pyBigWig")
+        out = tmp_path / "atac.bw"
+
+        # Distinct values, so adjacent bins cannot merge into a single interval.
+        self._write(
+            [(np.arange(1, 11, dtype=float).reshape(10, 1), "chr1")],
+            output_path=out,
+            chrom_sizes=self.CHROM_SIZES,
+            resolution=128,
+            chromosome_order=["chr1"],
+        )
+
+        bw = pyBigWig.open(str(out))
+        try:
+            intervals = bw.intervals("chr1")
+        finally:
+            bw.close()
+
+        assert list(intervals) == [
+            (i * 128, (i + 1) * 128, float(i + 1)) for i in range(10)
+        ]
+
+    def test_multiple_tracks_write_one_file_each(self, tmp_path):
+        pyBigWig = pytest.importorskip("pyBigWig")
+        out = tmp_path / "dnase.bw"
+
+        written = self._write(
+            [(np.ones((10, 3)), "chr1"), (np.ones((5, 3)), "chr2")],
+            output_path=out,
+            chrom_sizes=self.CHROM_SIZES,
+            resolution=128,
+            track_names=["k562", "gm12878", "hepg2"],
+            chromosome_order=["chr1", "chr2"],
+        )
+
+        assert [p.name for p in written] == [
+            "dnase_k562.bw", "dnase_gm12878.bw", "dnase_hepg2.bw",
+        ]
+        # Each track file spans both chromosomes, so the output is one file per
+        # track -- not one per (track, chromosome) as the per-chromosome writer gives.
+        for path in written:
+            bw = pyBigWig.open(str(path))
+            try:
+                assert bw.intervals("chr1") and bw.intervals("chr2")
+            finally:
+                bw.close()
+
+    def test_header_declares_only_the_chromosomes_written(self, tmp_path):
+        pyBigWig = pytest.importorskip("pyBigWig")
+        out = tmp_path / "atac.bw"
+
+        self._write(
+            [(np.ones((10, 1)), "chr1")],
+            output_path=out,
+            chrom_sizes=self.CHROM_SIZES,
+            resolution=128,
+            chromosome_order=["chr1"],
+        )
+
+        bw = pyBigWig.open(str(out))
+        try:
+            assert bw.chroms() == {"chr1": 1280}
+        finally:
+            bw.close()
+
+    def test_trailing_partial_bin_is_dropped(self, tmp_path):
+        """chr2 holds 5 whole bins, so a 6th value has nowhere valid to go."""
+        pyBigWig = pytest.importorskip("pyBigWig")
+        out = tmp_path / "atac.bw"
+
+        self._write(
+            [(np.arange(1, 7, dtype=float).reshape(6, 1), "chr2")],
+            output_path=out,
+            chrom_sizes=self.CHROM_SIZES,
+            resolution=128,
+            chromosome_order=["chr2"],
+        )
+
+        bw = pyBigWig.open(str(out))
+        try:
+            intervals = bw.intervals("chr2")
+        finally:
+            bw.close()
+
+        assert len(intervals) == 5
+        assert intervals[-1] == (512, 640, 5.0)
+
+    def test_out_of_order_chromosome_rejected(self, tmp_path):
+        pytest.importorskip("pyBigWig")
+
+        with pytest.raises(ValueError, match="header order"):
+            self._write(
+                [(np.ones((5, 1)), "chr2"), (np.ones((10, 1)), "chr1")],
+                output_path=tmp_path / "atac.bw",
+                chrom_sizes=self.CHROM_SIZES,
+                resolution=128,
+                chromosome_order=["chr1", "chr2"],
+            )
+
+    def test_chromosomes_are_flushed_before_the_next_arrives(self, tmp_path):
+        """Laziness: an eager writer would drain the input before opening a file."""
+        pytest.importorskip("pyBigWig")
+        out = tmp_path / "atac.bw"
+
+        def chrom_arrays():
+            yield np.ones((10, 1)), "chr1"
+            raise RuntimeError("second chromosome failed")
+
+        with pytest.raises(RuntimeError, match="second chromosome failed"):
+            self._write(
+                chrom_arrays(),
+                output_path=out,
+                chrom_sizes=self.CHROM_SIZES,
+                resolution=128,
+                chromosome_order=["chr1", "chr2"],
+            )
+
+        # chr1 reached an open handle, which the finally block then closed.
+        assert out.exists()
+
+
+@pytest.mark.unit
+class TestFullChromosomeBigwigApi:
+    """The genome-wide default, and the flag that restores per-chromosome files."""
+
+    def test_split_by_chrom_defaults_to_one_file_per_track(self):
+        import inspect
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            predict_full_chromosomes_to_bigwig,
+        )
+
+        parameter = inspect.signature(predict_full_chromosomes_to_bigwig).parameters
+        assert parameter["split_by_chrom"].default is False
+
+    def test_bigwig_output_records_the_chromosomes_covered(self):
+        from alphagenome_pytorch.extensions.inference.full_chromosome import BigwigOutput
+
+        out = BigwigOutput(Path("dnase.bw"), ["chr20", "chr21"])
+        assert out.path.name == "dnase.bw"
+        assert out.chromosomes == ["chr20", "chr21"]
+
+
+@pytest.mark.unit
+class TestProgressStreamDiscipline:
+    """Progress prose must never reach stdout, which carries the JSON payload."""
+
+    @staticmethod
+    def _tiny_fasta(tmp_path):
+        fa = tmp_path / "tiny.fa"
+        fa.write_text(">chr1\n" + "ACGT" * 16 + "\n>chr2\n" + "ACGT" * 8 + "\n")
+        return fa
+
+    def test_provider_is_silent_when_progress_is_off(self, tmp_path, capsys):
+        pytest.importorskip("pyfaidx")
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            GenomeSequenceProvider,
+        )
+
+        provider = GenomeSequenceProvider(
+            self._tiny_fasta(tmp_path), chromosomes={"chr1"}, show_progress=False,
+        )
+        try:
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            assert captured.err == ""
+        finally:
+            provider.close()
+
+    def test_provider_reports_on_stderr_not_stdout(self, tmp_path, capsys):
+        """Both messages -- the provider's own and GenomeSequenceSource's."""
+        pytest.importorskip("pyfaidx")
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            GenomeSequenceProvider,
+        )
+
+        provider = GenomeSequenceProvider(
+            self._tiny_fasta(tmp_path), chromosomes={"chr1"}, show_progress=True,
+        )
+        try:
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            assert "Loading genome from" in captured.err
+            assert "Cached genome" in captured.err
+        finally:
+            provider.close()
+

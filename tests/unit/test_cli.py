@@ -884,6 +884,48 @@ class TestPredictAnnData:
             predict_cli.run(args)
 
 
+class TestLoadModelProgressStream:
+    """Loading a model is progress: --quiet silences it, --json never sees it.
+
+    stdout carries the JSON payload, so these messages belong on stderr and
+    must pass the same gate run() uses (`not quiet and not json_mode`).
+    """
+
+    @staticmethod
+    def _args(tmp_path, quiet):
+        model = tmp_path / "m.pth"
+        model.write_text("")
+        argv = ["predict", "--model", str(model), "--output", str(tmp_path),
+                "--head", "dnase", "--device", "cpu"]
+        if quiet:
+            argv.append("--quiet")
+        return build_parser().parse_args(argv)
+
+    def _load(self, tmp_path, capsys, *, quiet, json_mode):
+        import alphagenome_pytorch
+        from alphagenome_pytorch.cli import predict as predict_cli
+
+        with mock.patch.object(alphagenome_pytorch.AlphaGenome, "from_pretrained",
+                               return_value=object()):
+            predict_cli._load_model(self._args(tmp_path, quiet), None, json_mode)
+        return capsys.readouterr()
+
+    def test_reports_on_stderr_by_default(self, tmp_path, capsys):
+        captured = self._load(tmp_path, capsys, quiet=False, json_mode=False)
+        assert captured.out == ""
+        assert "Loading model from" in captured.err
+
+    def test_quiet_silences_it(self, tmp_path, capsys):
+        captured = self._load(tmp_path, capsys, quiet=True, json_mode=False)
+        assert captured.out == ""
+        assert captured.err == ""
+
+    def test_json_silences_it(self, tmp_path, capsys):
+        captured = self._load(tmp_path, capsys, quiet=False, json_mode=True)
+        assert captured.out == ""
+        assert captured.err == ""
+
+
 class TestPredictAnnDataWiring:
     """The --aggregate-* flags must map onto the packaged function's kwargs.
 
