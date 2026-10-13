@@ -186,6 +186,31 @@ class TestSpliceLoss:
         # contributes exactly 0.
         assert result['splice_site_usage_loss'].item() == 0.0
 
+    def test_splice_site_usage_default_mask_excludes_padding(self):
+        """Without a passed mask, the head's track_mask drops mouse padding."""
+        from alphagenome_pytorch.heads import SpliceSitesUsageHead
+
+        head = SpliceSitesUsageHead(
+            in_channels=8,
+            num_output_tracks=734,
+            num_organisms=2,
+            num_tracks_per_organism=(734, 180),
+        )
+        oi = torch.tensor([1])  # mouse
+        with torch.no_grad():
+            output = head(torch.randn(1, 8, 4), oi)
+        track_mask = output['track_mask']
+        # Released mouse records store -1 in the padding columns.
+        target = torch.where(track_mask, torch.rand(1, 4, 734), -1.0)
+
+        loss_fn = AlphaGenomeLoss(heads=['splice_site_usage'])
+        default = loss_fn({'splice_site_usage': output},
+                          {'splice_site_usage': target}, oi)
+        explicit = loss_fn({'splice_site_usage': output},
+                           {'splice_site_usage': target}, oi,
+                           {'splice_site_usage': track_mask})
+        torch.testing.assert_close(default['loss'], explicit['loss'])
+
     def test_splice_junctions_runs_on_dict_output(self):
         """splice_junctions consumes {'pred_counts', 'splice_junction_mask'}."""
         loss_fn = AlphaGenomeLoss(heads=['splice_junctions'])
