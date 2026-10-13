@@ -134,6 +134,53 @@ class TestAlphaGenomeLoss:
         both.backward()
         assert out_128.grad is not None and out_128.grad.abs().sum() > 0
 
+    def test_default_multinomial_resolution_is_per_resolution(self):
+        """Default segments are 2**17 bp at every resolution, as upstream."""
+        from alphagenome_pytorch import losses
+
+        b, s, c = 1, 2**18, 2  # two 131,072 bp segments at 1bp
+        out_1 = torch.rand(b, s, c) + 0.1
+        out_128 = torch.rand(b, s // 128, c) + 0.1
+        target_1 = torch.rand(b, s, c)
+        target_128 = target_1.reshape(b, s // 128, 128, c).sum(dim=2)
+        mask = torch.ones(b, 1, c, dtype=torch.bool)
+
+        expected = sum(
+            losses.multinomial_loss(
+                y_true=t, y_pred=o, mask=mask,
+                multinomial_resolution=2**17 // res, positional_weight=5.0,
+            )['loss']
+            for res, o, t in ((1, out_1, target_1), (128, out_128, target_128))
+        )
+        result = AlphaGenomeLoss(heads=['atac'])(
+            {'atac': {1: out_1, 128: out_128}},
+            {'atac': {1: target_1, 128: target_128}},
+            torch.tensor([0]),
+        )
+        torch.testing.assert_close(result['loss'], expected)
+
+    def test_multinomial_resolution_override(self):
+        """An int applies to every resolution; a dict is looked up per resolution."""
+        outputs = {'atac': {1: torch.rand(1, 256, 3) + 0.1, 128: torch.rand(1, 2, 3) + 0.1}}
+        target_1 = torch.rand(1, 256, 3)
+        targets = {'atac': {1: target_1, 128: target_1.reshape(1, 2, 128, 3).sum(dim=2)}}
+        oi = torch.tensor([0])
+
+        as_int = AlphaGenomeLoss(heads=['atac'], multinomial_resolution=2)(outputs, targets, oi)
+        as_dict = AlphaGenomeLoss(
+            heads=['atac'], multinomial_resolution={1: 2, 128: 2}
+        )(outputs, targets, oi)
+        torch.testing.assert_close(as_int['loss'], as_dict['loss'])
+
+        per_res = AlphaGenomeLoss(
+            heads=['atac'], multinomial_resolution={1: 256, 128: 2}
+        )(outputs, targets, oi)
+        assert not torch.allclose(per_res['loss'], as_int['loss'])
+
+        # Inputs shorter than 2**17 bp get one segment per sequence by default.
+        default = AlphaGenomeLoss(heads=['atac'])(outputs, targets, oi)
+        torch.testing.assert_close(default['loss'], per_res['loss'])
+
     def test_forward_sum_pools_tensor_target_to_coarser_resolutions(self):
         """A single finest-resolution target is sum-pooled for the 128bp output."""
         loss_fn = AlphaGenomeLoss(heads=['atac'], multinomial_resolution=2)

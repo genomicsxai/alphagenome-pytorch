@@ -6,7 +6,7 @@ and metrics for training AlphaGenome models.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Any, Tuple
+from typing import Dict, List, Optional, Sequence, Any, Tuple, Union
 import math
 
 import torch
@@ -63,7 +63,6 @@ class AlphaGenomeTrainingConfig:
     eps: float = 1e-8
     
     # Loss configuration
-    multinomial_resolution: int = 128
     positional_weight: float = 5.0  # JAX production value (AG_MODEL.md line 321)
 
 
@@ -114,10 +113,12 @@ class AlphaGenomeLoss(nn.Module):
             heads it names and leaves the rest at their upstream defaults
             (1.0 for count and splice-site heads, 0.2 for splice junctions).
             Pass `None` to use the defaults unchanged.
-        multinomial_resolution: Resolution for multinomial loss computation. This is the
-            segment size used to divide the sequence for multinomial loss. For JAX parity,
-            use `seq_len` (full sequence as 1 segment) or `seq_len // 8` for 8 segments
-            matching the model specification in their supplemental.
+        multinomial_resolution: Segment size, in bins of the output, used to divide
+            the sequence for multinomial loss. If None (default), uses
+            `2**17 // resolution` for each resolution as upstream, i.e. 131,072 bp
+            segments at both 1bp and 128bp (capped at the sequence length for
+            shorter inputs). An int applies to every head and resolution; a dict
+            maps resolution to segment size.
         positional_weight: Weight for positional component of multinomial loss.
             JAX production uses 5.0 (default), matching Borzoi.
     """
@@ -127,7 +128,7 @@ class AlphaGenomeLoss(nn.Module):
         model: Optional[nn.Module] = None,
         heads: Optional[List[str]] = None,
         head_weights: Optional[Dict[str, float]] = None,
-        multinomial_resolution: int = 128,
+        multinomial_resolution: Optional[Union[int, Dict[int, int]]] = None,
         positional_weight: float = 5.0,  # JAX production value
         gene_loss_weights: Optional[Dict[str, float]] = None,
         gene_cross_track_weight: float = 5.0,
@@ -162,6 +163,18 @@ class AlphaGenomeLoss(nn.Module):
                 buffer_name = f"_strand_channel_mask__{head}"
                 self.register_buffer(buffer_name, _build_strand_channel_mask(strands))
                 self._strand_mask_heads.append(head)
+
+    def _get_multinomial_resolution(self, resolution: Optional[int], seq_len: int) -> int:
+        """Return the multinomial segment size for one resolution."""
+        if isinstance(self.multinomial_resolution, dict):
+            return self.multinomial_resolution[resolution]
+        if self.multinomial_resolution is not None:
+            return self.multinomial_resolution
+        if resolution is None:
+            raise ValueError(
+                "multinomial_resolution must be set when outputs are not keyed by resolution."
+            )
+        return min(2**17 // resolution, seq_len)
 
     def _get_strand_channel_mask(self, head: str) -> Optional[torch.Tensor]:
         """Return the `[2, 1, C]` strand-channel mask for a head, or None."""
@@ -387,7 +400,9 @@ class AlphaGenomeLoss(nn.Module):
             y_true=scaled_target,  # Now scaled!
             y_pred=output,         # Already scaled from forward pass
             mask=mask,
-            multinomial_resolution=self.multinomial_resolution,
+            multinomial_resolution=self._get_multinomial_resolution(
+                resolution, output.shape[seq_axis]
+            ),
             positional_weight=self.positional_weight,
             channels_last=is_channels_last,
         )
