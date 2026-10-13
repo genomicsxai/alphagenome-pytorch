@@ -1,6 +1,8 @@
 """Integration tests for training loss gradient parity.
 
-This module tests gradient parity when using AlphaGenomeLoss (multinomial_loss).
+This module tests gradient parity of the multinomial training loss. The PyTorch
+side calls multinomial_loss per resolution and sums by hand; it does not call
+AlphaGenomeLoss.
 
 CURRENT IMPLEMENTATION:
 - Both JAX and PyTorch use experimental space (unscaled) predictions and targets
@@ -402,7 +404,7 @@ def cached_training_gradients(
     """Cache training gradients for both models.
 
     Uses production training behavior:
-    - PyTorch: AlphaGenomeLoss with model=pytorch_model, positional_weight=5.0
+    - PyTorch: multinomial_loss per resolution, summed, with target scaling, positional_weight=5.0
     - JAX: multinomial_loss with target scaling, positional_weight=5.0
 
     Returns dict with structure:

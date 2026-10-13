@@ -113,6 +113,39 @@ class TestAlphaGenomeLoss:
         assert 'atac_loss' in result
         assert 'dnase_loss' in result
 
+    def test_forward_sums_all_resolutions(self):
+        """A {1: ..., 128: ...} head gets the sum of both losses, as upstream."""
+        loss_fn = AlphaGenomeLoss(heads=['atac'], multinomial_resolution=2)
+        out_1 = (torch.rand(1, 256, 3) + 0.1).requires_grad_()
+        out_128 = (torch.rand(1, 2, 3) + 0.1).requires_grad_()
+        target_1 = torch.rand(1, 256, 3)
+        target_128 = target_1.reshape(1, 2, 128, 3).sum(dim=2)
+        oi = torch.tensor([0])
+
+        both = loss_fn(
+            {'atac': {1: out_1, 128: out_128}},
+            {'atac': {1: target_1, 128: target_128}},
+            oi,
+        )['loss']
+        only_1 = loss_fn({'atac': {1: out_1}}, {'atac': {1: target_1}}, oi)['loss']
+        only_128 = loss_fn({'atac': {128: out_128}}, {'atac': {128: target_128}}, oi)['loss']
+        torch.testing.assert_close(both, only_1 + only_128)
+
+        both.backward()
+        assert out_128.grad is not None and out_128.grad.abs().sum() > 0
+
+    def test_forward_sum_pools_tensor_target_to_coarser_resolutions(self):
+        """A single finest-resolution target is sum-pooled for the 128bp output."""
+        loss_fn = AlphaGenomeLoss(heads=['atac'], multinomial_resolution=2)
+        outputs = {'atac': {1: torch.rand(1, 256, 3) + 0.1, 128: torch.rand(1, 2, 3) + 0.1}}
+        target_1 = torch.rand(1, 256, 3)
+        target_128 = target_1.reshape(1, 2, 128, 3).sum(dim=2)
+        oi = torch.tensor([0])
+
+        from_tensor = loss_fn(outputs, {'atac': target_1}, oi)['loss']
+        from_dict = loss_fn(outputs, {'atac': {1: target_1, 128: target_128}}, oi)['loss']
+        torch.testing.assert_close(from_tensor, from_dict)
+
 
 @pytest.mark.unit
 class TestSpliceLoss:

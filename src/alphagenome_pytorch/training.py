@@ -102,6 +102,8 @@ class AlphaGenomeLoss(nn.Module):
     (not the sum of weights). A weight of 0.2 therefore down-weights that
     head's contribution by exactly 0.2× relative to a weight-1.0 head with
     the same residual, matching upstream JAX `HeadConfig.loss_weight` semantics.
+    A head with outputs at several resolutions (`{1: ..., 128: ...}`) gets the
+    sum of its per-resolution losses, as in upstream `GenomeTracksHead.loss`.
 
     Args:
         model: AlphaGenome model instance. Required to access head modules for target scaling.
@@ -302,17 +304,42 @@ class AlphaGenomeLoss(nn.Module):
             
             return donor_ratios_loss + acceptor_ratios_loss + 0.2 * (accept_total_loss + donor_total_loss)
 
-        # Handle resolution dict outputs (e.g., {1: tensor, 128: tensor})
-        resolution = None
+        # Handle resolution dict outputs (e.g., {1: tensor, 128: tensor}).
+        # Sum the loss over every resolution present, as upstream
+        # GenomeTracksHead.loss does. A target given as a single tensor is
+        # taken to be at the finest resolution and sum-pooled for the others.
         if isinstance(output, dict):
-            # Use highest resolution available
-            res_keys = [k for k in output.keys() if isinstance(k, int)]
+            res_keys = sorted(k for k in output.keys() if isinstance(k, int))
             if res_keys:
-                resolution = min(res_keys)  # 1bp > 128bp
-                output = output[resolution]
-                if isinstance(target, dict):
-                    target = target[resolution]
+                head_loss = 0.0
+                for resolution in res_keys:
+                    head_loss = head_loss + self._compute_track_loss(
+                        head,
+                        output[resolution],
+                        target[resolution] if isinstance(target, dict) else target,
+                        mask[resolution] if isinstance(mask, dict) else mask,
+                        organism_index,
+                        resolution=resolution,
+                        gene_mask=gene_mask,
+                    )
+                return head_loss
 
+        return self._compute_track_loss(
+            head, output, target, mask, organism_index,
+            resolution=None, gene_mask=gene_mask,
+        )
+
+    def _compute_track_loss(
+        self,
+        head: str,
+        output: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        organism_index: torch.Tensor,
+        resolution: Optional[int],
+        gene_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute the loss of a genome track or contact map head at one resolution."""
         # Default mask if not provided
         # Loss functions expect mask to match data format
         if mask is None:
@@ -336,6 +363,12 @@ class AlphaGenomeLoss(nn.Module):
             # If mask is provided, we assume it matches the output format.
             # We need to determine channels_last for scale/multinomial_loss.
             is_channels_last = (mask.shape[-2] == 1)
+
+        # Sum-pool a finer-resolution target to this output's resolution
+        seq_axis = -2 if is_channels_last else -1
+        if resolution is not None and target.shape[seq_axis] != output.shape[seq_axis]:
+            factor = target.shape[seq_axis] // output.shape[seq_axis]
+            target = target.unflatten(seq_axis, (output.shape[seq_axis], factor)).sum(seq_axis)
 
         # Contact maps use MSE (no scaling needed)
         if head == 'contact_maps':
