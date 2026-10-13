@@ -113,6 +113,86 @@ class TestAlphaGenomeLoss:
         assert 'atac_loss' in result
         assert 'dnase_loss' in result
 
+    def test_forward_sums_all_resolutions(self):
+        """A {1: ..., 128: ...} head gets the sum of both losses, as upstream."""
+        loss_fn = AlphaGenomeLoss(heads=['atac'], multinomial_resolution=2)
+        out_1 = (torch.rand(1, 256, 3) + 0.1).requires_grad_()
+        out_128 = (torch.rand(1, 2, 3) + 0.1).requires_grad_()
+        target_1 = torch.rand(1, 256, 3)
+        target_128 = target_1.reshape(1, 2, 128, 3).sum(dim=2)
+        oi = torch.tensor([0])
+
+        both = loss_fn(
+            {'atac': {1: out_1, 128: out_128}},
+            {'atac': {1: target_1, 128: target_128}},
+            oi,
+        )['loss']
+        only_1 = loss_fn({'atac': {1: out_1}}, {'atac': {1: target_1}}, oi)['loss']
+        only_128 = loss_fn({'atac': {128: out_128}}, {'atac': {128: target_128}}, oi)['loss']
+        torch.testing.assert_close(both, only_1 + only_128)
+
+        both.backward()
+        assert out_128.grad is not None and out_128.grad.abs().sum() > 0
+
+    def test_default_multinomial_resolution_is_per_resolution(self):
+        """Default segments are 2**17 bp at every resolution, as upstream."""
+        from alphagenome_pytorch import losses
+
+        b, s, c = 1, 2**18, 2  # two 131,072 bp segments at 1bp
+        out_1 = torch.rand(b, s, c) + 0.1
+        out_128 = torch.rand(b, s // 128, c) + 0.1
+        target_1 = torch.rand(b, s, c)
+        target_128 = target_1.reshape(b, s // 128, 128, c).sum(dim=2)
+        mask = torch.ones(b, 1, c, dtype=torch.bool)
+
+        expected = sum(
+            losses.multinomial_loss(
+                y_true=t, y_pred=o, mask=mask,
+                multinomial_resolution=2**17 // res, positional_weight=5.0,
+            )['loss']
+            for res, o, t in ((1, out_1, target_1), (128, out_128, target_128))
+        )
+        result = AlphaGenomeLoss(heads=['atac'])(
+            {'atac': {1: out_1, 128: out_128}},
+            {'atac': {1: target_1, 128: target_128}},
+            torch.tensor([0]),
+        )
+        torch.testing.assert_close(result['loss'], expected)
+
+    def test_multinomial_resolution_override(self):
+        """An int applies to every resolution; a dict is looked up per resolution."""
+        outputs = {'atac': {1: torch.rand(1, 256, 3) + 0.1, 128: torch.rand(1, 2, 3) + 0.1}}
+        target_1 = torch.rand(1, 256, 3)
+        targets = {'atac': {1: target_1, 128: target_1.reshape(1, 2, 128, 3).sum(dim=2)}}
+        oi = torch.tensor([0])
+
+        as_int = AlphaGenomeLoss(heads=['atac'], multinomial_resolution=2)(outputs, targets, oi)
+        as_dict = AlphaGenomeLoss(
+            heads=['atac'], multinomial_resolution={1: 2, 128: 2}
+        )(outputs, targets, oi)
+        torch.testing.assert_close(as_int['loss'], as_dict['loss'])
+
+        per_res = AlphaGenomeLoss(
+            heads=['atac'], multinomial_resolution={1: 256, 128: 2}
+        )(outputs, targets, oi)
+        assert not torch.allclose(per_res['loss'], as_int['loss'])
+
+        # Inputs shorter than 2**17 bp get one segment per sequence by default.
+        default = AlphaGenomeLoss(heads=['atac'])(outputs, targets, oi)
+        torch.testing.assert_close(default['loss'], per_res['loss'])
+
+    def test_forward_sum_pools_tensor_target_to_coarser_resolutions(self):
+        """A single finest-resolution target is sum-pooled for the 128bp output."""
+        loss_fn = AlphaGenomeLoss(heads=['atac'], multinomial_resolution=2)
+        outputs = {'atac': {1: torch.rand(1, 256, 3) + 0.1, 128: torch.rand(1, 2, 3) + 0.1}}
+        target_1 = torch.rand(1, 256, 3)
+        target_128 = target_1.reshape(1, 2, 128, 3).sum(dim=2)
+        oi = torch.tensor([0])
+
+        from_tensor = loss_fn(outputs, {'atac': target_1}, oi)['loss']
+        from_dict = loss_fn(outputs, {'atac': {1: target_1, 128: target_128}}, oi)['loss']
+        torch.testing.assert_close(from_tensor, from_dict)
+
 
 @pytest.mark.unit
 class TestSpliceLoss:
@@ -185,6 +265,31 @@ class TestSpliceLoss:
         # _safe_masked_mean clamps the denominator, so a fully-masked head
         # contributes exactly 0.
         assert result['splice_site_usage_loss'].item() == 0.0
+
+    def test_splice_site_usage_default_mask_excludes_padding(self):
+        """Without a passed mask, the head's track_mask drops mouse padding."""
+        from alphagenome_pytorch.heads import SpliceSitesUsageHead
+
+        head = SpliceSitesUsageHead(
+            in_channels=8,
+            num_output_tracks=734,
+            num_organisms=2,
+            num_tracks_per_organism=(734, 180),
+        )
+        oi = torch.tensor([1])  # mouse
+        with torch.no_grad():
+            output = head(torch.randn(1, 8, 4), oi)
+        track_mask = output['track_mask']
+        # Released mouse records store -1 in the padding columns.
+        target = torch.where(track_mask, torch.rand(1, 4, 734), -1.0)
+
+        loss_fn = AlphaGenomeLoss(heads=['splice_site_usage'])
+        default = loss_fn({'splice_site_usage': output},
+                          {'splice_site_usage': target}, oi)
+        explicit = loss_fn({'splice_site_usage': output},
+                           {'splice_site_usage': target}, oi,
+                           {'splice_site_usage': track_mask})
+        torch.testing.assert_close(default['loss'], explicit['loss'])
 
     def test_splice_junctions_runs_on_dict_output(self):
         """splice_junctions consumes {'pred_counts', 'splice_junction_mask'}."""
