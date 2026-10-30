@@ -618,16 +618,19 @@ class SpliceSitesJunctionHead(nn.Module):
                 return embedding[batch_idx, :, indices]  # (B, P, H)
 
             def _apply_rope(embedding, indices, params, organism_index):
-                x = _index_embeddings(embedding, indices)  # (B, P, H)
-                batch_params = params[organism_index]  # (B, 2, T, H)
-                scale = batch_params[:, [0], :, :]
-                offset = batch_params[:, [1], :, :]
-                x = scale * x[:, :, None, :] + offset  # (B, P, T, H)
-                return apply_rope(
-                    x, indices,
-                    max_position=self._max_position_encoding_distance,
-                    inplace=True,
-                )
+                # JAX casts to float32 here: positions reach 2**20, which bfloat16 cannot resolve, so the
+                # rotation also runs with autocast disabled (under autocast its einsum would round to bfloat16)
+                with torch.autocast(device_type=embedding.device.type, enabled=False):
+                    x = _index_embeddings(embedding, indices).float()  # (B, P, H)
+                    batch_params = params[organism_index].float()  # (B, 2, T, H)
+                    scale = batch_params[:, [0], :, :]
+                    offset = batch_params[:, [1], :, :]
+                    x = scale * x[:, :, None, :] + offset  # (B, P, T, H)
+                    return apply_rope(
+                        x, indices,
+                        max_position=self._max_position_encoding_distance,
+                        inplace=True,
+                    )
 
             pos_donor_logits = _apply_rope(
                 splice_site_logits, pos_donor_idx,
