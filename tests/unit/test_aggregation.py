@@ -29,7 +29,7 @@ from alphagenome_pytorch.aggregation import (
     normalize_expression,
 )
 from alphagenome_pytorch.named_outputs import TrackMetadata
-from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+from alphagenome_pytorch.annotations import GeneAnnotation
 
 
 # --------------------------------------------------------------------------- #

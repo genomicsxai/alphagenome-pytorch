@@ -256,7 +256,7 @@ defined over whole chromosomes. ``--annotation`` is required.
        ``--output``, instead of BigWigs. ``--chromosomes`` mode only.
    * - ``--annotation PATH``
      - *(required)*
-     - Gene annotation, GTF/GFF or parquet. Must include exon rows when
+     - Gene annotation, GTF or parquet. Must include exon rows when
        ``--aggregate-over exons``.
    * - ``--aggregate-over``
      - ``exons``

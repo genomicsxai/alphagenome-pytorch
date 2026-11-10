@@ -352,7 +352,7 @@ class TestStitchingWithMockModel:
             predict_full_chromosomes_to_anndata,
             GenomeSequenceProvider,
         )
-        from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+        from alphagenome_pytorch.annotations import GeneAnnotation
 
         chrom_len = 131072 * 2  # two 131072bp tiles at crop_bp=0
         config = TilingConfig(crop_bp=0, resolution=128, batch_size=1)
@@ -392,7 +392,7 @@ class TestStitchingWithMockModel:
             predict_full_chromosomes_to_anndata,
             GenomeSequenceProvider,
         )
-        from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+        from alphagenome_pytorch.annotations import GeneAnnotation
 
         chrom_len = 131072
         config = TilingConfig(crop_bp=0, resolution=128, batch_size=1)
@@ -422,7 +422,7 @@ class TestStitchingWithMockModel:
             predict_full_chromosomes_to_anndata,
             GenomeSequenceProvider,
         )
-        from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+        from alphagenome_pytorch.annotations import GeneAnnotation
 
         chrom_len = 131072
         config = TilingConfig(crop_bp=0, resolution=128, batch_size=1)
@@ -463,7 +463,7 @@ class TestStitchingWithMockModel:
             predict_full_chromosomes_to_anndata,
             GenomeSequenceProvider,
         )
-        from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+        from alphagenome_pytorch.annotations import GeneAnnotation
 
         chrom_len = 131072
         config = TilingConfig(crop_bp=0, resolution=128, batch_size=1)
@@ -500,7 +500,7 @@ class TestStitchingWithMockModel:
             predict_full_chromosomes_to_anndata,
             GenomeSequenceProvider,
         )
-        from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+        from alphagenome_pytorch.annotations import GeneAnnotation
 
         chrom_len = 131072
         config = TilingConfig(crop_bp=0, resolution=128, batch_size=1)

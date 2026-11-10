@@ -415,7 +415,7 @@ Flag                                    Default     Meaning
                                                     ``0.0`` disables the term entirely.
 ``--gene-cross-track-weight W``         ``5.0``     Inner multinomial weight (paper default). Only
                                                     used when ``--gene-loss-weight > 0``.
-``--gtf PATH``                          *(none)*    Annotation, parquet or GTF/GFF;
+``--gtf PATH``                          *(none)*    Annotation, parquet or GTF;
                                                     ``protein_coding`` **gene** rows build the
                                                     per-window gene-body masks. Prefer parquet —
                                                     it loads in seconds where a GENCODE GTF takes
@@ -468,7 +468,7 @@ Requirements that are checked before training starts:
   gene-only file, which is all the LFC loss needs. An annotation without exon
   rows is rejected.
 
-  Both flags take parquet or GTF/GFF, and both are much faster on parquet.
+  Both flags take parquet or GTF, and both are much faster on parquet.
   Convert once with ``scripts/convert_gtf_to_parquet.py`` and point ``--gtf`` at
   the result: it preserves all the features, so a single file will work for the gene-body
   masks and the exon metric (no extra ``--gene-expr-annotation`` necessary).

@@ -20,7 +20,7 @@ from alphagenome_pytorch.extensions.finetuning.training import (
     _accumulate_gene_expr_windows,
     _gene_expr_metrics,
 )
-from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+from alphagenome_pytorch.annotations import GeneAnnotation
 
 INTERVAL = ("chr1", 100, 120)  # width 20, 1bp resolution
 

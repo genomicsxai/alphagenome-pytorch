@@ -813,7 +813,7 @@ def compute_gene_expression_metrics(
         _accumulate_gene_expr_windows,
         _gene_expr_metrics,
     )
-    from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+    from alphagenome_pytorch.annotations import GeneAnnotation
 
     annotation = GeneAnnotation(annotation_path)
     if not annotation.has_exon_annotations():

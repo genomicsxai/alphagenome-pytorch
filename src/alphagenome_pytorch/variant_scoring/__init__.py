@@ -65,7 +65,7 @@ from .sequence import (
 )
 
 # Gene annotations
-from .annotations import GeneAnnotation, GeneInfo, PolyAAnnotation
+from ..annotations import GeneAnnotation, GeneInfo, PolyAAnnotation
 
 # Scorers
 from .scorers import (

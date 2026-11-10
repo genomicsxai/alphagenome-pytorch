@@ -239,7 +239,7 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Path to a Gencode-compatible annotation: a parquet (fast, "
-            "recommended) or a GTF/GFF (parsed via pyranges, minutes for hg38). "
+            "recommended) or a GTF (parsed via pyranges, minutes for hg38). "
             "Required when --gene-loss-weight > 0. The protein_coding gene rows "
             "are used to build per-window gene masks. A parquet with exon rows "
             "also serves --gene-expr-eval, so one file can cover both."
@@ -318,7 +318,7 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Annotation for --gene-expr-eval: a parquet (fast, recommended) or "
-            "GTF/GFF (slow, needs pyranges) that INCLUDES exon rows. If unset, "
+            "GTF (slow, needs pyranges) that INCLUDES exon rows. If unset, "
             "falls back to --gtf. Unlike --gtf's gene-only table (gene LFC loss), "
             "this needs exon features."
         ),

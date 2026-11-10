@@ -68,7 +68,7 @@ interchangeable:
    The AlphaGenome gene-expression quantity: log-transformed mean coverage over
    a gene's annotated exons, strand-matched by default, keeping genes with at
    least ``min_exon_fraction`` (default 50%) of their exons fully inside the
-   window. Takes a :class:`~alphagenome_pytorch.variant_scoring.annotations.GeneAnnotation`
+   window. Takes a :class:`~alphagenome_pytorch.annotations.GeneAnnotation`
    built from a GTF/parquet that includes exon rows.
 
 Both return a :class:`~alphagenome_pytorch.aggregation.GeneCounts`.
@@ -94,7 +94,7 @@ Aggregating one window
    import torch
    from alphagenome_pytorch import AlphaGenome
    from alphagenome_pytorch.aggregation import gene_expression
-   from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+   from alphagenome_pytorch.annotations import GeneAnnotation
 
    model = AlphaGenome.from_pretrained("model.pth", device="cuda")
    annotation = GeneAnnotation("gencode.v46.parquet")
@@ -235,7 +235,7 @@ variant-scoring package but is documented here because aggregation is its main
 consumer. Build it from a GTF/parquet that includes exon rows, or from a
 pre-filtered DataFrame.
 
-.. autoclass:: alphagenome_pytorch.variant_scoring.annotations.GeneAnnotation
+.. autoclass:: alphagenome_pytorch.annotations.GeneAnnotation
    :members:
    :show-inheritance:
 

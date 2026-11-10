@@ -375,7 +375,7 @@ Mostly used with the ``rna_seq`` head to produce a gene expression count table.
 Flag                     Meaning
 ======================== =================================================================
 ``--anndata NAME``       Write ``{output}/NAME`` (a ``.h5ad``) instead of BigWigs
-``--annotation PATH``    GTF/GFF or parquet annotation (required with ``--anndata``)
+``--annotation PATH``    GTF or parquet annotation (required with ``--anndata``)
 ``--aggregate-over``     ``exons`` (default) or ``gene-body`` (exons + introns)
 ``--aggregate-func``     ``sum`` (default) / ``mean`` (per-base) / ``log-mean``
 ``--gene-strand``        ``all`` (default) or ``match`` (NaN antisense cells)

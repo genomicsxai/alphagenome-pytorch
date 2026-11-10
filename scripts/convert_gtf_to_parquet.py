@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Convert GTF annotation file to optimized Parquet format.
 
-This script converts a GTF/GFF file (e.g., GENCODE annotation) to Parquet format
+This script converts a GTF file (e.g., GENCODE annotation) to Parquet format
 for fast loading with the GeneAnnotation class. Loading a ~1.5GB GTF takes several
 minutes, while loading the equivalent Parquet takes seconds.
 
@@ -30,7 +30,7 @@ def convert_gtf_to_parquet(
     """Convert GTF file to Parquet format.
 
     Args:
-        input_path: Path to input GTF/GFF file
+        input_path: Path to input GTF file
         output_path: Path to output Parquet file
         compression: Parquet compression codec ('snappy', 'gzip', 'zstd', 'none')
     """
@@ -128,7 +128,7 @@ Examples:
     parser.add_argument(
         "--input", "-i",
         required=True,
-        help="Path to input GTF/GFF file",
+        help="Path to input GTF file",
     )
     parser.add_argument(
         "--output", "-o",

@@ -354,7 +354,7 @@ def test_gene_expression_metrics_match_validation_metric(tmp_path):
     import pandas as pd
 
     from alphagenome_pytorch.aggregation import combine_gene_expression, gene_expression_values
-    from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+    from alphagenome_pytorch.annotations import GeneAnnotation
 
     script = _load_script_module()
     rows = []

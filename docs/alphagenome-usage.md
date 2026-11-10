@@ -351,7 +351,7 @@ import them from the submodule.
 
 ```python
 from alphagenome_pytorch.aggregation import gene_expression
-from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+from alphagenome_pytorch.annotations import GeneAnnotation
 
 annotation = GeneAnnotation("gencode.v46.parquet")   # needs exon rows
 interval = ("chr20", 30_000_000, 30_131_072)         # 0-based half-open

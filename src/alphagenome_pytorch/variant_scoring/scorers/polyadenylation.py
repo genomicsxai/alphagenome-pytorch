@@ -19,7 +19,7 @@ from ..types import Interval, OutputType, Variant, VariantScore
 from .base import BaseVariantScorer
 
 if TYPE_CHECKING:
-    from ..annotations import GeneAnnotation, PolyAAnnotation
+    from ...annotations import GeneAnnotation, PolyAAnnotation
 
 # Constants matching JAX implementation
 MAX_GENES = 22

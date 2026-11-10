@@ -91,8 +91,9 @@ def register(subparsers: argparse._SubParsersAction) -> None:
                                "--output, by summing whole-chromosome signal over each gene's "
                                "exons (or body), instead of BigWig. Requires --annotation.")
     gene_out.add_argument("--annotation", type=str, default=None,
-                          help="GTF/parquet gene annotation for --anndata. Needs exon rows "
-                               "when --aggregate-over exons (the default).")
+                          help="GTF/parquet gene annotation for --anndata (a GTF may be "
+                               "gzipped). Needs exon rows when --aggregate-over exons "
+                               "(the default).")
     gene_out.add_argument("--aggregate-over", choices=["exons", "gene-body"], default="exons",
                           help="Aggregate signal over each gene's exons (default) or its "
                                "full gene body.")
@@ -526,13 +527,13 @@ def run(args: argparse.Namespace) -> int:
         if not Path(args.annotation).exists():
             raise FileNotFoundError(f"Annotation not found: {args.annotation}")
         import importlib.util
-        engine = (
-            "pyranges"
-            if Path(args.annotation).suffix.lower() in (".gtf", ".gff", ".gff3")
-            else "pyarrow"
-        )
-        missing = [m for m in ("pandas", "anndata", engine)
+        missing = [m for m in ("pandas", "anndata")
                    if importlib.util.find_spec(m) is None]
+        if not missing:  # the annotations module itself needs pandas
+            from ..annotations import annotation_format
+            engine = "pyranges" if annotation_format(args.annotation) == "gtf" else "pyarrow"
+            if importlib.util.find_spec(engine) is None:
+                missing.append(engine)
         if missing:
             raise ImportError(
                 f"--anndata needs {', '.join(missing)} (not installed). Install with: "
