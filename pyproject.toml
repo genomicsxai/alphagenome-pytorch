@@ -21,7 +21,7 @@ agt = "alphagenome_pytorch.cli:main"
 test = [
     "pytest>=7.0.0",
     "pytest-xdist",
-    "alphagenome",
+    "alphagenome>=0.7.0,<2",  # 2.x removed alphagenome.models.dna_output
     "chex",
     "einshape",
     "pyranges",
@@ -66,13 +66,13 @@ scoring = [
     "pandas",
     "tqdm",
     "pyranges",
-    "alphagenome",
+    "alphagenome>=0.7.0,<2",  # 2.x removed alphagenome.models.dna_output
 ]
 serving = [
     "grpcio",
     "pandas",
     "pyfaidx",
-    "alphagenome",
+    "alphagenome>=0.7.0,<2",  # 2.x removed alphagenome.models.dna_output
     "PyYAML",
 ]
 hf = [

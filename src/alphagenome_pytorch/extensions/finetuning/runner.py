@@ -85,7 +85,6 @@ from torch.utils.data.distributed import DistributedSampler
 # Workaround for torch.compile bug in quantization pattern matcher
 import torch._inductor.config
 torch._inductor.config.post_grad_fusion_options = {}
-torch._inductor.config.pattern_matcher = False
 
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
