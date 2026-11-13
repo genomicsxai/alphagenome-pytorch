@@ -376,8 +376,28 @@ class TestSpliceSitesUsageHead:
         assert track_mask.dtype == torch.bool
         assert track_mask.shape == (B, 1, 734)
         assert bool(track_mask[0].all())
-        assert bool(track_mask[1, :, :180].all())
-        assert not bool(track_mask[1, :, 180:].any())
+        assert bool(track_mask[1, :, :90].all())
+        assert not bool(track_mask[1, :, 90:367].any())
+        assert bool(track_mask[1, :, 367:457].all())
+        assert not bool(track_mask[1, :, 457:].any())
+
+    def test_track_mask_matches_builtin_metadata_padding(self):
+        """Masked-out columns should be the padding tracks of the built-in metadata."""
+        pytest.importorskip("pandas")
+        from alphagenome_pytorch.heads import SpliceSitesUsageHead
+        from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
+
+        head = SpliceSitesUsageHead(
+            in_channels=128,
+            num_output_tracks=734,
+            num_organisms=2,
+            num_tracks_per_organism=(734, 180),
+        )
+        catalog = TrackMetadataCatalog.load_builtin()
+        for org_idx in (0, 1):
+            tracks = catalog.get_tracks("splice_site_usage", organism=org_idx, strict=True)
+            expected = torch.tensor([not t.is_padding for t in tracks])
+            assert torch.equal(head.track_mask[org_idx], expected)
 
 @pytest.mark.unit
 class TestSpliceSitesJunctionHead:

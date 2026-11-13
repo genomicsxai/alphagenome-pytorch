@@ -481,16 +481,26 @@ class SpliceSitesUsageHead(nn.Module):
                 f"must equal num_organisms ({num_organisms})"
             )
 
+        if num_output_tracks % 2:
+            raise ValueError(
+                f"num_output_tracks ({num_output_tracks}) must be even (two strands)"
+            )
         for org_idx, tracks in enumerate(num_tracks_per_organism):
-            if tracks < 0 or tracks > num_output_tracks:
+            if tracks < 0 or tracks > num_output_tracks or tracks % 2:
                 raise ValueError(
-                    f"num_tracks_per_organism[{org_idx}]={tracks} must be in "
+                    f"num_tracks_per_organism[{org_idx}]={tracks} must be even and in "
                     f"[0, {num_output_tracks}]"
                 )
 
+        # Tracks are two strand blocks of tissue slots (+ strand first). An
+        # organism with fewer tracks fills the first tracks // 2 slots of each
+        # block and the rest are padding, as in the built-in track metadata
+        # (mouse: 180 real tracks at columns 0-89 and 367-456).
         # Computed on-the-fly from config, not learned - exclude from state_dict
-        track_mask = torch.arange(num_output_tracks)[None, :] < torch.tensor(
-            list(num_tracks_per_organism),
+        slots_per_strand = num_output_tracks // 2
+        tissue_slot = torch.arange(num_output_tracks) % slots_per_strand
+        track_mask = tissue_slot[None, :] < torch.tensor(
+            [tracks // 2 for tracks in num_tracks_per_organism],
             dtype=torch.long,
         )[:, None]
         self.register_buffer('track_mask', track_mask, persistent=False)
