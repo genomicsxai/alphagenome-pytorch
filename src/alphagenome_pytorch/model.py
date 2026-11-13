@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Optional, Tuple, Union
 from pathlib import Path
 import warnings
@@ -10,6 +12,56 @@ from . import layers, convolutions, attention, embeddings, heads
 from .config import DtypePolicy
 from .named_outputs import NamedOutputs, TrackMetadataCatalog
 from alphagenome_pytorch.utils.splicing import generate_splice_site_positions
+
+
+# --- Sequence-length constraints (imposed by the encoder/decoder + pair path) ---
+# Two geometry constraints stack, and the tighter one binds:
+#   1. Encoder/decoder: the encoder halves the sequence 7 times (one initial pool
+#      + six DownResBlocks) down to 128 bp trunk bins, and the decoder rebuilds
+#      full resolution through U-Net skips. That alone requires a multiple of 128.
+#   2. Transformer pair path: SequenceToPairBlock pools the 128 bp trunk by a
+#      further factor of 16, and AttentionBiasBlock expands the resulting bias
+#      back by 16 (``repeat_interleave``). Those two steps only realign when the
+#      trunk length is a multiple of 16 — i.e. the *input* length is a multiple
+#      of 128 * 16 = 2048. The pair path runs on every transformer block and its
+#      bias is added to the main attention logits, so a length that is a multiple
+#      of 128 but NOT of 2048 crashes the forward pass (shape mismatch in the
+#      attention bias / value matmul) for *all* outputs, not just contact maps.
+# The binding constraint is therefore a multiple of 2048. The model was trained
+# on windows up to 1 Mb; longer is untested.
+#
+# This is the single source of truth for the constraint — the serving layer and
+# the predict CLI both call ``validate_sequence_length``, so relaxing or
+# tightening the rule (e.g. a new max) is a one-line change here.
+SEQUENCE_LENGTH_BIN = 128  # 2**7, from the encoder's seven pooling stages
+PAIR_POOL_FACTOR = 16  # extra pooling in SequenceToPairBlock / AttentionBiasBlock
+SEQUENCE_LENGTH_MULTIPLE = SEQUENCE_LENGTH_BIN * PAIR_POOL_FACTOR  # 2048
+MIN_SEQUENCE_LENGTH = SEQUENCE_LENGTH_MULTIPLE  # one pair bin (16 trunk bins)
+MAX_SEQUENCE_LENGTH = 2 ** 20  # 1_048_576 — trained ceiling
+
+
+def validate_sequence_length(length: int) -> None:
+    """Raise ``ValueError`` unless ``length`` is one the model can process.
+
+    Valid lengths are multiples of :data:`SEQUENCE_LENGTH_MULTIPLE` (2048) within
+    ``[MIN_SEQUENCE_LENGTH, MAX_SEQUENCE_LENGTH]``. The 2048 bp granularity comes
+    from the transformer's pair path, which pools the 128 bp trunk by 16 and
+    expands the attention bias back by 16; a length that is a multiple of 128 but
+    not of 2048 desynchronises those steps and crashes the forward pass (see the
+    module-level note above). At the 2048 bp minimum the contact-map grid is 1x1;
+    track outputs are unaffected.
+    """
+    if (
+        length < MIN_SEQUENCE_LENGTH
+        or length > MAX_SEQUENCE_LENGTH
+        or length % SEQUENCE_LENGTH_MULTIPLE != 0
+    ):
+        raise ValueError(
+            f"Sequence length {length} not supported. Length must be a multiple "
+            f"of {SEQUENCE_LENGTH_MULTIPLE} within "
+            f"[{MIN_SEQUENCE_LENGTH}, {MAX_SEQUENCE_LENGTH}]."
+        )
+
 
 class SequenceEncoder(nn.Module):
     """Encodes DNA sequence to trunk representation. Outputs NCL format (B, C, S)."""
@@ -493,23 +545,40 @@ class AlphaGenome(nn.Module):
             ... )
         """
         from alphagenome_pytorch.extensions.finetuning.checkpointing import (
-            load_delta_config,
+            _read_delta_export_header,
+            finalize_finetuned_organism_context,
             load_delta_weights,
         )
         from alphagenome_pytorch.extensions.finetuning.transfer import (
             load_trunk,
             prepare_for_transfer,
+            remove_all_heads,
+            transfer_config_from_dict,
         )
 
         if dtype_policy is None:
             dtype_policy = DtypePolicy.default()
 
-        # 1. Create base model and load pretrained trunk
+        # 1. Create base model and load pretrained trunk. Note ``cls(**kwargs)`` is
+        #    built here (preserving subclass + constructor kwargs like num_organisms),
+        #    so from_delta must NOT delegate to the canonical loader — it only shares
+        #    the organism-context finalizer below.
         model = cls(dtype_policy=dtype_policy, **kwargs)
         model = load_trunk(model, base_path, exclude_heads=True)
+        # ``exclude_heads=True`` means the native heads (atac, dnase, ...) were
+        # never populated from the base file — they still hold the constructor's
+        # random init. ``prepare_for_transfer`` only drops heads the config names
+        # in remove_heads/keep_heads, and configs written by ``agt finetune``
+        # leave both empty, so without this the returned model carries
+        # randomly-initialised heads beside the fine-tuned one and a full forward
+        # yields garbage from every head that was never trained. Matches the
+        # canonical loader (``load_finetuned_model``).
+        model = remove_all_heads(model)
 
-        # 2. Read config and set up adapters/heads
-        config = load_delta_config(delta_path)
+        # 2. Read the exported header once (config + organism provenance) and set up
+        #    adapters/heads.
+        header = _read_delta_export_header(delta_path)
+        config = transfer_config_from_dict(header["transfer_config"])
         model = prepare_for_transfer(model, config)
 
         # 3. Load delta weights
@@ -518,6 +587,17 @@ class AlphaGenome(nn.Module):
         # 4. Move to target device
         if device:
             model.to(device)
+
+        # 5. Attach the fine-tune organism context (same helper the canonical loader
+        #    uses) so from_delta and load_finetuned_model behave consistently.
+        finalize_finetuned_organism_context(
+            model,
+            {
+                "organism": header.get("organism"),
+                "organism_indices": header.get("organism_indices"),
+                "track_metadata": header.get("track_metadata"),
+            },
+        )
 
         return model
 

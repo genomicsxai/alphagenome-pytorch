@@ -1,0 +1,30 @@
+name: Plugin docs sync
+
+on:
+  pull_request:
+    paths:
+      - 'docs/alphagenome-usage.md'
+      - 'docs/cli.rst'
+      - 'plugins/alphagenome/skills/**'
+      - '.claude/skills/**'
+      - '.claude-plugin/marketplace.json'
+      - 'scripts/check_usage_metadata.py'
+      - 'src/alphagenome_pytorch/data/track_metadata_human.parquet'
+      - 'src/alphagenome_pytorch/data/track_metadata_mouse.parquet'
+      - '.github/workflows/plugin_docs_sync.yml'
+  push:
+    branches: [main]
+
+jobs:
+  check-usage-guide-in-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install metadata reader
+        run: pip install pandas pyarrow
+      - name: Validate vendored guide and metadata facts
+        run: python scripts/check_usage_metadata.py

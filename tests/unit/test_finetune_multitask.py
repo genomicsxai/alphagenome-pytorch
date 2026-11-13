@@ -1,4 +1,4 @@
-"""Unit tests for multimodal support in scripts/finetune.py."""
+"""Unit tests for multimodal support in the finetuning entry point."""
 
 from __future__ import annotations
 
@@ -9,17 +9,15 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-# Import script module symbols directly (tests run from repository root)
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
-
-import finetune as finetune_module  # noqa: E402
-from finetune import (  # noqa: E402
+from alphagenome_pytorch.extensions.finetuning import runner as finetune_module
+from alphagenome_pytorch.extensions.finetuning.args import parse_args
+from alphagenome_pytorch.extensions.finetuning.runner import (
     MultimodalDataset,
     collate_multimodal,
-    parse_args,
+    load_track_metadata_for_finetune,
     unwrap_training_model,
 )
-from alphagenome_pytorch.extensions.finetuning.training import (  # noqa: E402
+from alphagenome_pytorch.extensions.finetuning.training import (
     _compute_multinomial_resolution,
 )
 
@@ -233,6 +231,48 @@ class TestParseArgsStrandPairs:
         assert args.modality_strand_pairs["rna_seq"] == [(0, 1), (2, 3)]
         assert args.modality_strand_pairs["atac"] is None
 
+    def test_config_strand_accepts_string_and_list_forms(self, monkeypatch, tmp_path):
+        """modalities.<head>.strand may be a compact/separated string or a YAML list."""
+        yaml = pytest.importorskip("yaml")
+
+        def _strands_for(strand_spec):
+            config = {
+                "modalities": {
+                    "rna_seq": {
+                        "bigwig": ["rp1.bw", "rm1.bw", "rp2.bw", "rm2.bw"],
+                        "strand": strand_spec,
+                    },
+                }
+            }
+            config_path = tmp_path / "train.yaml"
+            config_path.write_text(yaml.safe_dump(config))
+            monkeypatch.setattr(
+                sys, "argv", _required_cli_args() + ["--config", str(config_path)]
+            )
+            return parse_args().modality_strands["rna_seq"]
+
+        assert _strands_for("+-+-") == "+-+-"                    # compact string
+        assert _strands_for("+,-,+,-") == "+-+-"                 # separated string
+        assert _strands_for(["+", "-", "+", "-"]) == "+-+-"      # YAML list
+
+    def test_config_strand_list_wrong_length_rejected(self, monkeypatch, tmp_path):
+        yaml = pytest.importorskip("yaml")
+        config = {
+            "modalities": {
+                "rna_seq": {
+                    "bigwig": ["rp1.bw", "rm1.bw", "rp2.bw", "rm2.bw"],
+                    "strand": ["+", "-"],  # 2 chars, 4 bigwigs
+                },
+            }
+        }
+        config_path = tmp_path / "train.yaml"
+        config_path.write_text(yaml.safe_dump(config))
+        monkeypatch.setattr(
+            sys, "argv", _required_cli_args() + ["--config", str(config_path)]
+        )
+        with pytest.raises(SystemExit):
+            parse_args()
+
     def test_cli_overrides_config_strand_pairs(self, monkeypatch, tmp_path):
         yaml = pytest.importorskip("yaml")
         config = {
@@ -367,6 +407,110 @@ class TestCollateMultimodal:
         assert torch.equal(modality_targets["atac"][128][0], targets1)
         assert torch.equal(modality_targets["atac"][128][1], targets2)
 
+    def test_collate_preserves_gene_mask(self):
+        # Regression guard: the collate historically dropped item[2], silently
+        # no-op'ing the gene-LFC training loss. It must now survive collation as
+        # extras["gene_mask"], stacked with a leading batch axis.
+        gm1 = torch.zeros(256, 2, 4, dtype=torch.bool)
+        gm2 = torch.ones(256, 2, 4, dtype=torch.bool)
+        batch = [
+            (torch.randn(256, 4), {"rna_seq": {1: torch.randn(256, 3)}}, gm1),
+            (torch.randn(256, 4), {"rna_seq": {1: torch.randn(256, 3)}}, gm2),
+        ]
+        sequences, modality_targets, extras = collate_multimodal(batch)
+        assert "gene_mask" in extras
+        assert extras["gene_mask"].shape == (2, 256, 2, 4)
+        assert torch.equal(extras["gene_mask"][0], gm1)
+        assert torch.equal(extras["gene_mask"][1], gm2)
+        assert "coords" not in extras
+
+    def test_collate_preserves_coords(self):
+        batch = [
+            (torch.randn(256, 4), {"rna_seq": {1: torch.randn(256, 3)}}, ("chr1", 0, 256)),
+            (torch.randn(256, 4), {"rna_seq": {1: torch.randn(256, 3)}}, ("chr2", 5, 261)),
+        ]
+        sequences, modality_targets, extras = collate_multimodal(batch)
+        assert extras["coords"] == [("chr1", 0, 256), ("chr2", 5, 261)]
+        assert "gene_mask" not in extras
+
+    def test_collate_preserves_gene_mask_and_coords(self):
+        gm = torch.ones(256, 2, 4, dtype=torch.bool)
+        batch = [
+            (torch.randn(256, 4), {"rna_seq": {1: torch.randn(256, 3)}}, gm, ("chr1", 0, 256)),
+        ]
+        sequences, modality_targets, extras = collate_multimodal(batch)
+        assert extras["gene_mask"].shape == (1, 256, 2, 4)
+        assert extras["coords"] == [("chr1", 0, 256)]
+
+    def test_unpack_batch_decodes_collate_contract(self):
+        # _unpack_batch is the consumer-side decode of the collate output.
+        from alphagenome_pytorch.extensions.finetuning.training import _unpack_batch
+
+        seqs = torch.randn(2, 8, 4)
+        targets = {"rna_seq": {1: torch.randn(2, 8, 3)}}
+        # 2-tuple (no extras) -> empty extras dict
+        s, t, e = _unpack_batch((seqs, targets))
+        assert s is seqs and t is targets and e == {}
+        # 3-tuple -> extras passed straight through
+        extras = {"gene_mask": torch.ones(2, 8, 2, 4), "coords": [("chr1", 0, 8), ("chr2", 5, 13)]}
+        s, t, e = _unpack_batch((seqs, targets, extras))
+        assert e is extras
+
+
+@pytest.mark.unit
+class TestParseArgsGeneExprEval:
+    """Validation of the --gene-expr-eval flag in scripts/finetune.py."""
+
+    def _rna_cli(self, monkeypatch, extra):
+        monkeypatch.setattr(
+            sys, "argv",
+            _required_cli_args()
+            + ["--modality", "rna_seq", "--bigwig", "rna1.bw"] + extra,
+        )
+
+    def test_happy_path_sets_flags(self, monkeypatch):
+        self._rna_cli(monkeypatch, [
+            "--gene-expr-eval",
+            "--gene-expr-annotation", "gencode.parquet",
+            "--track-strands", "+",
+        ])
+        args = parse_args()
+        assert args.gene_expr_eval is True
+        assert args.gene_expr_annotation == "gencode.parquet"
+
+    def test_falls_back_to_gtf_annotation(self, monkeypatch):
+        self._rna_cli(monkeypatch, [
+            "--gene-expr-eval", "--gtf", "genes.gtf", "--track-strands", "+",
+        ])
+        args = parse_args()  # --gtf satisfies the annotation requirement
+        assert args.gene_expr_eval is True
+
+    def test_requires_annotation(self, monkeypatch):
+        self._rna_cli(monkeypatch, ["--gene-expr-eval", "--track-strands", "+"])
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    def test_requires_strands(self, monkeypatch):
+        self._rna_cli(monkeypatch, [
+            "--gene-expr-eval", "--gene-expr-annotation", "gencode.parquet",
+        ])
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    def test_requires_rna_seq_modality(self, monkeypatch):
+        monkeypatch.setattr(
+            sys, "argv",
+            _required_cli_args()
+            + ["--modality", "atac", "--bigwig", "atac1.bw",
+               "--gene-expr-eval", "--gene-expr-annotation", "gencode.parquet"],
+        )
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    def test_off_by_default(self, monkeypatch):
+        self._rna_cli(monkeypatch, [])
+        assert parse_args().gene_expr_eval is False
+
 
 @pytest.mark.unit
 class TestUnwrapTrainingModel:
@@ -401,3 +545,103 @@ class TestUnwrapTrainingModel:
         wrapped = FakeCompiled(FakeDDP(base))
 
         assert unwrap_training_model(wrapped) is base
+
+
+@pytest.mark.unit
+class TestLoadTrackMetadataForFinetune:
+    """Tests for --track-metadata loading/validation/embedding."""
+
+    @staticmethod
+    def _write_csv(path: Path, lines: list[str]) -> None:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_none_path_returns_unchanged(self):
+        names = {"atac": ["a", "b"]}
+        out_names, rows = load_track_metadata_for_finetune(None, names, rank=0)
+        assert out_names is names
+        assert rows is None
+
+    def test_happy_path_overrides_names_and_embeds_rows(self, tmp_path):
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name,biosample_name",
+            "human,atac,liver,Liver",
+            "human,atac,brain,Brain",
+        ])
+        out_names, rows = load_track_metadata_for_finetune(
+            str(csv), {"atac": ["bw0", "bw1"]}, rank=0,
+        )
+        assert out_names == {"atac": ["liver", "brain"]}
+        assert [r["track_name"] for r in rows] == ["liver", "brain"]
+
+    def test_count_mismatch_raises(self, tmp_path):
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name",
+            "human,atac,liver",
+        ])
+        with pytest.raises(ValueError, match="Counts must match"):
+            load_track_metadata_for_finetune(str(csv), {"atac": ["bw0", "bw1"]}, rank=0)
+
+    def test_mouse_tracks_embed_under_organism_one(self, tmp_path):
+        """--organism mouse validates and embeds mouse (organism=1) tracks."""
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name",
+            "mouse,atac,liver",
+            "mouse,atac,brain",
+        ])
+        out_names, rows = load_track_metadata_for_finetune(
+            str(csv), {"atac": ["bw0", "bw1"]}, rank=0, organism="mouse",
+        )
+        assert out_names == {"atac": ["liver", "brain"]}
+        assert all(int(r["organism"]) == 1 for r in rows)
+
+    def test_mouse_tracks_without_organism_flag_raise(self, tmp_path):
+        """Mouse-tagged tracks without --organism mouse must raise (the trainer
+        would otherwise forward at the human embedding)."""
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name",
+            "mouse,atac,liver",
+            "mouse,atac,brain",
+        ])
+        with pytest.raises(ValueError, match="trains organism 0"):
+            load_track_metadata_for_finetune(str(csv), {"atac": ["bw0", "bw1"]}, rank=0)
+
+    def test_organism_flag_conflicts_with_parquet_raises(self, tmp_path):
+        """--organism mouse but human-tagged parquet -> clear error."""
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name",
+            "human,atac,liver",
+            "human,atac,brain",
+        ])
+        with pytest.raises(ValueError, match="trains organism 1"):
+            load_track_metadata_for_finetune(
+                str(csv), {"atac": ["bw0", "bw1"]}, rank=0, organism="mouse",
+            )
+
+    def test_mixed_organism_not_supported(self, tmp_path):
+        """A mixed human+mouse catalog is rejected (single-organism fine-tune)."""
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "organism,output_type,track_name",
+            "human,atac,liver",
+            "mouse,atac,m_liver",
+        ])
+        with pytest.raises(ValueError, match="not supported yet"):
+            load_track_metadata_for_finetune(str(csv), {"atac": ["bw0", "bw1"]}, rank=0)
+
+    def test_organism_flag_fills_missing_column(self, tmp_path):
+        """--organism mouse fills rows lacking an 'organism' value -> organism 1."""
+        csv = tmp_path / "meta.csv"
+        self._write_csv(csv, [
+            "output_type,track_name",
+            "atac,liver",
+            "atac,brain",
+        ])
+        _names, rows = load_track_metadata_for_finetune(
+            str(csv), {"atac": ["bw0", "bw1"]}, rank=0, organism="mouse",
+        )
+        assert all(int(r["organism"]) == 1 for r in rows)

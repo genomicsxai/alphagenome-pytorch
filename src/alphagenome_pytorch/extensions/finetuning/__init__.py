@@ -3,15 +3,14 @@
 from typing import TYPE_CHECKING
 
 from alphagenome_pytorch.extensions.finetuning.adapters import (
-    LoRA, Locon, IA3, IA3_FF, AdapterHoulsby
+    LoRA, Locon, IA3, IA3_FF, AdapterHoulsby, merge_adapters
 )
-from alphagenome_pytorch.extensions.finetuning.training import (
-    ModalityConfig, collate_genomic, MODALITY_CONFIGS,
-    create_lr_scheduler, compute_finetuning_loss,
-    train_epoch, validate,
-    ProfilingStats, train_epoch_ddp, validate_ddp,
-    train_epoch_multihead, validate_multihead,
-    train_epoch_sequence_parallel,
+# The modality registry is dependency-light (dataclasses only). Import it eagerly
+# so the flag layer (extensions.finetuning.args) reads it without pulling in the
+# training module (torch/tqdm); the rest of training's API is exposed lazily via
+# __getattr__ below.
+from alphagenome_pytorch.extensions.finetuning.modalities import (
+    ModalityConfig, MODALITY_CONFIGS,
 )
 from alphagenome_pytorch.extensions.finetuning.transfer import TransferConfig
 
@@ -30,10 +29,15 @@ from alphagenome_pytorch.extensions.finetuning.checkpointing import (
     PreemptionHandler, setup_preemption_handler,
     save_delta_checkpoint, load_delta_checkpoint, is_delta_checkpoint,
     get_adapter_state_dict, get_new_head_state_dict,
-    compute_base_model_hash, DELTA_CHECKPOINT_VERSION,
+    compute_base_model_hash, compute_base_model_weights_hash,
+    compute_base_model_weights_hash_from_file,
+    BASE_MODEL_WEIGHTS_HASH_VERSION, DELTA_CHECKPOINT_VERSION,
     export_model_weights, export_delta_weights,
-    load_delta_config, load_delta_weights,
+    load_delta_config, load_delta_weights, is_delta_weights_export,
     load_finetuned_model,
+    describe_checkpoint, CheckpointInfo, CHECKPOINT_KINDS, DELTA_SHAPED_KINDS,
+    FinetunedOrganismContext, resolve_finetuned_organism,
+    select_organism_index, finalize_finetuned_organism_context,
 )
 
 # Transfer config serialization
@@ -55,11 +59,34 @@ if TYPE_CHECKING:
 
 
 def __getattr__(name):
-    """Lazy import for datasets to avoid pyfaidx/pyBigWig dependency at import time."""
+    """Lazily load heavier submodules so `import ...finetuning` stays cheap.
+
+    Keeps the training module (and its torch/tqdm imports) and the dataset
+    readers (pyfaidx/pyBigWig) out of `sys.modules` until a symbol from them is
+    actually used — e.g. building the finetune argument parser touches neither.
+    """
+    if name in (
+        "collate_genomic",
+        "create_lr_scheduler",
+        "compute_finetuning_loss",
+        "train_epoch",
+        "validate",
+        "ProfilingStats",
+        "train_epoch_ddp",
+        "validate_ddp",
+        "train_epoch_multihead",
+        "validate_multihead",
+        "train_epoch_sequence_parallel",
+    ):
+        from alphagenome_pytorch.extensions.finetuning import training
+        return getattr(training, name)
     if name in ("ATACDataset", "RNASeqDataset", "GenomicDataset", "CachedGenome",
                 "compute_track_means", "MultimodalDataset", "collate_multimodal"):
         from alphagenome_pytorch.extensions.finetuning import datasets
         return getattr(datasets, name)
+    if name in ("convert_bigwigs_to_mmap", "convert_single_bigwig"):
+        from alphagenome_pytorch.extensions.finetuning import preprocessing
+        return getattr(preprocessing, name)
     if name in (
         "apply_atac_transforms",
         "apply_rnaseq_transforms",
@@ -88,12 +115,16 @@ __all__ = [
     "collate_multimodal",
     "CachedGenome",
     "compute_track_means",
+    # BigWig -> mmap preprocessing (lazy-loaded)
+    "convert_bigwigs_to_mmap",
+    "convert_single_bigwig",
     # Adapters
     "LoRA",
     "Locon",
     "IA3",
     "IA3_FF",
     "AdapterHoulsby",
+    "merge_adapters",
     # Training
     "ModalityConfig",
     "MODALITY_CONFIGS",
@@ -134,6 +165,9 @@ __all__ = [
     "get_adapter_state_dict",
     "get_new_head_state_dict",
     "compute_base_model_hash",
+    "compute_base_model_weights_hash",
+    "compute_base_model_weights_hash_from_file",
+    "BASE_MODEL_WEIGHTS_HASH_VERSION",
     "DELTA_CHECKPOINT_VERSION",
     "transfer_config_to_dict",
     "transfer_config_from_dict",
@@ -142,8 +176,18 @@ __all__ = [
     "export_delta_weights",
     "load_delta_config",
     "load_delta_weights",
+    "is_delta_weights_export",
     # Inference loading
     "load_finetuned_model",
+    "describe_checkpoint",
+    "CheckpointInfo",
+    "CHECKPOINT_KINDS",
+    "DELTA_SHAPED_KINDS",
+    # Organism provenance / selection
+    "FinetunedOrganismContext",
+    "resolve_finetuned_organism",
+    "select_organism_index",
+    "finalize_finetuned_organism_context",
     # Data transforms (lazy-loaded)
     "apply_atac_transforms",
     "apply_rnaseq_transforms",

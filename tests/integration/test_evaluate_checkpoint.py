@@ -109,6 +109,7 @@ def test_evaluate_split_returns_nonempty_predictions(
         loader=loader,
         device=device,
         resolutions=RESOLUTIONS,
+        organism_index=0,
     )
 
     # Both resolutions should be populated with batch-first arrays.
@@ -146,6 +147,7 @@ def test_evaluate_native_split_reads_nested_outputs(
         loader=loader,
         device=device,
         resolutions=RESOLUTIONS,
+        organism_index=0,
     )
 
     for res in RESOLUTIONS:
@@ -180,6 +182,7 @@ def test_evaluate_native_split_skips_missing_resolution(
         loader=loader,
         device=device,
         resolutions=(1, 64),
+        organism_index=0,
     )
     assert 1 in preds
     assert 64 not in preds

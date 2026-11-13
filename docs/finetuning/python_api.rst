@@ -161,6 +161,12 @@ End-to-end finetuning with LoRA adapters:
 Saving and Loading Finetuned Models
 ------------------------------------
 
+.. seealso::
+
+   :doc:`checkpoints` is the complete reference: every artifact kind, which
+   ones need base weights, which to share, and how to load each from both the
+   CLI and Python. This section covers the Python API levels in more detail.
+
 After training, only the adapter and head weights need to be saved (~5-10MB)
 instead of the full model (~1GB). There are three API levels for working with
 these delta weights, from simplest to most flexible:
@@ -196,6 +202,10 @@ recipients only need the delta file plus the base pretrained weights:
 
    # After training, export for sharing
    export_delta_weights(model, config, "my_lora.safetensors")
+
+For a self-describing artifact ready to publish (manifest, model card,
+optional metrics) wrap the delta export into a bundle with
+``agt adapters export`` — see :doc:`/serving/adapters`.
 
 Loading Delta Weights (High-level)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -305,6 +315,16 @@ After merging adapters, you can export the full model weights (no longer a delta
    model = merge_adapters(model)
    export_model_weights(model, "finetuned_model.safetensors")
 
+The result loads like ordinary base weights — ``AlphaGenome.from_pretrained``,
+or ``agt predict --model finetuned_model.safetensors`` — with no transfer config
+and no base weights needed.
+
+.. warning::
+
+   A full export carries **no metadata**: no track names, no organism, no
+   provenance. Record your track names alongside it, or the output channels will
+   be unlabeled. Every other artifact kind keeps them for you.
+
 Extracting Embeddings for Custom Heads
 --------------------------------------
 
@@ -373,7 +393,7 @@ AlphaGenome requires significant GPU memory. Two key optimizations help:
 .. code-block:: bash
 
    # Use only 128bp resolution
-   python scripts/finetune.py --resolutions 128 ...
+   agt finetune --resolutions 128 ...
 
 
 Loss Function

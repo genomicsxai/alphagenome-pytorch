@@ -25,7 +25,9 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     # Register subcommands — each module has register(subparsers)
-    from alphagenome_pytorch.cli import info, predict, score, convert, preprocess, serve, finetune
+    from alphagenome_pytorch.cli import (
+        adapters, convert, finetune, info, predict, preprocess, score, serve,
+    )
 
     info.register(subparsers)
     predict.register(subparsers)
@@ -34,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     convert.register(subparsers)
     preprocess.register(subparsers)
     serve.register(subparsers)
+    adapters.register(subparsers)
 
     return parser
 
@@ -46,7 +49,7 @@ def _get_runners() -> dict[str, object]:
     global _COMMAND_RUNNERS
     if _COMMAND_RUNNERS is None:
         from alphagenome_pytorch.cli import (
-            info, predict, score, convert, preprocess, serve, finetune,
+            adapters, convert, finetune, info, predict, preprocess, score, serve,
         )
         _COMMAND_RUNNERS = {
             "info": info.run,
@@ -56,6 +59,7 @@ def _get_runners() -> dict[str, object]:
             "convert": convert.run,
             "preprocess": preprocess.run,
             "serve": serve.run,
+            "adapters": adapters.run,
         }
     return _COMMAND_RUNNERS
 
@@ -66,7 +70,11 @@ def main(argv: list[str] | None = None) -> int:
     Returns an integer exit code (0 = success).
     """
     parser = build_parser()
-    args = parser.parse_args(argv)
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(tokens)
+    # Subcommands that let a config file supply values need to know which flags
+    # were passed explicitly, which only the raw tokens record.
+    args._argv = tokens
 
     if args.command is None:
         parser.print_help()

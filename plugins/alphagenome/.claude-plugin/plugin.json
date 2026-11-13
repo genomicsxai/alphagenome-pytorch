@@ -1,0 +1,11 @@
+{
+  "name": "alphagenome",
+  "version": "0.1.0",
+  "description": "Run metadata-aware predictions and fine-tune AlphaGenome-PyTorch on custom genomic tracks.",
+  "author": {
+    "name": "genomicsxai",
+    "url": "https://github.com/genomicsxai/alphagenome-pytorch"
+  },
+  "license": "Apache-2.0",
+  "keywords": ["genomics", "alphagenome", "pytorch", "bioinformatics"]
+}

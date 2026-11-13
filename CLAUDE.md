@@ -33,7 +33,9 @@ pytest tests/jax_comparison/ -v
 pytest tests/ -n 4 --jax-checkpoint=...
 
 # Convert JAX weights to PyTorch (includes track means)
-python scripts/convert_weights.py --input jax_checkpoint --output model.pth
+agt convert --input jax_checkpoint --output model.pth
+# equivalently (the script takes the checkpoint as a positional argument):
+python scripts/convert_weights.py jax_checkpoint --output model.pth
 ```
 
 ## Architecture
@@ -113,11 +115,15 @@ GenomeTracksHead for each assay type
 - Works for both inference (`torch.no_grad()`) and training (`train_epoch_sequence_parallel`)
 - Encoder and decoder run locally per rank; transformer runs globally after an all-gather of the trunk
 - Embeddings returned are local to each rank (`S_local`, not full `S`)
-- Enable in finetune.py with `--sequence-parallel [--overlap-highres N] [--overlap-lowres N]`
+- Enable with `agt finetune --sequence-parallel [--overlap-highres N]` (equivalently
+  `python scripts/finetune.py`). There is no `--overlap-lowres` flag: the low-res
+  overlap is computed as `overlap_highres // 128`. (The `SequenceParallelism` class
+  itself does take an `overlap_lowres` argument.)
 
 ```bash
-torchrun --nproc_per_node=2 scripts/finetune.py \
-    --sequence-parallel --overlap-highres 1024 --overlap-lowres 32 \
+# torchrun needs a module/script target, so invoke the CLI via -m
+torchrun --nproc_per_node=2 -m alphagenome_pytorch.cli finetune \
+    --sequence-parallel --overlap-highres 1024 \
     --genome hg38.fa --modality atac --bigwig *.bw \
     --train-bed train.bed --val-bed val.bed --pretrained-weights model.pth
 ```

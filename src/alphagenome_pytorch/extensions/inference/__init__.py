@@ -28,11 +28,14 @@ Example:
 """
 
 from .full_chromosome import (
+    BigwigOutput,
     TilingConfig,
     GenomeSequenceProvider,
     predict_full_chromosome,
     predict_full_chromosomes_to_bigwig,
+    predict_full_chromosomes_to_anndata,
     write_bigwig,
+    write_chromosomes_bigwig,
     HEAD_CONFIGS,
 )
 from .regions import (
@@ -53,11 +56,14 @@ from .regions import (
 )
 
 __all__ = [
+    'BigwigOutput',
     'TilingConfig',
     'GenomeSequenceProvider',
     'predict_full_chromosome',
     'predict_full_chromosomes_to_bigwig',
+    'predict_full_chromosomes_to_anndata',
     'write_bigwig',
+    'write_chromosomes_bigwig',
     'HEAD_CONFIGS',
     # Region / locus / sequence prediction
     'BedRegion',

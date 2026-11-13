@@ -246,3 +246,37 @@ class TestFinetuningHeadGradients:
 
         outputs = head(embeddings_dict, organism_index)
         assert outputs[128].shape == (1, 100, n_tracks)
+
+
+class TestOrganismAgnosticHead:
+    """A single-organism fine-tuned head ignores the organism index.
+
+    The trunk forward selects the organism embedding (mouse -> index 1), but a
+    num_organisms=1 head has one slot and must use it regardless of the index.
+    """
+
+    def _emb(self):
+        return {128: torch.randn(1, 3072, 16)}
+
+    def test_single_organism_head_ignores_organism_index(self):
+        torch.manual_seed(0)
+        head = create_finetuning_head('atac', n_tracks=3, resolutions=(128,))
+        assert head.num_organisms == 1
+        emb = self._emb()
+        out_human = head(emb, torch.tensor([0]))[128]
+        out_mouse = head(emb, torch.tensor([1]))[128]  # trunk at mouse, head slot 0
+        assert torch.allclose(out_human, out_mouse)
+
+    def test_multi_organism_head_uses_distinct_slots(self):
+        torch.manual_seed(0)
+        head = create_finetuning_head('atac', n_tracks=3, resolutions=(128,), num_organisms=2)
+        emb = self._emb()
+        out0 = head(emb, torch.tensor([0]))[128]
+        out1 = head(emb, torch.tensor([1]))[128]
+        assert not torch.allclose(out0, out1)
+
+    def test_multi_organism_head_rejects_out_of_range_index(self):
+        head = create_finetuning_head('atac', n_tracks=3, resolutions=(128,), num_organisms=2)
+        # Index 3 is genuinely invalid and must raise, not be silently masked.
+        with pytest.raises(IndexError):
+            head(self._emb(), torch.tensor([3]))

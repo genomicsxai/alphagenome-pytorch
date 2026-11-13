@@ -807,8 +807,17 @@ def main() -> None:
         num_workers=args.num_workers,
         collate_fn=collate_genomic,
     )
+    from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+        select_organism_index,
+    )
+
+    # Evaluate at the organism the checkpoint was trained on.
+    organism_index = select_organism_index(
+        model.finetuned_organism_context, num_organisms=model.num_organisms,
+    )
     predictions, targets, loss = evaluate_split(
         model, modality, loader, device, resolutions,
+        organism_index=organism_index,
     )
     source = args.source_resolution
     cropped_predictions, cropped_targets = center_crop_profiles(

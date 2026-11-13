@@ -69,6 +69,7 @@ from tqdm import tqdm
 
 from alphagenome_pytorch.extensions.finetuning.checkpointing import (
     load_finetuned_model as _load_finetuned_model,
+    select_organism_index,
 )
 from alphagenome_pytorch.extensions.finetuning.datasets import GenomicDataset
 from alphagenome_pytorch.extensions.finetuning.evaluation import (
@@ -821,6 +822,11 @@ def parse_args() -> argparse.Namespace:
         "--modality",
         help="Native head/modality to evaluate in --native-only mode (e.g. atac)",
     )
+    p.add_argument(
+        "--organism", type=int, default=None, choices=[0, 1],
+        help="Organism index to evaluate at. Default: the organism the checkpoint "
+             "was trained on (from its metadata). Override for a mixed/legacy checkpoint.",
+    )
 
     # Options
     p.add_argument(
@@ -941,6 +947,7 @@ def main() -> None:
         modality = args.modality
         resolutions = parse_resolutions(args.resolutions)
         track_names = []
+        organism_index = 0 if args.organism is None else args.organism
         ckpt_meta = {
             "mode": "native_only",
             "pretrained_weights": args.pretrained_weights,
@@ -976,6 +983,12 @@ def main() -> None:
             "Checkpoint epoch: %s, val_loss: %s",
             ckpt_meta["epoch"], ckpt_meta["val_loss"],
         )
+        # Evaluate at the organism the checkpoint was trained on (explicit
+        # --organism overrides). The native comparison uses the same organism.
+        organism_index = select_organism_index(
+            model.finetuned_organism_context, explicit=args.organism,
+            num_organisms=model.num_organisms,
+        )
 
     if metric_bin_sizes and args.metric_source_resolution not in resolutions:
         sys.exit(
@@ -989,6 +1002,7 @@ def main() -> None:
         native_model, native_track_idx, native_display_name = load_native_model(
             args.pretrained_weights, args.native_biosample,
             args.native_track_index, modality, device,
+            organism_index=organism_index,
         )
 
     # ---- Feature: metrics ----
@@ -1044,6 +1058,7 @@ def main() -> None:
             # Finetuned evaluation
             ft_preds, targets, loss = evaluate_split(
                 model, modality, loader, device, resolutions,
+                organism_index=organism_index,
             )
             log.info("Loss: %.4f", loss)
 
@@ -1113,6 +1128,7 @@ def main() -> None:
             native_preds = evaluate_native_split(
                 native_model, modality, native_track_idx,
                 loader, device, resolutions,
+                organism_index=organism_index,
             )
 
             if metric_bin_sizes:
@@ -1250,6 +1266,7 @@ def main() -> None:
         # Finetuned predictions on regions
         ft_region_preds, region_targets, _ = evaluate_split(
             model, modality, region_loader, device, resolutions,
+            organism_index=organism_index,
         )
 
         # Native predictions on regions
@@ -1260,6 +1277,7 @@ def main() -> None:
             native_region_preds = evaluate_native_split(
                 native_model, modality, native_track_idx,
                 region_loader, device, resolutions,
+                organism_index=organism_index,
             )
             native_model.cpu()
             model = model.to(device)

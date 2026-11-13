@@ -8,10 +8,15 @@ from __future__ import annotations
 import hashlib
 import os
 import signal
+import struct
+import sys
 import tempfile
+import warnings
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 import torch
 import torch.distributed as dist
@@ -20,6 +25,10 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from alphagenome_pytorch.extensions.finetuning.distributed import is_main_process
+from alphagenome_pytorch.organisms import (
+    normalize_organism_index,
+    normalize_organism_indices,
+)
 
 if TYPE_CHECKING:
     from alphagenome_pytorch.extensions.finetuning.transfer import TransferConfig
@@ -601,7 +610,25 @@ def _hash_state_dict_structure(state_dict: dict[str, torch.Tensor]) -> str:
         for key in sorted(state_dict.keys())
     ]
     content = str(items).encode("utf-8")
-    return f"sha256:{hashlib.sha256(content).hexdigest()[:16]}"
+    return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+def base_model_structure_hashes_match(left: str, right: str) -> bool:
+    """Compare full structure hashes while accepting legacy 16-hex digests."""
+    if left == right:
+        return True
+    try:
+        left_algorithm, left_digest = left.split(":", 1)
+        right_algorithm, right_digest = right.split(":", 1)
+    except ValueError:
+        return False
+    if left_algorithm != "sha256" or right_algorithm != "sha256":
+        return False
+    if len(left_digest) == 16 and len(right_digest) == 64:
+        return right_digest.startswith(left_digest)
+    if len(right_digest) == 16 and len(left_digest) == 64:
+        return left_digest.startswith(right_digest)
+    return False
 
 
 def compute_base_model_hash(model: nn.Module) -> str:
@@ -627,6 +654,110 @@ def compute_base_model_hash(model: nn.Module) -> str:
     return _hash_state_dict_structure(get_trunk_state_dict(model))
 
 
+BASE_MODEL_WEIGHTS_HASH_VERSION = "sha256-tensors-v1"
+
+
+def _hash_framed_bytes(hasher: Any, value: bytes) -> None:
+    """Hash a byte string with an unambiguous little-endian length prefix."""
+    hasher.update(struct.pack("<Q", len(value)))
+    hasher.update(value)
+
+
+def _canonical_tensor_bytes(tensor: torch.Tensor) -> bytes:
+    """Return contiguous tensor bytes in canonical little-endian order."""
+    tensor = tensor.detach().cpu().contiguous()
+    # Flatten first because PyTorch cannot reinterpret a zero-dimensional
+    # scalar as a dtype with a different element size.
+    raw = tensor.reshape(-1).view(torch.uint8).numpy().tobytes(order="C")
+    if sys.byteorder == "little" or tensor.element_size() == 1:
+        return raw
+
+    # Tensor storage follows host byte order. Normalize multi-byte elements on
+    # big-endian hosts so the digest is portable across architectures. Complex
+    # values contain two independently endian-sensitive scalar components.
+    element_size = (
+        tensor.element_size() // 2 if tensor.is_complex() else tensor.element_size()
+    )
+    return b"".join(
+        raw[offset : offset + element_size][::-1]
+        for offset in range(0, len(raw), element_size)
+    )
+
+
+def _hash_state_dict_weights(state_dict: Mapping[str, torch.Tensor]) -> str:
+    """Hash canonical tensor names, metadata, and numerical contents."""
+    hasher = hashlib.sha256()
+    hasher.update(b"alphagenome-base-model-weights\0v1\0")
+    for key in sorted(state_dict):
+        tensor = state_dict[key]
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"State dict value for {key!r} is {type(tensor).__name__}, "
+                "expected a torch.Tensor"
+            )
+        _hash_framed_bytes(hasher, key.encode("utf-8"))
+        _hash_framed_bytes(hasher, str(tensor.dtype).encode("ascii"))
+        hasher.update(struct.pack("<Q", tensor.ndim))
+        for dimension in tensor.shape:
+            hasher.update(struct.pack("<q", dimension))
+        _hash_framed_bytes(hasher, _canonical_tensor_bytes(tensor))
+    return f"{BASE_MODEL_WEIGHTS_HASH_VERSION}:{hasher.hexdigest()}"
+
+
+def compute_base_model_weights_hash(model: nn.Module) -> str:
+    """Compute an exact, serialization-independent hash of trunk tensor values.
+
+    Unlike :func:`compute_base_model_hash`, this identifies the numerical base
+    weights (and therefore a particular fold/checkpoint), not merely a
+    compatible architecture. Heads and adapters are excluded and adapter key
+    paths are normalized, matching the structural hash's trunk definition.
+    """
+    return _hash_state_dict_weights(get_trunk_state_dict(model))
+
+
+def _load_base_weights_state_dict(path: Path | str) -> dict[str, torch.Tensor]:
+    """Load a base weights file and return its normalized trunk tensors."""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Base weights file not found: {path}")
+
+    if path.suffix == ".safetensors":
+        try:
+            from safetensors.torch import load_file
+        except ImportError as exc:
+            raise ImportError(
+                "safetensors not installed. Install with: pip install safetensors"
+            ) from exc
+        loaded: Any = load_file(str(path), device="cpu")
+    else:
+        loaded = torch.load(str(path), map_location="cpu", weights_only=True)
+
+    # Accept both the normal bare state dict and common checkpoint wrappers.
+    if isinstance(loaded, Mapping) and isinstance(
+        loaded.get("model_state_dict"), Mapping
+    ):
+        loaded = loaded["model_state_dict"]
+    elif isinstance(loaded, Mapping) and isinstance(loaded.get("state_dict"), Mapping):
+        loaded = loaded["state_dict"]
+    if not isinstance(loaded, Mapping):
+        raise ValueError(f"Base weights file {path} does not contain a state dict")
+
+    state_dict = _strip_orig_mod(dict(loaded))
+    trunk = {
+        key: value
+        for key, value in state_dict.items()
+        if isinstance(value, torch.Tensor) and not key.startswith(_HEAD_PREFIXES)
+    }
+    if not trunk:
+        raise ValueError(f"Base weights file {path} contains no trunk tensors")
+    return trunk
+
+
+def compute_base_model_weights_hash_from_file(path: Path | str) -> str:
+    """Hash base trunk tensor values independently of ``.pth``/safetensors."""
+    return _hash_state_dict_weights(_load_base_weights_state_dict(path))
+
+
 def save_delta_checkpoint(
     path: Path | str,
     model: nn.Module,
@@ -634,6 +765,7 @@ def save_delta_checkpoint(
     base_model_hash: str | None = None,
     optimizer: Optimizer | None = None,
     scheduler: LRScheduler | None = None,
+    base_model_weights_hash: str | None = None,
     **metadata: Any,
 ) -> None:
     """Save a delta checkpoint containing only adapter and new head weights.
@@ -655,7 +787,16 @@ def save_delta_checkpoint(
             adapters and new heads, with normalized key paths).
         optimizer: Optional optimizer to save state for training resume.
         scheduler: Optional LR scheduler to save state for training resume.
-        **metadata: Additional metadata (epoch, val_loss, track_names, etc.)
+        base_model_weights_hash: Optional exact hash of the pristine base
+            model's trunk tensor values. This cannot be derived safely from a
+            model after fine-tuning, so callers should compute it from the
+            original weights file before training.
+        **metadata: Additional metadata (``epoch``, ``val_loss``,
+            ``track_names``, ``modality``, ``resolutions``,
+            ``track_metadata``, etc.). ``track_metadata`` should be a
+            list of row-dicts (e.g. from ``TrackMetadataCatalog.to_rows``)
+            so the served checkpoint is self-describing without
+            ``--track-metadata`` at serve time.
 
     Raises:
         ValueError: If adapters appear to be merged (no adapter params found
@@ -713,6 +854,7 @@ def save_delta_checkpoint(
         "head_state_dict": head_state_dict,
         "norm_state_dict": norm_state_dict,
         "base_model_hash": base_model_hash,
+        "base_model_weights_hash": base_model_weights_hash,
         "metadata": {
             "created_at": datetime.now(timezone.utc).isoformat(),
             **metadata,
@@ -741,8 +883,16 @@ def is_delta_checkpoint(path: Path | str) -> bool:
 
     Returns:
         True if the checkpoint is a delta checkpoint, False otherwise.
+        Returns False (rather than raising) for files that are not torch
+        pickles at all (e.g. ``.safetensors``), so callers that probe formats
+        in sequence can fall through cleanly.
     """
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if Path(path).suffix == ".safetensors":
+        return False
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return False
     return isinstance(checkpoint, dict) and "delta_checkpoint_version" in checkpoint
 
 
@@ -822,7 +972,7 @@ def load_delta_checkpoint(
         saved_hash = checkpoint.get("base_model_hash")
         if saved_hash is not None:
             current_hash = compute_base_model_hash(model)
-            if current_hash != saved_hash:
+            if not base_model_structure_hashes_match(current_hash, saved_hash):
                 raise ValueError(
                     f"Base model structure mismatch. "
                     f"Expected hash '{saved_hash}', got '{current_hash}'. "
@@ -864,6 +1014,8 @@ def load_delta_checkpoint(
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
     metadata = checkpoint.get("metadata", {})
+    if checkpoint.get("base_model_weights_hash") is not None:
+        metadata["base_model_weights_hash"] = checkpoint["base_model_weights_hash"]
     metadata["has_optimizer_state"] = has_optimizer_state
     metadata["has_scheduler_state"] = has_scheduler_state
     return config, metadata
@@ -920,6 +1072,12 @@ def export_delta_weights(
     config: "TransferConfig",
     path: Path | str,
     format: str = "safetensors",
+    *,
+    track_names: dict[str, list[str]] | list[str] | None = None,
+    track_metadata: list[dict[str, Any]] | None = None,
+    organism: str | None = None,
+    organism_indices: list[int] | None = None,
+    base_model_weights_hash: str | None = None,
 ) -> None:
     """Export only delta weights (adapters + new heads) for sharing.
 
@@ -932,6 +1090,21 @@ def export_delta_weights(
         config: TransferConfig used for training (to identify new heads).
         path: Output path. Extension is added based on format if not present.
         format: 'safetensors' or 'pth'.
+        track_names: Optional per-head (or single-head) track-name list. When
+            provided, recipients can populate sparse ``TrackMetadata`` entries
+            without supplying ``--track-metadata`` at serve time.
+        track_metadata: Optional list of metadata row-dicts (e.g. from
+            ``TrackMetadataCatalog.to_rows``). When provided, embeds rich
+            biological metadata so the served model is fully self-describing.
+        organism: Optional organism label (``"human"``/``"mouse"``) the tracks
+            were trained on. Embedded so recipients know the provenance without
+            inspecting per-track metadata.
+        organism_indices: Optional forward-facing set of trained organism indices
+            (e.g. ``[1]`` for mouse). Validated at export against the model's
+            ``num_organisms``; if both ``organism`` and ``organism_indices`` are
+            given, the scalar must be a member of the plural set.
+        base_model_weights_hash: Optional exact hash of the pristine base
+            model trunk tensors.
 
     Example:
         >>> # Export just the LoRA weights + head for sharing
@@ -949,6 +1122,26 @@ def export_delta_weights(
     import json
 
     path = Path(path)
+
+    # Validate + normalize organism provenance up front so a conflicting artifact
+    # (e.g. organism="mouse" + organism_indices=[0]) can never be written to disk.
+    # Only when an organism is actually supplied — otherwise there is nothing to
+    # embed and no need to require the model expose ``num_organisms``.
+    norm_organism_indices = None
+    norm_organism = None
+    if organism is not None or organism_indices is not None:
+        bound = model.num_organisms
+        norm_organism_indices = normalize_organism_indices(organism_indices, num_organisms=bound)
+        norm_organism = normalize_organism_index(organism, num_organisms=bound)
+        if (
+            norm_organism_indices is not None
+            and norm_organism is not None
+            and norm_organism not in norm_organism_indices
+        ):
+            raise ValueError(
+                f"organism {organism!r} (index {norm_organism}) is not in organism_indices "
+                f"{list(norm_organism_indices)}"
+            )
 
     # Get adapter, head, and trainable norm weights
     adapter_weights = get_adapter_state_dict(model)
@@ -968,16 +1161,101 @@ def export_delta_weights(
             )
         if not path.suffix:
             path = path.with_suffix(".safetensors")
+        # Optional self-describing extras, embedded in both formats (json-encoded
+        # for safetensors, raw for pth). Listed once so the two branches stay in
+        # sync with the reader in ``_read_delta_export_header``.
+        extras = {"transfer_config": config_dict}
+        if track_names is not None:
+            extras["track_names"] = track_names
+        if track_metadata is not None:
+            extras["track_metadata"] = track_metadata
+        if organism is not None:
+            extras["organism"] = organism
+        if norm_organism_indices is not None:
+            extras["organism_indices"] = list(norm_organism_indices)
+        if base_model_weights_hash is not None:
+            extras["base_model_weights_hash"] = base_model_weights_hash
         # safetensors metadata must be str -> str
-        metadata = {"transfer_config": json.dumps(config_dict)}
+        metadata = {k: json.dumps(v) for k, v in extras.items()}
         save_file({k: v.cpu() for k, v in weights.items()}, path, metadata=metadata)
     elif format == "pth":
         if not path.suffix:
             path = path.with_suffix(".pth")
-        # For pth, we wrap in a dict with config
-        torch.save({"weights": weights, "transfer_config": config_dict}, path)
+        extras = {"transfer_config": config_dict}
+        if track_names is not None:
+            extras["track_names"] = track_names
+        if track_metadata is not None:
+            extras["track_metadata"] = track_metadata
+        if organism is not None:
+            extras["organism"] = organism
+        if norm_organism_indices is not None:
+            extras["organism_indices"] = list(norm_organism_indices)
+        if base_model_weights_hash is not None:
+            extras["base_model_weights_hash"] = base_model_weights_hash
+        torch.save({"weights": weights, **extras}, path)
     else:
         raise ValueError(f"Unknown format: {format}. Use 'safetensors' or 'pth'.")
+
+
+def _read_delta_export_header(path: Path | str) -> dict[str, Any]:
+    """Read the embedded header of an exported delta-weights file.
+
+    Returns a dict with at least ``transfer_config`` (a dict ready for
+    ``transfer_config_from_dict``) and optionally ``track_names`` and
+    ``track_metadata``. Used internally by ``load_delta_config``,
+    ``is_delta_weights_export``, and the third branch of
+    ``load_finetuned_model``.
+    """
+    import json
+
+    path = Path(path)
+    header: dict[str, Any] = {}
+
+    if path.suffix == ".safetensors":
+        try:
+            from safetensors import safe_open
+        except ImportError:
+            raise ImportError(
+                "safetensors not installed. Install with: pip install safetensors"
+            )
+        with safe_open(path, framework="pt") as f:
+            metadata = f.metadata() or {}
+        if "transfer_config" not in metadata:
+            raise ValueError(
+                f"Delta weights file {path} is missing transfer_config metadata"
+            )
+        header["transfer_config"] = json.loads(metadata["transfer_config"])
+        if "track_names" in metadata:
+            header["track_names"] = json.loads(metadata["track_names"])
+        if "track_metadata" in metadata:
+            header["track_metadata"] = json.loads(metadata["track_metadata"])
+        if "organism" in metadata:
+            header["organism"] = json.loads(metadata["organism"])
+        if "organism_indices" in metadata:
+            header["organism_indices"] = json.loads(metadata["organism_indices"])
+        if "base_model_weights_hash" in metadata:
+            header["base_model_weights_hash"] = json.loads(
+                metadata["base_model_weights_hash"]
+            )
+    else:
+        data = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(data, dict) or "transfer_config" not in data:
+            raise ValueError(
+                f"Delta weights file {path} is missing transfer_config key"
+            )
+        header["transfer_config"] = data["transfer_config"]
+        if "track_names" in data:
+            header["track_names"] = data["track_names"]
+        if "track_metadata" in data:
+            header["track_metadata"] = data["track_metadata"]
+        if "organism" in data:
+            header["organism"] = data["organism"]
+        if "organism_indices" in data:
+            header["organism_indices"] = data["organism_indices"]
+        if "base_model_weights_hash" in data:
+            header["base_model_weights_hash"] = data["base_model_weights_hash"]
+
+    return header
 
 
 def load_delta_config(
@@ -1001,33 +1279,261 @@ def load_delta_config(
         >>> load_delta_weights(model, "colleague_lora.safetensors")
     """
     from alphagenome_pytorch.extensions.finetuning.transfer import transfer_config_from_dict
-    import json
 
-    path = Path(path)
+    header = _read_delta_export_header(path)
+    return transfer_config_from_dict(header["transfer_config"])
 
-    if path.suffix == ".safetensors":
+
+def is_delta_weights_export(path: Path | str) -> bool:
+    """Detect an ``export_delta_weights`` file (vs. delta checkpoint or full checkpoint).
+
+    Identified by the presence of an embedded ``transfer_config`` blob:
+    either a string entry in safetensors metadata, or a top-level key in a
+    ``.pth`` dict that also has a ``weights`` key but no
+    ``delta_checkpoint_version``. Returns False (rather than raising) on
+    unreadable or unrelated files so callers can fall through to other
+    format checks.
+    """
+    p = Path(path)
+    if p.suffix == ".safetensors":
         try:
             from safetensors import safe_open
         except ImportError:
+            return False
+        try:
+            with safe_open(p, framework="pt") as f:
+                metadata = f.metadata() or {}
+        except Exception:
+            return False
+        return "transfer_config" in metadata
+
+    try:
+        data = torch.load(p, map_location="cpu", weights_only=False)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    if "delta_checkpoint_version" in data:
+        return False
+    return "transfer_config" in data and "weights" in data
+
+
+#: Artifact kinds recognised by :func:`describe_checkpoint`. These names are the
+#: shared vocabulary between the loader, ``agt info`` and the documentation, so
+#: the routing table users read matches what the tools print.
+CHECKPOINT_KINDS = (
+    "full_checkpoint",
+    "delta_checkpoint",
+    "delta_export",
+    "full_export",
+    "bundle",
+)
+
+#: Kinds that carry only the difference from a base model and therefore cannot
+#: be loaded without the pretrained weights they were trained against.
+DELTA_SHAPED_KINDS = frozenset({"delta_checkpoint", "delta_export", "bundle"})
+
+_KIND_DESCRIPTIONS = {
+    "full_checkpoint": "a full training checkpoint (contains the complete model)",
+    "delta_checkpoint": (
+        "a delta checkpoint — it contains only the difference from a base model "
+        "(adapter, head and norm weights)"
+    ),
+    "delta_export": (
+        "an exported delta — it contains only the difference from a base model "
+        "(adapter, head and norm weights)"
+    ),
+    "full_export": "an exported full model (contains the complete model)",
+    "bundle": (
+        "an adapter bundle — it contains only the difference from a base model "
+        "(adapter, head and norm weights) plus a manifest"
+    ),
+}
+
+
+@dataclass
+class CheckpointInfo:
+    """What kind of artifact a path holds, and what is needed to load it.
+
+    Attributes:
+        kind: One of :data:`CHECKPOINT_KINDS`.
+        requires_base_weights: True when the artifact stores only a delta and
+            must be loaded alongside the base weights it was trained against.
+        base_model_weights_hash: SHA-256 of the base checkpoint this artifact
+            was trained against, when the artifact recorded one. ``None`` for
+            older artifacts and for self-contained ones.
+        path: The path that was inspected.
+    """
+
+    kind: str
+    requires_base_weights: bool
+    base_model_weights_hash: str | None
+    path: Path
+
+    @property
+    def description(self) -> str:
+        """One-line human-readable summary of :attr:`kind`."""
+        return _KIND_DESCRIPTIONS[self.kind]
+
+
+def describe_checkpoint(path: Path | str) -> CheckpointInfo:
+    """Classify a fine-tuning artifact without loading the model.
+
+    This is the single classifier behind :func:`load_finetuned_model`'s
+    dispatch, ``agt info``, and the documentation's routing table. It reads only
+    what it needs: safetensors are classified from their header, so no tensor
+    data is touched.
+
+    Args:
+        path: Path to a checkpoint, exported weights file, or bundle directory.
+
+    Returns:
+        A :class:`CheckpointInfo`.
+
+    Raises:
+        FileNotFoundError: If *path* does not exist.
+        ValueError: If the file is not a recognised artifact.
+
+    Example:
+        >>> info = describe_checkpoint("best_model.delta.pth")
+        >>> info.kind, info.requires_base_weights
+        ('delta_checkpoint', True)
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {p}")
+
+    def _info(kind: str, base_hash: str | None = None) -> CheckpointInfo:
+        return CheckpointInfo(
+            kind=kind,
+            requires_base_weights=kind in DELTA_SHAPED_KINDS,
+            base_model_weights_hash=base_hash,
+            path=p,
+        )
+
+    # Bundles are directories carrying a manifest sidecar.
+    if p.is_dir():
+        from alphagenome_pytorch.extensions.serving.bundle import (
+            MANIFEST_FILENAME,
+            Manifest,
+        )
+
+        manifest_path = p / MANIFEST_FILENAME
+        if not manifest_path.is_file():
+            raise ValueError(
+                f"{p} is a directory but does not contain {MANIFEST_FILENAME}, "
+                "so it is not an adapter bundle."
+            )
+        manifest = Manifest.load(manifest_path)
+        return _info("bundle", manifest.base_model_weights_hash)
+
+    # safetensors: classify from the header alone, no tensors read.
+    if p.suffix == ".safetensors":
+        try:
+            from safetensors import safe_open
+        except ImportError as exc:  # pragma: no cover - depends on env
             raise ImportError(
                 "safetensors not installed. Install with: pip install safetensors"
-            )
-        with safe_open(path, framework="pt") as f:
-            metadata = f.metadata()
-            if not metadata or "transfer_config" not in metadata:
-                raise ValueError(
-                    f"Delta weights file {path} is missing transfer_config metadata"
-                )
-            config_dict = json.loads(metadata["transfer_config"])
-    else:
-        data = torch.load(path, map_location="cpu", weights_only=False)
-        if not isinstance(data, dict) or "transfer_config" not in data:
-            raise ValueError(
-                f"Delta weights file {path} is missing transfer_config key"
-            )
-        config_dict = data["transfer_config"]
+            ) from exc
+        with safe_open(p, framework="pt") as f:
+            metadata = f.metadata() or {}
+        if "transfer_config" in metadata:
+            return _info("delta_export", metadata.get("base_model_weights_hash"))
+        return _info("full_export")
 
-    return transfer_config_from_dict(config_dict)
+    try:
+        obj = torch.load(p, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        raise ValueError(
+            f"Could not read {p} as a checkpoint: {exc}. Expected a PyTorch "
+            "checkpoint (.pth), an exported weights file (.safetensors), or an "
+            "adapter bundle directory."
+        ) from exc
+    if not isinstance(obj, dict):
+        raise ValueError(
+            f"Unrecognized checkpoint format at {p}: expected a dict, got "
+            f"{type(obj).__name__}."
+        )
+    if "delta_checkpoint_version" in obj:
+        return _info("delta_checkpoint", obj.get("base_model_weights_hash"))
+    if "transfer_config" in obj and "weights" in obj:
+        return _info("delta_export", obj.get("base_model_weights_hash"))
+    if "model_state_dict" in obj:
+        return _info("full_checkpoint", obj.get("base_model_weights_hash"))
+    # A bare state_dict, as written by export_model_weights(format="pth").
+    if obj and all(isinstance(v, torch.Tensor) for v in obj.values()):
+        return _info("full_export")
+    raise ValueError(
+        f"Unrecognized checkpoint format at {p}. Keys: {list(obj.keys())[:10]}"
+    )
+
+
+def _load_full_state_dict(
+    model: nn.Module,
+    state_dict: dict[str, Any],
+    *,
+    strict: bool,
+) -> None:
+    """Load a complete model state dict, optionally insisting it be complete.
+
+    ``strict`` is True when no base weights were loaded first. In that case
+    nothing has seeded the trunk, so a missing key would silently leave a
+    randomly-initialised tensor in the model; we raise instead. ``track_means``
+    buffers stay tolerated, mirroring ``AlphaGenome.from_pretrained`` — older
+    weight files predate them and they are re-derivable.
+
+    Unexpected keys are never fatal: they mean the checkpoint carries extra
+    state this build does not use, which is forward-compatible.
+    """
+    result = model.load_state_dict(state_dict, strict=False)
+    if not strict:
+        return
+
+    missing = [k for k in result.missing_keys if "track_means" not in k]
+    if not missing:
+        return
+
+    shown = ", ".join(missing[:10])
+    if len(missing) > 10:
+        shown += f", ... ({len(missing) - 10} more)"
+    raise ValueError(
+        f"Checkpoint is missing {len(missing)} parameter(s) and no base weights "
+        f"were provided to fill them in: {shown}\n\n"
+        "Pass the base weights this checkpoint was fine-tuned from:\n"
+        "    Python: load_finetuned_model(checkpoint, pretrained_weights=<base weights>)\n"
+        "    CLI:    agt predict --model <base weights> --checkpoint <checkpoint>"
+    )
+
+
+def _require_base_weights(
+    pretrained_weights: Path | str | None,
+    kind: str,
+    base_model_weights_hash: str | None = None,
+) -> None:
+    """Fail fast when a delta-shaped artifact was given no base weights.
+
+    Called the moment the artifact kind is known and before any tensor work, so
+    the user does not wait on a load that cannot succeed. The message carries
+    the whole lesson: what the file is, that base weights are required, how to
+    supply them, and — when recorded — which base checkpoint to use.
+    """
+    if pretrained_weights is not None:
+        return
+    hint = ""
+    if base_model_weights_hash:
+        hint = (
+            f"\n\nIt was trained against the base weights with SHA-256 "
+            f"{base_model_weights_hash}. Check a candidate file with:\n"
+            f"    agt info <base-weights> --validate"
+        )
+    raise ValueError(
+        f"This checkpoint is {_KIND_DESCRIPTIONS[kind]}, so it cannot be loaded "
+        f"on its own — the base model weights it was trained against are "
+        f"required too.\n\n"
+        f"    Python: load_finetuned_model(checkpoint, pretrained_weights=<base weights>)\n"
+        f"    CLI:    agt predict --model <base weights> --checkpoint <checkpoint>"
+        f"{hint}"
+    )
 
 
 def load_delta_weights(
@@ -1054,7 +1560,7 @@ def load_delta_weights(
         >>> model = prepare_for_transfer(base_model, config)
         >>> load_delta_weights(model, "colleague_lora.safetensors")
     """
-    import json
+    from alphagenome_pytorch.extensions.finetuning.transfer import transfer_config_from_dict
 
     path = Path(path)
 
@@ -1066,18 +1572,41 @@ def load_delta_weights(
                 "safetensors not installed. Install with: pip install safetensors"
             )
         weights = load_file(path)
+        # Config lives in the (cheap) metadata header, not the weight tensors.
+        config = transfer_config_from_dict(
+            _read_delta_export_header(path)["transfer_config"]
+        )
     else:
         data = torch.load(path, map_location="cpu", weights_only=False)
         if not isinstance(data, dict) or "weights" not in data:
             raise ValueError(
                 f"Delta weights file {path} is missing 'weights' key"
             )
+        if "transfer_config" not in data:
+            raise ValueError(
+                f"Delta weights file {path} is missing transfer_config key"
+            )
         weights = data["weights"]
+        # Reuse the already-loaded dict for the config instead of re-reading
+        # the file via load_delta_config (avoids a second full torch.load).
+        config = transfer_config_from_dict(data["transfer_config"])
 
-    # Read config via load_delta_config (avoids duplicating parsing logic)
-    config = load_delta_config(path)
+    _apply_delta_weights_to_model(model, weights, strict)
+    return config
 
-    # Load weights into model
+
+def _apply_delta_weights_to_model(
+    model: nn.Module,
+    weights: dict[str, Any],
+    strict: bool,
+) -> None:
+    """Copy a delta weight-dict (adapters + new heads) into ``model`` in place.
+
+    Keys absent from the model are collected and reported as missing — raising
+    when ``strict``, otherwise warning. Shared by ``load_delta_weights`` and
+    ``load_finetuned_model``'s in-memory export path so a ``.pth`` export is
+    deserialized only once.
+    """
     current_state = model.state_dict()
     missing = []
     for key, value in weights.items():
@@ -1095,8 +1624,6 @@ def load_delta_weights(
         else:
             print(f"Warning: {msg}")
 
-    return config
-
 
 def _has_adapter_keys(state_dict: dict[str, Any]) -> bool:
     """Check if a state dict contains adapter-shaped keys."""
@@ -1109,9 +1636,168 @@ def _has_adapter_keys(state_dict: dict[str, Any]) -> bool:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class FinetunedOrganismContext:
+    """What organism(s) a fine-tuned checkpoint was trained on, and the default to use.
+
+    ``organism_indices`` is the declared/inferred set (``None`` only when unknown).
+    ``default_organism_index`` is the single index to forward at when unambiguous, else
+    ``None`` (a mixed checkpoint requires an explicit per-request choice); a checkpoint with
+    no organism metadata gets the compatibility default ``0`` with ``source="fallback"``.
+    ``source`` records provenance; ``conflicts`` are human-readable notes the loader warns on.
+    """
+
+    organism_indices: tuple[int, ...] | None
+    default_organism_index: int | None
+    source: Literal["checkpoint", "track_metadata", "fallback"]
+    conflicts: tuple[str, ...] = ()
+
+
+def _organisms_from_track_metadata(
+    track_metadata: Any, *, num_organisms: int
+) -> tuple[int, ...] | None:
+    """Distinct, explicitly-present organism indices from metadata rows, or ``None``.
+
+    Organism-less rows provide no evidence — they are skipped, never treated as human.
+    """
+    if not track_metadata:
+        return None
+    present: set[int] = set()
+    for row in track_metadata:
+        if not isinstance(row, dict):
+            continue
+        value = row.get("organism")
+        if value is None:
+            continue
+        index = normalize_organism_index(value, num_organisms=num_organisms)
+        if index is not None:
+            present.add(index)
+    return tuple(sorted(present)) if present else None
+
+
+def resolve_finetuned_organism(
+    *,
+    organism_indices: Any = None,
+    checkpoint_organism: Any = None,
+    track_metadata: Any = None,
+    num_organisms: int,
+) -> FinetunedOrganismContext:
+    """Resolve checkpoint organism provenance into a :class:`FinetunedOrganismContext`.
+
+    Pure — never warns; returns ``.conflicts`` for the caller to emit. Precedence:
+    plural ``organism_indices`` > scalar ``organism`` > track-metadata evidence > fallback ``0``.
+    Checkpoint declarations are authoritative: track metadata may only *broaden* to a mixed
+    set when no checkpoint organism is present. Invalid values raise.
+    """
+    conflicts: list[str] = []
+
+    plural = normalize_organism_indices(organism_indices, num_organisms=num_organisms)
+    scalar = normalize_organism_index(checkpoint_organism, num_organisms=num_organisms)
+    catalog = _organisms_from_track_metadata(track_metadata, num_organisms=num_organisms)
+
+    declared: tuple[int, ...] | None = None
+    source: Literal["checkpoint", "track_metadata", "fallback"] = "fallback"
+
+    if plural is not None:
+        declared = plural
+        source = "checkpoint"
+        if scalar is not None and scalar not in plural:
+            conflicts.append(
+                f"Checkpoint scalar organism {scalar} is not in declared "
+                f"organism_indices {list(plural)}; using the plural set."
+            )
+    elif scalar is not None:
+        declared = (scalar,)
+        source = "checkpoint"
+
+    if declared is not None:
+        if catalog is not None and set(catalog) != set(declared):
+            conflicts.append(
+                f"Track metadata organisms {list(catalog)} differ from the checkpoint "
+                f"declaration {list(declared)}; using the checkpoint declaration."
+            )
+    elif catalog is not None:
+        declared = catalog
+        source = "track_metadata"
+
+    if declared is None:
+        return FinetunedOrganismContext(
+            organism_indices=None,
+            default_organism_index=0,
+            source="fallback",
+            conflicts=tuple(conflicts),
+        )
+
+    default = declared[0] if len(declared) == 1 else None
+    return FinetunedOrganismContext(
+        organism_indices=declared,
+        default_organism_index=default,
+        source=source,
+        conflicts=tuple(conflicts),
+    )
+
+
+def select_organism_index(
+    context: FinetunedOrganismContext,
+    explicit: Any = None,
+    *,
+    num_organisms: int,
+) -> int:
+    """Pick the single ``organism_index`` for one inference request.
+
+    Explicit request wins (validated + bounds-checked). Warn only when the explicit choice
+    is outside a *known* declared set — a fallback context (``organism_indices is None``) is
+    unknown provenance, not proof the organism was untrained, so it must not warn. Without an
+    explicit request, use the derived default; a mixed checkpoint with no default raises.
+    """
+    if explicit is not None:
+        index = normalize_organism_index(explicit, num_organisms=num_organisms)
+        if context.organism_indices is not None and index not in context.organism_indices:
+            warnings.warn(
+                f"Requested organism {index} is not in the checkpoint's declared organisms "
+                f"{list(context.organism_indices)}; forwarding at {index} anyway.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return index
+    if context.default_organism_index is not None:
+        return context.default_organism_index
+    raise ValueError(
+        "This checkpoint has no single default organism (declared: "
+        f"{list(context.organism_indices) if context.organism_indices else None}); "
+        "pass an explicit organism."
+    )
+
+
+def finalize_finetuned_organism_context(
+    model: nn.Module, meta: dict[str, Any]
+) -> FinetunedOrganismContext:
+    """Resolve + attach the organism context. **Mutates both ``meta`` and ``model``.**
+
+    Reads the raw ``organism_indices``/``organism``/``track_metadata`` already in ``meta``,
+    resolves them against ``model.num_organisms``, emits any conflict warnings once, overwrites
+    the metadata with the resolved values, and attaches ``model.finetuned_organism_context``.
+    Called by every fine-tuned loading path (``load_finetuned_model`` and
+    ``AlphaGenome.from_delta``) after each has reconstructed its own model.
+    """
+    ctx = resolve_finetuned_organism(
+        organism_indices=meta.get("organism_indices"),
+        checkpoint_organism=meta.get("organism"),
+        track_metadata=meta.get("track_metadata"),
+        num_organisms=model.num_organisms,
+    )
+    for message in ctx.conflicts:
+        warnings.warn(message, UserWarning, stacklevel=2)
+    meta["organism_indices"] = ctx.organism_indices
+    meta["default_organism_index"] = ctx.default_organism_index
+    meta["organism_resolution_source"] = ctx.source
+    model.finetuned_organism_context = ctx
+    return ctx
+
+
 def load_finetuned_model(
     checkpoint_path: str | Path,
-    pretrained_weights: str | Path,
+    pretrained_weights: str | Path | None = None,
     device: str | torch.device = "cpu",
     dtype_policy: "DtypePolicy | None" = None,
     transfer_config: "TransferConfig | None" = None,
@@ -1132,7 +1818,13 @@ def load_finetuned_model(
 
     Args:
         checkpoint_path: Path to finetuned checkpoint (.pth or .delta.pth).
-        pretrained_weights: Path to base pretrained weights.
+        pretrained_weights: Path to base pretrained weights. Required for
+            delta-shaped artifacts (delta checkpoints, exported deltas and
+            adapter bundles), which store only the difference from a base
+            model. Optional for full checkpoints, which carry the complete
+            model; passing it anyway is harmless and preserves the historical
+            behaviour of seeding the trunk before the checkpoint overwrites it.
+            Use :func:`describe_checkpoint` to check which kind you have.
         device: Target device.
         dtype_policy: Precision policy. Default: ``full_float32()``.
         transfer_config: Optional externally-provided ``TransferConfig``
@@ -1144,13 +1836,28 @@ def load_finetuned_model(
 
     Returns:
         Tuple of ``(model, metadata)``.  *metadata* contains keys:
-        ``modality``, ``resolutions``, ``track_names``, ``epoch``,
-        ``val_loss``, ``head_names``.
+        ``modality``, ``resolutions``, ``track_names``,
+        ``track_metadata`` (list of row-dicts, when the checkpoint
+        embedded a metadata catalog; otherwise ``None``),
+        ``organism`` (``"human"``/``"mouse"`` the tracks were trained on,
+        or ``None`` for older checkpoints that predate this field),
+        ``base_model_weights_hash`` (exact base checkpoint identity when
+        recorded),
+        ``epoch``, ``val_loss``, ``head_names``.
+
+    Supported formats: delta checkpoint (``.delta.pth`` from
+    ``--save-delta``), exported delta weights (``.safetensors`` or
+    ``.pth`` from ``export_delta_weights``), or full checkpoint
+    (``.pth`` from ``save_checkpoint``).
 
     Example:
         >>> # Delta checkpoint
         >>> model, meta = load_finetuned_model(
         ...     "best_model.delta.pth", "pretrained.pth", device="cuda",
+        ... )
+        >>> # Exported delta weights (sharing format)
+        >>> model, meta = load_finetuned_model(
+        ...     "shared.safetensors", "pretrained.pth", device="cuda",
         ... )
         >>> # Full checkpoint with external config
         >>> from alphagenome_pytorch.extensions.finetuning.transfer import (
@@ -1180,10 +1887,82 @@ def load_finetuned_model(
 
     ckpt_path = Path(checkpoint_path)
 
-    # --- Path A: Delta checkpoint ---
-    if is_delta_checkpoint(ckpt_path):
+    def _finalize_and_return(model, meta):
+        """Resolve+attach the organism context, then move to device and eval.
+
+        The single exit for every branch. Does NOT freeze parameters: this loader is shared
+        by serving and by gradient-based ISM/DeepLIFT, which need gradients. Consumers that
+        want an inference-frozen model freeze at their own boundary.
+        """
+        finalize_finetuned_organism_context(model, meta)
+        model.eval()
+        return model.to(device), meta
+
+    def _finalize_delta_export(header, weights):
+        """Build an inference model from an exported delta header + weight dict.
+
+        Shared by the safetensors and ``.pth`` export paths so the file is read
+        only once (weights are already in memory by the time this runs).
+        """
+        config = transfer_config_from_dict(header["transfer_config"])
         model = AlphaGenome(dtype_policy=dtype_policy)
         model = load_trunk(model, str(pretrained_weights), exclude_heads=True)
+        model = remove_all_heads(model)
+        model = prepare_for_transfer(model, config)
+        # strict=False because exported deltas only carry adapter+head+norm
+        # weights; the trunk lives in the pretrained file.
+        _apply_delta_weights_to_model(model, weights, strict=False)
+        if merge:
+            model = merge_adapters(model)
+        meta = {
+            "modality": None,
+            "resolutions": None,
+            "track_names": header.get("track_names"),
+            "track_metadata": header.get("track_metadata"),
+            "organism": header.get("organism"),
+            "organism_indices": header.get("organism_indices"),
+            "base_model_weights_hash": header.get("base_model_weights_hash"),
+            "epoch": -1,
+            "val_loss": None,
+            "head_names": list(config.new_heads.keys()),
+        }
+        return _finalize_and_return(model, meta)
+
+    # --- Path A2 (safetensors): a .safetensors file is always an exported
+    # delta-weights file, never a torch pickle — handle it by suffix BEFORE any
+    # torch.load (torch.load on a safetensors file raises UnpicklingError).
+    if ckpt_path.suffix == ".safetensors":
+        from safetensors.torch import load_file
+        # Read the header first: it identifies the artifact and carries the base
+        # weights hash, so a missing --model fails before any tensor is read.
+        header = _read_delta_export_header(ckpt_path)
+        _require_base_weights(
+            pretrained_weights, "delta_export", header.get("base_model_weights_hash")
+        )
+        return _finalize_delta_export(header, load_file(ckpt_path))
+
+    # Every other format is a torch pickle: deserialize ONCE and dispatch on the
+    # in-memory dict's keys, instead of re-loading the file for each format probe.
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if not isinstance(ckpt, dict):
+        raise ValueError(
+            f"Unrecognized checkpoint format. Expected dict, got "
+            f"{type(ckpt).__name__}."
+        )
+
+    # --- Path A: Delta checkpoint (self-describing, carries a version tag) ---
+    if "delta_checkpoint_version" in ckpt:
+        _require_base_weights(
+            pretrained_weights, "delta_checkpoint", ckpt.get("base_model_weights_hash")
+        )
+        model = AlphaGenome(dtype_policy=dtype_policy)
+        model = load_trunk(model, str(pretrained_weights), exclude_heads=True)
+        # Strip the base model's (untrained) pretrained heads before reconstructing,
+        # matching the exported-delta and full-checkpoint paths. Without this a
+        # .delta.pth reload keeps the randomly-initialised native heads (atac,
+        # dnase, ...) alongside the fine-tuned head, so a full forward or iterating
+        # ``model.heads`` yields garbage from heads that were never trained.
+        model = remove_all_heads(model)
         config, metadata = load_delta_checkpoint(
             ckpt_path, model, verify_hash=False, strict=False,
         )
@@ -1194,21 +1973,32 @@ def load_finetuned_model(
             "modality": metadata.get("modality"),
             "resolutions": metadata.get("resolutions"),
             "track_names": metadata.get("track_names"),
+            "track_metadata": metadata.get("track_metadata"),
+            "organism": metadata.get("organism"),
+            "organism_indices": metadata.get("organism_indices"),
+            "base_model_weights_hash": metadata.get("base_model_weights_hash"),
             "epoch": metadata.get("epoch", -1),
             "val_loss": metadata.get("val_loss"),
             "head_names": head_names,
         }
-        model = model.to(device)
-        model.eval()
-        return model, meta
+        return _finalize_and_return(model, meta)
+
+    # --- Path A2 (.pth): Exported delta weights (transfer_config + weights) ---
+    if "transfer_config" in ckpt and "weights" in ckpt:
+        _require_base_weights(
+            pretrained_weights, "delta_export", ckpt.get("base_model_weights_hash")
+        )
+        header = {
+            "transfer_config": ckpt["transfer_config"],
+            "track_names": ckpt.get("track_names"),
+            "track_metadata": ckpt.get("track_metadata"),
+            "organism": ckpt.get("organism"),
+            "organism_indices": ckpt.get("organism_indices"),
+            "base_model_weights_hash": ckpt.get("base_model_weights_hash"),
+        }
+        return _finalize_delta_export(header, ckpt["weights"])
 
     # --- Path B/C: Full checkpoint ---
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    if not isinstance(ckpt, dict):
-        raise ValueError(
-            f"Unrecognized checkpoint format. Expected dict, got "
-            f"{type(ckpt).__name__}."
-        )
     if "model_state_dict" not in ckpt:
         raise ValueError(
             f"Unrecognized checkpoint format. Keys: {list(ckpt.keys())[:10]}"
@@ -1225,13 +2015,22 @@ def load_finetuned_model(
             effective_config = transfer_config_from_dict(embedded)
 
     model = AlphaGenome(dtype_policy=dtype_policy)
-    model = load_trunk(model, str(pretrained_weights), exclude_heads=True)
+    # A full checkpoint stores the complete ``model.state_dict()`` (trunk, heads
+    # and the persistent track_means buffers), so seeding the trunk from the base
+    # weights is optional: every key it supplies is overwritten below. When base
+    # weights are given we still load them, preserving the historical tolerance
+    # for partial checkpoints; when they are not, the state dict must stand on
+    # its own and is loaded strictly so gaps surface instead of leaving
+    # randomly-initialised tensors in place.
+    have_base_weights = pretrained_weights is not None
+    if have_base_weights:
+        model = load_trunk(model, str(pretrained_weights), exclude_heads=True)
     model = remove_all_heads(model)
 
     if effective_config is not None:
         # Path B: Reconstruct adapter architecture, then load full state dict
         model = prepare_for_transfer(model, effective_config)
-        model.load_state_dict(state_dict, strict=False)
+        _load_full_state_dict(model, state_dict, strict=not have_base_weights)
         if merge:
             model = merge_adapters(model)
         head_names = list(effective_config.new_heads.keys())
@@ -1268,19 +2067,21 @@ def load_finetuned_model(
             head = create_finetuning_head(assay_type=modality, n_tracks=n_tracks, resolutions=res)
             model.heads[modality] = head
 
-        model.load_state_dict(state_dict, strict=False)
+        _load_full_state_dict(model, state_dict, strict=not have_base_weights)
 
     meta = {
         "modality": ckpt.get("modality"),
         "resolutions": ckpt.get("resolutions"),
         "track_names": ckpt.get("track_names"),
+        "track_metadata": ckpt.get("track_metadata"),
+        "organism": ckpt.get("organism"),
+        "organism_indices": ckpt.get("organism_indices"),
+        "base_model_weights_hash": ckpt.get("base_model_weights_hash"),
         "epoch": ckpt.get("epoch", -1),
         "val_loss": ckpt.get("val_loss"),
         "head_names": head_names,
     }
-    model = model.to(device)
-    model.eval()
-    return model, meta
+    return _finalize_and_return(model, meta)
 
 
 __all__ = [
@@ -1301,13 +2102,28 @@ __all__ = [
     "export_delta_weights",
     "load_delta_config",
     "load_delta_weights",
+    "is_delta_weights_export",
     # Inference loading
     "load_finetuned_model",
+    # Artifact classification
+    "describe_checkpoint",
+    "CheckpointInfo",
+    "CHECKPOINT_KINDS",
+    "DELTA_SHAPED_KINDS",
+    # Organism provenance / selection
+    "FinetunedOrganismContext",
+    "resolve_finetuned_organism",
+    "select_organism_index",
+    "finalize_finetuned_organism_context",
     # Utilities
     "split_model_state_dict",
     "get_trunk_state_dict",
     "get_adapter_state_dict",
+    "compute_base_model_hash",
+    "base_model_structure_hashes_match",
+    "compute_base_model_weights_hash",
+    "compute_base_model_weights_hash_from_file",
+    "BASE_MODEL_WEIGHTS_HASH_VERSION",
     "get_new_head_state_dict",
     "get_norm_state_dict",
-    "compute_base_model_hash",
 ]

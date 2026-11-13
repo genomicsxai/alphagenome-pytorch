@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import itertools
 import logging
@@ -21,13 +22,34 @@ from alphagenome.models import dna_output
 from alphagenome.models import junction_data_utils, track_data_utils
 from alphagenome.protos import dna_model_pb2, dna_model_service_pb2, dna_model_service_pb2_grpc, tensor_pb2
 
-from .adapter import LocalDnaModelAdapter
-
 LOGGER = logging.getLogger(__name__)
 
 
+class _CatalogModelIdMissing(Exception):
+    """Catalog mode: the request omitted the required model-id metadata header.
+
+    Raised (rather than aborting immediately) so it flows through the RPC
+    method's broad ``except Exception`` handler and is mapped exactly once to
+    FAILED_PRECONDITION. Calling ``context.abort`` inside ``_acquire`` instead
+    would raise a bare ``Exception`` that the same handler re-aborts as INTERNAL,
+    losing the intended status code and details.
+    """
+
+
+class _CatalogModelNotFound(Exception):
+    """Catalog mode: the request named a model id that is not in the catalog.
+
+    See :class:`_CatalogModelIdMissing` for why this is a typed exception rather
+    than a direct ``context.abort``. Mapped to NOT_FOUND.
+    """
+
+
 def _set_grpc_error(context: grpc.ServicerContext, exc: Exception) -> None:
-    if isinstance(exc, ValueError):
+    if isinstance(exc, _CatalogModelIdMissing):
+        code = grpc.StatusCode.FAILED_PRECONDITION
+    elif isinstance(exc, _CatalogModelNotFound):
+        code = grpc.StatusCode.NOT_FOUND
+    elif isinstance(exc, ValueError):
         code = grpc.StatusCode.INVALID_ARGUMENT
     elif isinstance(exc, NotImplementedError):
         code = grpc.StatusCode.UNIMPLEMENTED
@@ -229,29 +251,102 @@ def _iter_output_payloads(
             yield response_cls(tensor_chunk=chunk)
 
 
+_MODEL_ID_METADATA_KEY = "alphagenome-model-id"
+
+
+def _organism_or_none(organism: Any) -> Any:
+    """Map the proto ``ORGANISM_UNSPECIFIED`` sentinel to ``None``.
+
+    A gRPC request that omits organism carries ``ORGANISM_UNSPECIFIED`` (0);
+    forwarding it as-is would resolve to human. Returning ``None`` lets the
+    runtime consult its embedded default (e.g. a mouse bundle's organism).
+    """
+    if organism == dna_model_pb2.ORGANISM_UNSPECIFIED:
+        return None
+    return organism
+
+
 class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
-    """gRPC implementation of notebook-critical DNA model methods."""
+    """gRPC implementation of notebook-critical DNA model methods.
+
+    Accepts either a singleton :class:`LocalDnaModelAdapter` (the
+    official-client-compatible mode) or a :class:`ServedModelRouter` (catalog
+    mode). In catalog mode, every RPC must include the metadata header
+    ``alphagenome-model-id``; missing it returns FAILED_PRECONDITION and
+    unknown ids return NOT_FOUND.
+    """
 
     def __init__(
         self,
-        adapter: LocalDnaModelAdapter,
+        adapter,
         *,
         bytes_per_chunk: int = 0,
         compression_type: tensor_pb2.CompressionType = tensor_pb2.COMPRESSION_TYPE_NONE,
     ):
-        self.adapter = adapter
+        from alphagenome_pytorch.extensions.serving.router import (
+            ServedModelRouter,
+        )
+        if isinstance(adapter, ServedModelRouter):
+            self.router = adapter
+            self.adapter = None
+        else:
+            self.router = None
+            self.adapter = adapter
         self.bytes_per_chunk = bytes_per_chunk
         self.compression_type = compression_type
+
+    @contextlib.contextmanager
+    def _acquire(self, context):
+        """Yield the per-request adapter, holding the router lock in catalog mode.
+
+        Enforces catalog-mode metadata rules by raising typed exceptions —
+        :class:`_CatalogModelIdMissing` (mapped to ``FAILED_PRECONDITION`` when
+        the ``alphagenome-model-id`` header is missing) and
+        :class:`_CatalogModelNotFound` (``NOT_FOUND`` for unknown ids). These
+        propagate through the caller's broad ``except Exception`` handler, which
+        aborts exactly once with the right code; aborting here directly would be
+        swallowed and re-aborted as INTERNAL (see the exception docstrings).
+
+        Keeps the shared base model swapped in for the duration of the ``with``
+        body so a concurrent RPC cannot re-swap it mid-forward. Keep only the
+        model computation inside the block; stream after release.
+        """
+        if self.router is None:
+            yield self.adapter
+            return
+        from alphagenome_pytorch.extensions.serving.router import (
+            ModelNotFoundError,
+        )
+        meta_pairs = context.invocation_metadata() or ()
+        model_id: str | None = None
+        for k, v in meta_pairs:
+            if k.lower() == _MODEL_ID_METADATA_KEY:
+                model_id = v
+                break
+        if model_id is None:
+            raise _CatalogModelIdMissing(
+                f"Catalog mode requires '{_MODEL_ID_METADATA_KEY}' metadata. "
+                f"Available models: {self.router.model_ids}"
+            )
+        try:
+            resolved = self.router.resolve_model_id(model_id)
+        except ModelNotFoundError:
+            raise _CatalogModelNotFound(
+                f"Unknown model id: {model_id!r}. Available: {self.router.model_ids}"
+            ) from None
+        with self.router.acquire(resolved) as adapter:
+            yield adapter
 
     def PredictSequence(self, request_iterator, context):
         try:
             request = _first_request(request_iterator, 'PredictSequence')
-            output = self.adapter.predict_sequence(
-                sequence=request.sequence,
-                organism=request.organism,
-                requested_outputs=[_normalize_output_type(v) for v in request.requested_outputs],
-                ontology_terms=_normalize_ontology_terms_from_proto(request.ontology_terms),
-            )
+            with self._acquire(context) as adapter:
+                output = adapter.predict_sequence(
+                    sequence=request.sequence,
+                    organism=_organism_or_none(request.organism),
+                    requested_outputs=[_normalize_output_type(v) for v in request.requested_outputs],
+                    ontology_terms=_normalize_ontology_terms_from_proto(request.ontology_terms),
+                )
             yield from _iter_output_payloads(
                 output,
                 response_cls=dna_model_service_pb2.PredictSequenceResponse,
@@ -266,12 +361,13 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
         try:
             request = _first_request(request_iterator, 'PredictInterval')
             interval = genome.Interval.from_proto(request.interval)
-            output = self.adapter.predict_interval(
-                interval=interval,
-                organism=request.organism,
-                requested_outputs=[_normalize_output_type(v) for v in request.requested_outputs],
-                ontology_terms=_normalize_ontology_terms_from_proto(request.ontology_terms),
-            )
+            with self._acquire(context) as adapter:
+                output = adapter.predict_interval(
+                    interval=interval,
+                    organism=_organism_or_none(request.organism),
+                    requested_outputs=[_normalize_output_type(v) for v in request.requested_outputs],
+                    ontology_terms=_normalize_ontology_terms_from_proto(request.ontology_terms),
+                )
             yield from _iter_output_payloads(
                 output,
                 response_cls=dna_model_service_pb2.PredictIntervalResponse,
@@ -287,13 +383,14 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
             request = _first_request(request_iterator, 'PredictVariant')
             interval = genome.Interval.from_proto(request.interval)
             variant = genome.Variant.from_proto(request.variant)
-            output = self.adapter.predict_variant(
-                interval=interval,
-                variant=variant,
-                organism=request.organism,
-                requested_outputs=[_normalize_output_type(v) for v in request.requested_outputs],
-                ontology_terms=_normalize_ontology_terms_from_proto(request.ontology_terms),
-            )
+            with self._acquire(context) as adapter:
+                output = adapter.predict_variant(
+                    interval=interval,
+                    variant=variant,
+                    organism=_organism_or_none(request.organism),
+                    requested_outputs=[_normalize_output_type(v) for v in request.requested_outputs],
+                    ontology_terms=_normalize_ontology_terms_from_proto(request.ontology_terms),
+                )
             yield from _iter_output_payloads(
                 output.reference,
                 response_cls=dna_model_service_pb2.PredictVariantResponse,
@@ -320,12 +417,13 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
             request = _first_request(request_iterator, 'ScoreVariant')
             interval = genome.Interval.from_proto(request.interval)
             variant = genome.Variant.from_proto(request.variant)
-            scores = self.adapter.score_variant(
-                interval=interval,
-                variant=variant,
-                variant_scorers=list(request.variant_scorers),
-                organism=request.organism,
-            )
+            with self._acquire(context) as adapter:
+                scores = adapter.score_variant(
+                    interval=interval,
+                    variant=variant,
+                    variant_scorers=list(request.variant_scorers),
+                    organism=_organism_or_none(request.organism),
+                )
             for score in scores:
                 score_output, chunks = _anndata_to_score_variant_output(
                     score,
@@ -348,13 +446,14 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
                 if request.HasField('interval_variant')
                 else None
             )
-            scores_nested = self.adapter.score_ism_variants(
-                interval=interval,
-                ism_interval=ism_interval,
-                variant_scorers=list(request.variant_scorers),
-                organism=request.organism,
-                interval_variant=interval_variant,
-            )
+            with self._acquire(context) as adapter:
+                scores_nested = adapter.score_ism_variants(
+                    interval=interval,
+                    ism_interval=ism_interval,
+                    variant_scorers=list(request.variant_scorers),
+                    organism=_organism_or_none(request.organism),
+                    interval_variant=interval_variant,
+                )
             for score in itertools.chain.from_iterable(scores_nested):
                 score_output, chunks = _anndata_to_score_variant_output(
                     score,
@@ -369,7 +468,8 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
 
     def GetMetadata(self, request, context):
         try:
-            metadata = self.adapter.output_metadata(request.organism)
+            with self._acquire(context) as adapter:
+                metadata = adapter.output_metadata(_organism_or_none(request.organism))
             output_metadata = []
             for output_type in dna_output.OutputType:
                 data = metadata.get(output_type)
@@ -392,7 +492,7 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
 
 
 def serve_grpc(
-    adapter: LocalDnaModelAdapter,
+    target,
     *,
     host: str = '127.0.0.1',
     port: int = 50051,
@@ -401,7 +501,12 @@ def serve_grpc(
     compression_type: tensor_pb2.CompressionType = tensor_pb2.COMPRESSION_TYPE_NONE,
     wait: bool = True,
 ) -> grpc.Server:
-    """Start a local gRPC server that implements `DnaModelService`."""
+    """Start a local gRPC server that implements ``DnaModelService``.
+
+    ``target`` may be a :class:`LocalDnaModelAdapter` (singleton mode) or a
+    :class:`ServedModelRouter` (catalog mode). Catalog mode requires every
+    request to pass ``alphagenome-model-id`` metadata.
+    """
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=max_workers),
         options=[
@@ -411,7 +516,7 @@ def serve_grpc(
     )
     dna_model_service_pb2_grpc.add_DnaModelServiceServicer_to_server(
         LocalDnaModelService(
-            adapter=adapter,
+            adapter=target,
             bytes_per_chunk=bytes_per_chunk,
             compression_type=compression_type,
         ),

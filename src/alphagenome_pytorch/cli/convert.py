@@ -39,8 +39,7 @@ def run(args: argparse.Namespace) -> int:
     elif output_path.endswith(".safetensors"):
         use_safetensors = True
 
-    # Import from script module
-    from scripts.convert_weights import convert, save_weights
+    from alphagenome_pytorch.jax_compat.convert import convert, save_weights
 
     state_dict = convert(args.input)
     save_weights(state_dict, output_path, use_safetensors=use_safetensors)

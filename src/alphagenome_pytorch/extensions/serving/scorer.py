@@ -49,6 +49,7 @@ from .adapter import (
     MAX_VARIANT_SCORERS_PER_REQUEST,
     _OFFICIAL_TO_PT_OUTPUT,
     _as_numpy,
+    _drop_padding_tracks,
     _interval_to_pt,
     _normalize_output_type,
     _pt_metadata_to_track_df,
@@ -442,6 +443,9 @@ class VariantScorer:
             output_name=pt_output.value,
         )
         var_df = _pt_metadata_to_track_df(track_metadata, num_tracks=n_tracks)
+        var_df, keep_padding_mask = _drop_padding_tracks(var_df)
+        if keep_padding_mask is not None and X.ndim == 2:
+            X = X[:, keep_padding_mask]
 
         if has_gene_metadata:
             obs_df = pd.DataFrame(obs_rows)

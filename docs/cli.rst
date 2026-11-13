@@ -53,18 +53,18 @@ Example output:
 
 .. code-block:: text
 
-   Head              Tracks (human)  Tracks (mouse)  Dimension  Resolutions
-   atac                         167             155        256  1bp, 128bp
-   dnase                        305             280        384  1bp, 128bp
-   procap                        12               8        128  1bp, 128bp
-   cage                         546             490        640  1bp, 128bp
-   rna_seq                      667             600        768  1bp, 128bp
-   chip_tf                     1617            1500       1664  128bp
-   chip_histone                1116            1000       1152  128bp
-   contact_maps                  28              28         28  64x64
-   splice_sites                   5               5          5  1bp
-   splice_junctions             734             734        734  pairwise
-   splice_site_usage            734             734        734  1bp
+   Head                   Tracks (human) Tracks (mouse) Dimension Resolutions
+   atac                              167             18       256 1bp, 128bp
+   dnase                             305             67       384 1bp, 128bp
+   procap                             12              0       128 1bp, 128bp
+   cage                              546            188       640 1bp, 128bp
+   rna_seq                           667            173       768 1bp, 128bp
+   chip_tf                          1617            127      1664 128bp
+   chip_histone                     1116            183      1152 128bp
+   contact_maps                       28              8        28 64x64
+   splice_sites                        4              4         5 1bp
+   splice_junctions                  367             90       734 pairwise
+   splice_site_usage                 734            180       734 1bp
 
 *Tracks* = real (non-padding) tracks per organism.
 *Dimension* = tensor channel size (includes padding).
@@ -127,8 +127,8 @@ JSON output
        {
          "name": "atac",
          "dimension": 256,
-         "tracks": {"human": 167, "mouse": 155},
-         "padding": {"human": 89, "mouse": 101},
+         "tracks": {"human": 167, "mouse": 18},
+         "padding": {"human": 89, "mouse": 238},
          "resolutions": ["1bp", "128bp"]
        }
      ]
@@ -168,6 +168,10 @@ Input mode          What it does                                    Output
 ``--locus``, ``--bed``, and ``--sequences`` are mutually exclusive. When
 ``--bed`` is given, ``--chromosomes`` can additionally be passed as a
 chromosome filter over the BED rows (see below).
+
+In ``--chromosomes`` mode, ``--anndata`` swaps the BigWig output for a
+per-gene × per-track count table — see
+:ref:`per-gene-anndata` below.
 
 Requires: ``pip install alphagenome-pytorch[inference]``
 
@@ -348,6 +352,52 @@ Errors you'll see:
    Error: Sequence 'seq1' (500000bp) is longer than the model window
    (131072bp); pass --tile to enable tiling.
 
+.. _per-gene-anndata:
+
+Per-gene counts (AnnData)
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+In ``--chromosomes`` mode, ``--anndata`` aggregates the tiled signal into a
+per-gene × per-track matrix and writes it as ``.h5ad`` instead of BigWigs.
+Mostly used with the ``rna_seq`` head to produce a gene expression count table.
+
+.. code-block:: bash
+
+   agt predict \
+       --model model.pth --fasta hg38.fa --output out/ \
+       --head rna_seq --chromosomes chr20 \
+       --resolution 1 --crop-bp 16384 \
+       --anndata gene_counts.h5ad \
+       --annotation gencode.v46.parquet \
+       --aggregate-over exons --aggregate-func sum --gene-strand match
+
+======================== =================================================================
+Flag                     Meaning
+======================== =================================================================
+``--anndata NAME``       Write ``{output}/NAME`` (a ``.h5ad``) instead of BigWigs
+``--annotation PATH``    GTF/GFF or parquet annotation (required with ``--anndata``)
+``--aggregate-over``     ``exons`` (default) or ``gene-body`` (exons + introns)
+``--aggregate-func``     ``sum`` (default) / ``mean`` (per-base) / ``log-mean``
+``--gene-strand``        ``all`` (default) or ``match`` (NaN antisense cells)
+``--track-strands``      Per-track strands (``+-+-`` or ``+,-,+,-``) when metadata lacks them
+``--keep-padding``       Keep placeholder padding tracks (dropped by default)
+======================== =================================================================
+
+Requires ``pip install 'alphagenome-pytorch[inference-anndata]'``. Combining
+``--anndata`` with ``--locus``, ``--bed``, or ``--sequences`` is an error, and
+``--aggregate-over exons`` needs an annotation that actually contains exon rows.
+
+The output has ``X`` of shape ``[n_tracks, n_genes]``, tracks in ``obs`` and
+genes in ``var``; transpose for genes as observations. ``obs`` carries the full
+track metadata (``track_name``, ``biosample_name``, ``assay_title``, ``strand``,
+...), and placeholder padding tracks are dropped unless you pass
+``--keep-padding``. For stranded assays pass ``--gene-strand match``, otherwise
+each gene is also scored by opposite-strand tracks — antisense signal, not the
+gene's own expression.
+
+See :ref:`per-gene-counts` for the aggregation modes, the unit caveat at 128bp,
+annotation preparation, and the equivalent Python API.
+
 Common options
 ^^^^^^^^^^^^^^
 
@@ -365,11 +415,63 @@ Flag                     Meaning
 ``--device STR``         PyTorch device (``cuda``, ``cpu``, ``mps``)
 ``--dtype-policy``       ``full_float32`` (default) or ``mixed_precision``
 ``--compile``            Wrap model with ``torch.compile``
-``--checkpoint PATH``    Finetuned checkpoint (LoRA, full, etc.)
+``--checkpoint SRC``     Finetuned model: a checkpoint file, a bundle directory, or an ``hf://`` URI
 ``--transfer-config``    TransferConfig JSON for adapter models
 ``--no-merge-adapters``  Keep LoRA/adapter modules separate from base weights
 ``--quiet``              Suppress progress bars and per-region status lines
 ======================== =================================================================
+
+.. _predict-with-a-finetuned-model:
+
+Predicting with a fine-tuned model
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``--model`` is the **base** model; ``--checkpoint`` is the fine-tune layered on
+top. Whether you need both depends on what kind of file you were given.
+
+Most shared fine-tunes — delta checkpoints, exported deltas and adapter bundles
+— contain only the *difference* from a base model, so they need both:
+
+.. code-block:: bash
+
+   agt predict \
+       --model model.pth \
+       --checkpoint k562-atac.delta.pth \
+       --head atac \
+       --locus chr1:1000000-1131072 \
+       --fasta hg38.fa \
+       --output preds/
+
+A full checkpoint or an exported full model contains everything, so
+``--model`` can be omitted:
+
+.. code-block:: bash
+
+   agt predict --checkpoint best_model.pth --head atac ...
+
+Not sure which you have? ``agt info <file>`` reports the kind and whether base
+weights are needed. :doc:`finetuning/checkpoints` covers every artifact kind.
+
+**Adapter bundles** are accepted directly, including straight from the Hub:
+
+.. code-block:: bash
+
+   agt predict \
+       --model model.pth \
+       --checkpoint hf://your-org/k562-atac-lora \
+       --head atac --locus chr1:1000000-1131072 \
+       --fasta hg38.fa --output preds/
+
+A bundle records the base model it was trained against, so pairing it with the
+wrong ``--model`` fails with a hash mismatch rather than silently producing
+meaningless predictions. A bare ``.delta.pth`` carries no such guarantee — if it
+came from someone else, check which base weights they used.
+
+.. note::
+
+   ``agt score`` does not accept bundle directories or URIs. For variant scoring
+   with a fine-tune, point ``--checkpoint`` at the checkpoint file itself
+   (``agt adapters pull`` will resolve a published bundle to a local path).
 
 JSON output
 ^^^^^^^^^^^
@@ -462,8 +564,13 @@ Requires: ``pip install alphagenome-pytorch[finetuning]``
        --train-bed train.bed --val-bed val.bed \
        --pretrained-weights model.pth
 
-``agt finetune`` forwards arguments to the training script and currently emits
-the script's normal console logs.
+``agt finetune`` is the training entry point; ``scripts/finetune.py`` is a thin
+shim that calls into it and takes the same arguments. Training progress is
+written to the console as it runs.
+
+By default a run writes only full checkpoints (~1GB). Add ``--save-delta`` for a
+small, shareable artifact. See :doc:`finetuning/cli` for the full output layout
+and :doc:`finetuning/checkpoints` for how to load or publish the result.
 
 
 ``agt score``
@@ -683,6 +790,75 @@ Flag                       Meaning
 ``--rest-port N``          Enable REST serving on this port.
 ``--device STR``           Torch device (default: ``cpu``).
 ========================== ==========================================================
+
+Serving fine-tuned models and adapter bundles:
+
+.. code-block:: bash
+
+   # Serve a fine-tuned checkpoint, a local bundle directory, or a bundle URI
+   agt serve --weights model.pth --fasta hg38.fa \
+       --checkpoint runs/wtc11-atac/best.delta.pth
+
+   # Serve many fine-tunes over a shared base from a catalog file
+   agt serve --weights model.pth --fasta hg38.fa --rest-port 8080 \
+       --adapter-catalog adapters.yaml
+
+``--checkpoint SRC``
+    Serve a fine-tuned model on top of ``--weights``. ``SRC`` may be a
+    ``.delta.pth`` / ``.safetensors`` file, a local bundle directory, or a
+    ``local:`` / ``file://`` / ``hf://`` bundle URI. A served single-organism
+    fine-tune (e.g. mouse) defaults to its trained organism when a request
+    omits ``organism``.
+
+``--transfer-config PATH``
+    TransferConfig JSON for older checkpoints that don't embed one.
+
+``--no-merge-adapters``
+    Keep adapter modules separate instead of merging them into the base weights.
+
+``--adapter-catalog PATH``
+    Serve multiple fine-tuned models over a shared base from a YAML/JSON
+    catalog. Enables the REST ``/v1/models`` endpoints; gRPC then requires the
+    ``alphagenome-model-id`` metadata header on every request. Mutually
+    exclusive with ``--checkpoint``.
+
+See :doc:`/serving/adapters` for the bundle format, catalog schema, REST/gRPC
+behavior, and the full ``agt adapters`` workflow.
+
+
+``agt adapters``
+----------------
+
+Package a fine-tuned **delta** checkpoint (``.delta.pth``) or delta-weights
+export (``.safetensors``) into a shareable **adapter bundle** (a delta-weights
+export plus an ``alphagenome_adapter.json`` manifest), and inspect, validate,
+pull, or publish bundles. A full or merged checkpoint cannot be exported — it
+has no separable adapter weights:
+
+.. code-block:: bash
+
+   # Build a bundle from a delta checkpoint
+   agt adapters export \
+       --checkpoint runs/wtc11-atac/best.delta.pth \
+       --base-model your-org/alphagenome \
+       --base-model-variant fold_1 \
+       --base-weights fold_1.safetensors \
+       --id wtc11-atac-lora --organism human --modality atac \
+       --out dist/wtc11-atac-lora
+
+   agt adapters inspect  dist/wtc11-atac-lora
+   agt adapters validate dist/wtc11-atac-lora --base-weights model.pth
+   agt adapters pull     hf://your-org/alphagenome-wtc11-atac-lora
+   agt adapters publish  dist/wtc11-atac-lora hf://your-org/alphagenome-wtc11-atac-lora
+
+Bundle management (``export`` / ``inspect`` / ``validate`` and local bundle
+operations) works in the base installation. Install ``[hf]`` for ``hf://``
+``pull`` / ``publish``, and ``[serving]`` to run ``agt serve``.
+``--base-model-variant`` records a readable variant such as ``fold_1`` or
+``all_folds``; ``--base-weights`` records the exact base tensor identity.
+
+See :doc:`/serving/adapters` for the bundle layout, manifest schema, URI forms,
+and catalog serving.
 
 
 Dependency Gating

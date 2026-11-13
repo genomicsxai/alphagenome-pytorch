@@ -28,6 +28,25 @@ For fine-tuning (incl. BigWig data loading):
 pip install alphagenome-pytorch[finetuning]  # adds pyBigWig, pyfaidx
 ```
 
+### Use with coding agents
+
+If you use a coding agent, [`docs/alphagenome-usage.md`](docs/alphagenome-usage.md) is an
+agent-agnostic guide to running the model and pulling out predictions for a specific
+assay, cell type, or resolution, and [`docs/finetuning/`](docs/finetuning/index.rst)
+covers fine-tuning.
+
+For Claude Code, install them as a plugin so the agent picks them up automatically in any
+project:
+
+```
+/plugin marketplace add genomicsxai/alphagenome-pytorch
+/plugin install alphagenome@alphagenome
+```
+
+This adds two skills — one for predictions, one for fine-tuning — so you can ask things
+like *"get DNase predictions from GM12878 at 128bp"*, *"write a wrapper to get all the
+K562 predictions"*, or *"fine-tune on my ATAC BigWigs with LoRA"*.
+
 ## Quick Start
 
 ```python
@@ -109,7 +128,9 @@ emb['embeddings_128bp']  # (B, 1024, 3072) at 128bp
 Train a new head on your data with frozen trunk (linear probing) or with LoRA adapters:
 
 ```python
-from alphagenome_pytorch import AlphaGenome, TransferConfig, load_trunk, prepare_for_transfer
+from alphagenome_pytorch import (
+    AlphaGenome, TransferConfig, load_trunk, prepare_for_transfer,
+)
 
 # Load trunk, freeze, add custom heads
 model = AlphaGenome()
@@ -121,25 +142,29 @@ model = prepare_for_transfer(model, TransferConfig(
 ))
 ```
 
-The easiest way to start with fine-tuning is to use [`scripts/finetune.py`](scripts/finetune.py) that implements a flexible CLI interface:
+The easiest way to start with fine-tuning is the `agt finetune` CLI (installed with the
+package):
 
 ```bash
 # LoRA fine-tuning
-python scripts/finetune.py --mode lora --lora-rank 8 \
+agt finetune --mode lora --lora-rank 8 \
     --genome hg38.fa --modality atac --bigwig *.bw \
     --train-bed train.bed --val-bed val.bed \
     --pretrained-weights alphagenome.pt
 
 # LoRA + Locon on the last 4 encoder convs before attention
-python scripts/finetune.py --mode lora+locon --lora-rank 8 \
+agt finetune --mode lora+locon --lora-rank 8 \
     --locon-rank 4 --locon-targets down_blocks.4,down_blocks.5 \
     --genome hg38.fa --modality atac --bigwig *.bw \
     --train-bed train.bed --val-bed val.bed \
     --pretrained-weights alphagenome.pt
 
-# Multi-GPU
-torchrun --nproc_per_node=4 scripts/finetune.py --mode lora ...
+# Multi-GPU (torchrun needs a module target)
+torchrun --nproc_per_node=4 -m alphagenome_pytorch.cli finetune --mode lora ...
 ```
+
+`agt finetune` and `python scripts/finetune.py` are the same code path with the same
+flags; the script is kept as a compatibility shim (it only works from a repo clone).
 
 Note that Locon targets are explicit by design. You can use the syntax 
 `down_blocks.3,down_blocks.4,down_blocks.5` to choose targets.
@@ -164,13 +189,20 @@ See a compiled [ARCHITECTURE_COMPARISON.md](ARCHITECTURE_COMPARISON.md) for some
 | chip_tf | 1617 | 1664 | 128bp | TF binding |
 | chip_histone | 1116 | 1152 | 128bp | Histone modifications |
 | contact_maps | 28 | 28 | 64×64 | 3D chromatin contacts |
-| splice_sites | 5 | 5 | 1bp | Splice site classification (D+, A+, D−, A−, none) |
+| splice_sites | 4 | 5 | 1bp | Splice site classification (D+, A+, D−, A−, none) |
 | splice_junctions | 734 | 734 | pairwise | Junction read counts (367 tissues × 2 strands) |
 | splice_site_usage | 734 | 734 | 1bp | Fraction of transcripts using splice site |
 
 Tracks column shows the number of real human tracks (without padding). Dimension is the raw output tensor size — padding fills the gap. When using `named_outputs=True`, padding is stripped by default. See [named outputs guide](docs/named_outputs.rst) for details.
 
 See more information about model outputs [in the official AlphaGenome documentation](https://www.alphagenomedocs.com/exploring_model_metadata.html).
+
+Track predictions can also be aggregated into a **per-gene × per-track matrix** —
+over annotated exons (gene expression) or gene bodies — and exported as AnnData
+for scanpy. Use `agt predict --chromosomes ... --anndata` for whole chromosomes,
+or `alphagenome_pytorch.aggregation` for individual windows. See the
+[per-gene counts guide](docs/full_chromosome_prediction.rst) and
+[aggregation API](docs/api/aggregation.rst).
 
 ## Example Notebooks
 

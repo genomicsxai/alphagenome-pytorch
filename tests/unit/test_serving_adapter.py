@@ -14,6 +14,7 @@ from alphagenome_pytorch.variant_scoring.scorers import CenterMaskScorer
 from alphagenome_pytorch.variant_scoring.types import (
     AggregationType as PTAggregationType,
     OutputType as PTOutputType,
+    TrackMetadata as PTTrackMetadata,
 )
 
 from .serving_fakes import FakeAnndataModule, FakeRuntime, FakeScoringModel
@@ -22,6 +23,72 @@ from .serving_fakes import FakeAnndataModule, FakeRuntime, FakeScoringModel
 @pytest.fixture
 def adapter():
     return LocalDnaModelAdapter(FakeRuntime())
+
+
+def _runtime_with_padding_tracks(num_real: int, num_padding: int) -> FakeRuntime:
+    """Runtime whose DNase head is wider than its real track metadata.
+
+    Mirrors the released checkpoints, where e.g. 89 of the 256 ATAC channels
+    are reserved ``Padding`` tracks. Column ``i`` of the predictions carries
+    the constant ``i`` so track/column alignment is checkable after filtering.
+    """
+    runtime = FakeRuntime()
+    tracks = list(runtime._metadata[0][PTOutputType.DNASE])[:num_real]
+    tracks += [
+        PTTrackMetadata(
+            track_index=num_real + i,
+            track_name='Padding',
+            track_strand='.',
+            output_type=PTOutputType.DNASE,
+        )
+        for i in range(num_padding)
+    ]
+    runtime._metadata[0][PTOutputType.DNASE] = tracks
+
+    num_tracks = len(tracks)
+
+    def predict(sequence, organism=None, **kwargs):
+        del organism, kwargs
+        values = np.zeros((1, len(sequence), num_tracks), dtype=np.float32)
+        for i in range(num_tracks):
+            values[0, :, i] = float(i)
+        return {'dnase': {1: values}}
+
+    runtime.predict = predict
+    return runtime
+
+
+def test_predict_drops_padding_tracks():
+    adapter = LocalDnaModelAdapter(_runtime_with_padding_tracks(num_real=2, num_padding=3))
+    output = adapter.predict_sequence(
+        sequence='A' * SEQUENCE_LENGTH_16KB,
+        requested_outputs={dna_output.OutputType.DNASE},
+        ontology_terms=None,
+    )
+
+    assert output.dnase.metadata['name'].tolist() == ['track_a', 'track_b']
+    assert output.dnase.values.shape == (SEQUENCE_LENGTH_16KB, 2)
+    # Surviving columns keep their original channel values (0 and 1).
+    assert np.allclose(output.dnase.values[0], [0.0, 1.0])
+
+
+def test_output_metadata_drops_padding_tracks():
+    adapter = LocalDnaModelAdapter(_runtime_with_padding_tracks(num_real=2, num_padding=3))
+    metadata = adapter.output_metadata(dna_model_pb2.ORGANISM_HOMO_SAPIENS)
+    assert metadata.dnase['name'].tolist() == ['track_a', 'track_b']
+
+
+def test_predict_keeps_all_padding_head_with_unique_names():
+    """A head with no metadata at all is placeholder-filled, not padding."""
+    adapter = LocalDnaModelAdapter(_runtime_with_padding_tracks(num_real=0, num_padding=3))
+    output = adapter.predict_sequence(
+        sequence='A' * SEQUENCE_LENGTH_16KB,
+        requested_outputs={dna_output.OutputType.DNASE},
+        ontology_terms=None,
+    )
+
+    assert output.dnase.values.shape == (SEQUENCE_LENGTH_16KB, 3)
+    assert output.dnase.metadata['name'].tolist() == ['track_0', 'track_1', 'track_2']
 
 
 @pytest.fixture

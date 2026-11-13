@@ -25,7 +25,16 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--weights", required=True,
                    help="Path to AlphaGenome PyTorch weights file. With --checkpoint, this is the base/pretrained weights path.")
     p.add_argument("--checkpoint", default=None,
-                   help="Optional fine-tuned checkpoint to serve for raw predictions.")
+                   help="Optional fine-tuned checkpoint or bundle URI to serve. "
+                        "Accepts a `.delta.pth`/`.safetensors` file path, a local "
+                        "bundle directory (with alphagenome_adapter.json), or a "
+                        "URI: `local:...`, `file://...`, `hf://org/repo[/subdir][@rev]`.")
+    p.add_argument("--adapter-catalog", default=None,
+                   help="Path to a YAML/JSON catalog file describing multiple "
+                        "adapter bundles to serve over a shared base. Mutually "
+                        "exclusive with --checkpoint. REST `/v1/models` endpoints "
+                        "become available; gRPC requires alphagenome-model-id "
+                        "metadata on every request.")
     p.add_argument("--transfer-config", default=None,
                    help="Optional TransferConfig JSON for older fine-tuned checkpoints.")
     p.add_argument("--no-merge-adapters", action="store_true",

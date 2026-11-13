@@ -1,6 +1,8 @@
 """
 Utility functions for splicing prediction heads.
 """
+from __future__ import annotations
+
 import torch
 
 def _top_k_splice_sites(

@@ -651,3 +651,26 @@ aligned — no manual index tracking needed.
 doesn't change between 1bp and 128bp — only the sequence dimension differs.
 ``NamedOutputHead`` lets you query metadata and filter without choosing a
 resolution first.
+
+API Reference
+-------------
+
+.. autoclass:: alphagenome_pytorch.named_outputs.TrackMetadata
+   :members:
+   :show-inheritance:
+
+.. autoclass:: alphagenome_pytorch.named_outputs.TrackMetadataCatalog
+   :members:
+   :show-inheritance:
+
+.. autoclass:: alphagenome_pytorch.named_outputs.NamedTrackTensor
+   :members:
+   :show-inheritance:
+
+.. autoclass:: alphagenome_pytorch.named_outputs.NamedOutputHead
+   :members:
+   :show-inheritance:
+
+.. autoclass:: alphagenome_pytorch.named_outputs.NamedOutputs
+   :members:
+   :show-inheritance:

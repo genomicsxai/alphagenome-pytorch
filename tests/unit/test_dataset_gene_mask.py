@@ -223,3 +223,37 @@ class TestMultimodalDatasetGeneMask:
         seq, modality_targets, gene_mask = result
         assert set(modality_targets.keys()) == {"atac", "rna_seq"}
         assert gene_mask.shape == (2048, 2, 4)
+
+    def test_return_coords_appends_window_coords(
+        self, fasta_file, bigwig_file, bed_file
+    ):
+        ds = GenomicDataset(
+            genome_fasta=fasta_file, bigwig_files=[bigwig_file],
+            bed_file=bed_file, sequence_length=2048, resolutions=(1,),
+        )
+        multi = MultimodalDataset({"atac": ds}, return_coords=True)
+        result = multi[0]
+        # No gene_mask, so coords are the sole trailing element.
+        assert len(result) == 3
+        seq, modality_targets, coords = result
+        assert "atac" in modality_targets
+        # coords is the window this sample spans, taken from the primary dataset.
+        assert coords == ds._positions_list[0]
+        chrom, start, end = coords
+        assert isinstance(chrom, str) and end - start == 2048
+
+    def test_return_coords_with_gene_mask_orders_mask_then_coords(
+        self, fasta_file, bigwig_file, bed_file, extractor
+    ):
+        rna = GenomicDataset(
+            genome_fasta=fasta_file, bigwig_files=[bigwig_file],
+            bed_file=bed_file, sequence_length=2048, resolutions=(1,),
+            gene_mask_extractor=extractor, g_max=4,
+        )
+        multi = MultimodalDataset({"rna_seq": rna}, return_coords=True)
+        result = multi[0]
+        # gene_mask (Tensor) first, then coords (tuple) — the order collate sniffs.
+        assert len(result) == 4
+        seq, modality_targets, gene_mask, coords = result
+        assert gene_mask.shape == (2048, 2, 4)
+        assert coords == rna._positions_list[0]

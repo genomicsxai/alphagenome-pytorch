@@ -40,7 +40,7 @@ import json
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -97,8 +97,10 @@ class CachedGenome:
         self.chrom_sizes = self._source.chrom_sizes
         self._cache = self._source._cache
 
+        n_chroms = len(self._cache)
         cached_size_mb = sum(arr.nbytes for arr in self._cache.values()) / 1e6
-        print(f"CachedGenome: Loaded {len(self._cache)} chromosomes ({cached_size_mb:.1f} MB)")
+        print(f"CachedGenome: Loaded {n_chroms} "
+              f"chromosome{'s' if n_chroms != 1 else ''} ({cached_size_mb:.1f} MB)")
 
     def fetch(self, chrom: str, start: int, end: int, copy: bool = True) -> np.ndarray:
         """Fetch one-hot encoded sequence for a region.
@@ -551,15 +553,20 @@ class GenomicDataset(Dataset):
             self._positions_list.append((chrom, final_start, final_end))
 
         if n_skipped > 0:
+            was = "was" if n_skipped == 1 else "were"
+            it = "it" if n_skipped == 1 else "they"
             warnings.warn(
-                f"{n_skipped} intervals were skipped because they would exceed "
-                f"chromosome boundaries when expanded to sequence_length={sequence_length}."
+                f"{n_skipped} interval{'s' if n_skipped != 1 else ''} {was} skipped "
+                f"because {it} would exceed chromosome boundaries when expanded to "
+                f"sequence_length={sequence_length}."
             )
 
         if n_truncated > 0:
+            was = "was" if n_truncated == 1 else "were"
             warnings.warn(
-                f"{n_truncated} intervals were larger than sequence_length={sequence_length} "
-                f"and were centered and truncated, which may lose important flanking regions."
+                f"{n_truncated} interval{'s' if n_truncated != 1 else ''} {was} larger "
+                f"than sequence_length={sequence_length} and {was} centered and "
+                f"truncated, which may lose important flanking regions."
             )
 
         self.n_tracks = len(bigwig_files)
@@ -594,7 +601,9 @@ class GenomicDataset(Dataset):
                 sum(arr.nbytes for arr in bw._cache.values())
                 for bw in self._cached_bigwigs
             ) / 1e6
-            print(f"CachedBigWig: Loaded {len(bigwig_files)} files ({cached_size_mb:.1f} MB)")
+            n_files = len(bigwig_files)
+            print(f"CachedBigWig: Loaded {n_files} "
+                  f"file{'s' if n_files != 1 else ''} ({cached_size_mb:.1f} MB)")
         # Note: ThreadPoolExecutor for lazy reads is created lazily in _ensure_handles()
         # to be fork-safe with DataLoader workers
 
@@ -963,9 +972,13 @@ class MultimodalDataset(Dataset):
         >>> # modality_targets = {"atac": {1: tensor, 128: tensor}, "rna_seq": {...}}
     """
 
-    def __init__(self, datasets: dict[str, GenomicDataset]):
+    def __init__(self, datasets: dict[str, GenomicDataset], return_coords: bool = False):
         self.datasets = datasets
         self.modalities = list(datasets.keys())
+        # When True, __getitem__ appends the window's (chrom, start, end) coords
+        # as a trailing tuple element. Used by the gene-expression validation
+        # metric, which needs per-window coordinates to build exon masks.
+        self.return_coords = return_coords
 
         # Verify all datasets have the same length
         lengths = {name: len(ds) for name, ds in datasets.items()}
@@ -1014,23 +1027,40 @@ class MultimodalDataset(Dataset):
                 targets_dict = result[1]
             modality_targets[modality] = targets_dict
 
+        # Optional trailing extras, in a fixed order the collate can sniff by
+        # type: gene_mask (Tensor) then coords (tuple). Both are optional.
+        extras: list = []
         if gene_mask is not None:
-            return sequence, modality_targets, gene_mask
+            extras.append(gene_mask)
+        if self.return_coords:
+            extras.append(self._primary_dataset._positions_list[idx])
+
+        if extras:
+            return (sequence, modality_targets, *extras)
         return sequence, modality_targets
 
 
 def collate_multimodal(
-    batch: list[tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]]]],
-) -> tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]]]:
+    batch: list[tuple],
+) -> tuple:
     """Collate function for MultimodalDataset.
 
     Args:
-        batch: List of (sequence, modality_targets) tuples.
+        batch: List of tuples, each ``(sequence, modality_targets)`` optionally
+            followed by extras — a ``gene_mask`` tensor (training gene-LFC loss)
+            and/or a ``(chrom, start, end)`` coords tuple (gene-expression
+            validation metric). Extras are identified by type, not position.
 
     Returns:
-        Tuple of (sequences, modality_targets) where:
-            - sequences: Stacked sequences (batch, seq_len, 4)
-            - modality_targets: Dict of modality -> {resolution -> (batch, out_len, n_tracks)}
+        ``(sequences, modality_targets)`` when there are no extras, otherwise
+        ``(sequences, modality_targets, extras)`` where ``extras`` is a dict
+        with optional keys:
+            - ``"gene_mask"``: stacked ``(batch, seq_len, 2, g_max)`` bool masks
+            - ``"coords"``: list of per-sample ``(chrom, start, end)`` tuples
+
+        Historically this collate dropped everything past ``item[1]``, silently
+        discarding the gene_mask so the gene-LFC training loss never fired;
+        preserving extras here is what makes that loss (and the val metric) work.
     """
     sequences = torch.stack([item[0] for item in batch])
 
@@ -1045,6 +1075,19 @@ def collate_multimodal(
                 item[1][modality][res] for item in batch
             ])
 
+    # Collate optional trailing extras. Each item carries the same schema, so we
+    # sniff types from the first item: a Tensor is the gene_mask, anything else
+    # (a coords tuple) is coordinates.
+    extras: dict[str, Any] = {}
+    for pos in range(2, len(batch[0])):
+        sample = batch[0][pos]
+        if isinstance(sample, torch.Tensor):
+            extras["gene_mask"] = torch.stack([item[pos] for item in batch])
+        else:
+            extras["coords"] = [tuple(item[pos]) for item in batch]
+
+    if extras:
+        return sequences, modality_targets, extras
     return sequences, modality_targets
 
 

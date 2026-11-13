@@ -7,3 +7,4 @@ API Reference
    model
    layers
    training
+   aggregation

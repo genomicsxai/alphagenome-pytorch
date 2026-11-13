@@ -55,8 +55,15 @@ class TestFinetuningPipeline:
 
     @pytest.mark.parametrize("modality", ["rna_seq", "atac"])
     @pytest.mark.parametrize("sequence_length", [16384, 32768])
-    def test_finetuning_pipeline(self, mock_data_dir, finetuning_model, tmp_path, modality, sequence_length):
-        """Test fine-tuning pipeline runs for 1 epoch successfully."""
+    @pytest.mark.parametrize("organism", [0, 1], ids=["human", "mouse"])
+    def test_finetuning_pipeline(self, mock_data_dir, finetuning_model, tmp_path, modality, sequence_length, organism):
+        """Test fine-tuning pipeline runs for 1 epoch successfully.
+
+        Parametrized over organism so both a human (index 0) and a mouse
+        (index 1) fine-tune run without errors: the trunk forwards at the given
+        organism (selecting its organism embedding) while the single-organism
+        head uses its one slot.
+        """
         # Setup
         model = finetuning_model
         model = remove_all_heads(model)
@@ -147,9 +154,10 @@ class TestFinetuningPipeline:
             positional_weight=5.0,
             epoch=1,
             log_every=1,
+            organism=organism,
         )
 
-        # Verify loss is finite
+        # Verify loss is finite (the org-1/mouse forward must not error or NaN)
         assert torch.isfinite(torch.tensor(train_loss)), f"Loss is not finite: {train_loss}"
 
         # Test checkpoint saving
@@ -175,3 +183,104 @@ class TestFinetuningPipeline:
         # Head state is included in model_state_dict (heads are part of the model)
         assert any(k.startswith(f"heads.{modality}") for k in checkpoint["model_state_dict"])
     
+
+    @pytest.mark.parametrize("organism", [0, 1], ids=["human", "mouse"])
+    def test_finetune_step_runs_for_both_organisms_no_weights(self, mock_data_dir, organism):
+        """A fine-tune epoch runs without errors at organism 0 (human) and 1
+        (mouse), from a randomly-initialised model (no pretrained weights).
+
+        This guards the organism fix end-to-end: the trunk forwards at the given
+        organism (selecting its organism embedding), the single-organism head
+        uses its one slot, and the loss is finite. Mouse (index 1) used to be
+        impossible — the trainer hardcoded organism 0.
+        """
+        torch.manual_seed(0)
+        modality = "atac"
+        cfg = MODALITY_CONFIGS[modality]
+
+        model = AlphaGenome()
+        model = remove_all_heads(model)
+        head = create_finetuning_head(assay_type=modality, n_tracks=2, resolutions=cfg.resolutions)
+        model.heads[modality] = head
+        assert head.num_organisms == 1  # organism-agnostic head
+
+        # Linear-probe: freeze trunk, train the head only.
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in head.parameters():
+            p.requires_grad = True
+
+        device = torch.device("cpu")
+        model = model.to(device)
+
+        dataset = ATACDataset(
+            genome_fasta=str(mock_data_dir / "mock_genome.fa"),
+            bigwig_files=[str(mock_data_dir / f"mock_atac_track{i}.bw") for i in [1, 2]],
+            bed_file=str(mock_data_dir / "mock_positions.bed"),
+            resolutions=cfg.resolutions,
+            sequence_length=16384,
+        )
+        loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_genomic)
+        optimizer = torch.optim.AdamW(list(head.parameters()), lr=1e-4)
+        scheduler = create_lr_scheduler(optimizer, warmup_steps=0, total_steps=len(loader))
+
+        train_loss = train_epoch(
+            model=model,
+            head=head,
+            train_loader=loader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            resolution_weights=cfg.default_resolution_weights,
+            positional_weight=5.0,
+            epoch=1,
+            log_every=1,
+            organism=organism,
+        )
+        assert torch.isfinite(torch.tensor(train_loss)), f"Loss not finite: {train_loss}"
+
+    def test_organism_index_selects_distinct_embeddings(self):
+        """The organism index must actually drive the trunk embedding.
+
+        Forwarding the *same* sequence at organism 0 (human) vs 1 (mouse) must
+        produce *different* embeddings (the organism_embed + per-organism output
+        embedders are selected by the index), while the same organism is
+        deterministic. This is what makes a mouse fine-tune use mouse
+        representations rather than silently reusing the human ones.
+        """
+        torch.manual_seed(0)
+        model = AlphaGenome().eval()
+        x = torch.randn(1, 16384, 4)
+        with torch.no_grad():
+            human = model(x, torch.tensor([0]), return_embeddings=True)
+            mouse = model(x, torch.tensor([1]), return_embeddings=True)
+            human2 = model(x, torch.tensor([0]), return_embeddings=True)
+        for key in ("embeddings_128bp", "embeddings_1bp"):
+            assert torch.allclose(human[key], human2[key]), (
+                f"{key}: same organism (0) should be deterministic"
+            )
+            assert not torch.allclose(human[key], mouse[key]), (
+                f"{key}: human (0) and mouse (1) forwards must differ — the "
+                "organism index is not selecting the organism embedding"
+            )
+
+    def test_real_organism_embeddings_are_distinct(self, finetuning_model):
+        """With real pretrained weights, the trained human and mouse organism
+        embeddings are distinct and a mouse (index 1) forward uses the mouse
+        representation — not the human one. Requires --torch-weights.
+        """
+        model = finetuning_model.eval()
+
+        # Trained organism_embed slots must be genuinely different vectors.
+        oe = model.organism_embed.weight  # (2, dim): row 0 = human, 1 = mouse
+        assert not torch.allclose(oe[0], oe[1])
+
+        torch.manual_seed(0)
+        x = torch.randn(1, 16384, 4)
+        with torch.no_grad():
+            human = model(x, torch.tensor([0]), return_embeddings=True)
+            mouse = model(x, torch.tensor([1]), return_embeddings=True)
+        for key in ("embeddings_128bp", "embeddings_1bp"):
+            assert not torch.allclose(human[key], mouse[key]), (
+                f"{key}: human and mouse forwards must differ with real weights"
+            )

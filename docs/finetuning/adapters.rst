@@ -282,3 +282,10 @@ compatible with vanilla AlphaGenome.
      - The bottleneck contains a nonlinear activation (ReLU) between
        the down- and up-projections, so it cannot be represented as
        a single linear transform.
+
+.. important::
+
+   Merging is one-way: it folds the adapters into the base weights and removes
+   the separate modules. Save or export your adapters (delta checkpoint / delta
+   weights) **before** merging — a merged or ``full`` checkpoint has no adapter
+   parameters left to extract.
