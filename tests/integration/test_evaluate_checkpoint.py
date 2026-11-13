@@ -209,9 +209,9 @@ def test_center_crop_and_sum_pool_metric_views(script_module):
     np.testing.assert_array_equal(pred_views[4], target_views[4])
 
 
-def test_borzoi_window_rejected_for_131kb_predictions(script_module):
+def test_score_window_larger_than_predictions_rejected(script_module):
     values = np.zeros((1, 131_072, 1), dtype=np.float32)
-    with pytest.raises(ValueError, match="cannot be scored over the 196,608-bp"):
+    with pytest.raises(ValueError, match="cover only 131,072 bp"):
         script_module.center_crop_profiles(values, values, 196_608, 1)
 
 
@@ -347,3 +347,64 @@ def test_native_only_requires_native_track_selector(script_module, monkeypatch, 
 
     with pytest.raises(SystemExit, match="--native-biosample or --native-track-index"):
         script_module.main()
+
+
+def test_gene_expression_metrics_match_validation_metric(tmp_path):
+    """--gene-annotation reports the same numbers as --gene-expr-eval."""
+    import pandas as pd
+
+    from alphagenome_pytorch.aggregation import combine_gene_expression, gene_expression_values
+    from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+
+    script = _load_script_module()
+    rows = []
+    for g in range(8):
+        strand = "+" if g % 2 == 0 else "-"
+        start = 10 + 30 * g
+        for feature in ("gene", "exon"):
+            rows.append(dict(
+                Chromosome="chr1", Start=start, End=start + 20, Strand=strand,
+                Feature=feature, gene_id=f"G{g}", gene_name=f"g{g}",
+                gene_type="protein_coding",
+            ))
+    annotation_path = tmp_path / "genes.parquet"
+    pd.DataFrame(rows).to_parquet(annotation_path)
+
+    rng = np.random.default_rng(0)
+    positions = [("chr1", 0, 256)]
+    preds = {1: rng.gamma(1.0, 2.0, size=(1, 256, 4)).astype(np.float32)}
+    targets = {1: (preds[1] * rng.lognormal(0, 0.3, size=preds[1].shape)).astype(np.float32)}
+    strands = script.resolve_track_strands("+-+-", {}, "rna_seq", 4)
+
+    metrics = script.compute_gene_expression_metrics(
+        preds, targets, positions, modality="rna_seq",
+        annotation_path=str(annotation_path), track_strands=strands,
+    )
+
+    annotation = GeneAnnotation(pd.DataFrame(rows))
+    pred, gene_ids, _ = gene_expression_values(
+        torch.from_numpy(preds[1][0]), annotation, positions[0], track_strands=strands,
+    )
+    obs, _, _ = gene_expression_values(
+        torch.from_numpy(targets[1][0]), annotation, positions[0], track_strands=strands,
+    )
+    expected = combine_gene_expression([(gene_ids, pred, obs)], track_strands=strands)
+    assert metrics["rna_seq_gene_log_expr_n_genes"] == expected["n_genes"] == 8
+    for key in ("across_genes", "across_genes_norm", "across_tracks_norm"):
+        assert metrics[f"rna_seq_gene_log_expr_pearson_{key}"] == pytest.approx(expected[key])
+        assert not np.isnan(expected[key])
+
+
+def test_track_strands_fall_back_to_checkpoint_metadata():
+    script = _load_script_module()
+    meta = {"track_metadata": [
+        {"output_name": "rna_seq", "track_index": 1, "strand": "-"},
+        {"output_name": "rna_seq", "track_index": 0, "strand": "+"},
+        {"output_name": "atac", "track_index": 0, "strand": "."},
+    ]}
+    assert script.resolve_track_strands(None, meta, "rna_seq", 2) == ["+", "-"]
+    with pytest.raises(SystemExit):
+        script.resolve_track_strands(None, {}, "rna_seq", 2)
+    with pytest.raises(SystemExit):
+        script.resolve_track_strands("+-+", meta, "rna_seq", 2)
+

@@ -21,6 +21,14 @@ Usage examples:
         --test-bed test.bed --output-dir eval/ --metrics \
         --native-biosample "WTC11"
 
+    # Metrics + gene-expression correlations (RNA-seq checkpoint)
+    python scripts/evaluate_checkpoint.py \
+        --checkpoint best_model.pth \
+        --pretrained-weights model_fold1.pth \
+        --genome GRCh38.fa --bigwig sample_fwd.bw sample_rev.bw \
+        --test-bed test.bed --output-dir eval/ --metrics \
+        --gene-annotation gencode.v46.annotation.parquet --track-strands +-
+
     # Native/pretrained model metrics only
     python scripts/evaluate_checkpoint.py \
         --native-only --metrics \
@@ -509,8 +517,7 @@ def center_crop_profiles(
     if width > available:
         raise ValueError(
             f"Requested {score_window_bp:,} bp scoring window, but predictions "
-            f"cover only {available * source_resolution:,} bp. A 131-kbp model "
-            "cannot be scored over the 196,608-bp Borzoi window without tiling."
+            f"cover only {available * source_resolution:,} bp."
         )
     left = (available - width) // 2
     right = left + width
@@ -733,6 +740,7 @@ def save_summary_json(
     loss: float | None,
     out_path: Path,
     evaluation_info: dict | None = None,
+    gene_expression: dict | None = None,
 ) -> None:
     """Save machine-readable JSON summary."""
     def _clean(m: dict) -> dict:
@@ -758,9 +766,75 @@ def save_summary_json(
         }
     if native_info:
         data["native_track"] = native_info
+    if gene_expression:
+        data["gene_expression"] = gene_expression
 
     with open(out_path, "w") as f:
         json.dump(data, f, indent=2, default=str)
+
+
+def resolve_track_strands(
+    explicit: str | None, ckpt_meta: dict, modality: str, n_tracks: int,
+) -> list[str]:
+    """Strands from --track-strands, else from the checkpoint's track metadata."""
+    if explicit:
+        strands = [c for c in explicit if c not in ", \t"]
+    else:
+        rows = [
+            row for row in ckpt_meta.get("track_metadata") or []
+            if str(row.get("output_name") or row.get("output_type") or "").lower()
+            == modality.lower()
+        ]
+        if not rows or any(row.get("strand") is None for row in rows):
+            sys.exit(
+                "Error: the checkpoint records no track strands; pass --track-strands"
+            )
+        rows.sort(key=lambda row: row.get("track_index", 0))
+        strands = [str(row["strand"]) for row in rows]
+    if len(strands) != n_tracks:
+        sys.exit(f"Error: {len(strands)} track strands for {n_tracks} BigWigs")
+    return strands
+
+
+def compute_gene_expression_metrics(
+    preds: dict[int, np.ndarray],
+    targets: dict[int, np.ndarray],
+    positions: list[tuple[str, int, int]],
+    *,
+    modality: str,
+    annotation_path: str,
+    track_strands: list[str],
+) -> dict:
+    """Gene-expression correlations, computed exactly as --gene-expr-eval does.
+
+    Uses the finest available resolution over each full input window.
+    """
+    from alphagenome_pytorch.extensions.finetuning.training import (
+        _accumulate_gene_expr_windows,
+        _gene_expr_metrics,
+    )
+    from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+
+    annotation = GeneAnnotation(annotation_path)
+    if not annotation.has_exon_annotations():
+        sys.exit(f"Error: --gene-annotation has no exon rows: {annotation_path}")
+    resolution = min(preds)
+    windows: list = []
+    _accumulate_gene_expr_windows(
+        windows,
+        pred_unscaled=torch.from_numpy(np.ascontiguousarray(preds[resolution])),
+        targets=torch.from_numpy(np.ascontiguousarray(targets[resolution])),
+        coords=positions,
+        annotation=annotation,
+        track_strands=track_strands,
+        window_cache={},
+    )
+    metrics = _gene_expr_metrics(
+        windows, modality=modality, track_strands=track_strands,
+    )
+    for key, value in metrics.items():
+        log.info("  %s: %s", key, value)
+    return {"resolution_bp": resolution, **metrics}
 
 
 # =============================================================================
@@ -808,6 +882,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bigwig", nargs="+", help="BigWig signal file(s)")
     p.add_argument("--test-bed", help="Test split BED file")
     p.add_argument("--regions-bed", help="Named regions BED4 file (chrom, start, end, name)")
+    p.add_argument(
+        "--gene-annotation",
+        help=(
+            "GTF/parquet with exon rows. With --metrics on an RNA-seq checkpoint, "
+            "also report the gene-expression correlations that "
+            "`agt finetune --gene-expr-eval` logs during validation."
+        ),
+    )
+    p.add_argument(
+        "--track-strands",
+        help=(
+            "Per-BigWig strands for --gene-annotation, e.g. '+-+-' "
+            "(default: the strands recorded in the checkpoint)."
+        ),
+    )
 
     # Native head comparison
     p.add_argument(
@@ -851,8 +940,7 @@ def parse_args() -> argparse.Namespace:
         "--score-window-bp", type=int, default=None,
         help=(
             "Centered scoring width in bp, applied after full-context inference. "
-            "Use 196608 for the 1-Mbp AlphaGenome/Borzoi comparison; omit for "
-            "native 131-kbp finetuning comparisons."
+            "Omit to score the full input window."
         ),
     )
     p.add_argument("--sequence-length", type=int, default=131072)
@@ -932,6 +1020,8 @@ def main() -> None:
         sys.exit("Error: --metrics requires --test-bed and --bigwig")
     if args.native_only and args.bigwig and len(args.bigwig) != 1:
         sys.exit("Error: --native-only evaluates one native track; pass exactly one --bigwig")
+    if args.gene_annotation and (not run_metrics or args.native_only):
+        sys.exit("Error: --gene-annotation requires --metrics with a finetuned checkpoint")
     if run_regions and (not args.regions_bed or not args.bigwig):
         sys.exit("Error: --regions requires --regions-bed and --bigwig")
     if run_ism and (not args.regions_bed or not args.genome):
@@ -1013,6 +1103,7 @@ def main() -> None:
     native_metric_preds: dict[int, np.ndarray] = {}
     metric_targets: dict[int, np.ndarray] = {}
     loss = None
+    gene_metrics: dict | None = None
 
     if run_metrics:
         log.info("=" * 60)
@@ -1116,6 +1207,15 @@ def main() -> None:
                     p, t, metrics_dir / f"scatter_counts_test_{res}bp.png",
                     title_suffix=f"(test, {res}bp)",
                 )
+
+        if args.gene_annotation:
+            gene_metrics = compute_gene_expression_metrics(
+                ft_preds, targets, positions, modality=modality,
+                annotation_path=args.gene_annotation,
+                track_strands=resolve_track_strands(
+                    args.track_strands, ckpt_meta, modality, len(args.bigwig),
+                ),
+            )
 
         # Native evaluation on same data
         if native_model is not None:
@@ -1357,6 +1457,7 @@ def main() -> None:
         },
         native_info, loss,
         out_dir / "summary.json",
+        gene_expression=gene_metrics,
         evaluation_info={
             "test_bed": args.test_bed,
             "sequence_length_bp": args.sequence_length,

@@ -776,6 +776,12 @@ def main(args: argparse.Namespace | None = None) -> None:
                 f"GTF/parquet that includes exon features."
             )
         gene_expr_track_strands = list(args.modality_strands["rna_seq"])
+        # The metric merges each '+' track with its '-' partner (by order).
+        if gene_expr_track_strands.count("+") != gene_expr_track_strands.count("-"):
+            raise ValueError(
+                "--gene-expr-eval needs RNA-seq tracks in +/- pairs, got strands "
+                f"{''.join(gene_expr_track_strands)}"
+            )
         val_dataset.return_coords = True
 
     # Optional rich track metadata (overrides BigWig stems with parquet names
