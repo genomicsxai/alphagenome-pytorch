@@ -643,13 +643,16 @@ def _gene_expr_metrics(
     *,
     modality: str,
     world_size: int = 1,
+    track_strands: list[str] | None = None,
 ) -> dict[str, float]:
     """Reduce accumulated per-window ``(gene_ids, pred, obs)`` to gene-expression correlations.
 
     Gathers windows across ranks (DDP), deduplicates genes, and returns the three
     correlation flavors plus the gene count under ``{modality}_gene_log_expr_*``
-    keys. Pure given ``gene_expr_windows`` (the ``world_size == 1`` path needs no
-    distributed context), so it is unit-testable without a model.
+    keys. ``track_strands`` must be the strands the windows were matched with, so
+    ``+``/``-`` track pairs are merged before correlating. Pure given
+    ``gene_expr_windows`` (the ``world_size == 1`` path needs no distributed
+    context), so it is unit-testable without a model.
     """
     from alphagenome_pytorch.aggregation import combine_gene_expression
 
@@ -659,7 +662,7 @@ def _gene_expr_metrics(
         dist.all_gather_object(gathered, gene_expr_windows)
         all_windows = [w for part in gathered if part for w in part]
 
-    ge = combine_gene_expression(all_windows)
+    ge = combine_gene_expression(all_windows, track_strands=track_strands)
     prefix = f"{modality}_gene_log_expr_pearson"
     return {
         f"{prefix}_across_genes": ge["across_genes"],
@@ -1871,6 +1874,7 @@ def validate_multihead(
     if gene_expr_enabled:
         metrics.update(_gene_expr_metrics(
             gene_expr_windows, modality=gene_expr_modality, world_size=world_size,
+            track_strands=gene_expr_track_strands,
         ))
 
     return avg_loss, metrics

@@ -390,9 +390,13 @@ Other useful pieces:
   primitive, for arbitrary interval masks. Pure tensor, no pandas/anndata import.
 - `GeneCountAccumulator` — stream tiles and keep a running `[gene, track]` matrix,
   so a gene spanning tiles is summed once.
-- `gene_expression_correlations(pred, obs)` — the three correlation flavors
-  (`across_genes`, `across_genes_norm`, `across_tracks_norm`) that
-  `agt finetune --gene-expr-eval` reports each validation epoch.
+- `gene_expression_correlations(pred, obs, track_strands=...)` — the three
+  correlation flavors (`across_genes`, `across_genes_norm`, `across_tracks_norm`)
+  that `agt finetune --gene-expr-eval` reports each validation epoch, and
+  `scripts/evaluate_checkpoint.py --gene-annotation` reports on a test set. For
+  strand-matched stranded tracks, pass `track_strands` so each `+`/`-` pair is
+  merged into one sense column (`collapse_strand_pairs`); the normalized
+  flavors use only genes with a complete row.
 
 Three things that bite:
 

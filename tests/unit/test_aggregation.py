@@ -20,7 +20,9 @@ from alphagenome_pytorch.aggregation import (
     GeneCounts,
     aggregate_genes,
     aggregate_intervals,
+    collapse_strand_pairs,
     combine_gene_expression,
+    _gene_expression_correlation_arrays,
     gene_expression,
     gene_expression_correlations,
     gene_expression_values,
@@ -149,6 +151,63 @@ def test_gene_expression_correlations_handles_nan():
     pred[0, 1] = float("nan")  # strand-incompatible cell
     d = gene_expression_correlations(pred, truth)
     assert not math.isnan(d["across_genes"])
+
+
+def test_collapse_strand_pairs_keeps_sense_value_per_pair():
+    nan = float("nan")
+    values = torch.tensor([
+        [1.0, nan, 2.0, nan, 9.0],   # '+' gene
+        [nan, 3.0, nan, 4.0, 8.0],   # '-' gene
+    ])
+    out = collapse_strand_pairs(values, ["+", "-", "+", "-", "."])
+    torch.testing.assert_close(out, torch.tensor([[1.0, 2.0, 9.0], [3.0, 4.0, 8.0]]))
+    # Blocked layout (all '+' then all '-') pairs by order the same way.
+    blocked = values[:, [0, 2, 1, 3, 4]]
+    torch.testing.assert_close(
+        collapse_strand_pairs(blocked, ["+", "+", "-", "-", "."]), out,
+    )
+    with pytest.raises(ValueError, match="cannot pair"):
+        collapse_strand_pairs(values[:, :3], ["+", "-", "+"])
+
+
+def test_stranded_correlations_are_not_inflated_by_missing_cells():
+    """Off-strand NaN cells must not be filled: that fakes a shared pattern."""
+    torch.manual_seed(4)
+    genes, samples = 40, 4
+    pred = torch.randn(genes, samples)
+    obs = torch.randn(genes, samples)   # unrelated -> normalized r near 0
+    stranded_pred = torch.full((genes, 2 * samples), float("nan"))
+    stranded_obs = stranded_pred.clone()
+    for g in range(genes):
+        off = g % 2
+        stranded_pred[g, off::2] = pred[g]
+        stranded_obs[g, off::2] = obs[g]
+    strands = ["+", "-"] * samples
+
+    dense = gene_expression_correlations(pred, obs)
+    collapsed = gene_expression_correlations(
+        stranded_pred, stranded_obs, track_strands=strands,
+    )
+    for key in dense:
+        assert collapsed[key] == pytest.approx(dense[key], abs=1e-6)
+    assert abs(collapsed["across_tracks_norm"]) < 0.3
+    # Without strands there is no complete gene: undefined, not inflated.
+    unpaired = gene_expression_correlations(stranded_pred, stranded_obs)
+    assert math.isnan(unpaired["across_genes_norm"])
+    assert math.isnan(unpaired["across_tracks_norm"])
+
+
+def test_constant_genes_are_undefined_not_zero():
+    torch.manual_seed(5)
+    obs = torch.rand(10, 4) + 1.0   # positive, so a zero gene ranks lowest
+    pred = obs + 0.01 * torch.randn(10, 4)
+    arrays = _gene_expression_correlation_arrays(pred, obs)
+    assert (arrays["across_tracks_norm"] > 0.9).all()
+    pred[0] = 0.0
+    obs[0] = 0.0                       # e.g. an unexpressed gene
+    arrays = _gene_expression_correlation_arrays(pred, obs)
+    assert math.isnan(arrays["across_tracks_norm"][0])
+    assert (arrays["across_tracks_norm"][1:] > 0.9).all()
 
 
 # --------------------------------------------------------------------------- #
