@@ -58,6 +58,7 @@ class ConvBlock(nn.Module):
         self.kernel_size = kernel_size
 
         self.norm = layers.RMSBatchNorm(in_channels)
+        self.activation = layers.QuickGELU()
 
         if kernel_size == 1:
             # Use Conv1d(k=1) instead of Linear - same math, native NCL
@@ -67,7 +68,7 @@ class ConvBlock(nn.Module):
 
     def forward(self, x):
         # x: (B, C, S) - NCL format, no transposes needed
-        return self.conv(layers.gelu(self.norm(x)))
+        return self.conv(self.activation(self.norm(x)))
 
 class DnaEmbedder(nn.Module):
     """Embeds one-hot DNA to feature space. Expects NCL format (B, 4, S)."""

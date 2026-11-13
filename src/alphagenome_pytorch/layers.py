@@ -2,14 +2,56 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-def gelu(x):
-    """GELU using JAX's custom approximation: sigmoid(1.702 * x) * x
+class QuickGELU(nn.Module):
+    """GELU using sigmoid-gated approximation."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        coef = torch.tensor(1.702, dtype=x.dtype, device=x.device)
+        return torch.sigmoid(coef * x) * x
 
-    Matches JAX: alphagenome_research.model.layers.gelu
-    JAX explicitly converts coefficient to match input dtype.
+class Log1p(nn.Module):
+    """Hookable torch.log1p wrapper."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.log1p(x)
+
+class UndoSoftClip(nn.Module):
+    """Hookable inverse of soft clipping used when unscaling genomic track predictions."""
+    def __init__(self, soft_clip_value: float):
+        super().__init__()
+        self.soft_clip_value = soft_clip_value
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.where(
+            x > self.soft_clip_value,
+            (x + self.soft_clip_value) ** 2 / (4 * self.soft_clip_value),
+            x,
+        )
+
+class UndoSquashing(nn.Module):
+    """Undo the power-law squashing used for RNA-seq targets."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.pow(x, 1.0 / 0.75)
+
+# Similar to tangermeme.deep_lift_shap.BilinearOp; defined locally to avoid
+# making tangermeme a required dependency.
+class BilinearOp(nn.Module):
+    """Bilinear contraction of two tensors.
+
+    Args:
+        equation:
+            If None, computes ``torch.matmul(left, right)``.
+            If a string, uses it as the equation in ``torch.einsum(equation, left, right)``.
+
+    The operands are used exactly as passed; any transpose, reshape, cast,
+    or scaling should happen outside this module.
     """
-    coef = torch.tensor(1.702, dtype=x.dtype, device=x.device)
-    return torch.sigmoid(coef * x) * x
+    def __init__(self, equation: str | None = None):
+        super().__init__()
+        self.equation = equation
+
+    def forward(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        if self.equation is None:
+            return torch.matmul(left, right)
+        return torch.einsum(self.equation, left, right)
 
 class Pool1d(nn.Module):
     """1D pooling with SAME padding. Expects NCL input (B, C, S).
@@ -22,6 +64,12 @@ class Pool1d(nn.Module):
         self.kernel_size = kernel_size
         self.stride = stride if stride is not None else kernel_size
         self.method = method
+        if self.method == 'max':
+            self.pool = nn.MaxPool1d(kernel_size=self.kernel_size, stride=self.stride)
+        elif self.method in ['avg', 'mean']:
+            self.pool = nn.AvgPool1d(kernel_size=self.kernel_size, stride=self.stride)
+        else:
+            self.pool = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, S) - NCL format, no transpose needed
@@ -34,12 +82,9 @@ class Pool1d(nn.Module):
         if pad_total > 0:
             x = F.pad(x, (pad_left, pad_right))
 
-        if self.method == 'max':
-            return F.max_pool1d(x, kernel_size=self.kernel_size, stride=self.stride)
-        elif self.method in ['avg', 'mean']:
-            return F.avg_pool1d(x, kernel_size=self.kernel_size, stride=self.stride)
-        else:
+        if self.pool is None:
             raise NotImplementedError(f"Pooling method {self.method} not implemented")
+        return self.pool(x)
 
 class RMSBatchNorm(nn.Module):
     """RMS Batch Normalization supporting both channels-first and channels-last formats.
@@ -87,8 +132,16 @@ class LayerNorm(nn.Module):
 
     Matches JAX: alphagenome_research.model.layers.LayerNorm
     JAX computes variance in float32 for numerical stability, then casts back.
+    Here, we compute the entire normalization in float32 to use standard
+    DeepLIFT rules, then cast back to the input dtype before applying weight
+    and bias.
     """
-    def __init__(self, normalized_shape, eps: float = 1e-5, elementwise_affine: bool = True, rms_norm: bool = False):
+    def __init__(
+        self,
+        normalized_shape, eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        rms_norm: bool = False
+    ):
         super().__init__()
         if isinstance(normalized_shape, int):
             normalized_shape = (normalized_shape,)
@@ -96,6 +149,15 @@ class LayerNorm(nn.Module):
         self.eps = eps
         self.elementwise_affine = elementwise_affine
         self.rms_norm = rms_norm
+
+        if self.rms_norm:
+            # RMSNorm: x / sqrt(mean(x^2) + eps)
+            self.norm = nn.RMSNorm(self.normalized_shape, eps=self.eps, elementwise_affine=False)
+        else:
+            # Standard LayerNorm with centering
+            self.norm = nn.LayerNorm(
+                self.normalized_shape, eps=self.eps, elementwise_affine=False, bias=False
+            )
 
         if self.elementwise_affine:
             self.weight = nn.Parameter(torch.ones(self.normalized_shape))
@@ -106,22 +168,7 @@ class LayerNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_dtype = x.dtype
-        dims = tuple(range(x.ndim - len(self.normalized_shape), x.ndim))
-
-        if self.rms_norm:
-            # RMSNorm: x / sqrt(mean(x^2) + eps)
-            # JAX computes variance in float32 for stability
-            variance = torch.mean(x.float() ** 2, dim=dims, keepdim=True)
-            inv = torch.rsqrt(variance + self.eps).to(input_dtype)
-            x_norm = x * inv
-        else:
-            # Standard LayerNorm with centering
-            # JAX: mean and variance both computed in float32
-            mean = torch.mean(x.float(), dim=dims, keepdim=True)
-            x_centered = x - mean.to(input_dtype)
-            variance = torch.mean(x_centered.float() ** 2, dim=dims, keepdim=True)
-            inv = torch.rsqrt(variance + self.eps).to(input_dtype)
-            x_norm = x_centered * inv
+        x_norm = self.norm(x.float()).to(input_dtype)
 
         if self.elementwise_affine:
             return x_norm * self.weight + self.bias

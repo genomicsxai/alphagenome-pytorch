@@ -70,7 +70,6 @@ class SequenceEncoder(nn.Module):
         super().__init__()
         self.gradient_checkpointing = False
         self.dna_embedder = convolutions.DnaEmbedder()
-        self.pool = layers.Pool1d(kernel_size=2)
 
         self.down_blocks = nn.ModuleList()
         in_channels = 768  # Initial output from embedder
@@ -81,6 +80,10 @@ class SequenceEncoder(nn.Module):
             self.down_blocks.append(convolutions.DownResBlock(in_channels))
             in_channels += 128
 
+        self.pools = nn.ModuleList(
+            [layers.Pool1d(kernel_size=2) for _ in range(len(self.bin_sizes) + 1)]
+        )
+
     def forward(self, x):
         # x input: (B, S, 4) from user - NLC format
         x = x.transpose(1, 2)  # → (B, 4, S) NCL format
@@ -88,7 +91,7 @@ class SequenceEncoder(nn.Module):
         intermediates = {}
         x = self.dna_embedder(x)
         intermediates['bin_size_1'] = x
-        x = self.pool(x)
+        x = self.pools[0](x)
 
         for i, block in enumerate(self.down_blocks):
             if self.gradient_checkpointing and torch.is_grad_enabled():
@@ -97,7 +100,7 @@ class SequenceEncoder(nn.Module):
                 x = block(x)
             bin_size = self.bin_sizes[i]
             intermediates[f'bin_size_{bin_size}'] = x
-            x = self.pool(x)
+            x = self.pools[i + 1](x)
 
         # x: (B, 1536, 1024), intermediates: all NCL
         return x, intermediates

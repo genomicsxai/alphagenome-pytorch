@@ -557,7 +557,7 @@ variance = torch.mean(x ** 2, dim=..., keepdim=True)  # Uses input dtype
 **Impact**: Small floating-point differences in RoPE frequencies
 
 #### 6.5 GELU Approximation
-**Location**: `layers.py:gelu`
+**Location**: `layers.py:QuickGELU`
 **Issue**: Both use sigmoid approximation, but dtype handling may differ
 ```python
 # JAX:
@@ -578,7 +578,7 @@ return layers.gelu(layers.RMSBatchNorm()(x) + organism_embedding)
 ```python
 out = self.norm(x_proj)
 out = out + emb.unsqueeze(1)
-out = layers.gelu(out)
+out = self.activation(out)
 ```
 **Status**: Should be equivalent, verify norm placement
 
