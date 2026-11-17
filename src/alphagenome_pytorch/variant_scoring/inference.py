@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from .annotations import GeneAnnotation
+from ..annotations import GeneAnnotation
 from .scorers.base import BaseVariantScorer
 from .sequence import FastaExtractor, apply_variant_to_sequence, sequence_to_onehot
 from .types import Interval, OutputType, TrackMetadata, Variant, VariantScore, tidy_scores
@@ -137,7 +137,7 @@ class VariantScoringModel:
         # Initialize polyA annotation if path provided
         self._polya_annotation: 'PolyAAnnotation | None' = None
         if polya_path is not None:
-            from .annotations import PolyAAnnotation
+            from ..annotations import PolyAAnnotation
             self._polya_annotation = PolyAAnnotation(polya_path)
 
         # Track metadata for tidy_scores output
