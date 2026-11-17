@@ -24,7 +24,9 @@ import torch.distributed as dist
 from tqdm import tqdm
 
 from alphagenome_pytorch import losses
-from alphagenome_pytorch.losses import multinomial_loss
+from alphagenome_pytorch.losses import DEFAULT_NUM_SEGMENTS as NUM_SEGMENTS
+from alphagenome_pytorch.losses import _compute_multinomial_resolution, multinomial_loss
+
 # Re-exported so existing `from ...training import ModalityConfig, MODALITY_CONFIGS`
 # imports keep working; the definitions now live in the dependency-light
 # `modalities` module the flag layer reads.
@@ -32,10 +34,6 @@ from alphagenome_pytorch.extensions.finetuning.modalities import (
     ModalityConfig,
     MODALITY_CONFIGS,
 )
-
-# Number of segments for multinomial loss computation.
-# AlphaGenome divides sequences into 8 equal segments for numerical stability.
-NUM_SEGMENTS = 8
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -670,29 +668,6 @@ def _gene_expr_metrics(
         f"{prefix}_across_tracks_norm": ge["across_tracks_norm"],
         f"{modality}_gene_log_expr_n_genes": ge["n_genes"],
     }
-
-
-def _compute_multinomial_resolution(
-    seq_len: int,
-    num_segments: int = NUM_SEGMENTS,
-    min_segment_size: int | None = None,
-) -> int:
-    """Compute positions per segment for multinomial loss.
-
-    Args:
-        seq_len: Total sequence length (number of positions).
-        num_segments: Target number of segments.
-        min_segment_size: Minimum positions per segment (optional).
-
-    Returns:
-        Resolution (positions per segment).
-    """
-    resolution = max(1, seq_len // num_segments)
-
-    if min_segment_size is not None:
-        resolution = max(resolution, min_segment_size)
-
-    return resolution
 
 
 def train_epoch_ddp(

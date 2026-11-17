@@ -97,13 +97,9 @@ class AlphaGenomeLoss(nn.Module):
     2. Call model with `return_scaled_predictions=True` during training
     3. Pass `organism_index` to the forward method
 
-    Aggregation: the total loss is `sum(head_weight * head_loss) / num_heads`,
-    where the divisor is the *count* of heads that produced a loss this step
-    (not the sum of weights). A weight of 0.2 therefore down-weights that
-    head's contribution by exactly 0.2× relative to a weight-1.0 head with
-    the same residual, matching upstream JAX `HeadConfig.loss_weight` semantics.
-    A head with outputs at several resolutions (`{1: ..., 128: ...}`) gets the
-    sum of its per-resolution losses, as in upstream `GenomeTracksHead.loss`.
+    The total loss is `sum(head_weight * head_loss)`, as in upstream and
+    `agt finetune`. Each track head contributes the sum of its per-resolution
+    losses.
 
     Args:
         model: AlphaGenome model instance. Required to access head modules for target scaling.
@@ -114,15 +110,17 @@ class AlphaGenomeLoss(nn.Module):
             heads it names and leaves the rest at their upstream defaults
             (1.0 for count and splice-site heads, 0.2 for splice junctions).
             Pass `None` to use the defaults unchanged.
-        multinomial_resolution: Segment size, in bins of the output, used to divide
-            the sequence for multinomial loss. If None (default), uses
-            `2**17 // resolution` for each resolution as upstream, i.e. 131,072 bp
-            segments at both 1bp and 128bp (capped at the sequence length for
-            shorter inputs). Tensor outputs without a resolution key retain
-            the 128-bin default. An int applies to every head and resolution; a
-            dict maps resolution to segment size.
+        multinomial_resolution: An int sets the segment size in output bins for
+            every head and resolution. A dict sets the size per resolution.
+            With None (default), keyed outputs derive their segment size from the
+            output length and fine-tuning settings. Plain tensors retain the
+            128-bin default.
         positional_weight: Weight for positional component of multinomial loss.
             JAX production uses 5.0 (default), matching Borzoi.
+        num_segments: Target number of segments for resolution-keyed outputs
+            when no segment size is supplied. Defaults to eight, as in `agt finetune`.
+        min_segment_size: Optional minimum segment size in output bins for
+            resolution-keyed outputs, capped at the output length.
     """
 
     def __init__(
@@ -135,6 +133,9 @@ class AlphaGenomeLoss(nn.Module):
         gene_loss_weights: Optional[Dict[str, float]] = None,
         gene_cross_track_weight: float = 5.0,
         track_strands: Optional[Dict[str, Sequence[str]]] = None,
+        *,
+        num_segments: int = losses.DEFAULT_NUM_SEGMENTS,
+        min_segment_size: Optional[int] = None,
     ):
         super().__init__()
         self.model = model
@@ -146,6 +147,8 @@ class AlphaGenomeLoss(nn.Module):
         self.head_weights = {**DEFAULT_HEAD_WEIGHTS, **(head_weights or {})}
         self.multinomial_resolution = multinomial_resolution
         self.positional_weight = positional_weight
+        self.num_segments = num_segments
+        self.min_segment_size = min_segment_size
 
         # Gene LFC loss config (B3.2 / Decima-style).
         # `gene_loss_weights[head]` is the OUTER multiplier on the head's gene
@@ -174,7 +177,9 @@ class AlphaGenomeLoss(nn.Module):
             return self.multinomial_resolution
         if resolution is None:
             return 128
-        return min(2**17 // resolution, seq_len)
+        return losses._compute_multinomial_resolution(
+            seq_len, self.num_segments, self.min_segment_size,
+        )
 
     def _get_strand_channel_mask(self, head: str) -> Optional[torch.Tensor]:
         """Return the `[2, 1, C]` strand-channel mask for a head, or None."""
@@ -205,7 +210,6 @@ class AlphaGenomeLoss(nn.Module):
         masks = masks or {}
         head_losses = {}
         total_loss = torch.tensor(0.0, device=self._get_device(outputs))
-        num_heads = 0
 
         for head in self.heads:
             if head not in outputs:
@@ -226,11 +230,6 @@ class AlphaGenomeLoss(nn.Module):
 
             head_losses[f'{head}_loss'] = head_loss
             total_loss = total_loss + self.head_weights.get(head, 1.0) * head_loss
-            num_heads += 1
-
-        # Average across heads
-        if num_heads > 0:
-            total_loss = total_loss / num_heads
 
         head_losses['loss'] = total_loss
         return head_losses

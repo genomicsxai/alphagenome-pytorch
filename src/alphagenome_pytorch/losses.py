@@ -11,6 +11,29 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
+DEFAULT_NUM_SEGMENTS = 8
+
+
+def _compute_multinomial_resolution(
+    seq_len: int,
+    num_segments: int = DEFAULT_NUM_SEGMENTS,
+    min_segment_size: Optional[int] = None,
+) -> int:
+    """Derive the number of output bins per equal segment."""
+    if seq_len < 1 or num_segments < 1:
+        raise ValueError("seq_len and num_segments must be positive.")
+
+    segment_size = min(seq_len, max(1, seq_len // num_segments, min_segment_size or 1))
+    if seq_len % segment_size == 0:
+        return segment_size
+
+    # Use fewer equal segments when the requested size leaves a remainder.
+    segments = seq_len // segment_size
+    while seq_len % segments:
+        segments -= 1
+    return seq_len // segments
+
+
 def _safe_masked_mean(
     x: Tensor,
     mask: Optional[Tensor] = None,

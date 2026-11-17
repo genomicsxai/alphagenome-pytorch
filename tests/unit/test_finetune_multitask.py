@@ -54,6 +54,11 @@ class TestComputeMultinomialResolution:
         assert _compute_multinomial_resolution(64, min_segment_size=16) == 16
         assert _compute_multinomial_resolution(256, min_segment_size=16) == 32
 
+    def test_segments_fit_context_length(self):
+        assert _compute_multinomial_resolution(35) == 5
+        assert _compute_multinomial_resolution(64, min_segment_size=17) == 32
+        assert _compute_multinomial_resolution(4, min_segment_size=8) == 4
+
     def test_small_sequence(self):
         assert _compute_multinomial_resolution(8) == 1
         assert _compute_multinomial_resolution(4) == 1
