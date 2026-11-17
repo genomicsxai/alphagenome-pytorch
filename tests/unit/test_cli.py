@@ -1583,3 +1583,134 @@ class TestApplyTrainingStrands:
         from alphagenome_pytorch.cli.predict import _strands_from_checkpoint
         rows = self._fn()(None, {"h": ["+", "-", "+"]}, {"h": ["a", "b", "c"]}, "human")
         assert _strands_from_checkpoint(rows, "h") == ["+", "-", "+"]
+
+
+class TestScaleBigwigTogether:
+    """--together scales a stranded pair so the pair sums to --target."""
+
+    @staticmethod
+    def _write_bw(path, values):
+        pyBigWig = pytest.importorskip("pyBigWig")
+        bw = pyBigWig.open(str(path), "w")
+        bw.addHeader([("chr1", len(values))])
+        bw.addEntries("chr1", 0, values=[float(v) for v in values], span=1, step=1)
+        bw.close()
+
+    @staticmethod
+    def _total(path, *, absolute=False):
+        from alphagenome_pytorch.extensions.finetuning.signal_scaling import bigwig_total_signal
+        return bigwig_total_signal(str(path), absolute=absolute)
+
+    def _run(self, tmp_path, *extra):
+        from alphagenome_pytorch.cli import preprocess as pre_cli
+
+        plus, minus = tmp_path / "plus.bw", tmp_path / "minus.bw"
+        self._write_bw(plus, [3.0] * 10)   # total 30
+        self._write_bw(minus, [1.0] * 10)  # total 10
+        out = tmp_path / "out"
+        args = build_parser().parse_args([
+            "preprocess", "scale-bigwig", "--input", str(plus), str(minus),
+            "--output", str(out), "--target", "100", *extra,
+        ])
+        assert pre_cli.run(args) == 0
+        return out / "plus.bw", out / "minus.bw"
+
+    def test_default_scales_each_file(self, tmp_path):
+        plus, minus = self._run(tmp_path)
+        assert self._total(plus) == pytest.approx(100.0)
+        assert self._total(minus) == pytest.approx(100.0)
+
+    def test_together_shares_one_factor(self, tmp_path):
+        plus, minus = self._run(tmp_path, "--together")
+        assert self._total(plus) + self._total(minus) == pytest.approx(100.0)
+        # The +/- ratio is preserved.
+        assert self._total(plus) == pytest.approx(75.0)
+        assert self._total(minus) == pytest.approx(25.0)
+
+    def test_keeps_gaps_and_runs(self, tmp_path):
+        """Scaling works on intervals: gaps stay gaps, runs stay runs."""
+        pyBigWig = pytest.importorskip("pyBigWig")
+        from alphagenome_pytorch.cli import preprocess as pre_cli
+
+        src = tmp_path / "sparse.bw"
+        bw = pyBigWig.open(str(src), "w")
+        bw.addHeader([("chr1", 1_000_000), ("chr2", 500)])  # chr2 has no data
+        bw.addEntries(["chr1", "chr1"], [100, 900_000], ends=[200, 900_300],
+                      values=[2.0, 0.5])  # total 100*2 + 300*0.5 = 350
+        bw.close()
+
+        out = tmp_path / "scaled.bw"
+        args = build_parser().parse_args([
+            "preprocess", "scale-bigwig", "--input", str(src),
+            "--output", str(out), "--target", "700",
+        ])
+        assert pre_cli.run(args) == 0
+
+        with pyBigWig.open(str(out)) as bw:
+            assert bw.chroms() == {"chr1": 1_000_000, "chr2": 500}
+            assert bw.intervals("chr1") == ((100, 200, 4.0), (900_000, 900_300, 1.0))
+            assert not bw.intervals("chr2")
+        assert self._total(out) == pytest.approx(700.0)
+
+    def test_together_uses_magnitudes_of_negative_strand(self, tmp_path):
+        """Minus-strand files often store negative values (ENCODE, deepTools)."""
+        from alphagenome_pytorch.cli import preprocess as pre_cli
+
+        plus, minus = tmp_path / "plus.bw", tmp_path / "minus.bw"
+        self._write_bw(plus, [3.0] * 10)    # |total| 30
+        self._write_bw(minus, [-1.0] * 10)  # |total| 10
+        out = tmp_path / "out"
+        args = build_parser().parse_args([
+            "preprocess", "scale-bigwig", "--input", str(plus), str(minus),
+            "--output", str(out), "--target", "100", "--together",
+        ])
+        assert pre_cli.run(args) == 0
+        assert self._total(out / "plus.bw") == pytest.approx(75.0)
+        assert self._total(out / "minus.bw") == pytest.approx(-25.0)
+        # Sign is kept.
+        import pyBigWig
+        with pyBigWig.open(str(out / "minus.bw")) as bw:
+            assert bw.header()["maxVal"] <= 0
+
+    def test_dense_window_path(self, tmp_path):
+        """Windows where most bases differ take the fixed-step write path."""
+        pyBigWig = pytest.importorskip("pyBigWig")
+        from alphagenome_pytorch.cli import preprocess as pre_cli
+
+        values = [1.0, 2.0] * 50  # every base differs from its neighbour
+        src = tmp_path / "dense.bw"
+        self._write_bw(src, values)
+        out = tmp_path / "scaled.bw"
+        args = build_parser().parse_args([
+            "preprocess", "scale-bigwig", "--input", str(src),
+            "--output", str(out), "--target", "300",  # total 150 -> x2
+        ])
+        assert pre_cli.run(args) == 0
+        with pyBigWig.open(str(out)) as bw:
+            assert bw.values("chr1", 0, 100) == [2 * v for v in values]
+
+    def test_default_still_uses_signed_sum(self, tmp_path):
+        from alphagenome_pytorch.cli import preprocess as pre_cli
+
+        src, out = tmp_path / "signed.bw", tmp_path / "out.bw"
+        self._write_bw(src, [3.0, -1.0])
+        args = build_parser().parse_args([
+            "preprocess", "scale-bigwig", "--input", str(src),
+            "--output", str(out), "--target", "100",
+        ])
+        assert pre_cli.run(args) == 0
+        assert self._total(out) == pytest.approx(100.0)
+        assert self._total(out, absolute=True) == pytest.approx(200.0)
+
+    def test_together_rejects_zero_combined_total(self, tmp_path):
+        from alphagenome_pytorch.cli import preprocess as pre_cli
+
+        src, out = tmp_path / "zero.bw", tmp_path / "out.bw"
+        self._write_bw(src, [0.0, 0.0])
+        args = build_parser().parse_args([
+            "preprocess", "scale-bigwig", "--input", str(src),
+            "--output", str(out), "--target", "100", "--together",
+        ])
+        with pytest.raises(ValueError, match="positive combined input total"):
+            pre_cli.run(args)
+        assert not out.exists()

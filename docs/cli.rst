@@ -753,6 +753,49 @@ JSON output:
 
 ``--dry-run`` returns the same JSON but skips writing output files.
 
+By default each file is scaled using its own signed sum. Add
+``--together`` to scale all inputs by one factor based on their combined
+absolute signal. The output preserves each file's sign and its share of
+the total. For example, strand totals of 30M and 10M become 75M and 25M
+with ``--target 100M --together``. In JSON output, ``target_total`` is
+each file's share when using ``--together``.
+
+The table gives the corresponding options for the
+`AlphaGenome preprocessing conventions <https://storage.googleapis.com/deepmind-media/papers/alphagenome.pdf>`_.
+The offline command scales the files you pass it. Leave ChIP fold-change
+tracks out of the input list to preserve their units.
+
+.. list-table::
+   :header-rows: 1
+
+   * - Assay
+     - Normalization
+     - Command
+   * - RNA-seq, stranded
+     - The ``+``/``-`` pair sums to 100M (1M reads x 100 bp).
+     - ``--together``, one run per pair
+   * - RNA-seq, unstranded
+     - The file sums to 100M.
+     - Default
+   * - CAGE, PRO-cap
+     - Each strand sums to 100M.
+     - Default
+   * - ATAC, DNase
+     - Each track sums to 100M, after averaging replicates.
+     - Default, after averaging
+   * - ChIP-seq
+     - Fold change over control.
+     - Omit these files
+
+.. code-block:: bash
+
+   # Stranded RNA-seq: the pair sums to 100M
+   agt preprocess scale-bigwig \
+       --input sample_plus.bw sample_minus.bw \
+       --output scaled/ \
+       --target 100M \
+       --together
+
 
 ``agt serve``
 -------------

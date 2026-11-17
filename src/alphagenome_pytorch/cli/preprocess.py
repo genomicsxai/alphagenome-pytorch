@@ -8,12 +8,17 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
-import re
 import sys
+import tempfile
 from pathlib import Path
 
 from alphagenome_pytorch.cli._deps import require_extra
 from alphagenome_pytorch.cli._output import emit_json, emit_text
+from alphagenome_pytorch.extensions.finetuning.signal_scaling import (
+    bigwig_total_signal,
+    iter_bigwig_windows,
+    parse_target,
+)
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -50,22 +55,10 @@ def register(subparsers: argparse._SubParsersAction) -> None:
                      help="Target total signal (e.g. 100M, 50k)")
     sb.add_argument("--dry-run", action="store_true",
                      help="Compute scale factor without writing")
-
-
-def parse_target(s: str) -> float:
-    """Parse human-readable target strings like '100M', '50k' to numbers."""
-    s = s.strip()
-    suffixes = {"k": 1e3, "K": 1e3, "m": 1e6, "M": 1e6, "g": 1e9, "G": 1e9, "b": 1e9, "B": 1e9}
-    m = re.match(r'^([0-9]*\.?[0-9]+)\s*([a-zA-Z]?)$', s)
-    if m is None:
-        raise ValueError(f"Cannot parse target: '{s}'. Use format like '100M', '50k', or a plain number.")
-    number = float(m.group(1))
-    suffix = m.group(2)
-    if suffix:
-        if suffix not in suffixes:
-            raise ValueError(f"Unknown suffix '{suffix}' in target '{s}'. Use k, M, G.")
-        number *= suffixes[suffix]
-    return number
+    sb.add_argument("--together", action="store_true",
+                     help="Scale all inputs by one factor so their combined total "
+                          "equals --target (e.g. a stranded RNA-seq +/- pair). "
+                          "Files stay separate.")
 
 
 def _run_bigwig_to_mmap(args: argparse.Namespace) -> int:
@@ -116,8 +109,6 @@ def _run_scale_bigwig(args: argparse.Namespace) -> int:
 
     json_mode = getattr(args, "json_output", False)
 
-    import numpy as np
-
     target = parse_target(args.target)
     bigwig_files = args.input
     dry_run = args.dry_run
@@ -130,24 +121,35 @@ def _run_scale_bigwig(args: argparse.Namespace) -> int:
         )
         return 1
 
-    results = []
+    bigwig_files = [str(p) for p in bigwig_files]
     for bw_path in bigwig_files:
-        bw_path = str(bw_path)
         if not Path(bw_path).exists():
             raise FileNotFoundError(f"BigWig file not found: {bw_path}")
 
-        total_signal = _compute_bigwig_total(bw_path)
-        scale_factor = target / total_signal if total_signal > 0 else 1.0
+    if not args.output:
+        outputs = [None] * len(bigwig_files)
+    elif len(bigwig_files) == 1:
+        outputs = [args.output]
+    else:
+        outputs = [str(Path(args.output) / Path(p).name) for p in bigwig_files]
+        if not dry_run:
+            destinations = {Path(p).resolve() for p in outputs}
+            sources = {Path(p).resolve() for p in bigwig_files}
+            if destinations & sources or len(destinations) != len(outputs):
+                raise ValueError("Output files must be distinct and separate from the input files.")
 
-        # Determine output path
-        if args.output and len(bigwig_files) == 1:
-            out_path = args.output
-        elif args.output:
-            out_dir = Path(args.output)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = str(out_dir / Path(bw_path).name)
-        else:
-            out_path = None
+    totals = [bigwig_total_signal(p, absolute=args.together) for p in bigwig_files]
+    combined_total = sum(totals)
+    if args.together and (combined_total <= 0 or target <= 0):
+        raise ValueError("--together needs a positive combined input total and target.")
+
+    if not dry_run and len(bigwig_files) > 1:
+        Path(args.output).mkdir(parents=True, exist_ok=True)
+
+    results = []
+    for bw_path, out_path, total_signal in zip(bigwig_files, outputs, totals):
+        denom = combined_total if args.together else total_signal
+        scale_factor = target / denom if denom > 0 else 1.0
 
         if not dry_run and out_path:
             _write_scaled_bigwig(bw_path, out_path, scale_factor)
@@ -156,7 +158,9 @@ def _run_scale_bigwig(args: argparse.Namespace) -> int:
             "input": bw_path,
             "output": out_path,
             "original_total": round(total_signal, 1),
-            "target_total": target,
+            # With --together, target applies to the sum, so report
+            # this file's share of it.
+            "target_total": round(total_signal * scale_factor, 1) if args.together else target,
             "scale_factor": round(scale_factor, 4),
         })
 
@@ -166,50 +170,63 @@ def _run_scale_bigwig(args: argparse.Namespace) -> int:
 
     if json_mode:
         emit_json({"files": results})
+    elif args.together:
+        print(f"combined: total={combined_total:.0f}, target={target:.0f}")
 
     return 0
 
 
-def _compute_bigwig_total(path: str) -> float:
-    """Compute total signal across all chromosomes in a BigWig file."""
-    import pyBigWig
+def _runs(values):
+    """Run-length encode *values*, dropping NaN gaps.
+
+    Returns (starts, ends, run_values) relative to the window start.
+    """
     import numpy as np
 
-    total = 0.0
-    with pyBigWig.open(path) as bw:
-        for chrom, size in bw.chroms().items():
-            values = bw.values(chrom, 0, size, numpy=True)
-            if values is not None:
-                total += float(np.nansum(values))
-    return total
+    valid = ~np.isnan(values)
+    # A run starts where validity or value changes.
+    change = np.empty(len(values), dtype=bool)
+    change[0] = True
+    change[1:] = (valid[1:] != valid[:-1]) | (valid[1:] & (values[1:] != values[:-1]))
+    starts = np.flatnonzero(change)
+    ends = np.append(starts[1:], len(values))
+    keep = valid[starts]
+    return starts[keep], ends[keep], values[starts[keep]]
 
 
 def _write_scaled_bigwig(input_path: str, output_path: str, scale_factor: float) -> None:
-    """Write a scaled BigWig file chromosome-by-chromosome."""
-    import pyBigWig
+    """Write a scaled BigWig file. NaN gaps stay gaps; equal-value runs stay runs."""
     import numpy as np
+    import pyBigWig
 
-    with pyBigWig.open(input_path) as bw_in:
-        chroms = bw_in.chroms()
-        header = list(chroms.items())
+    output = Path(output_path)
+    # Write beside the destination so a failed write leaves it intact.
+    with tempfile.TemporaryDirectory(dir=output.parent) as temp_dir:
+        staged = Path(temp_dir) / output.name
+        with pyBigWig.open(input_path) as bw_in, pyBigWig.open(str(staged), "w") as bw_out:
+            chroms = bw_in.chroms()
+            bw_out.addHeader(list(chroms.items()))
 
-        bw_out = pyBigWig.open(output_path, "w")
-        bw_out.addHeader(header)
-
-        for chrom, size in chroms.items():
-            values = bw_in.values(chrom, 0, size, numpy=True)
-            if values is None:
-                continue
-            values = np.nan_to_num(np.asarray(values, dtype=np.float64), nan=0.0)
-            values *= scale_factor
-
-            # Write in chunks
-            CHUNK = 1_000_000
-            for start in range(0, len(values), CHUNK):
-                end = min(start + CHUNK, len(values))
-                bw_out.addEntries(chrom, start, values=values[start:end].tolist(), span=1, step=1)
-
-        bw_out.close()
+            for chrom, size in chroms.items():
+                for offset, values in iter_bigwig_windows(bw_in, chrom, size):
+                    starts, ends, run_values = _runs(values)
+                    if len(starts) == 0:
+                        continue
+                    if len(starts) > len(values) // 2 and not np.isnan(values).any():
+                        # Fixed-step output is cheaper for dense windows.
+                        bw_out.addEntries(
+                            chrom, offset,
+                            values=values.astype(np.float64) * scale_factor,
+                            span=1, step=1,
+                        )
+                    else:
+                        bw_out.addEntries(
+                            [chrom] * len(starts),
+                            starts + offset,
+                            ends=ends + offset,
+                            values=run_values.astype(np.float64) * scale_factor,
+                        )
+        staged.replace(output)
 
 
 def run(args: argparse.Namespace) -> int:

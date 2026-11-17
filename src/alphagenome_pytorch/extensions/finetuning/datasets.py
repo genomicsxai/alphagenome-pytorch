@@ -38,6 +38,7 @@ Multi-head example:
 from __future__ import annotations
 import json
 import warnings
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Literal
@@ -382,6 +383,14 @@ def _load_intervals_from_bed(
     return intervals, chromosomes
 
 
+def _track_scale_array(scales: Sequence[float], n_tracks: int) -> np.ndarray:
+    with np.errstate(over="ignore"):
+        array = np.asarray(scales, dtype=np.float32)
+    if array.shape != (n_tracks,) or not np.all(np.isfinite(array) & (array > 0)):
+        raise ValueError(f"track_scales must contain {n_tracks} finite, positive factors.")
+    return array
+
+
 class GenomicDataset(Dataset):
     """Dataset for genomic fine-tuning (ATAC, RNA-seq, etc).
 
@@ -415,6 +424,9 @@ class GenomicDataset(Dataset):
         use_mmap: If True, treat bigwig_files as paths to mmap directories
             created by ``convert_bigwig_to_mmap()``. Provides fastest reads
             with minimal memory overhead.
+        track_scales: Optional per-track factors applied to the 1 bp
+            signal before binning (see ``agt finetune --target-total``).
+            Default: signals are used as stored.
 
     Example:
         >>> from alphagenome_pytorch.extensions.finetuning.datasets import (
@@ -461,6 +473,7 @@ class GenomicDataset(Dataset):
         use_mmap: bool = False,
         gene_mask_extractor: "Any | None" = None,
         g_max: int | None = None,
+        track_scales: Sequence[float] | None = None,
     ):
         _ensure_genomic_deps()
 
@@ -570,6 +583,10 @@ class GenomicDataset(Dataset):
             )
 
         self.n_tracks = len(bigwig_files)
+        self.track_scales = (
+            _track_scale_array(track_scales, self.n_tracks)
+            if track_scales is not None else None
+        )
 
         # Initialize remaining caches / lazy handles
         self._cached_bigwigs: list[CachedBigWig] | None = None
@@ -742,6 +759,9 @@ class GenomicDataset(Dataset):
             # Stack tracks at 1bp: (seq_len, n_tracks)
             raw_signals = np.stack(raw_signals, axis=-1)
 
+        if self.track_scales is not None:
+            raw_signals = raw_signals * self.track_scales
+
         # Create targets at each resolution
         targets_dict = {}
         for res in self.resolutions:
@@ -810,6 +830,7 @@ def compute_track_means(
     resolution: int = 1,
     max_samples: int | None = None,
     strand_pair_groups: list[tuple[int, int]] | None = None,
+    track_scales: Sequence[float] | None = None,
 ) -> torch.Tensor:
     """Compute nonzero_mean signal per track from training data.
 
@@ -833,6 +854,8 @@ def compute_track_means(
             official scaling semantics (upstream notebook averages plus/minus
             strand means by track name). Default `None` keeps existing
             per-track behavior bit-equal.
+        track_scales: Optional per-track factors, the same ones passed to
+            :class:`GenomicDataset`, so the means match the scaled targets.
 
     Returns:
         Track means tensor of shape (1, n_tracks) suitable for passing
@@ -847,6 +870,7 @@ def compute_track_means(
         >>> head = create_finetuning_head('atac', n_tracks=2, track_means=track_means)
     """
     _ensure_genomic_deps()
+    scales = _track_scale_array(track_scales, len(bigwig_files)) if track_scales is not None else None
 
     # Load intervals
     all_intervals, chromosomes = _load_intervals_from_bed(bed_file)
@@ -918,6 +942,9 @@ def compute_track_means(
         track_nonzero_sums / track_nonzero_counts,
         1.0,
     )
+    if scales is not None:
+        # Scale each nonzero mean (or its fallback) before pair averaging.
+        track_means *= scales
 
     if strand_pair_groups is not None:
         seen: set[int] = set()

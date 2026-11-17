@@ -115,6 +115,11 @@ For reproducible experiments, use ``--config config.yaml``.
           # CLI: --strand-pairs 'rna_seq:auto'  (overrides this value)
           strand_pairs: auto
 
+      # Scale targets so each track's genome-wide signal sums to this total,
+      # as in AlphaGenome. rna_seq strand pairs share one factor.
+      # CLI: --target-total 100M. Default: use the BigWig values as stored.
+      # target_total: 100M
+
       # Alternative: global modality weights (same as task_weight per modality)
       # modality_weights: "atac:1.0,rna_seq:0.5,chip_tf:1.0"
       # or as dict:
@@ -231,6 +236,32 @@ config did not mention. Modalities defined only in the config are left alone.
 Per-modality settings such as ``resolutions`` and ``task_weight`` come from the
 config either way, so a command line can override the file list while keeping
 the config's per-modality tuning.
+
+**Depth normalization.** Add ``--target-total 100M`` to a fine-tuning
+command to scale targets in memory. Rank 0 scans the eligible BigWigs
+before training and shares the factors with the other ranks. The training
+and validation datasets apply the same factors before binning, and the head
+uses track means in the corresponding units.
+
+For stranded RNA-seq, add ``--strand-pairs rna_seq:auto`` when the BigWigs
+are ordered plus/minus by sample. For example, if a pair starts with genome-wide
+totals of 30M and 10M, both strands are multiplied by 2.5 and end up at
+75M and 25M. CAGE and PRO-cap use separate factors for each strand.
+ATAC and DNase are also scaled per track. The two ChIP modalities bypass
+depth normalization so their fold-change units are preserved.
+
+Each normalized track or pair needs a positive total. Normalized tracks
+must contain non-negative signal. If a minus-strand BigWig encodes coverage
+with negative values, flip its sign before using this flag.
+
+The factor typically cancels when the loss divides targets by their track
+means. If independently scaled tracks share an averaged mean through
+``strand_pairs``, their relative weights in model space can change.
+Predictions and metrics computed in signal space use the scaled units.
+For an external evaluation, supply observed targets in the same units,
+for example by scaling the original BigWigs with
+``agt preprocess scale-bigwig``. Training logs and checkpoints record
+the factors. Use the same inputs and normalization settings when resuming.
 
 .. _what-a-run-produces:
 
