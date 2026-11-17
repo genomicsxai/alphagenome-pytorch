@@ -107,22 +107,44 @@ def compute_metrics(
     true: Tensor,
     track_names: Optional[list] = None,
     eps: float = 1e-8,
+    *,
+    track_mask: Optional[Tensor] = None,
 ) -> Dict[str, float]:
     """Compute comprehensive metrics for genomic predictions.
 
     Args:
         pred: Predictions with shape (batch, seq_len, tracks).
         true: Targets with shape (batch, seq_len, tracks).
-        track_names: Optional list of track names for labeling.
+        track_names: Optional list of track names in input channel order.
         eps: Small epsilon for numerical stability.
+        track_mask: Optional boolean tensor of shape (tracks,), where True
+            keeps a channel in both predictions and targets. The mask applies
+            to every sample in the batch.
 
     Returns:
-        Dictionary with metrics:
-            - profile_pearson_r: Mean profile correlation (across batch and tracks)
-            - profile_pearson_r_per_track: Per-track mean profile correlation
-            - count_pearson_r: Mean count correlation (across tracks)
-            - count_pearson_r_per_track: Per-track count correlation
+        Profile and count Pearson scores averaged over selected tracks, plus
+        scores for each selected track if names are given. An all-False mask
+        returns an empty dictionary.
     """
+    if track_mask is not None:
+        if pred.ndim != 3 or pred.shape != true.shape:
+            raise ValueError("pred and true must have the same (batch, positions, tracks) shape")
+        num_tracks = pred.shape[-1]
+        if track_mask.dtype != torch.bool:
+            raise TypeError("track_mask must be a boolean tensor")
+        if track_mask.shape != (num_tracks,):
+            raise ValueError(f"track_mask must have shape ({num_tracks},)")
+        if track_names is not None and len(track_names) != num_tracks:
+            raise ValueError("track_names must have one name per input track")
+
+        indices = track_mask.nonzero(as_tuple=True)[0]
+        if indices.numel() == 0:
+            return {}
+        pred = pred.index_select(-1, indices.to(pred.device))
+        true = true.index_select(-1, indices.to(true.device))
+        if track_names is not None:
+            track_names = [track_names[i] for i in indices.tolist()]
+
     results = {}
 
     # Profile Pearson R: correlation over positions
