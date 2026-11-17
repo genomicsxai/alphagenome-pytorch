@@ -139,7 +139,8 @@ from alphagenome_pytorch.extensions.finetuning.transfer import (
     transfer_config_to_dict,
 )
 
-from alphagenome_pytorch.extensions.finetuning.args import parse_args
+from alphagenome_pytorch.extensions.finetuning.args import parse_args, resolve_dtype
+from alphagenome_pytorch.extensions.finetuning.training import validate_bfloat16_autocast
 
 # =============================================================================
 # Utilities
@@ -713,12 +714,17 @@ def main(args: argparse.Namespace | None = None) -> None:
         args = parse_args()
 
     # Setup distributed
-    rank, world_size, local_rank, device = setup_distributed()
+    rank, world_size, local_rank, device = setup_distributed(getattr(args, "device", "auto"))
+    args.dtype = resolve_dtype(
+        getattr(args, "dtype", None), cuda=device.type == "cuda", use_amp=not args.no_amp
+    )
+    if args.dtype == "bfloat16":
+        validate_bfloat16_autocast(device)
 
     # Set seed
     if args.seed is not None:
         torch.manual_seed(args.seed + rank)
-        if torch.cuda.is_available():
+        if device.type == "cuda":
             torch.cuda.manual_seed_all(args.seed + rank)
         print_rank0(f"Random seed: {args.seed} (+ rank offset)", rank)
 
@@ -1115,7 +1121,7 @@ def main(args: argparse.Namespace | None = None) -> None:
             current_epoch = epoch
 
             # Clear GPU cache between epochs for robustness
-            if torch.cuda.is_available():
+            if device.type == "cuda":
                 torch.cuda.empty_cache()
 
             # Training
@@ -1214,7 +1220,7 @@ def main(args: argparse.Namespace | None = None) -> None:
             )
 
             # Synchronize CUDA to ensure all validation ops complete before next epoch
-            if torch.cuda.is_available():
+            if device.type == "cuda":
                 torch.cuda.synchronize()
 
             current_lr = scheduler.get_last_lr()[0]

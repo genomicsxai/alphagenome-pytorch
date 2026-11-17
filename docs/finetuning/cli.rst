@@ -10,6 +10,16 @@ and it can be configured with CLI flags, a YAML config file, or both.
    but it works system-wide and ships with the installed package.
 
 
+For single-process training, use ``--device cpu``, ``--device mps``, or
+``--device cuda:N`` to select a device explicitly. The default, ``auto``,
+tries CUDA, MPS, then CPU. With ``torchrun``, use ``--device auto`` or
+``--device cuda`` so each process uses its assigned CUDA device.
+
+When omitted, ``--dtype`` defaults to ``bfloat16`` on CUDA with AMP enabled and
+``float32`` otherwise. An explicit ``--dtype bfloat16`` requires AMP and a
+device with bf16 autocast support.
+
+
 YAML Configuration
 ------------------
 
@@ -62,8 +72,10 @@ For reproducible experiments, use ``--config config.yaml``.
       locon_alpha: 1
       locon_targets: "down_blocks.4,down_blocks.5"  # Required when Locon is enabled
 
+      device: auto                       # 'auto', 'cpu', 'mps', 'cuda', or 'cuda:N'
+
       # Model precision
-      dtype: bfloat16                    # 'bfloat16' or 'float32'
+      dtype: null                        # Device default, or 'bfloat16' or 'float32'
 
       # Head initialization
       head_init_scheme: truncated_normal # 'truncated_normal' or 'uniform'

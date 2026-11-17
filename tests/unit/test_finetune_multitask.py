@@ -60,6 +60,114 @@ class TestComputeMultinomialResolution:
 
 
 @pytest.mark.unit
+class TestFinetuneDevice:
+    @pytest.mark.parametrize(
+        "requested, cuda_available, mps_available, expected",
+        [
+            ("auto", False, False, "cpu"),
+            ("auto", False, True, "mps"),
+            ("auto", True, True, "cuda:0"),
+            ("cpu", True, True, "cpu"),
+            ("mps", True, True, "mps"),
+            ("cuda:2", True, True, "cuda:2"),
+        ],
+    )
+    def test_resolve_device(self, monkeypatch, requested, cuda_available, mps_available, expected):
+        from alphagenome_pytorch.extensions.finetuning.distributed import resolve_device
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 3)
+        monkeypatch.setattr(torch.backends.mps, "is_available", lambda: mps_available)
+        assert resolve_device(requested) == torch.device(expected)
+
+    @pytest.mark.parametrize(
+        "requested, error",
+        [("mps", "MPS is unavailable"), ("cuda", "CUDA is unavailable"), ("xpu", "Invalid fine-tuning device")],
+    )
+    def test_reports_unavailable_or_unsupported_device(self, monkeypatch, requested, error):
+        from alphagenome_pytorch.extensions.finetuning.distributed import resolve_device
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+        with pytest.raises(ValueError, match=error):
+            resolve_device(requested)
+
+    def test_torchrun_uses_local_rank_and_rejects_explicit_index(self, monkeypatch):
+        from alphagenome_pytorch.extensions.finetuning.distributed import setup_distributed
+
+        monkeypatch.setenv("RANK", "3")
+        monkeypatch.setenv("WORLD_SIZE", "4")
+        monkeypatch.setenv("LOCAL_RANK", "1")
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+        events = []
+        monkeypatch.setattr(torch.cuda, "set_device", events.append)
+        monkeypatch.setattr(torch.distributed, "init_process_group", lambda *, backend: events.append(backend))
+
+        for requested in ("cuda:0", "mps"):
+            with pytest.raises(ValueError, match="LOCAL_RANK"):
+                setup_distributed(requested)
+        assert events == []
+
+        assert setup_distributed() == (3, 4, 1, torch.device("cuda:1"))
+        assert events == [torch.device("cuda:1"), "nccl"]
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+        with pytest.raises(ValueError, match="CUDA is unavailable"):
+            setup_distributed()
+        assert events == [torch.device("cuda:1"), "nccl"]
+
+
+@pytest.mark.unit
+class TestFinetuneDtype:
+    cli_args = _required_cli_args()[1:] + ["--modality", "atac", "--bigwig", "atac.bw"]
+
+    @pytest.mark.parametrize(
+        "device, use_amp, expected",
+        [
+            ("cuda", True, "bfloat16"),
+            ("cuda", False, "float32"),
+            ("cpu", True, "float32"),
+            ("mps", True, "float32"),
+        ],
+    )
+    def test_defaults_follow_device_and_amp(self, device, use_amp, expected):
+        from alphagenome_pytorch.extensions.finetuning.args import resolve_dtype
+
+        args = parse_args(self.cli_args + ([] if use_amp else ["--no-amp"]))
+        assert args.dtype is None
+        assert resolve_dtype(args.dtype, cuda=device == "cuda", use_amp=not args.no_amp) == expected
+
+    def test_explicit_bfloat16_is_kept_with_amp(self):
+        from alphagenome_pytorch.extensions.finetuning.args import resolve_dtype
+
+        args = parse_args(self.cli_args + ["--dtype", "bfloat16"])
+        assert resolve_dtype(args.dtype, cuda=False, use_amp=not args.no_amp) == "bfloat16"
+
+    def test_bfloat16_and_no_amp_are_rejected_on_the_cli(self, capsys):
+        with pytest.raises(SystemExit):
+            parse_args(self.cli_args + ["--dtype", "bfloat16", "--no-amp"])
+        assert "--no-amp conflicts with --dtype bfloat16" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("amp_setting", ["use_amp: false", "no_amp: true"])
+    def test_bfloat16_and_no_amp_are_rejected_in_yaml(self, tmp_path, capsys, amp_setting):
+        pytest.importorskip("yaml")
+        config = tmp_path / "config.yaml"
+        config.write_text(f"dtype: bfloat16\n{amp_setting}\n")
+        argv = self.cli_args + ["--config", str(config)]
+
+        with pytest.raises(SystemExit):
+            parse_args(argv)
+        assert "--no-amp conflicts with --dtype bfloat16" in capsys.readouterr().err
+
+        args = parse_args(argv + ["--dtype", "float32"])
+        assert args.dtype == "float32"
+        assert args.no_amp
+
+
+@pytest.mark.unit
 class TestParseArgsMultimodal:
     """Tests for multimodal/task-weight parsing in scripts/finetune.py."""
 
