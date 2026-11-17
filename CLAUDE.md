@@ -148,9 +148,13 @@ torchrun --nproc_per_node=2 -m alphagenome_pytorch.cli finetune \
   ablation only), `--junction-loss` (`original`/`normalized`/`sparse` cross-entropy
   variants), `--junction-position-source` (`annotated` uses STAR-derived positions;
   `predicted` derives them from the `splice_site` classification head's top-k sites,
-  see `--junction-top-k`), `--pretrained-head-samples` (initialize head weights from
-  specific pretrained output tracks), `--min-alpha-juncs` (junction depth threshold
-  for the SSU loss).
+  see `--junction-top-k`/`--splice-site-threshold`, defaults 512/0.1 as in
+  alphagenome_research; `--max-splice-sites` sizes annotated mode, default 256),
+  `--pretrained-head-samples` (initialize head weights from specific pretrained
+  output tracks), `--min-alpha-juncs` (junction depth threshold for the SSU loss,
+  default 0 = off), `--splice-num-segments` (sequence partitions for the
+  splice_site/splice_usage losses, default 1; independent of `--num-segments`,
+  which only affects the genome-track multinomial loss).
 - `scripts/compute_ssu.py` / `scripts/get_star_junctions.py`: standalone
   preprocessing scripts that derive splice site usage (SSU) and junction counts
   from STAR alignment output, upstream of `--ssu`/`--star-junctions`.

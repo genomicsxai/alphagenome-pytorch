@@ -107,6 +107,23 @@ def targets_scaling(
     return x
 
 
+def _einsum_bf16_inputs_f32_output(equation: str, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """einsum with bf16-rounded inputs and fp32 accumulation/output.
+
+    Matches alphagenome_research's junction head, which always uses
+    ``precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32``. Under bf16
+    autocast a plain einsum would also round the *output* to bf16; products
+    of bf16 values are exact in fp32, so upcasting the rounded inputs and
+    running in fp32 reproduces the preset.
+    """
+    with torch.autocast(device_type=a.device.type, enabled=False):
+        return torch.einsum(
+            equation,
+            a.to(torch.bfloat16).float(),
+            b.to(torch.bfloat16).float(),
+        )
+
+
 class MultiOrganismLinear(nn.Module):
     """Linear layer with organism-specific weights. Expects NLC format (B, S, C).
 
@@ -712,8 +729,8 @@ class SpliceSitesJunctionHead(nn.Module):
         nd = self._apply_rope_sparse(neg_donor_logits,    neg_donor_idx,    "neg_donor",    organism_index)
         na = self._apply_rope_sparse(neg_acceptor_logits, neg_acceptor_idx, "neg_acceptor", organism_index)
 
-        pos_counts = F.softplus(torch.einsum("bdth,bath->bdat", pd, pa))
-        neg_counts = F.softplus(torch.einsum("bdth,bath->bdat", nd, na))
+        pos_counts = F.softplus(_einsum_bf16_inputs_f32_output("bdth,bath->bdat", pd, pa))
+        neg_counts = F.softplus(_einsum_bf16_inputs_f32_output("bdth,bath->bdat", nd, na))
 
         pos_mask = torch.einsum("bd,ba->bda", pos_donor_idx >= 0, pos_acceptor_idx >= 0)
         neg_mask = torch.einsum("bd,ba->bda", neg_donor_idx >= 0, neg_acceptor_idx >= 0)

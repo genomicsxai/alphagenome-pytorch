@@ -571,13 +571,14 @@ def load_pretrained_head_weights(
 
     Transferable:
         splice_site      — full head (5-class output is fixed; indices are ignored)
-        splice_junctions — conv + rope_params (tissue axis sliced/broadcast to match finetuning)
+        splice_junctions — full conv (shared hidden_dim, not per-tissue) + rope_params
+                           (tissue axis sliced/broadcast to match finetuning)
         splice_usage     — conv, broadcast or per-track gather
         rna_seq / atac / dnase / procap / cage — conv at each resolution
 
     rope_params in splice_junctions: the pretrained tensor has shape
     (num_organisms, 2, T_pretrained, H). We slice organism_idx and gather/broadcast
-    along the tissue axis using the same indices as conv, giving the finetuning head a
+    along the tissue axis using the given indices, giving the finetuning head a
     realistic scale/offset starting point so conv features propagate from step 1.
 
     Args:
@@ -698,8 +699,12 @@ def load_pretrained_head_weights(
                     continue
                 pt_slice = sd[pt_key][organism_idx : organism_idx + 1]
                 label = f"{modality}.{param_suffix}"
-                if modality == "splice_site":
-                    # Fixed 5-class output: copy full pretrained weight matrix directly
+                if modality in ("splice_site", "splice_junctions"):
+                    # splice_site: fixed 5-class output. splice_junctions: the conv
+                    # projects into a shared hidden_dim representation (dim 1 is
+                    # hidden channels, not tissues). Neither is per-track, so copy
+                    # the full organism slice; junction tissues are indexed via
+                    # rope_params below.
                     if pt_slice.shape != params[param_suffix].shape:
                         print(
                             f"  [pretrained-head] Shape mismatch for {label}: "
@@ -709,7 +714,7 @@ def load_pretrained_head_weights(
                     with torch.no_grad():
                         params[param_suffix].copy_(pt_slice.to(params[param_suffix].device))
                     loaded.append(label)
-                    print(f"  [pretrained-head] Loaded {pt_key}[org={organism_idx}] (full 5-class) → {label}")
+                    print(f"  [pretrained-head] Loaded {pt_key}[org={organism_idx}] (full) → {label}")
                 else:
                     if _try_copy(params[param_suffix], pt_slice, indices, label):
                         loaded.append(label)

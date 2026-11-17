@@ -49,7 +49,8 @@ DEFAULTS = {
     "count_weight": 1.0,
     "num_workers": 4,
     "max_grad_norm": 1.0,
-    "num_segments": 8,
+    "num_segments": None,
+    "splice_num_segments": 1,
     "min_segment_size": None,
     # Logging
     "wandb_project": "alphagenome-finetune",
@@ -466,11 +467,13 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
     )
     train.add_argument(
         "--drop-incomplete-accumulation",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Drop the final per-rank microbatches when they do not fill one complete "
-            "gradient-accumulation window. This makes every optimizer update use the "
-            "declared effective batch size."
+            "gradient-accumulation window, so every optimizer update uses the "
+            "declared effective batch size (default; matches alphagenome_ft). "
+            "--no-drop-incomplete-accumulation takes an undersized step instead."
         ),
     )
     train.add_argument("--lr", type=float, default=DEFAULTS["lr"], help="Learning rate")
@@ -484,8 +487,22 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
     )
     train.add_argument("--positional-weight", type=float, default=DEFAULTS["positional_weight"])
     train.add_argument("--count-weight", type=float, default=DEFAULTS["count_weight"])
-    train.add_argument("--max-grad-norm", type=float, default=DEFAULTS["max_grad_norm"])
-    train.add_argument("--num-segments", type=int, default=DEFAULTS["num_segments"])
+    train.add_argument("--max-grad-norm", type=float, default=DEFAULTS["max_grad_norm"],
+                       help="Clip gradients to this global norm; 0 or negative disables clipping.")
+    train.add_argument("--num-segments", type=int, default=DEFAULTS["num_segments"],
+                       help="Fixed number of segments for the genome-track multinomial loss. "
+                            "Default: unset = alphagenome_research's fixed 2**17 bp segments "
+                            "(8 at 1 Mb, 1 at 131 kb).")
+    train.add_argument(
+        "--splice-num-segments",
+        type=int,
+        default=DEFAULTS["splice_num_segments"],
+        help=(
+            "Number of sequence partitions for the splice_site classification and "
+            "splice_usage losses; per-partition losses are summed. Default: 1 (single "
+            "global mean, as in alphagenome_research). Independent of --num-segments."
+        ),
+    )
     train.add_argument("--min-segment-size", type=int, default=DEFAULTS["min_segment_size"])
     train.add_argument(
         "--junction-position-source",
@@ -497,19 +514,38 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
             "'annotated' (default): use positions derived from STAR junction files. "
             "'predicted': derive positions from the top-k sites scored by the "
             "splice_site classification head (requires splice_site modality). "
-            "See --junction-top-k to control the number of sites selected."
+            "See --junction-top-k / --splice-site-threshold for predicted mode and "
+            "--max-splice-sites for annotated mode."
+        ),
+    )
+    train.add_argument(
+        "--max-splice-sites",
+        type=int,
+        default=256,
+        help=(
+            "Annotated mode: maximum number of STAR-derived splice sites per role "
+            "(Donor+/-, Acceptor+/-); sizes/truncates the dataset positions and "
+            "junction matrix. Default: 256 (matches alphagenome_ft --max-splice-sites)."
         ),
     )
     train.add_argument(
         "--junction-top-k",
         type=int,
-        default=256,
+        default=512,
         help=(
-            "Maximum splice-site capacity per role (Donor+/-, Acceptor+/-). "
-            "In predicted mode this is the top-k selected by the classification "
-            "head; in annotated mode it sizes/truncates the dataset positions "
-            "and junction matrix too. Default: 256, matching the JAX workflow "
-            "and AlphaGenome's splice-junction scoring constant."
+            "Predicted mode only: number of splice sites per role selected from the "
+            "classification head's probabilities. Default: 512, alphagenome_research's "
+            "DEFAULT_NUM_SPLICE_SITES."
+        ),
+    )
+    train.add_argument(
+        "--splice-site-threshold",
+        type=float,
+        default=0.1,
+        help=(
+            "Predicted mode only: drop selected sites whose classification probability "
+            "is below this value (padded with -1). Default: 0.1, alphagenome_research's "
+            "DEFAULT_SPLICE_SITE_THRESHOLD. 0 disables."
         ),
     )
     train.add_argument(
@@ -537,19 +573,23 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
     train.add_argument("--track-means-samples", type=int, default=None, help="Samples for track means (default: all)")
     train.add_argument("--profile-batches", type=int, default=0, help="Profile first N batches")
     train.add_argument("--compile", action="store_true", help="Use torch.compile")
-    train.add_argument("--seed", type=int, default=None, help="Random seed")
+    train.add_argument(
+        "--seed", type=int, default=1234,
+        help="Random seed for init and train-set shuffling (default 1234, as alphagenome_ft; "
+             "with matching seed/batch/device count both repos visit windows in the same order)",
+    )
     train.add_argument("--eval-train-pearson", action="store_true", help="Run an eval pass on train set each epoch to compute Pearson R")
     train.add_argument("--no-val-pearson", action="store_true", default=False, help="Skip Pearson R computation during validation (faster, lower memory; use --eval-only for full metrics)")
     train.add_argument("--metrics-per-sample", action="store_true", default=False, help="Also write per-biological-sample rows to epoch_log.csv (splice_junctions and splice_usage only)")
     train.add_argument(
         "--min-alpha-juncs",
         type=int,
-        default=5,
+        default=0,
         help=(
             "Minimum junction read depth (alpha) for a splice site to contribute to the SSU "
             "loss.  Positions with 0 <= alpha < threshold are excluded to avoid training on "
             "low-confidence SSU estimates; background positions (alpha=-1) are kept with "
-            "target=0 to anchor the head. Set to 0 to include all positions. Default: 5."
+            "target=0 to anchor the head. 0 includes all positions. Default: 0."
         ),
     )
     train.add_argument("--eval-only", action="store_true", help="Load checkpoint and run validation metrics without training; outputs to eval_only_metrics.json")
@@ -682,7 +722,7 @@ def postprocess_args(
 
     def _apply_config_scalar(attr: str, config: dict[str, Any], key: str | None = None) -> None:
         flag = f"--{attr.replace('_', '-')}"
-        if flag in cli_flags:
+        if flag in cli_flags or f"--no-{flag[2:]}" in cli_flags:
             return
         config_key = key or attr
         if config_key in config and config[config_key] is not None:
@@ -743,6 +783,7 @@ def postprocess_args(
         "count_weight",
         "max_grad_norm",
         "num_segments",
+        "splice_num_segments",
         "min_segment_size",
         "num_workers",
         "track_means_samples",

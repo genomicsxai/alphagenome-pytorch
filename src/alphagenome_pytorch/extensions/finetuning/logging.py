@@ -227,9 +227,8 @@ class TrainingLogger:
                 "epoch/val_loss": val_loss,
                 "epoch/learning_rate": lr,
             }
-            if extra:
-                for k, v in extra.items():
-                    wandb_metrics[f"epoch/{k}"] = v
+            for k, v in extra_copy.items():
+                wandb_metrics[f"epoch/{k}"] = v
             # Log histograms for distributions
             if histograms:
                 for k, values in histograms.items():

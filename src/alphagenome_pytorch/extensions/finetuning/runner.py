@@ -78,6 +78,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -326,7 +327,7 @@ def create_datasets(
                         sequence_length=args.sequence_length,
                         filter_to_junctions=False,
                         gtf_file=args.gtf,
-                        max_splice_sites=args.junction_top_k,
+                        max_splice_sites=args.max_splice_sites,
                     ),
                     SplicingDataset(
                         genome_fasta=genome,
@@ -336,7 +337,7 @@ def create_datasets(
                         sequence_length=args.sequence_length,
                         filter_to_junctions=False,
                         gtf_file=args.gtf,
-                        max_splice_sites=args.junction_top_k,
+                        max_splice_sites=args.max_splice_sites,
                     ),
                 )
             train_datasets[modality], val_datasets[modality] = _splice_dataset_cache[junc_key]
@@ -558,6 +559,53 @@ def apply_training_strands(
     return rows
 
 
+class AlignedShuffleSampler(torch.utils.data.Sampler):
+    """Training-set shuffle that reproduces alphagenome_ft's batch order.
+
+    alphagenome_ft shuffles the train split once per epoch with
+    ``np.random.default_rng(seed + epoch).shuffle(np.arange(n))`` and slices
+    consecutive global batches of ``batch_size * num_devices`` windows, each
+    sharded contiguously across devices. This sampler yields, for ``rank``,
+    the same contiguous per-device slice of every global batch, so with the
+    same seed, epoch, per-device batch size and device count, every optimizer
+    step sees the same set of windows on both frameworks.
+
+    With ``world_size > 1`` the trailing partial global batch is dropped
+    (alphagenome_ft sets ``drop_last`` when sharding over several devices);
+    with one replica it is kept, as on both sides.
+    """
+
+    def __init__(self, dataset, *, seed: int, batch_size: int,
+                 world_size: int = 1, rank: int = 0) -> None:
+        self._n = len(dataset)
+        self._seed = int(seed)
+        self._batch_size = int(batch_size)
+        self._world_size = int(world_size)
+        self._rank = int(rank)
+        self._epoch = 1
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    def _indices(self) -> list[int]:
+        order = np.arange(self._n)
+        np.random.default_rng(self._seed + self._epoch).shuffle(order)
+        if self._world_size == 1:
+            return order.tolist()
+        global_batch = self._batch_size * self._world_size
+        n_full = (self._n // global_batch) * global_batch
+        batches = order[:n_full].reshape(-1, self._world_size, self._batch_size)
+        return batches[:, self._rank, :].reshape(-1).tolist()
+
+    def __iter__(self):
+        return iter(self._indices())
+
+    def __len__(self) -> int:
+        if self._world_size == 1:
+            return self._n
+        return (self._n // (self._batch_size * self._world_size)) * self._batch_size
+
+
 def create_dataloaders(
     train_dataset,
     val_dataset,
@@ -567,18 +615,25 @@ def create_dataloaders(
     rank: int,
     is_multimodal: bool = False,
     sequence_parallel_mode: bool = False,
-) -> tuple[DataLoader, DataLoader, DistributedSampler | None, DistributedSampler | None]:
+    seed: int = 1234,
+) -> tuple[DataLoader, DataLoader, Any, DistributedSampler | None]:
     """Create data loaders with optional distributed samplers.
 
     Args:
         sequence_parallel_mode: If True, use non-distributed sampler (all ranks see same data).
     """
     # In sequence-parallel mode, all ranks must process the same sequence (shards of it)
+    # Train order follows alphagenome_ft (see AlignedShuffleSampler). In
+    # sequence-parallel mode every rank processes the same sequence, so all
+    # ranks use the single-replica order.
     if sequence_parallel_mode:
-        train_sampler = None
+        train_sampler = AlignedShuffleSampler(train_dataset, seed=seed, batch_size=batch_size)
         val_sampler = None
     else:
-        train_sampler = DistributedSampler(train_dataset, shuffle=True) if world_size > 1 else None
+        train_sampler = AlignedShuffleSampler(
+            train_dataset, seed=seed, batch_size=batch_size,
+            world_size=world_size, rank=rank,
+        )
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if world_size > 1 else None
 
     # Always use collate_multimodal since we now always use MultimodalDataset
@@ -958,7 +1013,7 @@ def main(args: argparse.Namespace | None = None) -> None:
     )
     print_rank0(
         "Junction positions: "
-        f"source={args.junction_position_source}, matrix_k={args.junction_top_k}, "
+        f"source={args.junction_position_source}, annotated_k={args.max_splice_sites}, "
         f"prediction_top_k={junction_forward_top_k}",
         rank,
     )
@@ -1008,6 +1063,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         rank,
         is_multimodal=True,  # Always multimodal now
         sequence_parallel_mode=args.sequence_parallel,
+        seed=args.seed,
     )
     raw_train_batches = len(train_loader)
     dropped_train_batches = 0
@@ -1115,7 +1171,10 @@ def main(args: argparse.Namespace | None = None) -> None:
     )
 
     # Scheduler
-    total_steps = (args.epochs * len(train_loader)) // args.gradient_accumulation_steps
+    # Optimizer steps actually taken: a trailing partial window still steps
+    # unless --drop-incomplete-accumulation trimmed the loader to whole windows.
+    steps_per_epoch = -(-len(train_loader) // args.gradient_accumulation_steps)
+    total_steps = args.epochs * steps_per_epoch
     scheduler = create_lr_scheduler(optimizer, args.warmup_steps, total_steps, schedule=args.lr_schedule)
     effective_batch_size = args.batch_size * args.gradient_accumulation_steps * world_size
     print_rank0(f"Gradient accumulation: {args.gradient_accumulation_steps}", rank)
@@ -1199,6 +1258,8 @@ def main(args: argparse.Namespace | None = None) -> None:
         "pretrained_head_samples": args.pretrained_head_sample_dict,
         "junction_position_source": args.junction_position_source,
         "junction_top_k": args.junction_top_k,
+        "max_splice_sites": args.max_splice_sites,
+        "splice_site_threshold": args.splice_site_threshold,
         "junction_prediction_top_k": junction_forward_top_k,
         "junction_loss": args.junction_loss,
         "min_alpha_juncs": args.min_alpha_juncs,
@@ -1210,7 +1271,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         "raw_train_batches_per_epoch": raw_train_batches,
         "train_batches_per_epoch": len(train_loader),
         "dropped_train_batches_per_epoch": dropped_train_batches,
-        "optimizer_steps_per_epoch": len(train_loader) // args.gradient_accumulation_steps,
+        "optimizer_steps_per_epoch": steps_per_epoch,
         "effective_batch_size": effective_batch_size,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
@@ -1220,6 +1281,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         "count_weight": args.count_weight,
         "max_grad_norm": args.max_grad_norm,
         "num_segments": args.num_segments,
+        "splice_num_segments": args.splice_num_segments,
         "min_segment_size": args.min_segment_size,
         "total_steps": total_steps,
         "n_trainable_params": sum(p.numel() for p in trainable_params),
@@ -1314,14 +1376,17 @@ def main(args: argparse.Namespace | None = None) -> None:
             count_weight=args.count_weight,
             compute_pearson=not args.no_val_pearson,
             num_segments=args.num_segments,
+            splice_num_segments=args.splice_num_segments,
             min_segment_size=args.min_segment_size,
             rank=rank, world_size=world_size,
             encoder_only=_eval_encoder_only,
             organism_idx=organism_index,
             junction_top_k=junction_forward_top_k,
+            splice_site_threshold=args.splice_site_threshold,
             junction_loss=args.junction_loss,
             compute_per_sample=args.metrics_per_sample,
             min_alpha_juncs=args.min_alpha_juncs,
+            metrics_seed=args.seed,
             gene_annotation=gene_expr_annotation,
             gene_expr_track_strands=gene_expr_track_strands,
             gene_expr_window_cache=gene_expr_window_cache,
@@ -1403,6 +1468,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     accumulation_steps=args.gradient_accumulation_steps,
                     frozen_backbone=frozen_backbone,
                     num_segments=args.num_segments,
+                    splice_num_segments=args.splice_num_segments,
                     min_segment_size=args.min_segment_size,
                     train_sampler=train_sampler,
                     rank=rank,
@@ -1416,6 +1482,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     strand_channel_masks=gene_strand_channel_masks,
                     organism_idx=organism_index,
                     junction_top_k=junction_forward_top_k,
+                    splice_site_threshold=args.splice_site_threshold,
                     junction_loss=args.junction_loss,
                     min_alpha_juncs=args.min_alpha_juncs,
                     handler=handler,
@@ -1449,6 +1516,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     world_size=world_size,
                     max_grad_norm=args.max_grad_norm,
                     num_segments=args.num_segments,
+                    splice_num_segments=args.splice_num_segments,
                     min_segment_size=args.min_segment_size,
                     profile_batches=args.profile_batches if epoch == start_epoch else 0,
                     log_fn=logger.log_step if is_main_process(rank) else None,
@@ -1458,6 +1526,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     strand_channel_masks=gene_strand_channel_masks,
                     organism_idx=organism_index,
                     junction_top_k=junction_forward_top_k,
+                    splice_site_threshold=args.splice_site_threshold,
                     junction_loss=args.junction_loss,
                     min_alpha_juncs=args.min_alpha_juncs,
                     handler=handler,
@@ -1486,6 +1555,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 count_weight=args.count_weight,
                 use_amp=use_amp,
                 num_segments=args.num_segments,
+                splice_num_segments=args.splice_num_segments,
                 min_segment_size=args.min_segment_size,
                 compute_pearson=not args.no_val_pearson,
                 rank=rank,
@@ -1493,9 +1563,11 @@ def main(args: argparse.Namespace | None = None) -> None:
                 encoder_only=encoder_only,
                 organism_idx=organism_index,
                 junction_top_k=junction_forward_top_k,
+                splice_site_threshold=args.splice_site_threshold,
                 junction_loss=args.junction_loss,
                 compute_per_sample=args.metrics_per_sample,
                 min_alpha_juncs=args.min_alpha_juncs,
+                metrics_seed=args.seed,
                 gene_annotation=gene_expr_annotation,
                 gene_expr_track_strands=gene_expr_track_strands,
                 gene_expr_window_cache=gene_expr_window_cache,
@@ -1529,11 +1601,13 @@ def main(args: argparse.Namespace | None = None) -> None:
             for key, val in val_metrics.items():
                 if key.endswith("_values"):
                     histograms[key] = val
-                elif "pearson" in key:
-                    extra[key] = val
+                elif key.endswith("_loss"):
+                    # Per-modality validation losses -> val_{modality}_loss.
+                    extra[f"val_{key.removesuffix('_loss')}_loss"] = val
                 else:
-                    head = key.removesuffix("_loss")
-                    extra[f"val_{head}_loss"] = val
+                    # Pearson/auPRC/nonzero-fraction metrics keep their own
+                    # names; "_per_sample" is consumed by log_epoch.
+                    extra[key] = val
 
             logger.log_epoch(epoch, train_loss, val_loss, current_lr, is_best, extra, histograms)
 

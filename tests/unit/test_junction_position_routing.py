@@ -77,6 +77,7 @@ def test_main_resolves_routing_before_loading_base_weights(monkeypatch, tmp_path
     args = SimpleNamespace(seed=None, run_name="routing-smoke", output_dir=str(tmp_path),
                            resume=None, track_metadata=None, organism="human",
                            junction_position_source=source, junction_top_k=256,
+                           max_splice_sites=256,
                            pretrained_weights="unused.safetensors")
     monkeypatch.setattr(runner, "setup_distributed", lambda: (0, 1, 0, torch.device("cpu")))
     monkeypatch.setattr(runner, "barrier", lambda: None)

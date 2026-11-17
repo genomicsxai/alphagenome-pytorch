@@ -85,7 +85,7 @@ gradient_accumulation_steps: 4
 lr: 1e-4
 warmup_steps: 500
 lr_schedule: cosine
-num_segments: 8          # multinomial-loss segmentation (optional)
+num_segments: null       # multinomial-loss segments; null = 2**17 bp segments as in alphagenome_research
 min_segment_size: 64     # optional floor for segment size
 
 # LoRA configuration

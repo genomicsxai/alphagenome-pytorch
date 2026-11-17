@@ -70,7 +70,10 @@ from alphagenome_pytorch.losses import multinomial_loss
 
 log = logging.getLogger(__name__)
 
-NUM_SEGMENTS = 8
+from alphagenome_pytorch.extensions.finetuning.training import (  # noqa: E402
+    NUM_SEGMENTS,
+    _compute_multinomial_resolution,
+)
 
 
 # =============================================================================
@@ -164,9 +167,7 @@ def evaluate_split(
                 dtype=torch.bool, device=device,
             )
             seq_len = pred.shape[-2]
-            mn_res = max(1, seq_len // NUM_SEGMENTS)
-            while mn_res > 1 and seq_len % mn_res != 0:
-                mn_res -= 1
+            mn_res = _compute_multinomial_resolution(seq_len, NUM_SEGMENTS, res=res)
             ld = multinomial_loss(
                 y_pred=pred, y_true=targets_scaled, mask=mask,
                 multinomial_resolution=mn_res,

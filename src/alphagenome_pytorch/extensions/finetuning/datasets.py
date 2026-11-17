@@ -1232,15 +1232,37 @@ class SplicingDataset(Dataset):
         if filter_to_junctions and not union_juncs.empty:
             intervals, _ = filter_intervals_with_junctions(intervals, union_juncs)
 
-        # Expand / truncate intervals to sequence_length from centre
+        # Chromosome sizes, for the same bounds check GenomicDataset applies.
+        if isinstance(genome_fasta, CachedGenome):
+            chrom_sizes = dict(genome_fasta.chrom_sizes)
+        else:
+            import pyfaidx as _pyfaidx
+            _fa = _pyfaidx.Fasta(str(genome_fasta))
+            try:
+                chrom_sizes = {ref: len(_fa[ref]) for ref in _fa.keys()}
+            finally:
+                _fa.close()
+
+        # Expand / truncate intervals to sequence_length from centre; skip
+        # windows that would run off a chromosome (matches GenomicDataset, so
+        # multimodal datasets keep identical window lists).
         positions = []
+        n_skipped = 0
         for _, row in intervals.iterrows():
             chrom, start, end = row["chrom"], int(row["start"]), int(row["end"])
             if (end - start) != sequence_length:
                 center = (start + end) // 2
                 start = center - sequence_length // 2
                 end = center + sequence_length // 2
+            if chrom not in chrom_sizes or start < 0 or end > chrom_sizes[chrom]:
+                n_skipped += 1
+                continue
             positions.append((chrom, start, end))
+        if n_skipped:
+            warnings.warn(
+                f"{n_skipped} intervals were skipped because they would exceed "
+                f"chromosome boundaries when expanded to sequence_length={sequence_length}."
+            )
         self._positions_list = positions
 
         # Genome access

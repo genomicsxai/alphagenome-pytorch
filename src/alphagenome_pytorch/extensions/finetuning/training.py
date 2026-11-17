@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -43,9 +44,10 @@ from alphagenome_pytorch.heads import (
     SpliceSitesJunctionHead,
 )
 
-# Number of segments for multinomial loss computation.
-# AlphaGenome divides sequences into 8 equal segments for numerical stability.
-NUM_SEGMENTS = 8
+# Multinomial loss segmentation. ``None`` follows alphagenome_research:
+# fixed 2**17 bp segments (8 segments at 1 Mb, 1 at 131 kb).
+NUM_SEGMENTS = None
+MULTINOMIAL_SEGMENT_BP = 2**17
 
 # Tuple of all splice head types for isinstance checks
 SPLICE_HEAD_TYPES = (SpliceSitesClassificationHead, SpliceSitesUsageHead, SpliceSitesJunctionHead)
@@ -100,28 +102,51 @@ def collate_genomic(
     return sequences, targets_dict
 
 
-def _top_k_positions_from_logits(logits_ncl: torch.Tensor, top_k: int) -> torch.Tensor:
+# alphagenome_research.model.model.DEFAULT_NUM_SPLICE_SITES / DEFAULT_SPLICE_SITE_THRESHOLD
+DEFAULT_JUNCTION_TOP_K = 512
+DEFAULT_SPLICE_SITE_THRESHOLD = 0.1
+
+
+def _top_k_positions_from_logits(
+    logits_ncl: torch.Tensor,
+    top_k: int,
+    threshold: float = DEFAULT_SPLICE_SITE_THRESHOLD,
+) -> torch.Tensor:
     """Derive splice-site positions from classification head logits via top-k selection.
+
+    Mirrors ``alphagenome_research.model.splicing._top_k_splice_sites``: top-k is
+    taken over the softmax *probabilities* (not raw logits) of each role
+    channel, sites with probability below ``threshold`` are dropped, and the
+    remaining positions are sorted ascending with ``-1`` padding at the end.
 
     Args:
         logits_ncl: (B, 5, S) — NCL logits from SpliceSitesClassificationHead
-                    (channels: 0=Donor+, 1=Acceptor+, 2=Donor-, 3=Acceptor-).
+                    (channels: 0=Donor+, 1=Acceptor+, 2=Donor-, 3=Acceptor-, 4=none).
         top_k: Maximum number of positions to select per role per batch item.
+        threshold: Minimum class probability for a selected site; 0 disables.
 
     Returns:
         positions: (B, 4, top_k) int32 tensor — [pos_donors, pos_acceptors,
                    neg_donors, neg_acceptors], padded with -1 where fewer than
-                   top_k sites exist.
+                   top_k sites exist or pass the threshold.
     """
     B, C, S = logits_ncl.shape
     device = logits_ncl.device
+    probs = torch.softmax(logits_ncl.float(), dim=1)
     positions = torch.full((B, 4, top_k), -1, dtype=torch.int32, device=device)
     k = min(top_k, S)
     for role_idx in range(4):  # Donor+, Acceptor+, Donor-, Acceptor-
-        scores = logits_ncl[:, role_idx, :]  # (B, S)
-        topk_idx = torch.topk(scores, k, dim=-1, sorted=True).indices
+        # Stable descending sort: ties resolve to the lower position, as
+        # jax.lax.top_k does (torch.topk's tie order is unspecified on CUDA).
+        values, topk_idx = torch.sort(probs[:, role_idx, :], dim=-1, descending=True, stable=True)
+        values, topk_idx = values[:, :k], topk_idx[:, :k]
+        if threshold > 0:
+            # Push below-threshold sites past every valid index so they sort last.
+            topk_idx = torch.where(values < threshold, torch.full_like(topk_idx, S), topk_idx)
         # Sort positions in ascending genomic order so RoPE distances are stable.
         sorted_idx, _ = topk_idx.sort(dim=-1)
+        if threshold > 0:
+            sorted_idx = torch.where(sorted_idx == S, torch.full_like(sorted_idx, -1), sorted_idx)
         positions[:, role_idx, :k] = sorted_idx.to(torch.int32)
     return positions
 
@@ -189,6 +214,7 @@ def _call_splice_junction_head_sp(
     junction_top_k: int | None,
     cls_head,
     device: torch.device,
+    splice_site_threshold: float = DEFAULT_SPLICE_SITE_THRESHOLD,
 ) -> dict:
     """Sequence-parallel forward pass for SpliceSitesJunctionHead.
 
@@ -228,7 +254,9 @@ def _call_splice_junction_head_sp(
         cls_logits_full  = sequence_parallel.gather_full(
             cls_logits_local, overlap=0,
         )                                                   # (B, 5, S)
-        positions = _top_k_positions_from_logits(cls_logits_full, junction_top_k)  # (B, 4, K)
+        positions = _top_k_positions_from_logits(
+            cls_logits_full, junction_top_k, splice_site_threshold,
+        )  # (B, 4, K)
     else:
         if annotated_positions is None:
             return {}
@@ -275,6 +303,7 @@ def _call_splice_head(
     channels_last,
     cls_head=None,
     junction_top_k: int | None = None,
+    splice_site_threshold: float = DEFAULT_SPLICE_SITE_THRESHOLD,
 ):
     """Call a splice head with the training-loop's embeddings_dict interface.
 
@@ -322,7 +351,9 @@ def _call_splice_head(
             # Run classification head to get per-position scores; always NCL internally.
             emb_for_cls = emb if not channels_last else emb.transpose(1, 2)
             cls_out = cls_head(emb_for_cls, org, channels_last=False)
-            positions = _top_k_positions_from_logits(cls_out["logits"], junction_top_k)
+            positions = _top_k_positions_from_logits(
+                cls_out["logits"], junction_top_k, splice_site_threshold,
+            )
         if positions is None:
             return {}
         # Clamp -1 padding to 0 to avoid PyTorch negative indexing wrapping.
@@ -331,9 +362,20 @@ def _call_splice_head(
         positions_clamped = positions.clamp(min=0)
         out = head(emb, org, splice_site_positions=positions_clamped, channels_last=channels_last)
         n_tissues = head._num_tissues
+        # The head masks pairs with positions >= 0, but it was given clamped
+        # positions, so re-apply that mask with the real (-1 padded) ones; the
+        # SP path does this already by passing unclamped positions.
+        pred_counts = out["pred_counts"]
+        pos_valid = positions >= 0
+        pos_pair = (pos_valid[:, 0, :, None] & pos_valid[:, 1, None, :])[..., None]
+        neg_pair = (pos_valid[:, 2, :, None] & pos_valid[:, 3, None, :])[..., None]
+        pred_counts = torch.cat([
+            torch.where(pos_pair, pred_counts[..., :n_tissues], 0.0),
+            torch.where(neg_pair, pred_counts[..., n_tissues:], 0.0),
+        ], dim=-1)
         return {
-            "pos_counts": out["pred_counts"][..., :n_tissues],
-            "neg_counts": out["pred_counts"][..., n_tissues:],
+            "pos_counts": pred_counts[..., :n_tissues],
+            "neg_counts": pred_counts[..., n_tissues:],
             "positions":  positions,
             "positions_are_predicted": junction_top_k is not None,
         }
@@ -545,7 +587,7 @@ def _get_junction_targets(predictions, targets_dict, device):
 
 
 def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: int = 1,
-                         junction_loss: str = "original", min_alpha_juncs: int = 5):
+                         junction_loss: str = "original", min_alpha_juncs: int = 0):
     """Compute loss for any of the three splice head types.
 
     Args:
@@ -555,8 +597,8 @@ def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: 
             'junction_positions', 'junction_matrix'.
         device: Torch device.
         num_segments: Number of equal-length partitions to split the sequence
-            into before computing loss. Each partition's loss is computed independently
-            and the results are averaged. Values > 1 upweight sequence regions with
+            into before computing the classification/usage loss. Each partition's
+            loss is computed independently and the results are summed. Values > 1 upweight sequence regions with
             fewer splice sites relative to a global mean, since each partition
             contributes equally regardless of how many valid positions it contains.
             Defaults to 1 (standard global mean, unchanged behaviour).
@@ -567,7 +609,7 @@ def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: 
             are excluded to avoid training on low-confidence SSU estimates.
             Background positions (alpha == 0) are also excluded so the model only
             trains on well-supported observations.  Set to 0 to include all positions.
-            Defaults to 5.  Requires 'usage_alpha' key in targets_dict; falls back
+            Defaults to 0 (all positions).  Requires 'usage_alpha' key in targets_dict; falls back
             to ones_like mask when absent.
 
     Returns:
@@ -967,8 +1009,10 @@ def create_lr_scheduler(
             return step / max(1, warmup_steps)
         if schedule == "constant":
             return 1.0
-        # Cosine decay
+        # Cosine decay, held at 0 past total_steps (matches alphagenome_ft's
+        # optimizer_utils.build_lr_schedule clip).
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        progress = min(max(progress, 0.0), 1.0)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     return LambdaLR(optimizer, lr_lambda)
@@ -1370,7 +1414,6 @@ class ProfilingStats:
         Returns:
             Formatted report string with timing breakdowns.
         """
-        import numpy as np
 
         lines = ["\n" + "=" * 70, "PROFILING REPORT", "=" * 70]
         total_time = 0.0
@@ -1406,7 +1449,6 @@ class ProfilingStats:
         Returns:
             Estimated epoch time in seconds.
         """
-        import numpy as np
 
         n_profiled = len(next(iter(self.times.values()))) if self.times else 0
         if n_profiled == 0:
@@ -1446,6 +1488,7 @@ def _run_head(
     heads: dict,
     embeddings_pair=None,
     return_scaled: bool = True,
+    splice_site_threshold: float = DEFAULT_SPLICE_SITE_THRESHOLD,
 ):
     """Forward pass through a head, dispatching by type (splice, contact_maps, genomic)."""
     if embeddings_pair is not None and modality == "contact_maps":
@@ -1460,6 +1503,7 @@ def _run_head(
         return _call_splice_head(
             head_module, embeddings_dict, organism_idx, _positions, channels_last=False,
             cls_head=_cls_head, junction_top_k=junction_top_k,
+            splice_site_threshold=splice_site_threshold,
         )
     return head(embeddings_dict, organism_idx, return_scaled=return_scaled, channels_last=True)
 
@@ -1555,23 +1599,37 @@ def _gene_expr_metrics(
 
 def _compute_multinomial_resolution(
     seq_len: int,
-    num_segments: int = NUM_SEGMENTS,
+    num_segments: int | None = NUM_SEGMENTS,
     min_segment_size: int | None = None,
+    res: int = 1,
 ) -> int:
     """Compute positions per segment for multinomial loss.
 
     Args:
-        seq_len: Total sequence length (number of positions).
-        num_segments: Target number of segments.
+        seq_len: Total sequence length (number of positions at this resolution).
+        num_segments: Fixed number of segments, or ``None`` (default) for
+            alphagenome_research's rule: segments of ``2**17 // res``
+            positions (131072 bp), so the segment count grows with length.
         min_segment_size: Minimum positions per segment (optional).
+        res: Track resolution in bp (only used when ``num_segments`` is None).
 
     Returns:
-        Resolution (positions per segment).
+        Resolution (positions per segment). Always divides ``seq_len``.
     """
-    resolution = max(1, seq_len // num_segments)
+    if num_segments is None:
+        # alphagenome_research GenomeTracksHead._compute_loss:
+        # multinomial_resolution = 2**17 // resolution.
+        resolution = min(seq_len, max(1, MULTINOMIAL_SEGMENT_BP // res))
+    else:
+        resolution = max(1, seq_len // num_segments)
 
     if min_segment_size is not None:
-        resolution = max(resolution, min_segment_size)
+        resolution = min(seq_len, max(resolution, min_segment_size))
+
+    if seq_len % resolution:
+        # The loss reshapes into equal segments; fall back to the largest
+        # segment size <= resolution that tiles the sequence.
+        resolution = math.gcd(seq_len, resolution)
 
     return resolution
 
@@ -1591,7 +1649,7 @@ def train_epoch_ddp(
     use_amp: bool = True,
     accumulation_steps: int = 1,
     frozen_backbone: bool = False,
-    num_segments: int = NUM_SEGMENTS,
+    num_segments: int | None = NUM_SEGMENTS,
     min_segment_size: int | None = None,
     train_sampler: DistributedSampler | None = None,
     rank: int = 0,
@@ -1750,7 +1808,7 @@ def train_epoch_ddp(
             # Compute multinomial loss
             current_seq_len = pred.shape[-2]
             multinomial_res = _compute_multinomial_resolution(
-                current_seq_len, num_segments, min_segment_size
+                current_seq_len, num_segments, min_segment_size, res=res,
             )
 
             loss_dict = multinomial_loss(
@@ -1816,7 +1874,8 @@ def train_epoch_ddp(
             if (frozen_backbone or encoder_only) and world_size > 1:
                 average_gradients_across_ranks(trainable_params)
 
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
+            if max_grad_norm is not None and max_grad_norm > 0:  # <= 0 disables clipping
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
@@ -1896,7 +1955,7 @@ def validate_ddp(
     positional_weight: float,
     count_weight: float,
     use_amp: bool = True,
-    num_segments: int = NUM_SEGMENTS,
+    num_segments: int | None = NUM_SEGMENTS,
     min_segment_size: int | None = None,
     compute_pearson: bool = True,
     rank: int = 0,
@@ -2006,7 +2065,7 @@ def validate_ddp(
                 # Compute multinomial loss
                 current_seq_len = pred_scaled.shape[-2]
                 multinomial_res = _compute_multinomial_resolution(
-                    current_seq_len, num_segments, min_segment_size
+                    current_seq_len, num_segments, min_segment_size, res=res,
                 )
 
                 loss_dict = multinomial_loss(
@@ -2110,7 +2169,8 @@ def train_epoch_multihead(
     use_amp: bool = True,
     accumulation_steps: int = 1,
     frozen_backbone: bool = False,
-    num_segments: int = NUM_SEGMENTS,
+    num_segments: int | None = NUM_SEGMENTS,
+    splice_num_segments: int = 1,
     min_segment_size: int | None = None,
     train_sampler: DistributedSampler | None = None,
     rank: int = 0,
@@ -2128,9 +2188,10 @@ def train_epoch_multihead(
     checkpoint_sync_group: Any | None = None,
     organism_idx: int = 0,
     junction_top_k: int | None = None,
+    splice_site_threshold: float = DEFAULT_SPLICE_SITE_THRESHOLD,
     junction_loss: str = "original",
     sequence_parallel: Any | None = None,
-    min_alpha_juncs: int = 5,
+    min_alpha_juncs: int = 0,
     handler: Any | None = None,
     gene_loss_weights: dict[str, float] | None = None,
     gene_cross_track_weight: float = 5.0,
@@ -2159,7 +2220,8 @@ def train_epoch_multihead(
         frozen_backbone: If True, use torch.no_grad() for backbone.
         num_segments: Number of segments for multinomial loss.
         min_segment_size: Minimum positions per segment.
-        num_segments: Number of sequence segments for both multinomial count loss and splice losses.
+        splice_num_segments: Number of sequence partitions for the splice_site
+            classification and splice_usage losses (1 = single global mean).
         train_sampler: DistributedSampler for DDP.
         rank: Process rank for DDP.
         world_size: Total number of processes.
@@ -2364,12 +2426,14 @@ def train_epoch_multihead(
                         junction_top_k,
                         _cls_head,
                         device,
+                        splice_site_threshold=splice_site_threshold,
                     )
                 else:
                     predictions = _run_head(
                         head, head_module, modality, embeddings_dict, organism_idx,
                         targets_dict, device, junction_top_k, heads,
                         embeddings_pair=embeddings_pair,
+                        splice_site_threshold=splice_site_threshold,
                     )
 
             modality_loss = torch.tensor(0.0, device=device)
@@ -2405,7 +2469,7 @@ def train_epoch_multihead(
                     splice_targets = targets_dict
                 modality_loss, splice_components = _compute_splice_loss(
                     head_module, predictions, splice_targets, device,
-                    num_segments=num_segments,
+                    num_segments=splice_num_segments,
                     junction_loss=junction_loss,
                     min_alpha_juncs=min_alpha_juncs,
                 )
@@ -2443,7 +2507,7 @@ def train_epoch_multihead(
 
                     current_seq_len = pred.shape[-2]
                     multinomial_res = _compute_multinomial_resolution(
-                        current_seq_len, num_segments, min_segment_size
+                        current_seq_len, num_segments, min_segment_size, res=res,
                     )
 
                     loss_dict = multinomial_loss(
@@ -2547,7 +2611,8 @@ def train_epoch_multihead(
                 # gradients computed outside it need explicit DP averaging.
                 average_gradients_across_ranks(trainable_params)
 
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
+            if max_grad_norm is not None and max_grad_norm > 0:  # <= 0 disables clipping
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
@@ -2669,7 +2734,8 @@ def validate_multihead(
     positional_weight: float,
     count_weight: float,
     use_amp: bool = True,
-    num_segments: int = NUM_SEGMENTS,
+    num_segments: int | None = NUM_SEGMENTS,
+    splice_num_segments: int = 1,
     min_segment_size: int | None = None,
     compute_pearson: bool = True,
     rank: int = 0,
@@ -2677,9 +2743,11 @@ def validate_multihead(
     encoder_only: bool = False,
     organism_idx: int = 0,
     junction_top_k: int | None = None,
+    splice_site_threshold: float = DEFAULT_SPLICE_SITE_THRESHOLD,
     junction_loss: str = "original",
     compute_per_sample: bool = False,
-    min_alpha_juncs: int = 5,
+    min_alpha_juncs: int = 0,
+    metrics_seed: int = 0,
     gene_annotation: Any = None,
     gene_expr_track_strands: list[str] | None = None,
     gene_expr_modality: str = "rna_seq",
@@ -2759,6 +2827,10 @@ def validate_multihead(
     }
 
     # For classification head auPRC: accumulate logits and one-hot targets
+    # Background subsample for splice_site auPRC, drawn exactly as alphagenome_ft
+    # does (np.random.default_rng(seed) per validation pass, permutation of the
+    # background indices of each batch in order).
+    _cls_bg_rng = np.random.default_rng(metrics_seed)
     accumulated_cls: dict[str, dict[str, list[Tensor]]] = {
         m: {"logits": [], "true": []} for m in heads
     }
@@ -2842,6 +2914,7 @@ def validate_multihead(
                     predictions_scaled = _run_head(
                         head, head_module, modality, embeddings_dict, organism_idx,
                         targets_dict, device, junction_top_k, heads,
+                        splice_site_threshold=splice_site_threshold,
                     )
                     if compute_pearson and not isinstance(head_module, SPLICE_HEAD_TYPES):
                         predictions_unscaled = head(
@@ -2853,7 +2926,7 @@ def validate_multihead(
                 if isinstance(head_module, SPLICE_HEAD_TYPES):
                     modality_loss, _ = _compute_splice_loss(
                         head_module, predictions_scaled, targets_dict, device,
-                        num_segments=num_segments,
+                        num_segments=splice_num_segments,
                         junction_loss=junction_loss,
                         min_alpha_juncs=min_alpha_juncs,
                     )
@@ -2877,7 +2950,9 @@ def validate_multihead(
                                     n_bg = _bg_idx.shape[0]
                                     if n_bg > 0:
                                         n_sample = min(n_active, n_bg)
-                                        perm = torch.randperm(n_bg, device=_logits_flat.device)[:n_sample]
+                                        perm = torch.from_numpy(
+                                            _cls_bg_rng.permutation(n_bg)[:n_sample]
+                                        ).to(_logits_flat.device)
                                         parts_logits.append(_logits_flat[_bg_idx[perm]])
                                         parts_true.append(_true_flat[_bg_idx[perm]])
                                 if parts_logits:
@@ -2951,7 +3026,7 @@ def validate_multihead(
 
                         current_seq_len = pred_scaled.shape[-2]
                         multinomial_res = _compute_multinomial_resolution(
-                            current_seq_len, num_segments, min_segment_size
+                            current_seq_len, num_segments, min_segment_size, res=res,
                         )
 
                         loss_dict = multinomial_loss(
@@ -3105,7 +3180,6 @@ def validate_multihead(
 
     # Compute per-sample Pearson rows (only when compute_per_sample=True)
     if compute_pearson:
-        import numpy as np
 
         if compute_per_sample:
             # Infer n_s from junction accumulation, fallback to usage
@@ -3229,7 +3303,8 @@ def train_epoch_sequence_parallel(
     use_amp: bool = True,
     accumulation_steps: int = 1,
     frozen_backbone: bool = False,
-    num_segments: int = NUM_SEGMENTS,
+    num_segments: int | None = NUM_SEGMENTS,
+    splice_num_segments: int = 1,
     min_segment_size: int | None = None,
     train_sampler: DistributedSampler | None = None,
     rank: int = 0,
@@ -3246,11 +3321,13 @@ def train_epoch_sequence_parallel(
     save_state: dict | None = None,
     checkpoint_sync_group: Any | None = None,
     junction_top_k: int | None = None,
+    splice_site_threshold: float = DEFAULT_SPLICE_SITE_THRESHOLD,
     junction_loss: str = "original",
     gene_loss_weights: dict[str, float] | None = None,
     gene_cross_track_weight: float = 5.0,
     strand_channel_masks: dict[str, Tensor] | None = None,
     organism_idx: int = 0,
+    min_alpha_juncs: int = 0,
 ) -> tuple[float, dict[str, float]]:  # noqa: D103 — thin wrapper
     """Thin wrapper — delegates to train_epoch_multihead with sequence_parallel enabled."""
     from alphagenome_pytorch.sequence_parallel import SequenceParallelism
@@ -3263,12 +3340,14 @@ def train_epoch_sequence_parallel(
         count_weight=count_weight, epoch=epoch, log_every=log_every, use_amp=use_amp,
         accumulation_steps=accumulation_steps, frozen_backbone=frozen_backbone,
         num_segments=num_segments, min_segment_size=min_segment_size,
+        splice_num_segments=splice_num_segments, min_alpha_juncs=min_alpha_juncs,
         train_sampler=train_sampler, rank=rank, world_size=world_size,
         max_grad_norm=max_grad_norm, profile_batches=profile_batches, log_fn=log_fn,
         encoder_only=encoder_only, save_every_steps=save_every_steps, save_fn=save_fn,
         global_step_offset=global_step_offset, skip_batches=skip_batches,
         save_state=save_state, checkpoint_sync_group=checkpoint_sync_group,
-        junction_top_k=junction_top_k, junction_loss=junction_loss,
+        junction_top_k=junction_top_k, splice_site_threshold=splice_site_threshold,
+        junction_loss=junction_loss,
         sequence_parallel=sequence_parallel, gene_loss_weights=gene_loss_weights,
         gene_cross_track_weight=gene_cross_track_weight,
         strand_channel_masks=strand_channel_masks, organism_idx=organism_idx,
