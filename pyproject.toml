@@ -7,7 +7,7 @@ name = "alphagenome-pytorch"
 dynamic = ["version"]
 description = "PyTorch implementation of AlphaGenome"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "torch>=2.0.0",
     "numpy",
@@ -21,7 +21,7 @@ agt = "alphagenome_pytorch.cli:main"
 test = [
     "pytest>=7.0.0",
     "pytest-xdist",
-    "alphagenome",
+    "alphagenome>=0.7.0,<2",  # 2.x removed alphagenome.models.dna_output
     "chex",
     "einshape",
     "pyranges",
@@ -45,7 +45,7 @@ inference = [
     "pyfaidx",
     "tqdm",
 ]
-# Whole-chromosome gene-count / AnnData export (predict_full_chromosome.py --anndata):
+# Whole-chromosome gene-count / AnnData export (agt predict --chromosomes --anndata):
 # adds pandas (metadata), anndata (.h5ad), and annotation readers (pyranges for
 # GTF, pyarrow for parquet) on top of the base inference deps.
 inference-anndata = [
@@ -66,13 +66,13 @@ scoring = [
     "pandas",
     "tqdm",
     "pyranges",
-    "alphagenome",
+    "alphagenome>=0.7.0,<2",  # 2.x removed alphagenome.models.dna_output
 ]
 serving = [
     "grpcio",
     "pandas",
     "pyfaidx",
-    "alphagenome",
+    "alphagenome>=0.7.0,<2",  # 2.x removed alphagenome.models.dna_output
     "PyYAML",
 ]
 hf = [

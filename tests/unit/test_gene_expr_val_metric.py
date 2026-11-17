@@ -211,3 +211,23 @@ class TestGeneExprResolutionSelection:
         with pytest.raises(ValueError, match="encoder_only forces 128bp"):
             self._validate(encoder_only=True, res_weights={128: 1.0},
                            gene_expr_resolution=1)
+
+
+def test_gene_expr_metrics_merges_strand_pairs():
+    """Stranded windows only have complete genes once +/- pairs are merged."""
+    torch.manual_seed(0)
+    nan = float("nan")
+    genes = [f"g{i}" for i in range(6)]
+    values = torch.rand(6, 2) + 1.0
+    stranded = torch.full((6, 4), nan)
+    for g in range(6):
+        stranded[g, g % 2::2] = values[g]
+    windows = [(genes, stranded, stranded + 0.01 * torch.rand(6, 4))]
+
+    merged = _gene_expr_metrics(
+        windows, modality="rna_seq", track_strands=["+", "-", "+", "-"],
+    )
+    unmerged = _gene_expr_metrics(windows, modality="rna_seq")
+    key = "rna_seq_gene_log_expr_pearson_across_genes_norm"
+    assert not math.isnan(merged[key])
+    assert math.isnan(unmerged[key])

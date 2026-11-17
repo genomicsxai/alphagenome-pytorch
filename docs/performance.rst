@@ -68,7 +68,7 @@ The ``predict()`` method handles autocast automatically. For the CLI scripts:
        --head atac --dtype-policy mixed_precision
 
    # Training
-   python scripts/finetune.py --amp ...
+   agt finetune --amp ...
 
 .. list-table::
    :header-rows: 1
@@ -104,7 +104,7 @@ The 1bp decoder is the most expensive part of the model. If you only need
        --head atac --resolution 128
 
    # Finetuning at 128bp only
-   python scripts/finetune.py --resolutions 128 ...
+   agt finetune --resolutions 128 ...
 
 Heads that only support 128bp (``chip_tf``, ``chip_histone``) always skip the
 decoder regardless of this setting.

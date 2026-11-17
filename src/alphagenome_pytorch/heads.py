@@ -680,16 +680,19 @@ class SpliceSitesJunctionHead(nn.Module):
         Returns:
             (B, K, T, H) tensor after RoPE.
         """
-        x = logits_nhk.transpose(1, 2)                      # (B, K, H)
-        batch_params = self.rope_params[rope_key][organism_index]  # (B, 2, T, H)
-        scale  = batch_params[:, [0], :, :]                  # (B, 1, T, H)
-        offset = batch_params[:, [1], :, :]
-        x = scale * x[:, :, None, :] + offset                # (B, K, T, H)
-        return apply_rope(
-            x, global_positions,
-            max_position=self._max_position_encoding_distance,
-            inplace=True,
-        )
+        # JAX casts to float32 here: positions reach 2**20, which bfloat16 cannot resolve, so the
+        # rotation also runs with autocast disabled (under autocast its einsum would round to bfloat16)
+        with torch.autocast(device_type=logits_nhk.device.type, enabled=False):
+            x = logits_nhk.transpose(1, 2).float()               # (B, K, H)
+            batch_params = self.rope_params[rope_key][organism_index].float()  # (B, 2, T, H)
+            scale  = batch_params[:, [0], :, :]                  # (B, 1, T, H)
+            offset = batch_params[:, [1], :, :]
+            x = scale * x[:, :, None, :] + offset                # (B, K, T, H)
+            return apply_rope(
+                x, global_positions,
+                max_position=self._max_position_encoding_distance,
+                inplace=True,
+            )
 
     def _predict_from_sparse_logits(
         self,

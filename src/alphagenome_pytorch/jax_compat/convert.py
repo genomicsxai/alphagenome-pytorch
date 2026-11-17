@@ -12,6 +12,8 @@ Steps:
 Needs the 'jax' extra: pip install alphagenome-pytorch[jax]
 """
 
+from __future__ import annotations
+
 import argparse
 import sys
 import torch
@@ -61,7 +63,9 @@ def get_track_means_for_head(metadata, head_name, num_tracks):
     # Keep NaN values - they will be sanitized when loading into the model
     nan_count = np.isnan(means).sum()
     if nan_count > 0:
-        print(f"  {head_name}: {nan_count} tracks have NaN means (will be sanitized on load)")
+        print(f"  {head_name}: {nan_count} track{'s' if nan_count != 1 else ''} "
+              f"{'has' if nan_count == 1 else 'have'} NaN means "
+              "(will be sanitized on load)")
 
     # Pad to num_tracks if needed
     if len(means) < num_tracks:

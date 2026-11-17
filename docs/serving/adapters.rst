@@ -257,10 +257,10 @@ Organism defaulting:
   (e.g. a mouse finetune serves mouse), not human.
 - An explicit ``organism`` in the request overrides the bundle default.
 - A **mixed-organism** bundle (trained on more than one organism) is rejected at
-  catalog startup — multi-organism serving is not supported in v1.
+  catalog startup — multi-organism serving is not currently supported.
 
-Constraints (v1)
-~~~~~~~~~~~~~~~~
+Constraints
+~~~~~~~~~~~
 
 - Adapters must remain unmerged — pass ``--no-merge-adapters`` semantics
   permanently in catalog mode.

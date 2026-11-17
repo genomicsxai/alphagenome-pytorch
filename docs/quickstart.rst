@@ -302,6 +302,8 @@ usage and faster inference, use mixed precision with bfloat16 compute:
 Next Steps
 ----------
 
-- :doc:`full_chromosome_prediction` - Genome-wide predictions as BigWig files
+- :doc:`full_chromosome_prediction` - Genome-wide predictions as BigWig files,
+  or aggregated into per-gene count tables (AnnData)
+- :doc:`api/aggregation` - Gene-body / exon aggregation and gene expression
 - :doc:`finetuning/index` - Transfer learning on your own genomic tracks
 - :doc:`api/model` - Full API reference

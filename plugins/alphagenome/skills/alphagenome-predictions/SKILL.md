@@ -21,6 +21,7 @@ Read only the sections relevant to the task:
 | Work with tensors in Python | `The 30-second version` and `Step 1` |
 | Select an assay, cell type, or resolution | `Step 2`, `Step 3`, and `Recipes` |
 | Look up exact track counts or metadata literals | `Step 2` and `Available metadata fields` |
+| Build per-gene counts / a gene expression matrix | `Gene-level aggregation` |
 | Diagnose padding, custom metadata, precision, or raw outputs | `Gotchas` |
 
 Use a targeted search or section read instead of loading the whole guide. For example:
