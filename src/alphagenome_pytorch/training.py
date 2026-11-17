@@ -63,6 +63,7 @@ class AlphaGenomeTrainingConfig:
     eps: float = 1e-8
     
     # Loss configuration
+    multinomial_resolution: int = 128
     positional_weight: float = 5.0  # JAX production value (AG_MODEL.md line 321)
 
 
@@ -117,8 +118,9 @@ class AlphaGenomeLoss(nn.Module):
             the sequence for multinomial loss. If None (default), uses
             `2**17 // resolution` for each resolution as upstream, i.e. 131,072 bp
             segments at both 1bp and 128bp (capped at the sequence length for
-            shorter inputs). An int applies to every head and resolution; a dict
-            maps resolution to segment size.
+            shorter inputs). Tensor outputs without a resolution key retain
+            the 128-bin default. An int applies to every head and resolution; a
+            dict maps resolution to segment size.
         positional_weight: Weight for positional component of multinomial loss.
             JAX production uses 5.0 (default), matching Borzoi.
     """
@@ -171,9 +173,7 @@ class AlphaGenomeLoss(nn.Module):
         if self.multinomial_resolution is not None:
             return self.multinomial_resolution
         if resolution is None:
-            raise ValueError(
-                "multinomial_resolution must be set when outputs are not keyed by resolution."
-            )
+            return 128
         return min(2**17 // resolution, seq_len)
 
     def _get_strand_channel_mask(self, head: str) -> Optional[torch.Tensor]:

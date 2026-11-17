@@ -159,6 +159,18 @@ class TestAlphaGenomeLoss:
         )
         torch.testing.assert_close(result['loss'], expected)
 
+    def test_default_multinomial_resolution_for_tensor_output(self):
+        """Unkeyed predictions retain the existing 128-bin segment default."""
+        outputs = {'atac': torch.ones(1, 256, 3)}
+        targets = {'atac': torch.full_like(outputs['atac'], 2.0)}
+        organism_index = torch.tensor([0])
+
+        default_loss = AlphaGenomeLoss(heads=['atac'])(outputs, targets, organism_index)
+        explicit_loss = AlphaGenomeLoss(heads=['atac'], multinomial_resolution=128)(
+            outputs, targets, organism_index,
+        )
+        torch.testing.assert_close(default_loss['loss'], explicit_loss['loss'])
+
     def test_multinomial_resolution_override(self):
         """An int applies to every resolution; a dict is looked up per resolution."""
         outputs = {'atac': {1: torch.rand(1, 256, 3) + 0.1, 128: torch.rand(1, 2, 3) + 0.1}}
