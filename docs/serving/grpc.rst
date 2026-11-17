@@ -78,3 +78,28 @@ Use ``DnaClient`` with an insecure channel to your local tunnel:
    For local serving, instantiate ``dna_client.DnaClient`` directly with your
    channel, as shown above.
    ``dna_client.create(...)`` is intended for the hosted Google endpoint.
+
+Checkpoint selection and TLS
+----------------------------
+
+Declare the AlphaGenome 1 base checkpoint with ``--model-version FOLD_1``
+(or ``ALL_FOLDS``, ``FOLD_0``, ``FOLD_2``, or ``FOLD_3``). The declaration
+describes the loaded weights. It does not choose or download weights.
+
+On a declared deployment, an empty gRPC prediction or scoring version means
+``ALL_FOLDS``, as on the hosted AlphaGenome 1 API. A mismatch returns
+``INVALID_ARGUMENT``. When no version is declared, empty requests retain
+the legacy behavior and explicit version requests are rejected. A declared
+catalog with a base entry uses that entry when callers omit the model ID.
+Use the ``alphagenome-model-id`` request header to select an adapter. The
+``alphagenome-model-version`` response header identifies the declared base.
+
+Supply both ``--grpc-tls-cert`` and ``--grpc-tls-key`` with PEM files to
+enable TLS on ``--grpc-port``. Use a certificate trusted by the client
+for the endpoint hostname. TLS applies to the gRPC listener.
+
+REST callers continue to select a catalog entry with ``model_id`` or a
+model-scoped URL. ``GET /v1/models`` reports the declared ``model_version``
+for the base and ``base_model_variant`` for adapters. Metadata responses
+report ``model_version``. Serve different base checkpoints from separate
+instances.

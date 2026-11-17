@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 from alphagenome_pytorch.cli._deps import require_extra
 
@@ -54,6 +55,11 @@ def register(subparsers: argparse._SubParsersAction) -> None:
 
     p.add_argument("--grpc-port", type=int, default=50051,
                    help="gRPC server port.")
+    p.add_argument("--model-version",
+                   choices=["ALL_FOLDS", "FOLD_0", "FOLD_1", "FOLD_2", "FOLD_3"],
+                   help="AlphaGenome 1 checkpoint identity for the loaded base weights.")
+    p.add_argument("--grpc-tls-cert", type=Path, help="PEM certificate chain for gRPC.")
+    p.add_argument("--grpc-tls-key", type=Path, help="PEM private key for gRPC.")
     p.add_argument("--disable-grpc", action="store_true",
                    help="Disable gRPC server.")
 

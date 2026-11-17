@@ -49,7 +49,7 @@ Manifest Schema (v1)
      "id": "k562-atac-lora",
      "label": "K562 ATAC LoRA",
      "base_model_id": "your-org/alphagenome",
-     "base_model_variant": "fold_1",
+     "base_model_variant": "FOLD_1",
      "base_model_hash": "sha256:abc...",
      "base_model_weights_hash": "sha256-tensors-v1:def...",
      "alphagenome_pytorch_version": "x.y.z",

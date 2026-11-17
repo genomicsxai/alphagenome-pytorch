@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+from contextlib import closing
 
 import numpy as np
 import pytest
@@ -29,8 +30,8 @@ from alphagenome_pytorch.variant_scoring.types import (
 from .serving_fakes import FakeAnndataModule, FakeRuntime, FakeScoringModel
 
 
-def _start_rest(adapter):
-    server = serve_rest(adapter, host='127.0.0.1', port=0, wait=False)
+def _start_rest(adapter, **server_options):
+    server = serve_rest(adapter, host='127.0.0.1', port=0, wait=False, **server_options)
     host, port = server.server_address
     try:
         yield host, port
@@ -65,6 +66,21 @@ def _post(host: str, port: int, path: str, body: bytes) -> tuple[int, dict]:
         return response.status, payload
     finally:
         conn.close()
+
+
+def test_declared_model_version_in_rest_discovery():
+    adapter = LocalDnaModelAdapter(FakeRuntime())
+    for host, port in _start_rest(adapter, model_version="FOLD_1"):
+        with closing(http.client.HTTPConnection(host, port, timeout=10)) as conn:
+            conn.request("GET", "/v1/models")
+            response = conn.getresponse()
+            assert response.status == 200
+            assert json.load(response)["models"][0]["model_version"] == "FOLD_1"
+
+            conn.request("GET", "/v1/models/default/metadata?organism=HOMO_SAPIENS")
+            response = conn.getresponse()
+            assert response.status == 200
+            assert json.load(response)["model_version"] == "FOLD_1"
 
 
 def test_predict_sequence_happy_path(rest_server):

@@ -398,6 +398,7 @@ class _ServingHandler(BaseHTTPRequestHandler):
     # on the subclass produced by ``_make_handler``.
     adapter: LocalDnaModelAdapter | None = None
     router: Any | None = None
+    model_version: str | None = None
 
     def _read_json(self) -> dict[str, Any]:
         content_length = int(self.headers.get('Content-Length', '0'))
@@ -465,13 +466,15 @@ class _ServingHandler(BaseHTTPRequestHandler):
             path = self.path.split('?', 1)[0]
 
             if path == '/v1/models':
-                if self.router is None:
-                    # Singleton mode: surface the implicit single model.
-                    self._write_json({'models': [{
-                        'id': 'default', 'kind': 'singleton', 'label': None,
-                    }]})
-                else:
-                    self._write_json({'models': self.router.list_models()})
+                models = (
+                    [{'id': 'default', 'kind': 'singleton', 'label': None}]
+                    if self.router is None else self.router.list_models()
+                )
+                if self.model_version:
+                    for card in models:
+                        field = 'base_model_variant' if card['kind'] == 'adapter' else 'model_version'
+                        card[field] = self.model_version
+                self._write_json({'models': models})
                 return
 
             scoped_id, rest = self._scoped_model_id(path)
@@ -479,14 +482,20 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 organism = self._parse_query_value('organism')
                 with self._acquire_adapter(scoped_model_id=scoped_id) as adapter:
                     metadata = adapter.output_metadata(organism=organism)
-                self._write_json({'metadata': _serialize_output_metadata(metadata)})
+                payload = {'metadata': _serialize_output_metadata(metadata)}
+                if self.model_version:
+                    payload['model_version'] = self.model_version
+                self._write_json(payload)
                 return
 
             if path.startswith('/v1/output_metadata'):
                 organism = self._parse_query_value('organism')
                 with self._acquire_adapter() as adapter:
                     metadata = adapter.output_metadata(organism=organism)
-                self._write_json({'metadata': _serialize_output_metadata(metadata)})
+                payload = {'metadata': _serialize_output_metadata(metadata)}
+                if self.model_version:
+                    payload['model_version'] = self.model_version
+                self._write_json(payload)
                 return
             self._write_json({'error': 'Not found'}, status=HTTPStatus.NOT_FOUND)
         except Exception as exc:
@@ -648,13 +657,14 @@ class _ServingHandler(BaseHTTPRequestHandler):
         return None
 
 
-def _make_handler(target: Any):
+def _make_handler(target: Any, model_version: str | None = None):
     """Build a handler subclass bound to either a singleton adapter or a router."""
     from alphagenome_pytorch.extensions.serving.router import ServedModelRouter
 
     class Handler(_ServingHandler):
         pass
 
+    Handler.model_version = model_version
     if isinstance(target, ServedModelRouter):
         Handler.router = target
         Handler.adapter = None
@@ -670,10 +680,11 @@ def serve_rest(
     host: str = '127.0.0.1',
     port: int = 8080,
     wait: bool = True,
+    model_version: str | None = None,
 ) -> ThreadingHTTPServer:
     """Start a local REST server. ``target`` may be a :class:`LocalDnaModelAdapter`
     (singleton) or a :class:`ServedModelRouter` (catalog mode)."""
-    server = ThreadingHTTPServer((host, port), _make_handler(target))
+    server = ThreadingHTTPServer((host, port), _make_handler(target, model_version))
     bound_host, bound_port = server.server_address
     LOGGER.info('Local REST serving started at http://%s:%d', bound_host, bound_port)
 
