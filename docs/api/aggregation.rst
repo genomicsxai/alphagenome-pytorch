@@ -230,10 +230,9 @@ Module Reference
 Gene annotation
 ---------------
 
-The exon-based helpers take a ``GeneAnnotation``, which lives in the
-variant-scoring package but is documented here because aggregation is its main
-consumer. Build it from a GTF/parquet that includes exon rows, or from a
-pre-filtered DataFrame.
+The exon-based helpers take a ``GeneAnnotation`` from
+``alphagenome_pytorch.annotations``. Build it from a GTF or parquet file that
+includes exon rows, or from a pre-filtered DataFrame.
 
 .. autoclass:: alphagenome_pytorch.annotations.GeneAnnotation
    :members:

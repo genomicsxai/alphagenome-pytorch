@@ -572,46 +572,46 @@ class PolyAAnnotation:
             # Normalize chromosome naming (ensure 'Chromosome' column exists)
             if 'Chromosome' not in self._df.columns and 'chr' in self._df.columns:
                 self._df['Chromosome'] = self._df['chr']
-            
+
             # Detect if this is a linked parquet with proper Ensembl gene_ids
             if 'gene_id' in self._df.columns:
                 sample_id = str(self._df['gene_id'].iloc[0])
                 self._has_gene_id = sample_id.startswith('ENSG')
             else:
                 self._has_gene_id = False
-            
+
             # Build gene_id index for fast lookup if available
             if self._has_gene_id:
                 self._build_gene_index()
-                
+
         return self._df
-    
+
     def _build_gene_index(self) -> None:
         """Build index mapping gene_id to PAS rows for fast lookup."""
         self._gene_id_index = {}
         # Group by gene_id for fast lookup
         for gene_id, group in self._df.groupby('gene_id'):
             self._gene_id_index[gene_id] = group
-    
+
     @property
     def has_gene_id(self) -> bool:
         """Whether this parquet has linked Ensembl gene IDs."""
         _ = self.df  # Ensure loaded
         return self._has_gene_id or False
-    
+
     def get_total_pas_count_for_gene(self, gene_id: str, strand: str | None = None) -> int:
         """Get total number of PAS sites for a gene (for coverage calculation).
-        
+
         Args:
             gene_id: Gene ID (with or without version)
             strand: Optional strand filter
-            
+
         Returns:
             Total PAS count for the gene
         """
         _ = self.df  # Ensure loaded
         gene_id_base = gene_id.split('.')[0]
-        
+
         if self._has_gene_id and self._gene_id_index:
             if gene_id_base not in self._gene_id_index:
                 return 0
@@ -643,17 +643,17 @@ class PolyAAnnotation:
             List of 0-based PAS positions relative to the interval.
         """
         _ = self.df  # Ensure loaded
-        
+
         gene_strand = gene_info.get('strand', '+')
         gene_id = gene_info.get('gene_id', '').split('.')[0]
-        
+
         # Use gene_id-based filtering if available (matches JAX behavior)
         if self._has_gene_id and self._gene_id_index and gene_id:
             return self._get_pas_by_gene_id(gene_id, gene_strand, interval)
-        
+
         # Fallback to spatial overlap
         return self._get_pas_by_spatial(gene_info, interval, downstream_extension)
-    
+
     def _get_pas_by_gene_id(
         self,
         gene_id: str,
@@ -663,33 +663,33 @@ class PolyAAnnotation:
         """Get PAS positions by gene_id filtering (JAX-compatible)."""
         if gene_id not in self._gene_id_index:
             return []
-        
+
         gene_pas = self._gene_id_index[gene_id]
-        
+
         # Filter by strand
         strand_col = 'pas_strand' if 'pas_strand' in gene_pas.columns else 'Strand'
         gene_pas = gene_pas[gene_pas[strand_col] == strand]
-        
+
         # Filter by interval
         chrom = interval.chromosome
         chrom_col = gene_pas['Chromosome'].astype(str)
         chrom_match = (
-            (chrom_col == chrom) | 
+            (chrom_col == chrom) |
             (chrom_col == 'chr' + chrom) |
             ('chr' + chrom_col == chrom)
         )
-        
+
         mask = (
             chrom_match &
             (gene_pas['Start'] >= interval.start) &
             (gene_pas['Start'] < interval.end)
         )
-        
+
         positions = gene_pas.loc[mask, 'Start'].values
         relative_positions = [int(pos - interval.start) for pos in positions]
-        
+
         return sorted(relative_positions)
-    
+
     def _get_pas_by_spatial(
         self,
         gene_info: dict[str, Any],
@@ -716,7 +716,7 @@ class PolyAAnnotation:
         # Handle chromosome prefix differences
         chrom_col = df['Chromosome'].astype(str)
         chrom_match = (
-            (chrom_col == chrom) | 
+            (chrom_col == chrom) |
             (chrom_col == 'chr' + chrom) |
             ('chr' + chrom_col == chrom)
         )
@@ -754,7 +754,7 @@ class PolyAAnnotation:
         # Handle chromosome prefix differences
         chrom_col = df['Chromosome'].astype(str)
         chrom_match = (
-            (chrom_col == chrom) | 
+            (chrom_col == chrom) |
             (chrom_col == 'chr' + chrom) |
             ('chr' + chrom_col == chrom)
         )

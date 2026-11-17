@@ -354,6 +354,7 @@ from alphagenome_pytorch.aggregation import gene_expression
 from alphagenome_pytorch.annotations import GeneAnnotation
 
 annotation = GeneAnnotation("gencode.v46.parquet")   # needs exon rows
+# .gtf and .gtf.gz also work (GTF reading needs pyranges)
 interval = ("chr20", 30_000_000, 30_131_072)         # 0-based half-open
 
 out = model.predict(dna, 0, named_outputs=True, heads=("rna_seq",), resolutions=(1,))
