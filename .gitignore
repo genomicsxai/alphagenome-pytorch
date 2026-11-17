@@ -70,6 +70,7 @@ scripts/*.err
 # OS
 .DS_Store
 Thumbs.db
+._*
 docs/_build/
 
 # Hatch VCS

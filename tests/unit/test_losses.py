@@ -344,6 +344,97 @@ class TestCrossEntropyLoss:
 
 
 @pytest.mark.unit
+class TestCrossEntropyLossSmoothingFix:
+    """Tests for cross_entropy_loss post-smoothing (B3.4 / upstream de264f5).
+
+    Golden values produced by running the upstream JAX
+    `cross_entropy_loss` on the same inputs
+    """
+
+    # Inputs reused across cases.
+    Y_TRUE = torch.tensor([[[1.0, 2.0, 3.0, 4.0],
+                            [0.5, 1.5, 2.5, 3.5]]])
+    Y_PRED = torch.tensor([[[1.5, 2.5, 0.5, 3.0],
+                            [0.8, 1.0, 2.0, 4.0]]])
+
+    def test_jax_parity_full_mask(self):
+        mask = torch.ones((1, 2, 4), dtype=torch.bool)
+        loss = losses.cross_entropy_loss(
+            y_true=self.Y_TRUE, y_pred=self.Y_PRED, mask=mask, axis=-1,
+        )
+        assert torch.isclose(loss, torch.tensor(1.402277946472168), atol=1e-6)
+
+    def test_jax_parity_partial_mask(self):
+        mask = torch.tensor([[[True, True, False, True],
+                              [True, False, True, True]]])
+        loss = losses.cross_entropy_loss(
+            y_true=self.Y_TRUE, y_pred=self.Y_PRED, mask=mask, axis=-1,
+        )
+        assert torch.isclose(loss, torch.tensor(0.9597185850143433), atol=1e-6)
+
+    def test_jax_parity_row_fully_masked(self):
+        """One reduction row entirely masked — must be finite (was NaN before fix)."""
+        mask = torch.tensor([[[True, True, True, True],
+                              [False, False, False, False]]])
+        loss = losses.cross_entropy_loss(
+            y_true=self.Y_TRUE, y_pred=self.Y_PRED, mask=mask, axis=-1,
+        )
+        assert torch.isfinite(loss)
+        assert torch.isclose(loss, torch.tensor(1.5595977306365967), atol=1e-6)
+
+    def test_jax_parity_axis_minus_two(self):
+        y_true = torch.tensor([[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]])
+        y_pred = torch.tensor([[[1.2, 1.8], [2.8, 4.2], [4.5, 6.5]]])
+        mask = torch.ones((1, 3, 2), dtype=torch.bool)
+        loss = losses.cross_entropy_loss(
+            y_true=y_true, y_pred=y_pred, mask=mask, axis=-2,
+        )
+        assert torch.isclose(loss, torch.tensor(0.9772524237632751), atol=1e-6)
+
+    def test_zero_counts_smoothed(self):
+        """All-zero counts: loss equals entropy of the smoothed uniform distribution.
+
+        With y_true = y_pred = 0 and eps = 1e-7, after smoothing the per-axis
+        distribution is uniform over the axis size (here 3), so the loss is
+        log(3) ≈ 1.0986123. Crucially, no inf from log(0).
+        """
+        y = torch.zeros((1, 2, 3))
+        mask = torch.ones((1, 2, 3), dtype=torch.bool)
+        loss = losses.cross_entropy_loss(
+            y_true=y, y_pred=y, mask=mask, axis=-1,
+        )
+        assert torch.isfinite(loss)
+        assert torch.isclose(loss, torch.tensor(1.0986123085021973), atol=1e-6)
+
+    def test_smoothing_gradient_finite(self):
+        """Zero-count predictions must yield finite gradient (no log(0))."""
+        y_true = torch.zeros((1, 2, 3))
+        y_pred = torch.zeros((1, 2, 3), requires_grad=True)
+        mask = torch.ones((1, 2, 3), dtype=torch.bool)
+        loss = losses.cross_entropy_loss(
+            y_true=y_true, y_pred=y_pred, mask=mask, axis=-1,
+        )
+        loss.backward()
+        assert y_pred.grad is not None
+        assert torch.all(torch.isfinite(y_pred.grad))
+
+    def test_perfect_prediction_closed_form(self):
+        """y_pred == y_true (uniform mask) reduces to entropy of smoothed distribution.
+
+        For y_true = y_pred = [1, 2, 3, 4] with eps = 1e-7 (negligible),
+        p = [0.1, 0.2, 0.3, 0.4]. Loss = -sum p log p ≈ 1.279854.
+        """
+        y = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        mask = torch.ones((1, 4), dtype=torch.bool)
+        loss = losses.cross_entropy_loss(
+            y_true=y, y_pred=y, mask=mask, axis=-1,
+        )
+        p = torch.tensor([0.1, 0.2, 0.3, 0.4])
+        expected = (-p * torch.log(p)).sum()
+        assert torch.isclose(loss, expected, atol=1e-5)
+
+
+@pytest.mark.unit
 class TestExtremeValues:
     """Tests for numerical stability with extreme inputs."""
 

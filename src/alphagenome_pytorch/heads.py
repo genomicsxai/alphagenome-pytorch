@@ -277,6 +277,20 @@ class GenomeTracksHead(nn.Module):
             # learnt_scale: (num_organisms, num_tracks)
             self.residual_scales[res_str] = nn.Parameter(torch.ones(num_organisms, num_tracks))
 
+    def _organism_slot(self, organism_index):
+        """Resolve which organism weight slot this head uses.
+
+        A single-organism fine-tuned head (``num_organisms == 1``) has exactly
+        one slot and is organism-agnostic: it uses slot 0 regardless of which
+        organism was selected for the *trunk* embedding (e.g. mouse data
+        forwards the trunk at index 1, but this head only has slot 0). A
+        multi-organism head uses the index as given — an out-of-range index
+        raises on indexing as usual, we do not mask it.
+        """
+        if self.num_organisms == 1:
+            return torch.zeros_like(organism_index) if torch.is_tensor(organism_index) else 0
+        return organism_index
+
     def _predict(self, x, organism_index, res_str):
         """Raw model prediction (in model space)."""
         # x: (B, C, S) - NCL format
@@ -292,6 +306,7 @@ class GenomeTracksHead(nn.Module):
 
     def unscale(self, x, organism_index, resolution, channels_last=True):
         """Unscales predictions to experimental data scale."""
+        organism_index = self._organism_slot(organism_index)
         track_means = self.track_means[organism_index]  # (B, num_tracks)
         return predictions_scaling(
             x,
@@ -314,6 +329,7 @@ class GenomeTracksHead(nn.Module):
         Returns:
             Targets in model space (same format as input)
         """
+        organism_index = self._organism_slot(organism_index)
         track_means = self.track_means[organism_index]  # (B, num_tracks)
         return targets_scaling(
             x,
@@ -338,6 +354,7 @@ class GenomeTracksHead(nn.Module):
         Returns:
             Dict mapping resolution to predictions in specified format
         """
+        organism_index = self._organism_slot(organism_index)
         outputs = {}
         for res in self.resolutions:
             if res not in embeddings_dict:
@@ -554,9 +571,11 @@ class SpliceSitesJunctionHead(nn.Module):
         )
 
         def make_rope_params():
-            return nn.Parameter(torch.zeros(
+            tensor = torch.empty(
                 self._num_organisms, 2, self._num_tissues, self._hidden_dim
-            ))
+            )
+            nn.init.trunc_normal_(tensor, std=0.1)
+            return nn.Parameter(tensor)
 
         self.rope_params = nn.ParameterDict({
             "pos_donor": make_rope_params(),
@@ -599,16 +618,19 @@ class SpliceSitesJunctionHead(nn.Module):
                 return embedding[batch_idx, :, indices]  # (B, P, H)
 
             def _apply_rope(embedding, indices, params, organism_index):
-                x = _index_embeddings(embedding, indices)  # (B, P, H)
-                batch_params = params[organism_index]  # (B, 2, T, H)
-                scale = batch_params[:, [0], :, :]
-                offset = batch_params[:, [1], :, :]
-                x = scale * x[:, :, None, :] + offset  # (B, P, T, H)
-                return apply_rope(
-                    x, indices,
-                    max_position=self._max_position_encoding_distance,
-                    inplace=True,
-                )
+                # JAX casts to float32 here: positions reach 2**20, which bfloat16 cannot resolve, so the
+                # rotation also runs with autocast disabled (under autocast its einsum would round to bfloat16)
+                with torch.autocast(device_type=embedding.device.type, enabled=False):
+                    x = _index_embeddings(embedding, indices).float()  # (B, P, H)
+                    batch_params = params[organism_index].float()  # (B, 2, T, H)
+                    scale = batch_params[:, [0], :, :]
+                    offset = batch_params[:, [1], :, :]
+                    x = scale * x[:, :, None, :] + offset  # (B, P, T, H)
+                    return apply_rope(
+                        x, indices,
+                        max_position=self._max_position_encoding_distance,
+                        inplace=True,
+                    )
 
             pos_donor_logits = _apply_rope(
                 splice_site_logits, pos_donor_idx,

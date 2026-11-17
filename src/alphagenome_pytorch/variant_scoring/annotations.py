@@ -3,7 +3,7 @@
 This module provides classes for loading and querying gene annotations
 from GTF/GFF or Parquet files for use with gene-centric variant scorers.
 
-For best performance, convert GTF files to Parquet format using:
+Convert GTF files to Parquet with:
     python scripts/convert_gtf_to_parquet.py --input annotation.gtf --output annotation.parquet
 """
 
@@ -17,7 +17,7 @@ import pandas as pd
 import torch
 
 if TYPE_CHECKING:
-    from .types import Interval
+    from .types import Interval, Variant
 
 
 @dataclass
@@ -32,36 +32,98 @@ class GeneInfo:
     strand: str
 
 
-class GeneAnnotation:
-    """Load and query gene/exon annotations from GTF or Parquet files.
+_REQUIRED_COLUMNS = ('Feature', 'Chromosome', 'Start', 'End', 'gene_id')
 
-    Supports both GTF/GFF files (using pyranges) and pre-converted Parquet files.
-    Parquet files load ~50-100x faster than GTF files.
+
+def _validate_annotation_frame(df: pd.DataFrame, source: str) -> None:
+    """Reject frames GeneAnnotation cannot index, at the point of supply.
+
+    Gene lookups are driven entirely by ``Feature == 'gene'`` rows, so a frame
+    without them answers every query with an empty result instead of raising.
+    Filtering a GTF on a transcript-level attribute (``tag``, ``transcript_type``)
+    drops those rows — fail loudly instead.
+    """
+    missing = [c for c in _REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Annotation from {source} is missing required column(s): {missing}. "
+            f"Expected at least {list(_REQUIRED_COLUMNS)}."
+        )
+    if not (df['Feature'] == 'gene').any():
+        raise ValueError(
+            f"Annotation from {source} contains no `Feature == 'gene'` rows, so "
+            "every gene lookup would return empty. Filtering a GTF on a "
+            "transcript-level attribute (e.g. tag == 'MANE_Select') drops them — "
+            "keep the gene rows alongside the filtered transcript/exon rows."
+        )
+
+
+class GeneAnnotation:
+    """Load and query gene/exon annotations from a GTF, Parquet file, or DataFrame.
+
+    Accepts GTF/GFF files (via pyranges), Parquet files, or an in-memory
+    DataFrame in the same layout — one row per GTF feature, with at least
+    ``Feature``, ``Chromosome``, ``Start``, ``End``, and ``gene_id`` columns,
+    and coordinates 0-based half-open.
+
+    Passing a DataFrame is the supported way to restrict the annotation: filter
+    it with pandas first. Keep the ``Feature == 'gene'`` rows — gene lookups are
+    built from those, and a frame without them is rejected at construction.
 
     To convert GTF to Parquet:
         python scripts/convert_gtf_to_parquet.py --input annotation.gtf --output annotation.parquet
 
     Example:
-        >>> # Fast loading from Parquet (recommended)
         >>> annotation = GeneAnnotation('/path/to/gencode.parquet')
         >>> genes = annotation.get_genes_in_interval(interval)
         >>>
-        >>> # Traditional GTF loading (slower)
         >>> annotation = GeneAnnotation('/path/to/gencode.gtf')
+        >>>
+        >>> # Pre-filtered DataFrame (e.g. protein-coding only). `gene_type` is
+        >>> # present on gene and exon rows alike, so one predicate covers both.
+        >>> import pandas as pd
+        >>> gtf = pd.read_parquet('/path/to/gencode.parquet')
+        >>> annotation = GeneAnnotation(gtf[gtf.gene_type == 'protein_coding'])
     """
 
-    def __init__(self, annotation_path: str | Path):
-        """Initialize with path to annotation file.
+    def __init__(self, annotation: str | Path | pd.DataFrame):
+        """Initialize from an annotation path or a DataFrame.
 
         Args:
-            annotation_path: Path to annotation file. Supports:
-                - Parquet files (.parquet) - fast loading, recommended
-                - GTF/GFF files (.gtf, .gff, .gff3) - slow, requires pyranges
+            annotation: One of:
+
+                - Parquet file path (.parquet)
+                - GTF/GFF file path (.gtf, .gff, .gff3), requires pyranges
+                - A pandas DataFrame in GTF layout (see the class docstring).
+                  Held by reference and not copied, so do not mutate it
+                  afterwards; the indices built from it would go stale.
+
+        Raises:
+            ValueError: If a DataFrame is missing required columns or has no
+                ``Feature == 'gene'`` rows.
         """
-        self.annotation_path = Path(annotation_path)
         self._df: pd.DataFrame | None = None
         self._gene_index: dict[str, GeneInfo] = {}
+        self._gene_index_built: bool = False
+        # Exon coordinates by (versionless) gene id. Built once, lazily, in a
+        # single groupby pass — see `_get_exons_for_gene`.
         self._exon_cache: dict[str, list[tuple[int, int]]] = {}
+        self._exon_index_built: bool = False
+        # Per-chromosome start-sorted gene index for fast interval overlap
+        # queries; built lazily in `get_genes_in_interval`.
+        self._interval_index: dict[str, dict[str, Any]] | None = None
+        self._max_gene_span: int = 0
+
+        if isinstance(annotation, pd.DataFrame):
+            # Validate eagerly: there is no IO to defer, and raising here points
+            # at the caller's filter rather than at some later gene lookup.
+            _validate_annotation_frame(annotation, 'DataFrame')
+            self.annotation_path = None
+            self._file_format = 'dataframe'
+            self._df = annotation
+            return
+
+        self.annotation_path = Path(annotation)
 
         # Detect file format
         suffix = self.annotation_path.suffix.lower()
@@ -75,10 +137,11 @@ class GeneAnnotation:
                 del _pr
             except ImportError:
                 raise ImportError(
-                    "pyranges is required for GTF files. "
+                    "pyranges is required to read GTF/GFF files. "
                     "Install with: pip install pyranges\n"
-                    "Or convert to Parquet for faster loading: "
-                    "python scripts/convert_gtf_to_parquet.py"
+                    "Or pass a .parquet file or a DataFrame, neither of which "
+                    "needs it. (scripts/convert_gtf_to_parquet.py converts a GTF "
+                    "once, but itself runs on pyranges.)"
                 )
         else:
             raise ValueError(
@@ -88,18 +151,23 @@ class GeneAnnotation:
 
     # Keep gtf_path as alias for backward compatibility
     @property
-    def gtf_path(self) -> Path:
-        """Alias for annotation_path (backward compatibility)."""
+    def gtf_path(self) -> Path | None:
+        """Alias for annotation_path (backward compatibility).
+
+        ``None`` when built from a DataFrame.
+        """
         return self.annotation_path
 
     @property
     def df(self) -> pd.DataFrame:
-        """Lazy-loaded annotation DataFrame."""
+        """Annotation DataFrame; loaded and indexed on first access."""
         if self._df is None:
             if self._file_format == 'parquet':
                 self._load_from_parquet()
             else:
                 self._load_from_gtf()
+            _validate_annotation_frame(self._df, str(self.annotation_path))
+        if not self._gene_index_built:
             self._build_gene_index()
         return self._df
 
@@ -123,6 +191,7 @@ class GeneAnnotation:
         """Build index of gene information."""
         # Filter for gene features
         genes_df = self._df[self._df['Feature'] == 'gene']
+        self._gene_index_built = True
 
         for _, row in genes_df.iterrows():
             gene_id = row.get('gene_id', '')
@@ -140,43 +209,55 @@ class GeneAnnotation:
                 strand=row.get('Strand', '.'),
             )
 
-    def _get_exons_for_gene(self, gene_id: str) -> list[tuple[int, int]]:
-        """Get exon coordinates for a gene.
+    @staticmethod
+    def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """Sort and merge overlapping/adjacent (start, end) intervals."""
+        if not intervals:
+            return []
+        intervals = sorted(intervals)
+        merged = [intervals[0]]
+        for start, end in intervals[1:]:
+            if start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
 
-        Args:
-            gene_id: Gene ID (without version)
+    def _build_exon_index(self) -> None:
+        """Index merged exon coordinates by versionless gene id in one pass.
 
-        Returns:
-            List of (start, end) tuples for exons (0-based coordinates)
+        Replaces per-gene full-frame filtering: a single ``groupby`` over the
+        exon rows populates ``_exon_cache`` for every gene at once, so
+        ``_get_exons_for_gene`` is O(1) even on a cold cache. Built lazily the
+        first time exons are requested, so gene-only consumers never pay for it.
         """
-        if gene_id in self._exon_cache:
-            return self._exon_cache[gene_id]
-
-        # Filter for exons of this gene
-        # Match both versioned and unversioned gene IDs
+        if 'Feature' not in self.df.columns:
+            self._exon_index_built = True
+            return
         exons_df = self.df[self.df['Feature'] == 'exon']
-        exons_df = exons_df[exons_df['gene_id'].str.split('.').str[0] == gene_id]
+        if not exons_df.empty:
+            # Group exon (start, end) pairs by versionless gene id, then merge.
+            base_ids = exons_df['gene_id'].str.split('.').str[0].to_numpy()
+            starts = exons_df['Start'].astype(int).to_numpy()
+            ends = exons_df['End'].astype(int).to_numpy()
+            by_gene: dict[str, list[tuple[int, int]]] = {}
+            for gid, s, e in zip(base_ids, starts, ends):
+                by_gene.setdefault(gid, []).append((int(s), int(e)))
+            for gid, ivals in by_gene.items():
+                self._exon_cache[gid] = self._merge_intervals(ivals)
+        self._exon_index_built = True
 
-        exons = []
-        for _, row in exons_df.iterrows():
-            # Coordinates are 0-based
-            start = int(row['Start'])
-            end = int(row['End'])
-            exons.append((start, end))
+    def _get_exons_for_gene(self, gene_id: str) -> list[tuple[int, int]]:
+        """Get merged exon coordinates for a gene (0-based (start, end) tuples)."""
+        if not self._exon_index_built:
+            self._build_exon_index()
+        return self._exon_cache.get(gene_id, [])
 
-        # Merge overlapping exons
-        if exons:
-            exons.sort()
-            merged = [exons[0]]
-            for start, end in exons[1:]:
-                if start <= merged[-1][1]:
-                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-                else:
-                    merged.append((start, end))
-            exons = merged
-
-        self._exon_cache[gene_id] = exons
-        return exons
+    def has_exon_annotations(self) -> bool:
+        """True if the annotation contains any exon rows (needed for exon masks)."""
+        if not self._exon_index_built:
+            self._build_exon_index()
+        return bool(self._exon_cache)
 
     def get_gene_info(self, gene_id: str) -> dict[str, Any] | None:
         """Get information for a gene.
@@ -221,28 +302,114 @@ class GeneAnnotation:
         Returns:
             List of gene IDs (without version)
         """
+        import bisect
+
+        if self._interval_index is None:
+            self._build_interval_index()
+
+        genes: list[tuple[int, str]] = []  # (insertion_rank, gene_id)
+        for key in self._matching_chrom_keys(interval.chromosome):
+            entry = self._interval_index.get(key)
+            if entry is None:
+                continue
+            starts = entry['starts']
+            ends = entry['ends']
+            ids = entry['ids']
+            ranks = entry['ranks']
+            # An overlapping gene has start < interval.end and start >=
+            # interval.start - max_gene_span (any gene starting earlier than that
+            # cannot reach into the interval). Bisect both bounds on the
+            # start-sorted array, then filter end > interval.start.
+            lo = bisect.bisect_left(starts, interval.start - self._max_gene_span)
+            hi = bisect.bisect_left(starts, interval.end)
+            for i in range(lo, hi):
+                if ends[i] <= interval.start:
+                    continue  # start < interval.end already guaranteed
+                if gene_types is not None:
+                    if self._gene_index[ids[i]].gene_type not in gene_types:
+                        continue
+                genes.append((ranks[i], ids[i]))
+
+        # Preserve the original _gene_index insertion order of the results.
+        genes.sort()
+        return [gid for _, gid in genes]
+
+    def _matching_chrom_keys(self, chrom: str) -> list[str]:
+        """Index keys matching a query chromosome, tolerating 'chr' prefix diffs.
+
+        Mirrors the original overlap check: a gene on chromosome ``K`` matches a
+        query ``Q`` when ``K == Q``, ``K == 'chr'+Q``, or ``Q == 'chr'+K``.
+        """
+        keys = {chrom, 'chr' + chrom}
+        if chrom.startswith('chr'):
+            keys.add(chrom[3:])
+        return list(keys)
+
+    def _build_interval_index(self) -> None:
+        """Per-chromosome, start-sorted gene arrays for O(log G + k) overlap."""
+        _ = self.df  # ensure gene index is built
+        by_chrom: dict[str, list[tuple[int, int, str, int]]] = {}
+        max_span = 0
+        for rank, (gene_id, info) in enumerate(self._gene_index.items()):
+            by_chrom.setdefault(info.chromosome, []).append(
+                (info.start, info.end, gene_id, rank)
+            )
+            span = info.end - info.start
+            if span > max_span:
+                max_span = span
+
+        index: dict[str, dict[str, Any]] = {}
+        for chrom, entries in by_chrom.items():
+            entries.sort(key=lambda e: e[0])  # by start
+            index[chrom] = {
+                'starts': [e[0] for e in entries],
+                'ends': [e[1] for e in entries],
+                'ids': [e[2] for e in entries],
+                'ranks': [e[3] for e in entries],
+            }
+        self._interval_index = index
+        self._max_gene_span = max_span
+
+    def get_genes_overlapping_variant(
+        self,
+        variant: 'Variant',
+        gene_types: list[str] | None = None,
+    ) -> list[str]:
+        """Get gene IDs whose body overlaps the variant position.
+
+        Mirrors the upstream JAX behavior: only genes whose body contains
+        the variant's 0-based start position are returned. Used by splicing
+        scorers to restrict scoring to variant-overlapping genes.
+
+        Args:
+            variant: Variant whose 0-based start defines the overlap query
+            gene_types: Optional list of gene types to include
+                (e.g., ['protein_coding', 'lncRNA'])
+
+        Returns:
+            List of gene IDs (without version)
+        """
         # Ensure index is built by accessing df
         _ = self.df
 
+        chrom = variant.chromosome
+        pos = variant.start  # 0-based
         genes = []
-        chrom = interval.chromosome
 
         for gene_id, info in self._gene_index.items():
-            # Check chromosome match (handle chr prefix)
+            # Check chromosome match (handle chr prefix differences)
             if info.chromosome != chrom:
                 if info.chromosome == 'chr' + chrom or chrom == 'chr' + info.chromosome:
-                    pass  # Match with chr prefix difference
+                    pass
                 else:
                     continue
 
-            # Check overlap
-            if info.end <= interval.start or info.start >= interval.end:
+            # Variant 0-based position must lie within [start, end)
+            if not (info.start <= pos < info.end):
                 continue
 
-            # Check gene type if specified
-            if gene_types is not None:
-                if info.gene_type not in gene_types:
-                    continue
+            if gene_types is not None and info.gene_type not in gene_types:
+                continue
 
             genes.append(gene_id)
 
@@ -268,31 +435,40 @@ class GeneAnnotation:
         Returns:
             Boolean mask tensor of shape (seq_length,) where True = exonic
         """
-        gene_id_base = gene_id.split('.')[0]
-        exons = self._get_exons_for_gene(gene_id_base)
-
         mask = torch.zeros(seq_length, dtype=torch.bool, device=device)
+        for bin_start, bin_end in self.get_exon_bin_ranges(
+            gene_id, interval, resolution, seq_length
+        ):
+            mask[bin_start:bin_end] = True
+        return mask
 
+    def get_exon_bin_ranges(
+        self,
+        gene_id: str,
+        interval: 'Interval',
+        resolution: int,
+        seq_length: int,
+    ) -> list[tuple[int, int]]:
+        """Exonic ``[bin_start, bin_end)`` ranges for a gene within an interval.
+
+        The compact form underlying :meth:`get_exon_mask` — a few int pairs per
+        gene instead of a dense ``[seq_length]`` tensor. Cheap to cache and to
+        rebuild a mask from (see ``aggregation._ExonWindow``).
+        """
+        exons = self._get_exons_for_gene(gene_id.split('.')[0])
+        ranges: list[tuple[int, int]] = []
         for exon_start, exon_end in exons:
-            # Convert to interval-relative coordinates
+            # Interval-relative coordinates
             rel_start = max(0, exon_start - interval.start)
             rel_end = min(interval.width, exon_end - interval.start)
-
             if rel_start >= interval.width or rel_end <= 0:
                 continue
-
-            # Convert to bin coordinates
-            bin_start = rel_start // resolution
-            bin_end = (rel_end + resolution - 1) // resolution  # Ceiling division
-
-            # Clamp to sequence length
-            bin_start = max(0, min(bin_start, seq_length))
-            bin_end = max(0, min(bin_end, seq_length))
-
+            # Bin coordinates (ceiling division on the end), clamped.
+            bin_start = max(0, min(rel_start // resolution, seq_length))
+            bin_end = max(0, min((rel_end + resolution - 1) // resolution, seq_length))
             if bin_start < bin_end:
-                mask[bin_start:bin_end] = True
-
-        return mask
+                ranges.append((bin_start, bin_end))
+        return ranges
 
     def get_gene_mask(
         self,
@@ -344,8 +520,13 @@ class PolyAAnnotation:
     """PolyA site annotations from GENCODE polyAs GTF or linked parquet.
 
     This class loads and queries polyadenylation site annotations from
-    GENCODE polyAs files. For best results, use a linked parquet created
-    by scripts/preprocess_polya.py which contains proper Ensembl gene IDs.
+    GENCODE polyAs files.
+
+    A *linked* parquet (from scripts/preprocess_polya.py) carries Ensembl gene
+    IDs, which changes what this class can do rather than just how fast it is:
+    PAS are matched to a gene by ID, mirroring the JAX reference. Without them,
+    :meth:`get_pas_for_gene` falls back to spatial overlap and
+    :meth:`get_total_pas_count_for_gene` returns 0.
 
     Features read: polyA_site, polyA_signal, pseudo_polyA
 
@@ -359,9 +540,10 @@ class PolyAAnnotation:
 
         Args:
             polya_path: Path to annotation file. Supports:
-                - Linked parquet files (recommended, created by preprocess_polya.py)
+                - Linked parquet from preprocess_polya.py (carries Ensembl gene
+                  IDs; see the class docstring for what they enable)
                 - Raw parquet files (.parquet)
-                - GTF files (.gtf) - slower, requires pyranges
+                - GTF files (.gtf), requires pyranges
         """
         self.polya_path = Path(polya_path)
         self._df: pd.DataFrame | None = None
@@ -379,9 +561,11 @@ class PolyAAnnotation:
                 del _pr
             except ImportError:
                 raise ImportError(
-                    "pyranges is required for GTF files. "
+                    "pyranges is required to read GTF/GFF files. "
                     "Install with: pip install pyranges\n"
-                    "Or convert to Parquet for faster loading."
+                    "Or pass a .parquet file, which does not need it. "
+                    "(scripts/preprocess_polya.py converts a GTF once, but "
+                    "itself runs on pyranges.)"
                 )
         else:
             raise ValueError(

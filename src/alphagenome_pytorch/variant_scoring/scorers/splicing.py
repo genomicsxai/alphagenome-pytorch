@@ -191,7 +191,9 @@ class GeneMaskSplicingScorer(BaseVariantScorer):
                 )
 
             if gene_ids is None:
-                gene_ids = gene_annotation.get_genes_in_interval(interval)
+                # Match upstream JAX: restrict to genes whose body contains
+                # the variant, not all genes in the prediction interval.
+                gene_ids = gene_annotation.get_genes_overlapping_variant(variant)
 
             if not gene_ids:
                 return []
@@ -275,6 +277,15 @@ class SpliceJunctionScorer(BaseVariantScorer):
     @property
     def requested_output(self) -> OutputType:
         return OutputType.SPLICE_JUNCTIONS
+
+    @property
+    def required_heads(self) -> frozenset[str]:
+        # The unified-splicing flow needs splice_sites probs to derive unified
+        # site positions. The junction head is re-run in the second pass on
+        # cached embeddings with those unified positions, which unconditionally
+        # overwrites any first-pass result, so requesting 'splice_junctions'
+        # here would just do a redundant junction-head forward per sequence.
+        return frozenset({'splice_sites'})
 
     @property
     def is_signed(self) -> bool:
@@ -362,7 +373,7 @@ class SpliceJunctionScorer(BaseVariantScorer):
         # Get genes overlapping the variant
         # JAX uses VARIANT_OVERLAPPING query type and filters to protein_coding
         if gene_ids is None:
-            gene_ids = gene_annotation.get_genes_in_interval(interval)
+            gene_ids = gene_annotation.get_genes_overlapping_variant(variant)
 
         if not gene_ids:
             return []

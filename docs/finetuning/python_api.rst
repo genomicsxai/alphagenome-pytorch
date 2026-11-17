@@ -66,6 +66,8 @@ Configure which heads to remove and add via :class:`~alphagenome_pytorch.extensi
        mode='lora',  # or a list: ['lora', 'locon']
        lora_rank=8,
        lora_alpha=16,
+       # For Locon, use block-level conv targets such as:
+       # locon_targets=['down_blocks.4', 'down_blocks.5'],  # Locon4
        # Remove original heads you don't need
        remove_heads=['atac', 'dnase', 'chip_tf', 'chip_histone'],
        # Or, alternatively, specify which to keep
@@ -108,10 +110,11 @@ End-to-end finetuning with LoRA adapters:
 
    # 3. Configure transfer learning
    config = TransferConfig(
-       mode='lora',  # or combine: ['lora', 'locon']
+       mode=['lora', 'locon'],  # Baskerville-style Locon parity
        lora_rank=8,
        lora_alpha=16,
        lora_targets=['q_proj', 'v_proj'],  # Apply LoRA to attention
+       locon_targets=['down_blocks.5'],    # Apply Locon to the last two encoder convs
        remove_heads=['atac', 'dnase', 'chip_tf', 'chip_histone'],
        new_heads={
            'my_atac': {'modality': 'atac', 'num_tracks': 10, 'resolutions': [1, 128]},
@@ -158,6 +161,12 @@ End-to-end finetuning with LoRA adapters:
 Saving and Loading Finetuned Models
 ------------------------------------
 
+.. seealso::
+
+   :doc:`checkpoints` is the complete reference: every artifact kind, which
+   ones need base weights, which to share, and how to load each from both the
+   CLI and Python. This section covers the Python API levels in more detail.
+
 After training, only the adapter and head weights need to be saved (~5-10MB)
 instead of the full model (~1GB). There are three API levels for working with
 these delta weights, from simplest to most flexible:
@@ -193,6 +202,10 @@ recipients only need the delta file plus the base pretrained weights:
 
    # After training, export for sharing
    export_delta_weights(model, config, "my_lora.safetensors")
+
+For a self-describing artifact ready to publish (manifest, model card,
+optional metrics) wrap the delta export into a bundle with
+``agt adapters export`` — see :doc:`/serving/adapters`.
 
 Loading Delta Weights (High-level)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -302,6 +315,16 @@ After merging adapters, you can export the full model weights (no longer a delta
    model = merge_adapters(model)
    export_model_weights(model, "finetuned_model.safetensors")
 
+The result loads like ordinary base weights — ``AlphaGenome.from_pretrained``,
+or ``agt predict --model finetuned_model.safetensors`` — with no transfer config
+and no base weights needed.
+
+.. warning::
+
+   A full export carries **no metadata**: no track names, no organism, no
+   provenance. Record your track names alongside it, or the output channels will
+   be unlabeled. Every other artifact kind keeps them for you.
+
 Extracting Embeddings for Custom Heads
 --------------------------------------
 
@@ -331,6 +354,17 @@ Available embeddings:
 - ``embeddings_128bp``: (B, L//128, 3072) — always computed
 - ``embeddings_pair``: (B, L//2048, L//2048, 128) — for contact maps
 
+Unlike ``predict()`` (which is wrapped in ``torch.no_grad()``), ``encode()`` honors
+the ambient autograd context so gradients can flow into the backbone for end-to-end
+fine-tuning. The trade-off is extra memory from the retained activation graph, so
+wrap the call in ``torch.no_grad()`` for pure inference or analysis:
+
+.. code-block:: python
+
+   # Inference / analysis: no gradients, lower memory
+   with torch.no_grad():
+       emb = model.encode(sequences, organism_idx, resolutions=(128,))
+
 Memory Optimization
 -------------------
 
@@ -359,7 +393,7 @@ AlphaGenome requires significant GPU memory. Two key optimizations help:
 .. code-block:: bash
 
    # Use only 128bp resolution
-   python scripts/finetune.py --resolutions 128 ...
+   agt finetune --resolutions 128 ...
 
 
 Loss Function

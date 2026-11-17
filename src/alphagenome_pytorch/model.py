@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Optional, Tuple, Union
 from pathlib import Path
 import warnings
@@ -10,6 +12,56 @@ from . import layers, convolutions, attention, embeddings, heads
 from .config import DtypePolicy
 from .named_outputs import NamedOutputs, TrackMetadataCatalog
 from alphagenome_pytorch.utils.splicing import generate_splice_site_positions
+
+
+# --- Sequence-length constraints (imposed by the encoder/decoder + pair path) ---
+# Two geometry constraints stack, and the tighter one binds:
+#   1. Encoder/decoder: the encoder halves the sequence 7 times (one initial pool
+#      + six DownResBlocks) down to 128 bp trunk bins, and the decoder rebuilds
+#      full resolution through U-Net skips. That alone requires a multiple of 128.
+#   2. Transformer pair path: SequenceToPairBlock pools the 128 bp trunk by a
+#      further factor of 16, and AttentionBiasBlock expands the resulting bias
+#      back by 16 (``repeat_interleave``). Those two steps only realign when the
+#      trunk length is a multiple of 16 — i.e. the *input* length is a multiple
+#      of 128 * 16 = 2048. The pair path runs on every transformer block and its
+#      bias is added to the main attention logits, so a length that is a multiple
+#      of 128 but NOT of 2048 crashes the forward pass (shape mismatch in the
+#      attention bias / value matmul) for *all* outputs, not just contact maps.
+# The binding constraint is therefore a multiple of 2048. The model was trained
+# on windows up to 1 Mb; longer is untested.
+#
+# This is the single source of truth for the constraint — the serving layer and
+# the predict CLI both call ``validate_sequence_length``, so relaxing or
+# tightening the rule (e.g. a new max) is a one-line change here.
+SEQUENCE_LENGTH_BIN = 128  # 2**7, from the encoder's seven pooling stages
+PAIR_POOL_FACTOR = 16  # extra pooling in SequenceToPairBlock / AttentionBiasBlock
+SEQUENCE_LENGTH_MULTIPLE = SEQUENCE_LENGTH_BIN * PAIR_POOL_FACTOR  # 2048
+MIN_SEQUENCE_LENGTH = SEQUENCE_LENGTH_MULTIPLE  # one pair bin (16 trunk bins)
+MAX_SEQUENCE_LENGTH = 2 ** 20  # 1_048_576 — trained ceiling
+
+
+def validate_sequence_length(length: int) -> None:
+    """Raise ``ValueError`` unless ``length`` is one the model can process.
+
+    Valid lengths are multiples of :data:`SEQUENCE_LENGTH_MULTIPLE` (2048) within
+    ``[MIN_SEQUENCE_LENGTH, MAX_SEQUENCE_LENGTH]``. The 2048 bp granularity comes
+    from the transformer's pair path, which pools the 128 bp trunk by 16 and
+    expands the attention bias back by 16; a length that is a multiple of 128 but
+    not of 2048 desynchronises those steps and crashes the forward pass (see the
+    module-level note above). At the 2048 bp minimum the contact-map grid is 1x1;
+    track outputs are unaffected.
+    """
+    if (
+        length < MIN_SEQUENCE_LENGTH
+        or length > MAX_SEQUENCE_LENGTH
+        or length % SEQUENCE_LENGTH_MULTIPLE != 0
+    ):
+        raise ValueError(
+            f"Sequence length {length} not supported. Length must be a multiple "
+            f"of {SEQUENCE_LENGTH_MULTIPLE} within "
+            f"[{MIN_SEQUENCE_LENGTH}, {MAX_SEQUENCE_LENGTH}]."
+        )
+
 
 class SequenceEncoder(nn.Module):
     """Encodes DNA sequence to trunk representation. Outputs NCL format (B, C, S)."""
@@ -278,7 +330,7 @@ class AlphaGenome(nn.Module):
         elif num_organisms == 2:
             # Human/mouse defaults matching the current pretrained setup.
             splice_usage_tracks_per_organism = (734, 180)
-            splice_junction_tracks_per_organism = (367, 90)
+            splice_junction_tracks_per_organism = (367, 367)
         else:
             warnings.warn(
                 "AlphaGenome currently only supports num_organisms in {1, 2}. "
@@ -443,6 +495,9 @@ class AlphaGenome(nn.Module):
                 (default), padding tracks are stripped.
         """
         catalog = metadata_catalog if metadata_catalog is not None else self._track_metadata_catalog
+        if catalog is None and not include_padding:
+            catalog = TrackMetadataCatalog.load_builtin()
+            self._track_metadata_catalog = catalog
         return NamedOutputs.from_raw(
             outputs,
             organism=organism,
@@ -490,23 +545,40 @@ class AlphaGenome(nn.Module):
             ... )
         """
         from alphagenome_pytorch.extensions.finetuning.checkpointing import (
-            load_delta_config,
+            _read_delta_export_header,
+            finalize_finetuned_organism_context,
             load_delta_weights,
         )
         from alphagenome_pytorch.extensions.finetuning.transfer import (
             load_trunk,
             prepare_for_transfer,
+            remove_all_heads,
+            transfer_config_from_dict,
         )
 
         if dtype_policy is None:
             dtype_policy = DtypePolicy.default()
 
-        # 1. Create base model and load pretrained trunk
+        # 1. Create base model and load pretrained trunk. Note ``cls(**kwargs)`` is
+        #    built here (preserving subclass + constructor kwargs like num_organisms),
+        #    so from_delta must NOT delegate to the canonical loader — it only shares
+        #    the organism-context finalizer below.
         model = cls(dtype_policy=dtype_policy, **kwargs)
         model = load_trunk(model, base_path, exclude_heads=True)
+        # ``exclude_heads=True`` means the native heads (atac, dnase, ...) were
+        # never populated from the base file — they still hold the constructor's
+        # random init. ``prepare_for_transfer`` only drops heads the config names
+        # in remove_heads/keep_heads, and configs written by ``agt finetune``
+        # leave both empty, so without this the returned model carries
+        # randomly-initialised heads beside the fine-tuned one and a full forward
+        # yields garbage from every head that was never trained. Matches the
+        # canonical loader (``load_finetuned_model``).
+        model = remove_all_heads(model)
 
-        # 2. Read config and set up adapters/heads
-        config = load_delta_config(delta_path)
+        # 2. Read the exported header once (config + organism provenance) and set up
+        #    adapters/heads.
+        header = _read_delta_export_header(delta_path)
+        config = transfer_config_from_dict(header["transfer_config"])
         model = prepare_for_transfer(model, config)
 
         # 3. Load delta weights
@@ -516,7 +588,44 @@ class AlphaGenome(nn.Module):
         if device:
             model.to(device)
 
+        # 5. Attach the fine-tune organism context (same helper the canonical loader
+        #    uses) so from_delta and load_finetuned_model behave consistently.
+        finalize_finetuned_organism_context(
+            model,
+            {
+                "organism": header.get("organism"),
+                "organism_indices": header.get("organism_indices"),
+                "track_metadata": header.get("track_metadata"),
+            },
+        )
+
         return model
+
+    @staticmethod
+    def _normalize_organism_index(organism_index, dna_sequence):
+        """Coerce ``organism_index`` to a (B,) long tensor on ``dna_sequence``'s device.
+
+        ``organism_index`` may be passed as a Python int for single-organism
+        batches, but downstream code (embedding lookups, named-output metadata
+        selection, head dispatch) expects a per-batch long tensor. Tensor
+        inputs are moved to ``dna_sequence``'s device, cast to ``torch.long``,
+        and scalar / ``(1,)`` shapes are broadcast to ``(B,)``.
+        """
+        batch_size = dna_sequence.shape[0]
+        device = dna_sequence.device
+        if isinstance(organism_index, int):
+            return torch.full((batch_size,), organism_index, dtype=torch.long, device=device)
+
+        organism_index = organism_index.to(device=device, dtype=torch.long)
+        if organism_index.ndim == 0:
+            organism_index = organism_index.unsqueeze(0)
+        if organism_index.shape == (1,):
+            organism_index = organism_index.expand(batch_size)
+        elif organism_index.shape != (batch_size,):
+            raise ValueError(
+                f"organism_index has shape {tuple(organism_index.shape)}, expected (), (1,), or ({batch_size},)"
+            )
+        return organism_index
 
     def _compute_embeddings_ncl(self, dna_sequence, organism_index, resolutions=None):
         """Internal method to compute embeddings in NCL format.
@@ -583,7 +692,8 @@ class AlphaGenome(nn.Module):
 
         Args:
             dna_sequence: One-hot encoded DNA sequence (B, S, 4) - NLC input format.
-            organism_index: Organism index per batch (B,). 0=human, 1=mouse.
+            organism_index: Organism index. Either a (B,) long tensor or an int
+                (broadcast to the full batch). 0=human, 1=mouse.
             resolutions: Tuple of resolutions to compute, e.g. (1, 128) or (128,).
                          If None, computes all resolutions. When 1bp is not needed,
                          the expensive decoder is skipped for faster computation.
@@ -598,25 +708,37 @@ class AlphaGenome(nn.Module):
                 - 'embeddings_128bp': (B, S//128, 3072) or (B, 3072, S//128) at 128bp.
                 - 'embeddings_pair': (B, S//2048, S//2048, 128) pair embeddings.
 
+        Note:
+            Unlike ``predict()`` (wrapped in ``torch.no_grad()``), ``encode()``
+            honors the ambient autograd context so gradients can flow into the
+            backbone for end-to-end fine-tuning. Wrap the call in
+            ``torch.no_grad()`` for pure inference/analysis to avoid retaining
+            the activation graph; omit it when you intend to backpropagate.
+
         Example:
-            # Get embeddings for fine-tuning with a custom head
             model = AlphaGenome.from_pretrained('model.pth', device='cuda')
             model.eval()
 
-            # Freeze backbone
-            for param in model.parameters():
-                param.requires_grad = False
-
-            # Get embeddings (128bp only for efficiency)
+            # Inference / analysis: no gradients, lower memory
             with torch.no_grad():
                 emb = model.encode(dna_seq, organism_idx, resolutions=(128,))
 
-            # Use with custom head (NCL format for Conv1d)
+            # Fine-tuning: switch to train mode and omit no_grad so gradients
+            # reach the backbone (NCL format for Conv1d heads)
+            model.train()
             emb = model.encode(dna_seq, organism_idx, channels_last=False)
             custom_output = my_conv_head(emb['embeddings_128bp'])
         """
-        embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = \
-            self._compute_embeddings_ncl(dna_sequence, organism_index, resolutions)
+        organism_index = self._normalize_organism_index(organism_index, dna_sequence)
+
+        # Derive autocast device_type from the actual tensor device so non-CUDA
+        # accelerators (e.g. "mps") are passed through rather than collapsed to "cpu".
+        device_type = dna_sequence.device.type
+        use_amp = self.dtype_policy.compute_dtype != torch.float32
+
+        with torch.autocast(device_type=device_type, dtype=self.dtype_policy.compute_dtype, enabled=use_amp):
+            embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = \
+                self._compute_embeddings_ncl(dna_sequence, organism_index, resolutions)
 
         # Build output dict with requested format
         # Use contiguous() after transpose to ensure memory layout is optimal
@@ -679,7 +801,8 @@ class AlphaGenome(nn.Module):
             Dict of predictions from each head. Keys are head names
             (atac, dnase, cage, etc.), values are dicts mapping
             resolution (1 or 128) to prediction tensors.
-            If return_embeddings is True, also contains 'embeddings_1bp' and 'embeddings_128bp'.
+            If return_embeddings is True, also contains 'embeddings_1bp',
+            'embeddings_128bp', and 'embeddings_pair'.
             If encoder_only is True, returns ``{"encoder_output": tensor}`` only.
 
         Raises:
@@ -813,6 +936,9 @@ class AlphaGenome(nn.Module):
                 if need_1bp:
                     outputs['embeddings_1bp'] = embeddings_1bp
                 outputs['embeddings_128bp'] = embeddings_128bp
+            # Pair embeddings have a (B, S, S, D) layout, not NCL, so they are
+            # added independently of channels_last (matching encode()).
+            outputs['embeddings_pair'] = embeddings_pair
 
         return self._cast_outputs(outputs)
 
@@ -886,19 +1012,12 @@ class AlphaGenome(nn.Module):
             Dict of predictions with all floating-point tensors in float32, or
             ``NamedOutputs`` when ``named_outputs=True``.
         """
-        device_type = "cuda" if dna_sequence.is_cuda else "cpu"
+        # Derive autocast device_type from the actual tensor device so non-CUDA
+        # accelerators (e.g. "mps") are passed through rather than collapsed to "cpu".
+        device_type = dna_sequence.device.type
         use_amp = self.dtype_policy.compute_dtype != torch.float32
 
-        # Handle integer organism_index by converting to tensor of shape (B,)
-        # forward() expects a tensor for embedding lookups.
-        if isinstance(organism_index, int):
-            batch_size = dna_sequence.shape[0]
-            organism_index = torch.full(
-                (batch_size,),
-                organism_index,
-                dtype=torch.long,
-                device=dna_sequence.device
-            )
+        organism_index = self._normalize_organism_index(organism_index, dna_sequence)
 
         with torch.autocast(device_type=device_type, dtype=self.dtype_policy.compute_dtype, enabled=use_amp):
             outputs = self.forward(dna_sequence, organism_index, **kwargs)

@@ -87,10 +87,18 @@ from .inference import (
     get_recommended_scorers,
 )
 
-# Visualization utilities
-from .visualization_utils import (
-    visualize_variant,
-)
+# Visualization utilities are loaded lazily. ``visualization_utils`` imports
+# matplotlib at module scope (heavy, and triggers a one-off font-cache build on
+# first use), yet most code that transitively imports ``variant_scoring`` — e.g.
+# the serving/adapter CLI paths — never plots. PEP 562 keeps
+# ``from alphagenome_pytorch.variant_scoring import visualize_variant`` working
+# while deferring the matplotlib import until the name is actually accessed.
+def __getattr__(name: str):
+    if name == "visualize_variant":
+        from .visualization_utils import visualize_variant
+
+        return visualize_variant
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     # Types

@@ -64,12 +64,16 @@ def apply_rope(x, positions=None, max_position=_MAX_RELATIVE_DISTANCE, inplace=F
         positions = positions.to(compute_dtype)
 
     num_freq = C // 2
-    # JAX geomspace equivalent: geomspace(1, max_position - num_freq + 1, num_freq)
-    base_freqs = torch.logspace(
-        math.log10(1), math.log10(max_position - num_freq + 1),
-        steps=num_freq, base=10, device=x.device, dtype=compute_dtype
+    # JAX geomspace equivalent: geomspace(1, max_position - num_freq + 1, num_freq).
+    # Use torch.exp(linspace * log(base)) instead of torch.logspace so this stays
+    # on-device on MPS, which lacks an aten::logspace.out kernel (pytorch/pytorch#141287).
+    # Compute in float32 and cast the sum (matching JAX's .astype).
+    log_end = math.log10(max_position - num_freq + 1)
+    base_freqs = torch.exp(
+        torch.linspace(0.0, log_end, steps=num_freq,
+                       device=x.device, dtype=torch.float32) * math.log(10.0)
     )
-    denom = torch.arange(num_freq, device=x.device, dtype=compute_dtype) + base_freqs
+    denom = (torch.arange(num_freq, device=x.device, dtype=torch.float32) + base_freqs).to(compute_dtype)
     inv_freq = 1.0 / denom
 
     theta = torch.einsum('bs,f->bsf', positions, inv_freq)
@@ -155,6 +159,9 @@ class MHABlock(nn.Module):
         self.norm_v = layers.LayerNorm(192)
         self.final_norm = layers.RMSBatchNorm(d_model, channels_last=True)
         self.linear_embedding = nn.Linear(8 * 192, d_model)
+        # nn.Module allows registering forward hooks to extract attn weights
+        # e.g.: mha.attn_softmax.register_forward_hook(...)
+        self.attn_softmax = nn.Softmax(dim=-1)
 
     def forward(self, x, attention_bias, compute_dtype=None):
         B, S, D = x.shape
@@ -187,7 +194,7 @@ class MHABlock(nn.Module):
         logits_soft_cap = 5.0
         att = torch.tanh(att / logits_soft_cap) * logits_soft_cap
 
-        attn_weights = F.softmax(att, dim=-1)
+        attn_weights = self.attn_softmax(att)
 
         # Value projection: bf16 matmul then cast back to compute dtype
         v_t = v.permute(0, 2, 1, 3)
@@ -307,6 +314,8 @@ class RowAttentionBlock(nn.Module):
         self.linear_q = nn.Linear(pair_dim, pair_dim, bias=False)
         self.linear_k = nn.Linear(pair_dim, pair_dim, bias=False)
         self.linear_v = nn.Linear(pair_dim, pair_dim)
+        # nn.Module allows registering forward hooks to extract attn weights
+        self.attn_softmax = nn.Softmax(dim=-1)
 
     def forward(self, x, compute_dtype=None):
         if compute_dtype is None:
@@ -321,7 +330,7 @@ class RowAttentionBlock(nn.Module):
         # Attention: bf16 einsum then cast to f32 (matches JAX BF16_BF16_F32)
         scale = 1.0 / math.sqrt(128.0)
         attn = torch.einsum('bpqf,bpkf->bpqk', q, k).float() * scale
-        attn = F.softmax(attn, dim=-1)
+        attn = self.attn_softmax(attn)
 
         # Value projection: bf16 einsum then cast back
         out = torch.einsum('bpqk,bpkf->bpqf', attn.to(compute_dtype), v).float()

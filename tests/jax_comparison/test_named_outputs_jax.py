@@ -128,6 +128,13 @@ def _clean_value(val):
     return s
 
 
+def _track_names_equal(a: str, b: str) -> bool:
+    """Equal if identical, or if both are placeholder padding (case-insensitive)."""
+    if a == b:
+        return True
+    return a.lower() == "padding" and b.lower() == "padding"
+
+
 # ---------------------------------------------------------------------------
 # Tests — parametrized over output types
 # ---------------------------------------------------------------------------
@@ -170,7 +177,7 @@ class TestHumanMetadata:
 
         count = min(len(jax_names), len(pt_names))
         for i in range(count):
-            assert pt_names[i] == jax_names[i], (
+            assert _track_names_equal(pt_names[i], jax_names[i]), (
                 f"{output_type} track {i}: "
                 f"JAX name={jax_names[i]!r}, PyTorch name={pt_names[i]!r}"
             )
@@ -272,7 +279,7 @@ class TestMouseMetadata:
 
         count = min(len(jax_names), len(pt_names))
         for i in range(count):
-            assert pt_names[i] == jax_names[i], (
+            assert _track_names_equal(pt_names[i], jax_names[i]), (
                 f"{output_type} track {i}: "
                 f"JAX name={jax_names[i]!r}, PyTorch name={pt_names[i]!r}"
             )

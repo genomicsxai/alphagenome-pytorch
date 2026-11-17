@@ -40,12 +40,13 @@ import json
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from alphagenome_pytorch.genome import GenomeSequenceSource
 from alphagenome_pytorch.utils.sequence import sequence_to_onehot
 
 # Lazy imports for pyfaidx/pyBigWig to avoid import errors when not needed
@@ -85,29 +86,21 @@ class CachedGenome:
     """
 
     def __init__(self, fasta_path: str, chromosomes: set[str] | None = None):
-        _ensure_genomic_deps()
         self.fasta_path = fasta_path
-        self._cache: dict[str, np.ndarray] = {}
-        self.chrom_sizes: dict[str, int] = {}
 
         print(f"CachedGenome: Loading genome from {fasta_path}...")
-        fasta = pyfaidx.Fasta(fasta_path)
-        try:
-            refs_to_load = chromosomes if chromosomes else set(fasta.keys())
+        self._source = GenomeSequenceSource(
+            fasta_path,
+            chromosomes=chromosomes,
+            cache=True,
+        )
+        self.chrom_sizes = self._source.chrom_sizes
+        self._cache = self._source._cache
 
-            for ref in fasta.keys():
-                length = len(fasta[ref])
-                self.chrom_sizes[ref] = length
-
-                if ref in refs_to_load:
-                    # Fetch and encode the entire chromosome
-                    seq_str = str(fasta[ref][:])
-                    self._cache[ref] = sequence_to_onehot(seq_str)
-        finally:
-            fasta.close()
-
+        n_chroms = len(self._cache)
         cached_size_mb = sum(arr.nbytes for arr in self._cache.values()) / 1e6
-        print(f"CachedGenome: Loaded {len(self._cache)} chromosomes ({cached_size_mb:.1f} MB)")
+        print(f"CachedGenome: Loaded {n_chroms} "
+              f"chromosome{'s' if n_chroms != 1 else ''} ({cached_size_mb:.1f} MB)")
 
     def fetch(self, chrom: str, start: int, end: int, copy: bool = True) -> np.ndarray:
         """Fetch one-hot encoded sequence for a region.
@@ -466,6 +459,8 @@ class GenomicDataset(Dataset):
         cache_signals: bool = False,
         max_io_workers: int = DEFAULT_MAX_IO_WORKERS,
         use_mmap: bool = False,
+        gene_mask_extractor: "Any | None" = None,
+        g_max: int | None = None,
     ):
         _ensure_genomic_deps()
 
@@ -475,6 +470,20 @@ class GenomicDataset(Dataset):
         self.cache_signals = cache_signals
         self.max_io_workers = max_io_workers
         self.use_mmap = use_mmap
+
+        # Optional gene-mask plumbing for the gene LFC training loss.
+        # When `gene_mask_extractor` is set, __getitem__ returns a 3-tuple
+        # (sequence, targets, gene_mask) instead of (sequence, targets);
+        # `g_max` then defines the fixed gene padding width.
+        self.gene_mask_extractor = gene_mask_extractor
+        if gene_mask_extractor is not None and g_max is None:
+            raise ValueError(
+                "gene_mask_extractor was provided but g_max is None. "
+                "Pass g_max explicitly, or call "
+                "alphagenome_pytorch.extensions.finetuning.gene_annotation.derive_g_max(...) "
+                "first to scan training intervals."
+            )
+        self.g_max = g_max
 
         # Normalise genome input: str path or pre-built CachedGenome
         if isinstance(genome_fasta, CachedGenome):
@@ -544,15 +553,20 @@ class GenomicDataset(Dataset):
             self._positions_list.append((chrom, final_start, final_end))
 
         if n_skipped > 0:
+            was = "was" if n_skipped == 1 else "were"
+            it = "it" if n_skipped == 1 else "they"
             warnings.warn(
-                f"{n_skipped} intervals were skipped because they would exceed "
-                f"chromosome boundaries when expanded to sequence_length={sequence_length}."
+                f"{n_skipped} interval{'s' if n_skipped != 1 else ''} {was} skipped "
+                f"because {it} would exceed chromosome boundaries when expanded to "
+                f"sequence_length={sequence_length}."
             )
 
         if n_truncated > 0:
+            was = "was" if n_truncated == 1 else "were"
             warnings.warn(
-                f"{n_truncated} intervals were larger than sequence_length={sequence_length} "
-                f"and were centered and truncated, which may lose important flanking regions."
+                f"{n_truncated} interval{'s' if n_truncated != 1 else ''} {was} larger "
+                f"than sequence_length={sequence_length} and {was} centered and "
+                f"truncated, which may lose important flanking regions."
             )
 
         self.n_tracks = len(bigwig_files)
@@ -587,7 +601,9 @@ class GenomicDataset(Dataset):
                 sum(arr.nbytes for arr in bw._cache.values())
                 for bw in self._cached_bigwigs
             ) / 1e6
-            print(f"CachedBigWig: Loaded {len(bigwig_files)} files ({cached_size_mb:.1f} MB)")
+            n_files = len(bigwig_files)
+            print(f"CachedBigWig: Loaded {n_files} "
+                  f"file{'s' if n_files != 1 else ''} ({cached_size_mb:.1f} MB)")
         # Note: ThreadPoolExecutor for lazy reads is created lazily in _ensure_handles()
         # to be fork-safe with DataLoader workers
 
@@ -693,14 +709,19 @@ class GenomicDataset(Dataset):
 
     def __getitem__(
         self, idx: int
-    ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+    ) -> "tuple[torch.Tensor, dict[int, torch.Tensor]] | tuple[torch.Tensor, dict[int, torch.Tensor], torch.Tensor]":
         """Get a single sample.
 
         Returns:
-            Tuple of (sequence, targets_dict):
+            Tuple of (sequence, targets_dict) by default, or
+            (sequence, targets_dict, gene_mask) when this dataset was
+            constructed with a `gene_mask_extractor`:
                 - sequence: One-hot encoded DNA (seq_len, 4)
                 - targets_dict: Dict mapping resolution to signals
                     {res: tensor of shape (output_len, n_tracks)}
+                - gene_mask: Bool tensor of shape (seq_len, 2, g_max)
+                    where axis 1 is [plus_strand_genes, minus_strand_genes]
+                    and the gene axis is zero-padded to g_max.
         """
         self._ensure_handles()
         chrom, start, end = self._positions_list[idx]
@@ -738,10 +759,24 @@ class GenomicDataset(Dataset):
                 binned = raw_signals.reshape(output_len, res, self.n_tracks).sum(axis=1)
                 targets_dict[res] = torch.from_numpy(binned).float()
 
-        return (
-            torch.from_numpy(sequence).float(),
-            targets_dict,
-        )
+        seq_tensor = torch.from_numpy(sequence).float()
+
+        if self.gene_mask_extractor is None:
+            return (seq_tensor, targets_dict)
+
+        gene_mask_np, _ = self.gene_mask_extractor.extract(chrom, start, end)
+        # Pad to fixed g_max along the gene axis. Shape: (S, 2, g_max).
+        num_genes = gene_mask_np.shape[-1]
+        if num_genes > self.g_max:
+            raise ValueError(
+                f"Window {chrom}:{start}-{end} contains {num_genes} genes, "
+                f"exceeding g_max={self.g_max}. Increase g_max (e.g. via "
+                "derive_g_max with more headroom) or shrink the window."
+            )
+        padded = np.zeros((self.sequence_length, 2, self.g_max), dtype=bool)
+        if num_genes > 0:
+            padded[:, :, :num_genes] = gene_mask_np
+        return (seq_tensor, targets_dict, torch.from_numpy(padded))
 
     def __del__(self) -> None:
         """Clean up file handles and thread pool (only if we own them)."""
@@ -774,6 +809,7 @@ def compute_track_means(
     sequence_length: int = 1_048_576,
     resolution: int = 1,
     max_samples: int | None = None,
+    strand_pair_groups: list[tuple[int, int]] | None = None,
 ) -> torch.Tensor:
     """Compute nonzero_mean signal per track from training data.
 
@@ -790,6 +826,13 @@ def compute_track_means(
         max_samples: Maximum number of samples to use for computing means.
             If None, uses all samples. Using a subset (e.g., 1000) speeds
             up computation while giving a good estimate.
+        strand_pair_groups: Optional list of (plus_idx, minus_idx) track
+            index pairs. When provided, the per-track nonzero means within
+            each pair are averaged and broadcast back to both indices, so
+            paired strands share a scaling factor. Mirrors AlphaGenome's
+            official scaling semantics (upstream notebook averages plus/minus
+            strand means by track name). Default `None` keeps existing
+            per-track behavior bit-equal.
 
     Returns:
         Track means tensor of shape (1, n_tracks) suitable for passing
@@ -876,6 +919,31 @@ def compute_track_means(
         1.0,
     )
 
+    if strand_pair_groups is not None:
+        seen: set[int] = set()
+        for pair in strand_pair_groups:
+            plus_idx, minus_idx = (int(i) for i in pair)  # raises if not a 2-tuple
+            for idx in (plus_idx, minus_idx):
+                if not 0 <= idx < n_tracks:
+                    raise ValueError(
+                        f"strand_pair_groups index {idx} out of range "
+                        f"[0, {n_tracks})"
+                    )
+                if idx in seen:
+                    raise ValueError(
+                        f"strand_pair_groups index {idx} appears in more than "
+                        f"one pair; averaging would be order-dependent"
+                    )
+            if plus_idx == minus_idx:
+                raise ValueError(
+                    f"strand_pair_groups pair ({plus_idx}, {minus_idx}) must "
+                    f"reference two distinct tracks"
+                )
+            seen.update((plus_idx, minus_idx))
+            paired_mean = 0.5 * (track_means[plus_idx] + track_means[minus_idx])
+            track_means[plus_idx] = paired_mean
+            track_means[minus_idx] = paired_mean
+
     print(f"Computed nonzero_mean per track: {track_means}")
 
     # Return as (1, n_tracks) for num_organisms=1
@@ -904,9 +972,13 @@ class MultimodalDataset(Dataset):
         >>> # modality_targets = {"atac": {1: tensor, 128: tensor}, "rna_seq": {...}}
     """
 
-    def __init__(self, datasets: dict[str, GenomicDataset]):
+    def __init__(self, datasets: dict[str, GenomicDataset], return_coords: bool = False):
         self.datasets = datasets
         self.modalities = list(datasets.keys())
+        # When True, __getitem__ appends the window's (chrom, start, end) coords
+        # as a trailing tuple element. Used by the gene-expression validation
+        # metric, which needs per-window coordinates to build exon masks.
+        self.return_coords = return_coords
 
         # Verify all datasets have the same length
         lengths = {name: len(ds) for name, ds in datasets.items()}
@@ -926,39 +998,69 @@ class MultimodalDataset(Dataset):
 
     def __getitem__(
         self, idx: int
-    ) -> tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]]]:
+    ) -> "tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]]] | tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]], torch.Tensor]":
         """Get sequence and targets for all modalities.
 
         Returns:
-            Tuple of (sequence, modality_targets) where:
-                - sequence: One-hot encoded DNA (seq_len, 4)
-                - modality_targets: Dict mapping modality name to targets_dict
-                    {modality: {resolution: tensor}}
+            Tuple of (sequence, modality_targets) by default. When any
+            wrapped GenomicDataset has a `gene_mask_extractor`, the
+            tuple is extended to (sequence, modality_targets, gene_mask)
+            using the gene_mask from the first such dataset (gene_mask is
+            sample-level, not per-modality, so any one source suffices).
         """
-        # Get sequence from primary dataset
-        sequence, _ = self._primary_dataset[idx]
+        # Get sequence (and possibly gene_mask) from primary dataset.
+        primary_result = self._primary_dataset[idx]
+        if len(primary_result) == 3:
+            sequence, _, gene_mask = primary_result
+        else:
+            sequence, _ = primary_result
+            gene_mask = None
 
-        # Get targets from all datasets
-        modality_targets = {}
+        # Get targets from all datasets. If the primary didn't have a
+        # gene_mask but another dataset does, use the first one we find.
+        modality_targets: dict[str, dict[int, torch.Tensor]] = {}
         for modality, dataset in self.datasets.items():
-            _, targets_dict = dataset[idx]
+            result = dataset[idx]
+            if len(result) == 3 and gene_mask is None:
+                _, targets_dict, gene_mask = result
+            else:
+                targets_dict = result[1]
             modality_targets[modality] = targets_dict
 
+        # Optional trailing extras, in a fixed order the collate can sniff by
+        # type: gene_mask (Tensor) then coords (tuple). Both are optional.
+        extras: list = []
+        if gene_mask is not None:
+            extras.append(gene_mask)
+        if self.return_coords:
+            extras.append(self._primary_dataset._positions_list[idx])
+
+        if extras:
+            return (sequence, modality_targets, *extras)
         return sequence, modality_targets
 
 
 def collate_multimodal(
-    batch: list[tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]]]],
-) -> tuple[torch.Tensor, dict[str, dict[int, torch.Tensor]]]:
+    batch: list[tuple],
+) -> tuple:
     """Collate function for MultimodalDataset.
 
     Args:
-        batch: List of (sequence, modality_targets) tuples.
+        batch: List of tuples, each ``(sequence, modality_targets)`` optionally
+            followed by extras — a ``gene_mask`` tensor (training gene-LFC loss)
+            and/or a ``(chrom, start, end)`` coords tuple (gene-expression
+            validation metric). Extras are identified by type, not position.
 
     Returns:
-        Tuple of (sequences, modality_targets) where:
-            - sequences: Stacked sequences (batch, seq_len, 4)
-            - modality_targets: Dict of modality -> {resolution -> (batch, out_len, n_tracks)}
+        ``(sequences, modality_targets)`` when there are no extras, otherwise
+        ``(sequences, modality_targets, extras)`` where ``extras`` is a dict
+        with optional keys:
+            - ``"gene_mask"``: stacked ``(batch, seq_len, 2, g_max)`` bool masks
+            - ``"coords"``: list of per-sample ``(chrom, start, end)`` tuples
+
+        Historically this collate dropped everything past ``item[1]``, silently
+        discarding the gene_mask so the gene-LFC training loss never fired;
+        preserving extras here is what makes that loss (and the val metric) work.
     """
     sequences = torch.stack([item[0] for item in batch])
 
@@ -973,6 +1075,19 @@ def collate_multimodal(
                 item[1][modality][res] for item in batch
             ])
 
+    # Collate optional trailing extras. Each item carries the same schema, so we
+    # sniff types from the first item: a Tensor is the gene_mask, anything else
+    # (a coords tuple) is coordinates.
+    extras: dict[str, Any] = {}
+    for pos in range(2, len(batch[0])):
+        sample = batch[0][pos]
+        if isinstance(sample, torch.Tensor):
+            extras["gene_mask"] = torch.stack([item[pos] for item in batch])
+        else:
+            extras["coords"] = [tuple(item[pos]) for item in batch]
+
+    if extras:
+        return sequences, modality_targets, extras
     return sequences, modality_targets
 
 

@@ -16,6 +16,8 @@ Example usage:
     outputs = model.predict(dna_seq, organism_idx)
 """
 
+from typing import TYPE_CHECKING
+
 try:
     from ._version import __version__, __version_tuple__
 except ImportError:
@@ -25,7 +27,26 @@ except ImportError:
 
 from .model import AlphaGenome
 
+if TYPE_CHECKING:
+    from .extensions.finetuning.transfer import (
+        TransferConfig,
+        load_trunk,
+        prepare_for_transfer,
+    )
+
+
+def __getattr__(name):
+    """Lazily expose fine-tuning helpers without loading optional dependencies."""
+    if name in {'TransferConfig', 'load_trunk', 'prepare_for_transfer'}:
+        from .extensions.finetuning import transfer
+
+        return getattr(transfer, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 __all__ = [
     '__version__',
     'AlphaGenome',
+    'TransferConfig',
+    'load_trunk',
+    'prepare_for_transfer',
 ]

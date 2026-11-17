@@ -5,8 +5,8 @@ Provides configuration, loss aggregation, optimizer/scheduler factories,
 and metrics for training AlphaGenome models.
 """
 
-from dataclasses import dataclass 
-from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Any, Tuple
 import math
 
 import torch
@@ -14,6 +14,31 @@ import torch.nn as nn
 from torch.optim.lr_scheduler import LambdaLR
 
 from . import losses
+
+
+def _build_strand_channel_mask(strands: Sequence[str]) -> torch.Tensor:
+    """Build a `[2, 1, C]` strand-channel mask from a per-track strand list.
+
+    Mirrors upstream `GenomeTracksHead._get_strand_channel_mask` semantics:
+      - axis 0 dim 0 (positive-strand bucket): `+` and `.` tracks contribute.
+      - axis 0 dim 1 (negative-strand bucket): `-` and `.` tracks contribute.
+
+    Args:
+        strands: Sequence of one-character strand codes per track. Each must
+            be one of `+`, `-`, `.`. Length defines C.
+
+    Returns:
+        Bool tensor of shape `[2, 1, C]`.
+    """
+    valid = {"+", "-", "."}
+    invalid = sorted({s for s in strands if s not in valid})
+    if invalid:
+        raise ValueError(
+            f"track strands must be one of {sorted(valid)}; got invalid values: {invalid}"
+        )
+    plus_compat = torch.tensor([s in ("+", ".") for s in strands], dtype=torch.bool)
+    minus_compat = torch.tensor([s in ("-", ".") for s in strands], dtype=torch.bool)
+    return torch.stack([plus_compat, minus_compat], dim=0).unsqueeze(1)  # [2, 1, C]
 
 
 @dataclass
@@ -42,7 +67,10 @@ class AlphaGenomeTrainingConfig:
     positional_weight: float = 5.0  # JAX production value (AG_MODEL.md line 321)
 
 
-# Default head weights (equal for all heads)
+# Default per-head loss weights matching upstream JAX `HeadConfig.loss_weight`
+# (google-deepmind/alphagenome_research, commit 7046b72). All heads weight 1.0
+# except splice junctions, which upstream weights at 0.2 to balance the very
+# different magnitude of the junction loss against the count-based heads.
 DEFAULT_HEAD_WEIGHTS = {
     'atac': 1.0,
     'dnase': 1.0,
@@ -52,6 +80,9 @@ DEFAULT_HEAD_WEIGHTS = {
     'chip_tf': 1.0,
     'chip_histone': 1.0,
     'contact_maps': 1.0,
+    'splice_sites': 1.0,
+    'splice_site_usage': 1.0,
+    'splice_junctions': 0.2,
 }
 
 
@@ -66,11 +97,21 @@ class AlphaGenomeLoss(nn.Module):
     2. Call model with `return_scaled_predictions=True` during training
     3. Pass `organism_index` to the forward method
 
+    Aggregation: the total loss is `sum(head_weight * head_loss) / num_heads`,
+    where the divisor is the *count* of heads that produced a loss this step
+    (not the sum of weights). A weight of 0.2 therefore down-weights that
+    head's contribution by exactly 0.2× relative to a weight-1.0 head with
+    the same residual, matching upstream JAX `HeadConfig.loss_weight` semantics.
+
     Args:
         model: AlphaGenome model instance. Required to access head modules for target scaling.
             Without this, targets will not be scaled to model space, resulting in incorrect gradients.
         heads: List of head names to compute loss for. If None, uses all heads.
-        head_weights: Dict mapping head names to loss weights. If None, equal weights.
+        head_weights: Dict mapping head names to loss weights. Merged *on top
+            of* `DEFAULT_HEAD_WEIGHTS`, so a partial dict only overrides the
+            heads it names and leaves the rest at their upstream defaults
+            (1.0 for count and splice-site heads, 0.2 for splice junctions).
+            Pass `None` to use the defaults unchanged.
         multinomial_resolution: Resolution for multinomial loss computation. This is the
             segment size used to divide the sequence for multinomial loss. For JAX parity,
             use `seq_len` (full sequence as 1 segment) or `seq_len // 8` for 8 segments
@@ -86,13 +127,43 @@ class AlphaGenomeLoss(nn.Module):
         head_weights: Optional[Dict[str, float]] = None,
         multinomial_resolution: int = 128,
         positional_weight: float = 5.0,  # JAX production value
+        gene_loss_weights: Optional[Dict[str, float]] = None,
+        gene_cross_track_weight: float = 5.0,
+        track_strands: Optional[Dict[str, Sequence[str]]] = None,
     ):
         super().__init__()
         self.model = model
         self.heads = heads or list(DEFAULT_HEAD_WEIGHTS.keys())
-        self.head_weights = head_weights or DEFAULT_HEAD_WEIGHTS
+        # Merge overrides onto a fresh copy of the defaults: a partial dict
+        # only changes the heads it names (so splice_junctions keeps its 0.2
+        # unless explicitly overridden), and we never alias/mutate the
+        # module-level constant.
+        self.head_weights = {**DEFAULT_HEAD_WEIGHTS, **(head_weights or {})}
         self.multinomial_resolution = multinomial_resolution
         self.positional_weight = positional_weight
+
+        # Gene LFC loss config (B3.2 / Decima-style).
+        # `gene_loss_weights[head]` is the OUTER multiplier on the head's gene
+        # LFC term, not on the head's overall loss. Default empty means off.
+        # `gene_cross_track_weight` is the INNER multiplier on the multinomial
+        # (positional) component within the gene LFC term; paper value 5.0.
+        self.gene_loss_weights: Dict[str, float] = dict(gene_loss_weights or {})
+        self.gene_cross_track_weight = gene_cross_track_weight
+
+        # Per-head strand-channel masks `[2, 1, C]` registered as buffers so
+        # they follow `.to(device)` with the loss module. Stored under
+        # mangled attribute names because `register_buffer` does not accept
+        # nested keys; we look them up via `_get_strand_channel_mask(head)`.
+        self._strand_mask_heads: List[str] = []
+        if track_strands:
+            for head, strands in track_strands.items():
+                buffer_name = f"_strand_channel_mask__{head}"
+                self.register_buffer(buffer_name, _build_strand_channel_mask(strands))
+                self._strand_mask_heads.append(head)
+
+    def _get_strand_channel_mask(self, head: str) -> Optional[torch.Tensor]:
+        """Return the `[2, 1, C]` strand-channel mask for a head, or None."""
+        return getattr(self, f"_strand_channel_mask__{head}", None)
     
     def forward(
         self,
@@ -100,6 +171,7 @@ class AlphaGenomeLoss(nn.Module):
         targets: Dict[str, torch.Tensor],
         organism_index: torch.Tensor,
         masks: Optional[Dict[str, torch.Tensor]] = None,
+        gene_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Compute per-head losses and aggregate.
 
@@ -108,6 +180,9 @@ class AlphaGenomeLoss(nn.Module):
             targets: Target values dict with same structure as outputs.
             organism_index: Organism indices (B,). Required for target scaling.
             masks: Optional boolean masks dict for each head.
+            gene_mask: Optional `[B, S, 2, G]` gene-body mask for the gene
+                LFC training loss. Only consumed by heads with a non-zero
+                entry in `self.gene_loss_weights`.
 
         Returns:
             Dict with 'loss' (total), and per-head losses like 'atac_loss', etc.
@@ -130,17 +205,18 @@ class AlphaGenomeLoss(nn.Module):
 
             # Compute loss based on head type
             head_loss = self._compute_head_loss(
-                head, head_output, head_target, head_mask, organism_index
+                head, head_output, head_target, head_mask, organism_index,
+                gene_mask=gene_mask,
             )
-            
+
             head_losses[f'{head}_loss'] = head_loss
             total_loss = total_loss + self.head_weights.get(head, 1.0) * head_loss
             num_heads += 1
-        
+
         # Average across heads
         if num_heads > 0:
             total_loss = total_loss / num_heads
-            
+
         head_losses['loss'] = total_loss
         return head_losses
     
@@ -151,6 +227,7 @@ class AlphaGenomeLoss(nn.Module):
         target: torch.Tensor,
         mask: Optional[torch.Tensor],
         organism_index: torch.Tensor,
+        gene_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute loss for a single head.
 
@@ -158,8 +235,73 @@ class AlphaGenomeLoss(nn.Module):
         and scales targets to match before loss computation.
 
         Uses multinomial loss for profile heads (ATAC, DNase, etc.)
-        and MSE for aggregate/contact map heads.
+        and MSE for aggregate/contact map heads. Optionally adds the gene
+        LFC term (Decima-style cross-track loss) when this head has a
+        non-zero entry in `self.gene_loss_weights`.
         """
+        if head == 'splice_sites':
+            logits = output['logits']
+            classification_mask = torch.any(target > 0, dim=-1, keepdim=True)
+            num_tracks = target.shape[-1]
+            return losses.cross_entropy_loss_from_logits(
+                y_pred_logits=logits,
+                y_true=(1.0 - 1e-7) * target.float() + 1e-7 / num_tracks,
+                mask=classification_mask,
+                axis=-1,
+            )
+
+        if head == 'splice_site_usage':
+            logits = output['logits']
+            if mask is None:
+                mask = torch.ones_like(target, dtype=torch.bool)
+            return losses.binary_crossentropy_from_logits(
+                y_pred=logits,
+                y_true=torch.clamp(target.float(), 1e-7, 1.0 - 1e-7),
+                mask=mask,
+            )
+
+        if head == 'splice_junctions':
+            pred_pair = output['pred_counts']
+            pairs_mask = output['splice_junction_mask']
+            
+            def _scale_junction_counts(counts):
+                return torch.where(
+                    counts > 10.0,
+                    2.0 * torch.sqrt(counts * 10.0) - 10.0,
+                    counts,
+                )
+                
+            sum_acceptors_tgt = torch.sum(torch.where(pairs_mask, target.float(), 0.0), dim=-2)
+            sum_acceptors_pred = torch.sum(torch.where(pairs_mask, pred_pair.float(), 0.0), dim=-2)
+            accept_total_loss = losses.poisson_loss(
+                y_true=_scale_junction_counts(sum_acceptors_tgt),
+                y_pred=sum_acceptors_pred,
+                mask=torch.any(pairs_mask, dim=-2)
+            )
+            
+            sum_donors_tgt = torch.sum(torch.where(pairs_mask, target.float(), 0.0), dim=-3)
+            sum_donors_pred = torch.sum(torch.where(pairs_mask, pred_pair.float(), 0.0), dim=-3)
+            donor_total_loss = losses.poisson_loss(
+                y_true=_scale_junction_counts(sum_donors_tgt),
+                y_pred=sum_donors_pred,
+                mask=torch.any(pairs_mask, dim=-3)
+            )
+            
+            donor_ratios_loss = losses.cross_entropy_loss(
+                y_true=target,
+                y_pred=pred_pair,
+                mask=pairs_mask,
+                axis=-3,
+            )
+            acceptor_ratios_loss = losses.cross_entropy_loss(
+                y_true=target,
+                y_pred=pred_pair,
+                mask=pairs_mask,
+                axis=-2,
+            )
+            
+            return donor_ratios_loss + acceptor_ratios_loss + 0.2 * (accept_total_loss + donor_total_loss)
+
         # Handle resolution dict outputs (e.g., {1: tensor, 128: tensor})
         resolution = None
         if isinstance(output, dict):
@@ -183,7 +325,7 @@ class AlphaGenomeLoss(nn.Module):
                 num_tracks = self.model.heads[head].num_tracks
                 if output.shape[-2] == num_tracks and output.shape[-1] != num_tracks:
                     is_channels_last = False
-            
+
             if is_channels_last:
                 num_channels = output.shape[-1]
                 mask = torch.ones((batch_size, 1, num_channels), dtype=torch.bool, device=output.device)
@@ -216,7 +358,67 @@ class AlphaGenomeLoss(nn.Module):
             positional_weight=self.positional_weight,
             channels_last=is_channels_last,
         )
-        return result['loss']
+        head_loss = result['loss']
+
+        # Optional gene LFC (cross-track) loss. Mirrors upstream's
+        # `_compute_cross_track_loss`; gated on (a) head has a non-zero
+        # gene_loss_weight, (b) gene_mask is present this batch, and
+        # (c) we are at 1bp resolution (matching upstream which only
+        # threads gene_mask through resolution == 1).
+        gene_w = self.gene_loss_weights.get(head, 0.0)
+        if gene_w > 0 and gene_mask is not None and resolution == 1:
+            # multinomial_loss internally normalizes to NLC; re-derive that
+            # form here for the gene LFC einsum, which expects [B, S, C].
+            if not is_channels_last:
+                pred_nlc = output.transpose(-1, -2).contiguous()
+                target_nlc = scaled_target.transpose(-1, -2).contiguous()
+                track_mask_nlc = mask.transpose(-1, -2).contiguous()
+            else:
+                pred_nlc = output
+                target_nlc = scaled_target
+                track_mask_nlc = mask
+
+            strand_channel_mask = self._get_strand_channel_mask(head)
+            if strand_channel_mask is None:
+                raise ValueError(
+                    f"head '{head}' has gene_loss_weight={gene_w} but no "
+                    f"track_strands were provided to AlphaGenomeLoss. "
+                    f"Pass `track_strands={{'{head}': '<+/-/. per track>'}}` "
+                    f"so the strand-channel mask can be built."
+                )
+
+            gene_loss, _ = self._compute_gene_lfc(
+                predictions=pred_nlc,
+                targets=target_nlc,
+                targets_mask=track_mask_nlc,
+                gene_mask=gene_mask,
+                strand_channel_mask=strand_channel_mask,
+            )
+            head_loss = head_loss + gene_w * gene_loss
+
+        return head_loss
+
+    def _compute_gene_lfc(
+        self,
+        *,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        targets_mask: Optional[torch.Tensor],
+        gene_mask: torch.Tensor,
+        strand_channel_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Thin wrapper around `losses.gene_lfc_loss` using this loss's
+        configured `gene_cross_track_weight`. Kept as a method for
+        clarity at call sites and for backward-compat with existing tests.
+        """
+        return losses.gene_lfc_loss(
+            predictions=predictions,
+            targets=targets,
+            targets_mask=targets_mask,
+            gene_mask=gene_mask,
+            strand_channel_mask=strand_channel_mask,
+            gene_cross_track_weight=self.gene_cross_track_weight,
+        )
     
     def _get_device(self, outputs: Dict) -> torch.device:
         """Get device from first tensor in outputs."""
@@ -287,4 +489,5 @@ __all__ = [
     'create_optimizer',
     'create_scheduler',
     'DEFAULT_HEAD_WEIGHTS',
+    '_build_strand_channel_mask',
 ]

@@ -54,6 +54,13 @@ html_static_path = ['_static']
 napoleon_google_docstrings = True
 napoleon_numpy_docstrings = True
 napoleon_include_init_with_doc = True
+# Render `Attributes:` sections as inline :ivar: fields. Without this, napoleon
+# emits a separate py:attribute for each entry, which collides with the ones
+# autodoc already generates from `undoc-members` (e.g. the GeneCounts dataclass
+# fields) and warns about duplicate object descriptions. This is global: it also
+# changes how any future page documenting a class with an `Attributes:` docstring
+# section renders. As of this change only api/aggregation is affected.
+napoleon_use_ivar = True
 
 # Intersphinx mapping
 intersphinx_mapping = {
@@ -64,6 +71,13 @@ intersphinx_mapping = {
 
 # Mock heavy imports so docs build without torch installed
 autodoc_mock_imports = ['torch']
+
+# NOTE: `torch` being mocked means `torch.Tensor | None` raises TypeError if it is
+# ever *evaluated* — mock objects don't implement `|`. Signature annotations are
+# evaluated at def time unless the module opts into PEP 563, so every module
+# reachable from the package __init__ needs `from __future__ import annotations`.
+# Autodoc reimports the package under the mock (with try_reload=True), so a module
+# missing it takes down every autodoc page, not just its own.
 
 # Autodoc settings
 autodoc_default_options = {

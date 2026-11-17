@@ -47,9 +47,21 @@ python scripts/finetune.py --mode lora \
     --pretrained-weights alphagenome.pth \
     --train-bed train.bed --val-bed val.bed \
     --modality atac --bigwig cell1_atac.bw cell2_atac.bw \
-    --modality rna_seq --bigwig cell1_rna.bw \
-    --modality-weights "atac:1.0,rna_seq:0.5"
+    --modality rna_seq --bigwig cell1_rna_plus.bw cell1_rna_minus.bw \
+    --modality-weights "atac:1.0,rna_seq:0.5" \
+    --strand-pairs "rna_seq:auto"
 ```
+
+For stranded assays (RNA-seq, CAGE, PRO-cap) the `+`/`-` bigwigs of a track
+should share one scaling factor. `--strand-pairs` averages each pair's
+nonzero-mean and broadcasts it back to both strands. Format is space-separated
+`modality:pairs`, where `pairs` is either `auto` (pairs consecutive bigwigs
+`(0,1),(2,3),…`, so order them `plus, minus, plus, minus`) or explicit
+semicolon-separated `plus,minus` index pairs, e.g. `rna_seq:0,2;1,3`. Indices
+are 0-based **into that modality's `--bigwig` list**, so each modality has its
+own index space — unstranded modalities (e.g. ATAC) simply get no entry and are
+left untouched. This affects only the scaling factor, not the loss or per-strand
+outputs.
 
 ### Multi-Modality Fine-tuning (YAML Config)
 
@@ -96,9 +108,11 @@ modalities:
 
   rna_seq:
     bigwig:
-      - /path/to/cell1_rna.bw
+      - /path/to/cell1_rna_plus.bw
+      - /path/to/cell1_rna_minus.bw
     resolutions: "128"    # Per-modality override (optional)
     task_weight: 0.5
+    strand_pairs: auto    # share +/- scaling; or [[0, 1]] for explicit pairs
 
   chip_tf:
     bigwig:
@@ -118,6 +132,7 @@ Notes:
 - Top-level `resolutions` is the global default.
 - `modalities.<name>.resolutions` overrides the global value for that modality.
 - `modalities.<name>.task_weight` sets per-modality loss weighting.
+- `modalities.<name>.strand_pairs` shares +/- strand track-mean scaling (`auto` or a list of `[plus, minus]` index pairs); CLI `--strand-pairs` overrides it.
 - CLI `--modality-weights` overrides YAML task weights when both are provided.
 - `num_segments` and `min_segment_size` apply to both training and validation multinomial loss.
 

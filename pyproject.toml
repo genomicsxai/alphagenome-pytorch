@@ -14,11 +14,14 @@ dependencies = [
     "safetensors"
 ]
 
+[project.scripts]
+agt = "alphagenome_pytorch.cli:main"
+
 [project.optional-dependencies]
 test = [
     "pytest>=7.0.0",
     "pytest-xdist",
-    "alphagenome",
+    "alphagenome>=0.7.0,<2",  # 2.x removed alphagenome.models.dna_output
     "chex",
     "einshape",
     "pyranges",
@@ -42,6 +45,16 @@ inference = [
     "pyfaidx",
     "tqdm",
 ]
+# Whole-chromosome gene-count / AnnData export (agt predict --chromosomes --anndata):
+# adds pandas (metadata), anndata (.h5ad), and annotation readers (pyranges for
+# GTF, pyarrow for parquet) on top of the base inference deps.
+inference-anndata = [
+    "alphagenome-pytorch[inference]",
+    "pandas",
+    "anndata",
+    "pyranges",
+    "pyarrow",
+]
 finetuning = [
     "pybigwig",
     "pandas",
@@ -53,7 +66,17 @@ scoring = [
     "pandas",
     "tqdm",
     "pyranges",
-    "alphagenome",
+    "alphagenome>=0.7.0,<2",  # 2.x removed alphagenome.models.dna_output
+]
+serving = [
+    "grpcio",
+    "pandas",
+    "pyfaidx",
+    "alphagenome>=0.7.0,<2",  # 2.x removed alphagenome.models.dna_output
+    "PyYAML",
+]
+hf = [
+    "huggingface_hub>=0.24",
 ]
 docs = [
     "sphinx>=7.0.0",
@@ -71,6 +94,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = ["-v", "--strict-markers"]
+
 markers = [
     "unit: Unit tests (no external dependencies)",
     "integration: Integration tests with full model (PyTorch only, no JAX required)",
@@ -84,6 +108,11 @@ markers = [
 
 [tool.hatch.version]
 source = "vcs"
+
+[tool.hatch.build]
+artifacts = [
+    "src/alphagenome_pytorch/data/*.parquet",
+]
 
 [tool.hatch.build.hooks.vcs]
 version-file = "src/alphagenome_pytorch/_version.py"
