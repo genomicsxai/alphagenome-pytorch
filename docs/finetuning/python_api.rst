@@ -406,5 +406,9 @@ The finetuning uses a multinomial loss with two components:
 
 Controlled by ``--positional-weight`` and ``--count-weight`` arguments (default: 5.0 and 1.0).
 
-The loss is computed over segments for memory efficiency. Configure with
-``--num-segments`` and ``--min-segment-size``.
+The loss compares totals and positional distributions within equal groups of
+consecutive output bins. ``agt finetune --num-segments N`` requests exactly
+``N`` groups and defaults to eight. Use ``--num-segments auto`` for the largest
+valid count up to eight. Both modes honor ``--min-segment-size``, which is in
+output bins at each resolution. For sequence-parallel training the count
+applies to each rank's shard. Validation uses the full context.

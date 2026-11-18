@@ -117,10 +117,11 @@ class AlphaGenomeLoss(nn.Module):
             128-bin default.
         positional_weight: Weight for positional component of multinomial loss.
             JAX production uses 5.0 (default), matching Borzoi.
-        num_segments: Target number of segments for resolution-keyed outputs
-            when no segment size is supplied. Defaults to eight, as in `agt finetune`.
+        num_segments: Exact number of equal segments for resolution-keyed
+            outputs when no segment size is supplied. Defaults to eight.
+            Use "auto" to choose the largest valid count up to eight.
         min_segment_size: Optional minimum segment size in output bins for
-            resolution-keyed outputs, capped at the output length.
+            resolution-keyed outputs.
     """
 
     def __init__(
@@ -134,7 +135,7 @@ class AlphaGenomeLoss(nn.Module):
         gene_cross_track_weight: float = 5.0,
         track_strands: Optional[Dict[str, Sequence[str]]] = None,
         *,
-        num_segments: int = losses.DEFAULT_NUM_SEGMENTS,
+        num_segments: losses.SegmentCount = losses.DEFAULT_NUM_SEGMENTS,
         min_segment_size: Optional[int] = None,
     ):
         super().__init__()

@@ -4,7 +4,7 @@ Losses for AlphaGenome PyTorch.
 Ported from alphagenome_research.model.losses (JAX implementation).
 """
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Literal, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -12,26 +12,38 @@ from torch import Tensor
 
 
 DEFAULT_NUM_SEGMENTS = 8
+SegmentCount = int | Literal["auto"]
 
 
 def _compute_multinomial_resolution(
     seq_len: int,
-    num_segments: int = DEFAULT_NUM_SEGMENTS,
+    num_segments: SegmentCount = DEFAULT_NUM_SEGMENTS,
     min_segment_size: Optional[int] = None,
 ) -> int:
-    """Derive the number of output bins per equal segment."""
-    if seq_len < 1 or num_segments < 1:
-        raise ValueError("seq_len and num_segments must be positive.")
+    """Return bins per segment for an exact count or automatic sizing."""
+    if seq_len < 1:
+        raise ValueError("The loss requires at least one output bin.")
 
-    segment_size = min(seq_len, max(1, seq_len // num_segments, min_segment_size or 1))
-    if seq_len % segment_size == 0:
-        return segment_size
+    minimum = 1 if min_segment_size is None else min_segment_size
+    if not 1 <= minimum <= seq_len:
+        raise ValueError(f"Minimum segment size {minimum} must be between 1 and {seq_len} output bins.")
 
-    # Use fewer equal segments when the requested size leaves a remainder.
-    segments = seq_len // segment_size
-    while seq_len % segments:
-        segments -= 1
-    return seq_len // segments
+    max_segments = seq_len // minimum
+    if num_segments == "auto":
+        segments = min(DEFAULT_NUM_SEGMENTS, max_segments)
+        while seq_len % segments:
+            segments -= 1
+        return seq_len // segments
+
+    if type(num_segments) is not int or num_segments < 1:
+        raise ValueError("The segment count must be a positive integer or 'auto'.")
+    if num_segments > max_segments or seq_len % num_segments:
+        raise ValueError(
+            f"{seq_len} output bins cannot form exactly {num_segments} equal segments "
+            f"of at least {minimum} bin(s). Choose a divisor of {seq_len} up to "
+            f"{max_segments}, or set the segment count to 'auto'."
+        )
+    return seq_len // num_segments
 
 
 def _safe_masked_mean(

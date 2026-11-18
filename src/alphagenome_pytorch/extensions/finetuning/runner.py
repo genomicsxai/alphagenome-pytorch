@@ -92,6 +92,7 @@ torch._dynamo.config.suppress_errors = True
 # AlphaGenome imports
 from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.config import DtypePolicy
+from alphagenome_pytorch.losses import _compute_multinomial_resolution
 from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
 from alphagenome_pytorch.sequence_parallel import SequenceParallelism
 from alphagenome_pytorch.extensions.finetuning import (
@@ -707,6 +708,40 @@ def create_model(
 # =============================================================================
 
 
+def _report_loss_segmentation(args: argparse.Namespace, world_size: int, rank: int) -> None:
+    """Validate and report segmentation before loading data or weights."""
+    resolutions = (
+        {128} if args.mode == "encoder-only"
+        else {res for values in args.modality_resolutions.values() for res in values}
+    )
+    scopes = [("full context", 1)]
+    if args.sequence_parallel and world_size > 1:
+        scopes.append(("training shard", world_size))
+
+    for resolution in sorted(resolutions):
+        if resolution < 1:
+            raise ValueError(f"Output resolution must be positive, got {resolution}.")
+        full_bins, remainder = divmod(args.sequence_length, resolution)
+        if remainder:
+            raise ValueError(
+                f"Sequence length {args.sequence_length} bp must be divisible by "
+                f"the {resolution} bp output resolution."
+            )
+        for scope, shards in scopes:
+            bins = full_bins // shards
+            try:
+                size = _compute_multinomial_resolution(
+                    bins, args.num_segments, args.min_segment_size,
+                )
+            except ValueError as exc:
+                raise ValueError(f"Loss segmentation at {resolution} bp ({scope}) failed. {exc}") from exc
+            print_rank0(
+                f"Loss segmentation at {resolution} bp ({scope}) uses "
+                f"{bins // size} segments of {size} bins each.",
+                rank,
+            )
+
+
 def main(args: argparse.Namespace | None = None) -> None:
     """Main training function."""
     if args is None:
@@ -714,6 +749,11 @@ def main(args: argparse.Namespace | None = None) -> None:
 
     # Setup distributed
     rank, world_size, local_rank, device = setup_distributed()
+    try:
+        _report_loss_segmentation(args, world_size, rank)
+    except ValueError:
+        cleanup_distributed()
+        raise
 
     # Set seed
     if args.seed is not None:

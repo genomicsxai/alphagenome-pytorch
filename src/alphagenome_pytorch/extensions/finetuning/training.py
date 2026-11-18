@@ -25,7 +25,7 @@ from tqdm import tqdm
 
 from alphagenome_pytorch import losses
 from alphagenome_pytorch.losses import DEFAULT_NUM_SEGMENTS as NUM_SEGMENTS
-from alphagenome_pytorch.losses import _compute_multinomial_resolution, multinomial_loss
+from alphagenome_pytorch.losses import SegmentCount, _compute_multinomial_resolution, multinomial_loss
 
 # Re-exported so existing `from ...training import ModalityConfig, MODALITY_CONFIGS`
 # imports keep working; the definitions now live in the dependency-light
@@ -685,7 +685,7 @@ def train_epoch_ddp(
     use_amp: bool = True,
     accumulation_steps: int = 1,
     frozen_backbone: bool = False,
-    num_segments: int = NUM_SEGMENTS,
+    num_segments: SegmentCount = NUM_SEGMENTS,
     min_segment_size: int | None = None,
     train_sampler: DistributedSampler | None = None,
     rank: int = 0,
@@ -719,7 +719,7 @@ def train_epoch_ddp(
         use_amp: Whether to use automatic mixed precision.
         accumulation_steps: Number of batches to accumulate gradients over.
         frozen_backbone: If True, use torch.no_grad() for backbone (memory optimization).
-        num_segments: Number of segments for multinomial loss.
+        num_segments: Exact multinomial segment count or "auto" for up to eight.
         min_segment_size: Minimum positions per segment.
         train_sampler: DistributedSampler for DDP (set epoch for shuffling).
         rank: Process rank for DDP.
@@ -1006,7 +1006,7 @@ def validate_ddp(
     positional_weight: float,
     count_weight: float,
     use_amp: bool = True,
-    num_segments: int = NUM_SEGMENTS,
+    num_segments: SegmentCount = NUM_SEGMENTS,
     min_segment_size: int | None = None,
     compute_pearson: bool = True,
     rank: int = 0,
@@ -1029,7 +1029,7 @@ def validate_ddp(
         positional_weight: Weight for positional component of multinomial loss.
         count_weight: Weight for count component of multinomial loss.
         use_amp: Whether to use automatic mixed precision.
-        num_segments: Number of segments for multinomial loss.
+        num_segments: Exact multinomial segment count or "auto" for up to eight.
         min_segment_size: Minimum positions per segment.
         compute_pearson: Whether to compute Pearson R metrics.
         rank: Process rank for DDP.
@@ -1224,7 +1224,7 @@ def train_epoch_multihead(
     use_amp: bool = True,
     accumulation_steps: int = 1,
     frozen_backbone: bool = False,
-    num_segments: int = NUM_SEGMENTS,
+    num_segments: SegmentCount = NUM_SEGMENTS,
     min_segment_size: int | None = None,
     train_sampler: DistributedSampler | None = None,
     rank: int = 0,
@@ -1260,7 +1260,7 @@ def train_epoch_multihead(
         use_amp: Whether to use automatic mixed precision.
         accumulation_steps: Number of batches to accumulate gradients over.
         frozen_backbone: If True, use torch.no_grad() for backbone.
-        num_segments: Number of segments for multinomial loss.
+        num_segments: Exact multinomial segment count or "auto" for up to eight.
         min_segment_size: Minimum positions per segment.
         train_sampler: DistributedSampler for DDP.
         rank: Process rank for DDP.
@@ -1582,7 +1582,7 @@ def validate_multihead(
     positional_weight: float,
     count_weight: float,
     use_amp: bool = True,
-    num_segments: int = NUM_SEGMENTS,
+    num_segments: SegmentCount = NUM_SEGMENTS,
     min_segment_size: int | None = None,
     compute_pearson: bool = True,
     rank: int = 0,
@@ -1607,7 +1607,7 @@ def validate_multihead(
         positional_weight: Weight for positional component.
         count_weight: Weight for count component.
         use_amp: Whether to use automatic mixed precision.
-        num_segments: Number of segments for multinomial loss.
+        num_segments: Exact multinomial segment count or "auto" for up to eight.
         min_segment_size: Minimum positions per segment.
         compute_pearson: Whether to compute Pearson R metrics.
         rank: Process rank for DDP.
@@ -1872,7 +1872,7 @@ def train_epoch_sequence_parallel(
     use_amp: bool = True,
     accumulation_steps: int = 1,
     frozen_backbone: bool = False,
-    num_segments: int = NUM_SEGMENTS,
+    num_segments: SegmentCount = NUM_SEGMENTS,
     min_segment_size: int | None = None,
     train_sampler: DistributedSampler | None = None,
     rank: int = 0,
@@ -1914,7 +1914,7 @@ def train_epoch_sequence_parallel(
         use_amp: Whether to use automatic mixed precision.
         accumulation_steps: Number of batches to accumulate gradients over.
         frozen_backbone: If True, run backbone under torch.no_grad().
-        num_segments: Number of segments for multinomial loss.
+        num_segments: Exact multinomial segment count or "auto" for up to eight.
         min_segment_size: Minimum segment size for multinomial loss.
         train_sampler: DistributedSampler for shuffling across epochs.
         rank: Process rank for DDP.

@@ -138,8 +138,8 @@ class TestAlphaGenomeLoss:
         'seq_len, segment_sizes, settings',
         [
             (1024, {1: 128, 128: 1}, {}),
-            (4480, {1: 560, 128: 5}, {}),
-            (2048, {1: 512, 128: 8}, {'num_segments': 4, 'min_segment_size': 8}),
+            (4480, {1: 560, 128: 5}, {'num_segments': 'auto'}),
+            (2048, {1: 512, 128: 4}, {'num_segments': 4, 'min_segment_size': 4}),
         ],
     )
     def test_derived_multinomial_resolution(self, seq_len, segment_sizes, settings):
