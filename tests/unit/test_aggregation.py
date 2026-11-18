@@ -159,15 +159,23 @@ def test_collapse_strand_pairs_keeps_sense_value_per_pair():
         [1.0, nan, 2.0, nan, 9.0],   # '+' gene
         [nan, 3.0, nan, 4.0, 8.0],   # '-' gene
     ])
-    out = collapse_strand_pairs(values, ["+", "-", "+", "-", "."])
-    torch.testing.assert_close(out, torch.tensor([[1.0, 2.0, 9.0], [3.0, 4.0, 8.0]]))
-    # Blocked layout (all '+' then all '-') pairs by order the same way.
-    blocked = values[:, [0, 2, 1, 3, 4]]
-    torch.testing.assert_close(
-        collapse_strand_pairs(blocked, ["+", "+", "-", "-", "."]), out,
+    expected = torch.tensor([[1.0, 2.0, 9.0], [3.0, 4.0, 8.0]])
+    # A+, B+, B-, A- would silently pair the wrong samples by order.
+    shuffled = values[:, [0, 2, 3, 1, 4]]
+    strands = ["+", "+", "-", "-", "."]
+    by_index = collapse_strand_pairs(shuffled, strands, strand_pairs=[(0, 3), (1, 2)])
+    by_identity = collapse_strand_pairs(
+        shuffled, strands, strand_pair_ids=["A", "B", "B", "A", None],
     )
-    with pytest.raises(ValueError, match="cannot pair"):
-        collapse_strand_pairs(values[:, :3], ["+", "-", "+"])
+    torch.testing.assert_close(by_index, expected)
+    torch.testing.assert_close(by_identity, expected)
+
+    with pytest.raises(ValueError, match="require explicit"):
+        collapse_strand_pairs(shuffled, strands)
+    with pytest.raises(ValueError, match="leave stranded tracks unpaired"):
+        collapse_strand_pairs(shuffled, strands, strand_pairs=[(0, 3)])
+    with pytest.raises(ValueError, match=r"one '\+' and one '-' track"):
+        collapse_strand_pairs(shuffled, strands, strand_pair_ids=["A", "B", "B", "C", None])
 
 
 def test_stranded_correlations_are_not_inflated_by_missing_cells():
@@ -187,6 +195,7 @@ def test_stranded_correlations_are_not_inflated_by_missing_cells():
     dense = gene_expression_correlations(pred, obs)
     collapsed = gene_expression_correlations(
         stranded_pred, stranded_obs, track_strands=strands,
+        strand_pairs=[(2 * i, 2 * i + 1) for i in range(samples)],
     )
     for key in dense:
         assert collapsed[key] == pytest.approx(dense[key], abs=1e-6)
@@ -394,7 +403,14 @@ def test_combine_gene_expression_dedup_and_corr():
     out = combine_gene_expression([w1, w2])
     assert out["n_genes"] == 5                 # g2 counted once
     assert out["across_genes"] > 0.9
-    assert set(out) == {"across_genes", "across_genes_norm", "across_tracks_norm", "n_genes"}
+    assert set(out) == {
+        "across_genes",
+        "across_genes_norm",
+        "across_tracks_norm",
+        "one_vs_rest_lfc",
+        "one_vs_rest_lfc_per_track",
+        "n_genes",
+    }
 
 
 def test_combine_gene_expression_too_few_genes():

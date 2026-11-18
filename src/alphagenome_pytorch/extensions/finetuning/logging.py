@@ -8,7 +8,9 @@ from __future__ import annotations
 import csv
 import json
 from datetime import datetime
+from math import isfinite
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 from alphagenome_pytorch.extensions.finetuning.distributed import is_main_process
@@ -163,6 +165,38 @@ class TrainingLogger:
         if self.use_wandb:
             self.wandb.log(metrics, step=self.step)
 
+    def _append_epoch_scalars(self, metrics: dict[str, Any]) -> None:
+        path = self.output_dir / "epoch_log.csv"
+        fieldnames = []
+        if path.exists():
+            with path.open(newline="") as existing:
+                fieldnames = next(csv.reader(existing), [])
+        new_columns = [key for key in metrics if key not in fieldnames]
+        if fieldnames and new_columns:
+            # Rewrite once when a new metric appears, preserving old rows by
+            # column name. Replace only after the new file has been written.
+            fieldnames += new_columns
+            with NamedTemporaryFile("w", dir=path.parent, newline="", delete=False) as file:
+                temporary = Path(file.name)
+                try:
+                    writer = csv.DictWriter(file, fieldnames=fieldnames)
+                    writer.writeheader()
+                    with path.open(newline="") as existing:
+                        writer.writerows(csv.DictReader(existing))
+                    writer.writerow(metrics)
+                    file.close()
+                    temporary.chmod(path.stat().st_mode & 0o777)
+                    temporary.replace(path)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            return
+
+        with path.open("a", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames or new_columns)
+            if not fieldnames:
+                writer.writeheader()
+            writer.writerow(metrics)
+
     def log_epoch(
         self,
         epoch: int,
@@ -172,6 +206,8 @@ class TrainingLogger:
         is_best: bool = False,
         extra: dict[str, Any] | None = None,
         histograms: dict[str, list[float]] | None = None,
+        *,
+        track_metrics: dict[str, list[tuple[int, str, float]]] | None = None,
     ) -> None:
         """Log epoch-level metrics.
 
@@ -184,6 +220,7 @@ class TrainingLogger:
             extra: Additional scalar metrics to log.
             histograms: Dict of metric_name -> list of values for histogram logging
                        (only logged to W&B, not CSV).
+            track_metrics: Per-metric rows of (track index, track name, value).
         """
         if not is_main_process(self.rank):
             return
@@ -199,14 +236,16 @@ class TrainingLogger:
         if extra:
             metrics.update(extra)
 
-        # Append to epoch log (scalars only)
-        epoch_log_path = self.output_dir / "epoch_log.csv"
-        file_exists = epoch_log_path.exists()
-        with open(epoch_log_path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(metrics.keys()))
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(metrics)
+        self._append_epoch_scalars(metrics)
+        if track_metrics:
+            path = self.output_dir / "epoch_track_metrics.csv"
+            write_header = not path.exists() or path.stat().st_size == 0
+            with path.open("a", newline="") as file:
+                writer = csv.writer(file)
+                if write_header:
+                    writer.writerow(("epoch", "metric", "track_index", "track_name", "value"))
+                for key, tracks in track_metrics.items():
+                    writer.writerows((epoch, key, index, name, value) for index, name, value in tracks)
 
         # W&B logging
         if self.use_wandb:
@@ -219,10 +258,19 @@ class TrainingLogger:
             if extra:
                 for k, v in extra.items():
                     wandb_metrics[f"epoch/{k}"] = v
+            for key, tracks in (track_metrics or {}).items():
+                if f"{key}_per_track_values" in (histograms or {}):
+                    continue
+                names = [name for _, name, _ in tracks]
+                for index, name, value in tracks:
+                    label = name if names.count(name) == 1 else f"{name} [{index}]"
+                    wandb_metrics[f"epoch/{key}/{label}"] = value
             # Log histograms for distributions
             if histograms:
                 for k, values in histograms.items():
-                    wandb_metrics[f"epoch/{k}"] = self.wandb.Histogram(values)
+                    finite_values = [value for value in values if isfinite(value)]
+                    if finite_values:
+                        wandb_metrics[f"epoch/{k}"] = self.wandb.Histogram(finite_values)
             self.wandb.log(wandb_metrics, step=self.step)
 
     @property

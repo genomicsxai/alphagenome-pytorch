@@ -1187,6 +1187,34 @@ class TestLoadFinetunedModelNullTransferConfig:
             )
 
 
+@pytest.mark.parametrize("kind", ["full", "delta"])
+def test_load_finetuned_model_preserves_gene_expression_settings(kind, tmp_path, monkeypatch):
+    from alphagenome_pytorch.extensions.finetuning.checkpointing import load_finetuned_model
+
+    TestLoadFinetunedModelNullTransferConfig._stub_heavy_deps(monkeypatch)
+    model = nn.Sequential(nn.Linear(2, 2))
+    model.heads = nn.ModuleDict()
+    optimizer = torch.optim.AdamW(model.parameters())
+    path = tmp_path / "model.pth"
+    reductions = {"rna_seq": "sum", "atac": "mean"}
+    pairs = {"rna_seq": [(0, 1)]}
+    metadata = dict(
+        modality=["rna_seq", "atac"],
+        track_names={"rna_seq": ["rna_plus", "rna_minus"], "atac": ["atac"]},
+        resolutions={"rna_seq": (1,), "atac": (1,)},
+        strand_pairs=pairs,
+        gene_reduce_funcs=reductions,
+    )
+    if kind == "full":
+        save_checkpoint(path, 1, model, optimizer, 0.1, **metadata)
+    else:
+        save_delta_checkpoint(path, model, TransferConfig(mode="linear"), **metadata)
+
+    _, loaded = load_finetuned_model(path, "unused.pth", device="cpu", merge=False)
+    assert loaded["strand_pairs"] == pairs
+    assert loaded["gene_reduce_funcs"] == reductions
+
+
 class TestLoadFinetunedModelDeltaStripsNativeHeads:
     """A .delta.pth reload must drop the base model's untrained native heads."""
 

@@ -14,7 +14,10 @@ from alphagenome_pytorch.extensions.finetuning.args import parse_args
 from alphagenome_pytorch.extensions.finetuning.runner import (
     MultimodalDataset,
     collate_multimodal,
+    format_epoch_summary,
     load_track_metadata_for_finetune,
+    split_val_metrics,
+    track_names_for_metric,
     unwrap_training_model,
 )
 from alphagenome_pytorch.extensions.finetuning.training import (
@@ -618,6 +621,217 @@ class TestParseArgsGeneExprEval:
     def test_off_by_default(self, monkeypatch):
         self._rna_cli(monkeypatch, [])
         assert parse_args().gene_expr_eval is False
+
+
+@pytest.mark.unit
+class TestParseArgsThreePrimeRna:
+    """A 3'-biased library is the rna_seq head plus a per-head reduction, not a
+    modality of its own: the head name stays an output type, so the fine-tune
+    still serves and scores."""
+
+    def _cli(self, monkeypatch, extra):
+        monkeypatch.setattr(
+            sys, "argv",
+            _required_cli_args()
+            + ["--modality", "rna_seq", "--bigwig", "mic+.bw", "mic-.bw"]
+            + extra,
+        )
+
+    def test_track_strands_accepted(self, monkeypatch):
+        self._cli(monkeypatch, ["--track-strands", "+-"])
+        assert parse_args().modality_strands["rna_seq"] == "+-"
+
+    def test_reduce_func_flag_reaches_the_head(self, monkeypatch):
+        self._cli(monkeypatch, ["--track-strands", "+-",
+                                "--gene-reduce-func", "sum"])
+        assert parse_args().modality_gene_reduce_funcs == {"rna_seq": "sum"}
+
+    def test_satisfies_gene_loss_weight(self, monkeypatch):
+        self._cli(monkeypatch, [
+            "--track-strands", "+-", "--gtf", "genes.gtf",
+            "--gene-loss-weight", "0.1", "--gene-reduce-func", "sum",
+        ])
+        assert parse_args().gene_loss_weight == 0.1
+
+    def test_satisfies_gene_expr_eval_and_resolves_head(self, monkeypatch):
+        self._cli(monkeypatch, [
+            "--track-strands", "+-", "--gene-expr-annotation", "gencode.parquet",
+            "--gene-expr-eval", "--gene-reduce-func", "sum",
+        ])
+        args = parse_args()
+        assert args.gene_expr_eval is True
+        # The metric must read the head the same way the loss does.
+        assert args.modality_gene_reduce_funcs["rna_seq"] == "sum"
+
+    def test_reduce_func_flag_defaults_to_auto(self, monkeypatch):
+        self._cli(monkeypatch, ["--track-strands", "+-"])
+        assert parse_args().gene_reduce_func == "auto"
+
+    def test_reduce_func_flag_rejects_unknown_value(self, monkeypatch):
+        self._cli(monkeypatch, ["--track-strands", "+-",
+                                "--gene-reduce-func", "median"])
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    def test_three_prime_config_needs_no_new_modality(self, monkeypatch, tmp_path):
+        """The whole 3' setup in a YAML config: one rna_seq head, strands, and
+        the reduction that both the loss and the metric will use."""
+        yaml = pytest.importorskip("yaml")
+        config = {
+            "modalities": {
+                "rna_seq": {
+                    "bigwig": ["mic+.bw", "mic-.bw"],
+                    "strand": "+-",
+                    "gene_reduce_func": "sum",
+                    "strand_pairs": "auto",
+                },
+            },
+        }
+        config_path = tmp_path / "train.yaml"
+        config_path.write_text(yaml.safe_dump(config))
+        monkeypatch.setattr(
+            sys, "argv", _required_cli_args() + ["--config", str(config_path)]
+        )
+        args = parse_args()
+        assert args.modality_gene_reduce_funcs == {"rna_seq": "sum"}
+        assert args.modality_strands == {"rna_seq": "+-"}
+        assert args.modality_strand_pairs == {"rna_seq": [(0, 1)]}
+
+
+@pytest.mark.unit
+class TestEpochReporting:
+    """The epoch boundary runs after hours of compute, so everything there has
+    to survive a metric it did not expect. A per-track list formatted with
+    ``:.4f`` raised ``unsupported format string passed to list.__format__`` and
+    killed a run that had just finished epoch 1."""
+
+    # What validate_multihead actually returns for a stranded RNA head.
+    METRICS = {
+        "rna_seq_1bp_profile_pearson_r_mean": 0.42,
+        "rna_seq_1bp_profile_pearson_r_std": 0.11,
+        "rna_seq_1bp_profile_pearson_r_per_track": [0.4, 0.44],
+        "rna_seq_1bp_profile_pearson_r_values": [0.3, 0.5, 0.4, 0.44],
+        "rna_seq_1bp_count_pearson_r": 0.61,
+        "rna_seq_1bp_count_pearson_r_per_track": [0.6, 0.62],
+        "rna_seq_gene_log_expr_pearson_one_vs_rest_lfc": 0.25,
+        "rna_seq_gene_log_expr_pearson_one_vs_rest_lfc_per_track": [0.2, 0.3],
+        "rna_seq_gene_log_expr_n_genes": 812,
+    }
+    NAMES = {"rna_seq": ["Microglia+", "Microglia-"]}
+
+    def test_summary_survives_per_track_lists(self):
+        line = format_epoch_summary(1, 6.81, 3.25, {"rna_seq": 6.81}, self.METRICS)
+        assert "train_loss=6.8100" in line and "val_loss=3.2500" in line
+        assert "rna_seq_1bp_count_pearson_r=0.6100" in line
+        # The lists are skipped rather than formatted.
+        assert "per_track" not in line
+
+    def test_summary_skips_any_non_scalar(self):
+        """By type, so a metric shape nobody anticipated cannot end an epoch."""
+        line = format_epoch_summary(
+            1, 1.0, 1.0, {}, {"rna_seq_pearson_weird": {"a": 1}, "rna_seq_pearson_ok": 0.5}
+        )
+        assert "rna_seq_pearson_ok=0.5000" in line and "weird" not in line
+
+    def test_per_track_lists_keep_names_outside_epoch_scalars(self):
+        extra, histograms, tracks = split_val_metrics(
+            self.METRICS, self.NAMES, gene_expr_sample_names=["A", "B"],
+        )
+        assert tracks["rna_seq_1bp_profile_pearson_r"][0] == (0, "Microglia+", 0.4)
+        assert tracks["rna_seq_1bp_count_pearson_r"][1] == (1, "Microglia-", 0.62)
+        assert tracks["rna_seq_gene_log_expr_pearson_one_vs_rest_lfc"][0] == (0, "A", 0.2)
+        assert histograms["rna_seq_1bp_profile_pearson_r_values"] == [0.3, 0.5, 0.4, 0.44]
+        assert extra["val_loss_rna_seq_gene_log_expr_n_genes"] == 812
+        assert all("/" not in key for key in extra)
+
+    def test_epoch_resume_keeps_scalar_headers_and_writes_separate_track_rows(self, tmp_path):
+        import csv
+
+        from alphagenome_pytorch.extensions.finetuning.logging import TrainingLogger
+
+        TrainingLogger(tmp_path).log_epoch(
+            1, 0.5, 0.4, 0.001, extra={"original": 0.2},
+        )
+        logger = TrainingLogger(tmp_path)
+        logger.use_wandb = True
+        logger.wandb = MagicMock()
+        logger.log_epoch(
+            2, 0.5, 0.4, 0.001, extra={"new": 0.8, "original": 0.3},
+            track_metrics={"rna_seq_count": [(0, "A", 0.6), (1, "B", 0.7)]},
+        )
+        with (tmp_path / "epoch_log.csv").open() as file:
+            rows = list(csv.DictReader(file))
+        assert [(row["original"], row["new"]) for row in rows] == [("0.2", ""), ("0.3", "0.8")]
+        assert "rna_seq_count/A" not in rows[1]
+        with (tmp_path / "epoch_track_metrics.csv").open() as file:
+            assert list(csv.reader(file)) == [
+                ["epoch", "metric", "track_index", "track_name", "value"],
+                ["2", "rna_seq_count", "0", "A", "0.6"],
+                ["2", "rna_seq_count", "1", "B", "0.7"],
+            ]
+        assert logger.wandb.log.call_args.args[0]["epoch/rna_seq_count/A"] == 0.6
+
+    def test_per_track_falls_back_to_histogram_when_unnamed(self):
+        extra, histograms, tracks = split_val_metrics(
+            {"rna_seq_1bp_count_pearson_r_per_track": [0.1, 0.2, 0.3]}, self.NAMES
+        )
+        assert histograms["rna_seq_1bp_count_pearson_r_per_track_values"] == [0.1, 0.2, 0.3]
+        assert extra == {}
+
+    def test_nonfinite_histograms_do_not_block_wandb_epoch_logging(self, tmp_path):
+        from alphagenome_pytorch.extensions.finetuning.logging import TrainingLogger
+
+        logger = TrainingLogger(tmp_path)
+        logger.use_wandb = True
+        logger.wandb = MagicMock()
+        logger.log_epoch(
+            1, train_loss=0.5, val_loss=0.4, lr=0.001,
+            histograms={
+                "mixed_values": [0.25, float("nan"), float("inf"), -0.5],
+                "undefined_values": [float("nan"), -float("inf")],
+            },
+        )
+
+        logger.wandb.Histogram.assert_called_once_with([0.25, -0.5])
+        logger.wandb.log.assert_called_once()
+        metrics = logger.wandb.log.call_args.args[0]
+        assert metrics["epoch/val_loss"] == 0.4
+        assert "epoch/mixed_values" in metrics
+        assert "epoch/undefined_values" not in metrics
+
+    def test_fallback_does_not_overwrite_region_distribution(self):
+        """A wide head has both a per-(region, track) `_values` list and a
+        per-track list; the fallback histogram must not replace the former."""
+        names = {"rna_seq": [f"t{i}" for i in range(40)]}
+        extra, histograms, tracks = split_val_metrics(
+            {
+                "rna_seq_1bp_profile_pearson_r_values": [0.9] * 80,
+                "rna_seq_1bp_profile_pearson_r_per_track": [0.1] * 40,
+            },
+            names,
+        )
+        assert histograms["rna_seq_1bp_profile_pearson_r_values"] == [0.9] * 80
+        assert histograms["rna_seq_1bp_profile_pearson_r_per_track_values"] == [0.1] * 40
+        assert tracks["rna_seq_1bp_profile_pearson_r"][-1] == (39, "t39", 0.1)
+
+
+@pytest.mark.unit
+class TestTrackNamesForMetric:
+    """Per-track metric keys are labeled with the owning head's track names."""
+
+    def test_matches_head_prefix(self):
+        names = {"rna_seq": ["Mic+", "Mic-"], "atac": ["a"]}
+        assert track_names_for_metric(
+            "rna_seq_1bp_count_pearson_r_per_track", names
+        ) == ["Mic+", "Mic-"]
+        assert track_names_for_metric(
+            "atac_128bp_profile_pearson_r_per_track", names
+        ) == ["a"]
+
+    def test_unknown_head_returns_none(self):
+        assert track_names_for_metric(
+            "cage_1bp_count_pearson_r_per_track", {"atac": ["a"]}
+        ) is None
 
 
 @pytest.mark.unit

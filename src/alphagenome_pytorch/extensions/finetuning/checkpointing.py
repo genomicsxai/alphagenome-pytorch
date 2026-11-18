@@ -1839,6 +1839,8 @@ def load_finetuned_model(
         ``modality``, ``resolutions``, ``track_names``,
         ``track_metadata`` (list of row-dicts, when the checkpoint
         embedded a metadata catalog; otherwise ``None``),
+        ``strand_pairs`` (explicit per-head plus/minus channel indices when saved),
+        ``gene_reduce_funcs`` (resolved per-head gene reductions when saved),
         ``organism`` (``"human"``/``"mouse"`` the tracks were trained on,
         or ``None`` for older checkpoints that predate this field),
         ``base_model_weights_hash`` (exact base checkpoint identity when
@@ -1974,6 +1976,8 @@ def load_finetuned_model(
             "resolutions": metadata.get("resolutions"),
             "track_names": metadata.get("track_names"),
             "track_metadata": metadata.get("track_metadata"),
+            "strand_pairs": metadata.get("strand_pairs"),
+            "gene_reduce_funcs": metadata.get("gene_reduce_funcs"),
             "organism": metadata.get("organism"),
             "organism_indices": metadata.get("organism_indices"),
             "base_model_weights_hash": metadata.get("base_model_weights_hash"),
@@ -2074,6 +2078,8 @@ def load_finetuned_model(
         "resolutions": ckpt.get("resolutions"),
         "track_names": ckpt.get("track_names"),
         "track_metadata": ckpt.get("track_metadata"),
+        "strand_pairs": ckpt.get("strand_pairs"),
+        "gene_reduce_funcs": ckpt.get("gene_reduce_funcs"),
         "organism": ckpt.get("organism"),
         "organism_indices": ckpt.get("organism_indices"),
         "base_model_weights_hash": ckpt.get("base_model_weights_hash"),
