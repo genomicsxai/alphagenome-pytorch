@@ -194,8 +194,10 @@ def create_datasets(
     modality_track_names: dict[str, list[str]] = {}
     for modality, bigwigs in args.modality_to_bigwigs.items():
         modality_track_names[modality] = [Path(bw).stem for bw in bigwigs]
+        n_tracks = len(bigwigs)
         print_rank0(
-            f"  {modality}: {len(bigwigs)} tracks, resolutions={args.modality_resolutions[modality]} - "
+            f"  {modality}: {n_tracks} track{'s' if n_tracks != 1 else ''}, "
+            f"resolutions={args.modality_resolutions[modality]} - "
             f"{modality_track_names[modality]}",
             rank,
         )
@@ -215,7 +217,7 @@ def create_datasets(
             _load_intervals_from_bed,
         )
 
-        print_rank0(f"Loading GTF for gene LFC loss: {args.gtf}", rank)
+        print_rank0(f"Loading annotation for gene LFC loss: {args.gtf}", rank)
         gene_table = cached_load_gene_table(args.gtf, filter_protein_coding=True)
         gene_mask_extractor = GeneMaskExtractor(gene_table)
 
@@ -237,7 +239,8 @@ def create_datasets(
             g_max = max(g_max, derive_g_max(gene_mask_extractor, intervals, pad_bp=pad_bp))
             n_intervals += len(intervals)
         print_rank0(
-            f"Gene LFC: scanned {n_intervals} intervals "
+            f"Gene LFC: scanned {n_intervals} "
+            f"interval{'s' if n_intervals != 1 else ''} "
             f"(train padded +/-{shift_pad}bp for shift augmentation), g_max={g_max}",
             rank,
         )
@@ -823,6 +826,12 @@ def main(args: argparse.Namespace | None = None) -> None:
                 f"GTF/parquet that includes exon features."
             )
         gene_expr_track_strands = list(args.modality_strands["rna_seq"])
+        # The metric merges each '+' track with its '-' partner (by order).
+        if gene_expr_track_strands.count("+") != gene_expr_track_strands.count("-"):
+            raise ValueError(
+                "--gene-expr-eval needs RNA-seq tracks in +/- pairs, got strands "
+                f"{''.join(gene_expr_track_strands)}"
+            )
         val_dataset.return_coords = True
 
     # Optional rich track metadata (overrides BigWig stems with parquet names

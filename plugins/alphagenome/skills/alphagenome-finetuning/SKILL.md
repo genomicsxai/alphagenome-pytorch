@@ -70,6 +70,26 @@ Training: `--epochs 10`, `--batch-size 1`, `--lr 1e-4`, `--weight-decay 0.1`,
 `--warmup-steps 500`, `--lr-schedule cosine`, `--sequence-length 131072`,
 `--output-dir finetuning_output`.
 
+**What a run writes.** Output goes to `<output-dir>/<run-name>`, defaulting to
+`finetuning_output/<timestamp>`. A default run produces `best_model.pth` (on val
+improvement), `checkpoint_epoch{N}.pth` (every epoch — `--save-every` defaults to
+1), plus `config.json`, `training_log.csv`, `epoch_log.csv`. **`--save-delta` is
+off by default**, so a default run yields nothing shareable — `agt adapters
+export` needs a delta and rejects `best_model.pth`. No `transfer_config.json` is
+written; the config is embedded in each checkpoint.
+
+`--no-full-checkpoint` (deltas only, requires `--save-delta`) and
+`--no-save-checkpoints` (no weights at all, logs only) sound alike but differ:
+the first picks a format, the second turns saving off.
+
+**Loading: one file or two?** Full checkpoints and full exports are
+self-contained (`agt predict --checkpoint X`). Delta checkpoints, exported
+deltas and adapter bundles hold only the difference from a base model and need
+it too (`agt predict --model base.pth --checkpoint X`). `agt info <file>` reports
+which you have; in Python, `describe_checkpoint(path)` returns `.kind` and
+`.requires_base_weights`. Full reference:
+https://alphagenome-pytorch.readthedocs.io/en/latest/finetuning/checkpoints.html
+
 ## 5. Common variations
 
 **Delta checkpoints** (adapters + heads only, ~5–10MB vs ~1GB):
@@ -95,6 +115,33 @@ There is **no `--overlap-lowres` flag**; the low-res overlap is computed as
 `--batch-size 1`, `--dtype`/`--no-amp`.
 
 **Tracking**: `--wandb` (`--wandb-project`, default `alphagenome-finetune`).
+
+**Gene-level RNA-seq** — two independent features, both **off by default**:
+
+```bash
+# Cross-track gene LFC loss over gene bodies (paper weight: 0.1)
+--gene-loss-weight 0.1 --gene-cross-track-weight 5.0 \
+    --gtf gencode.v46.annotation.gtf --track-strands '+-'
+
+# Exon-based gene-expression correlations, reported each validation epoch
+--gene-expr-eval --gene-expr-annotation gencode.v46.parquet --track-strands '+-'
+```
+
+The loss aggregates over **gene bodies** (exons + introns) and needs `--gtf`,
+`rna_seq` in `--modality`, and `--track-strands`. Leaving `--gene-loss-weight` at
+`0.0` keeps loss values bit-identical to a run without it.
+
+The eval metric aggregates over **annotated exons** (log mean coverage,
+strand-matched, genes with ≥50% of exons in-window) and emits
+`rna_seq_gene_log_expr_pearson_{across_genes,across_genes_norm,across_tracks_norm}`
+plus `rna_seq_gene_log_expr_n_genes`. It needs an annotation that actually
+contains **exon rows**, so a gene-only `--gtf` is not enough on its own.
+
+Both `--gtf` and `--gene-expr-annotation` accept parquet or GTF/GFF. Convert
+once (`python scripts/convert_gtf_to_parquet.py --input x.gtf --output
+x.parquet`) and point `--gtf` at the parquet: it loads in seconds instead of
+minutes on every run's startup path, and since the converter keeps every
+feature, that single file drives both the gene-body masks and the exon metric.
 
 **Preparing BigWig data** (`agt preprocess`) — optional prep before training:
 ```bash

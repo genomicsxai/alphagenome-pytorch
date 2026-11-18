@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -241,3 +240,78 @@ class TestLoadGeneTable:
         df = load_gene_table(gtf_path, filter_protein_coding=True)
         assert df.iloc[0]["Start"] == 1100
         assert df.iloc[0]["End"] == 1200
+
+
+class TestLoadGeneTableParquet:
+    """Parquet input takes the same path as GTF, minus the pyranges parse.
+
+    A parquet from `scripts/convert_gtf_to_parquet.py` is `pyranges.read_gtf().df`
+    written out, so it already carries GTF-layout columns and 0-based coordinates.
+    """
+
+    @pytest.fixture
+    def annotation_frame(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "Chromosome": ["chr1", "chr1", "chr1"],
+                "Start": [1100, 1300, 1100],
+                "End": [1200, 1500, 1200],
+                "Strand": ["+", "+", "+"],
+                "Feature": ["gene", "gene", "transcript"],
+                "gene_id": ["GENE-A", "GENE-B", "GENE-A"],
+                "gene_name": ["A", "B", "A"],
+                "gene_type": ["protein_coding", "lncRNA", "protein_coding"],
+                # A real GENCODE frame carries ~25 more columns; they must not
+                # survive into the gene table.
+                "transcript_id": [None, None, "TX-A"],
+            }
+        )
+
+    @pytest.fixture
+    def parquet_path(self, annotation_frame, tmp_path) -> str:
+        path = tmp_path / "annotation.parquet"
+        annotation_frame.to_parquet(path)
+        return str(path)
+
+    def test_matches_gtf_behaviour(self, parquet_path):
+        df = load_gene_table(parquet_path, filter_protein_coding=True)
+        assert list(df["gene_id"]) == ["GENE-A"]
+        assert df.iloc[0]["Start"] == 1100
+        assert df.iloc[0]["End"] == 1200
+
+    def test_without_filter_keeps_all_genes(self, parquet_path):
+        df = load_gene_table(parquet_path, filter_protein_coding=False)
+        assert sorted(df["gene_id"]) == ["GENE-A", "GENE-B"]
+
+    def test_drops_non_gene_rows_and_extra_columns(self, parquet_path):
+        df = load_gene_table(parquet_path, filter_protein_coding=False)
+        assert len(df) == 2
+        assert "transcript_id" not in df.columns
+        assert set(df.columns) == {
+            "Chromosome", "Start", "End", "Strand",
+            "gene_id", "gene_name", "gene_type",
+        }
+
+    def test_pq_suffix_also_recognised(self, annotation_frame, tmp_path):
+        path = tmp_path / "annotation.pq"
+        annotation_frame.to_parquet(path)
+        assert list(load_gene_table(str(path))["gene_id"]) == ["GENE-A"]
+
+    def test_missing_required_columns_rejected(self, annotation_frame, tmp_path):
+        path = tmp_path / "no_gene_id.parquet"
+        annotation_frame.drop(columns=["gene_id"]).to_parquet(path)
+        with pytest.raises(ValueError, match="missing required columns"):
+            load_gene_table(str(path))
+
+    def test_no_gene_rows_rejected(self, annotation_frame, tmp_path):
+        path = tmp_path / "transcripts_only.parquet"
+        annotation_frame[annotation_frame["Feature"] == "transcript"].to_parquet(path)
+        with pytest.raises(ValueError, match="no `Feature == 'gene'` rows"):
+            load_gene_table(str(path))
+
+    def test_result_feeds_the_extractor(self, parquet_path):
+        """The parquet-loaded table has exactly what GeneMaskExtractor consumes."""
+        df = load_gene_table(parquet_path, filter_protein_coding=False)
+        extractor = GeneMaskExtractor(df)
+        mask, meta = extractor.extract("chr1", 1000, 2000)
+        assert mask.shape[-1] == len(meta) == 2

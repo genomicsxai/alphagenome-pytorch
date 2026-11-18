@@ -36,7 +36,7 @@ region must divide by *bases*, not by elements, or it comes out ``resolution``×
 too large. That is what ``bin_size`` is for.
 
 This buys **unit consistency**, not exact agreement between resolutions. Region
-means at 128bp remain an approximation: :meth:`GeneAnnotation.get_exon_bin_ranges`
+means at 128bp remain an approximation: :meth:`alphagenome_pytorch.variant_scoring.annotations.GeneAnnotation.get_exon_bin_ranges`
 includes every bin an exon *touches*, and such a boundary bin is an already-summed
 total that mixes exonic and non-exonic bases. No choice of divisor can separate
 them after the fact. Only regions whose boundaries land on bin edges agree exactly
@@ -62,6 +62,7 @@ if TYPE_CHECKING:  # avoid importing heavy / optional modules at import time
 __all__ = [
     "aggregate_intervals",
     "normalize_expression",
+    "collapse_strand_pairs",
     "gene_expression_correlations",
     "GeneCounts",
     "GeneCountAccumulator",
@@ -138,7 +139,8 @@ def _nan_pearson(pred: Tensor, obs: Tensor, dim: int, eps: float = 1e-8) -> Tens
 
     Positions that are NaN in ``pred`` or ``obs`` are dropped pairwise (their
     contribution is zeroed and excluded from the counts / means). Columns with
-    fewer than two valid points return NaN.
+    fewer than two valid points, or with zero variance on either side, return
+    NaN.
     """
     pred = pred.float()
     obs = obs.float()
@@ -157,11 +159,12 @@ def _nan_pearson(pred: Tensor, obs: Tensor, dim: int, eps: float = 1e-8) -> Tens
 
     num = (pc * oc).sum(dim=dim)
     den = pc.pow(2).sum(dim=dim).sqrt() * oc.pow(2).sum(dim=dim).sqrt()
-    r = num / (den + eps)
+    r = num / den.clamp(min=eps)
 
-    # Undefined where fewer than 2 valid points.
-    enough = (n.squeeze(dim) >= 2)
-    return torch.where(enough, r, torch.full_like(r, float("nan")))
+    # Undefined with fewer than 2 valid points, or when either side is constant
+    # (e.g. an unexpressed gene): r=0 there would bias the mean toward zero.
+    defined = (n.squeeze(dim) >= 2) & (den > eps)
+    return torch.where(defined, r, torch.full_like(r, float("nan")))
 
 
 def normalize_expression(matrix: Tensor) -> Tensor:
@@ -197,10 +200,98 @@ def normalize_expression(matrix: Tensor) -> Tensor:
     return qn
 
 
+def collapse_strand_pairs(values: Tensor, track_strands: "Sequence[str]") -> Tensor:
+    """Merge strand-matched ``+``/``-`` track pairs into one sense column each.
+
+    After strand matching, a stranded ``[G, C]`` matrix is NaN in every
+    off-strand cell, so no gene has a complete row and the normalized
+    correlations are undefined. Pairing the i-th ``+`` track with the i-th
+    ``-`` track (in column order, e.g. interleaved ``+,-,+,-`` per sample) and
+    keeping each gene's sense value gives a dense ``[G, P + D]`` matrix: one
+    column per pair, followed by the ``D`` unstranded (``'.'``) tracks.
+
+    Args:
+        values: ``[G, C]`` strand-matched values (off-strand cells NaN).
+        track_strands: per-track ``'+'``/``'-'``/``'.'`` labels, length ``C``.
+    """
+    strands = [str(t) for t in track_strands]
+    _validate_track_strands(strands)
+    if values.shape[-1] != len(strands):
+        raise ValueError(
+            f"track_strands has {len(strands)} entries but values have "
+            f"{values.shape[-1]} tracks."
+        )
+    plus = [i for i, t in enumerate(strands) if t == "+"]
+    minus = [i for i, t in enumerate(strands) if t == "-"]
+    unstranded = [i for i, t in enumerate(strands) if t == "."]
+    if len(plus) != len(minus):
+        raise ValueError(
+            f"cannot pair {len(plus)} '+' tracks with {len(minus)} '-' tracks."
+        )
+    # nanmean: the sense value for stranded genes, the average for '.' genes.
+    columns = [values[:, [p, m]].nanmean(dim=1) for p, m in zip(plus, minus)]
+    columns.extend(values[:, i] for i in unstranded)
+    if not columns:
+        return values[:, :0]
+    return torch.stack(columns, dim=1)
+
+
+def _gene_expression_correlation_arrays(
+    pred: Tensor,
+    obs: Tensor,
+    *,
+    track_strands: "Sequence[str] | None" = None,
+    eps: float = 1e-8,
+) -> dict[str, Tensor]:
+    """Per-track and per-gene values behind :func:`gene_expression_correlations`.
+
+    Returns a dict of tensors:
+      * ``across_genes`` — ``[C]`` raw per-track correlations across genes
+      * ``across_genes_norm`` — ``[C]`` normalized per-track correlations
+      * ``across_tracks_norm`` — ``[G]`` normalized per-gene correlations
+        (NaN for genes left out of the normalized matrix)
+      * ``norm_gene_mask`` — ``[G]`` bool, genes used for the normalized metrics
+
+    ``C`` counts columns after :func:`collapse_strand_pairs` when
+    ``track_strands`` is given.
+    """
+    if pred.shape != obs.shape:
+        raise ValueError(f"pred {tuple(pred.shape)} and obs {tuple(obs.shape)} must match")
+    if track_strands is not None:
+        pred = collapse_strand_pairs(pred, track_strands)
+        obs = collapse_strand_pairs(obs, track_strands)
+    pred = pred.float()
+    obs = obs.float()
+
+    g, c = pred.shape
+    out = {
+        # Raw / across genes: correlate over genes (dim=0), one r per track.
+        "across_genes": _nan_pearson(pred, obs, dim=0, eps=eps),
+        "across_genes_norm": torch.full((c,), float("nan")),
+        "across_tracks_norm": torch.full((g,), float("nan")),
+        "norm_gene_mask": torch.zeros(g, dtype=torch.bool),
+    }
+
+    # Normalized variants need a dense matrix: keep genes complete across the
+    # tracks that have any data. Filling missing cells instead would give pred
+    # and obs a shared NaN pattern and inflate the correlations.
+    finite = ~(torch.isnan(pred) | torch.isnan(obs))
+    keep_c = finite.any(dim=0)
+    keep_g = finite[:, keep_c].all(dim=1)
+    if keep_g.sum() >= 2 and keep_c.sum() >= 2:
+        pred_n = normalize_expression(pred[keep_g][:, keep_c])
+        obs_n = normalize_expression(obs[keep_g][:, keep_c])
+        out["across_genes_norm"][keep_c] = _nan_pearson(pred_n, obs_n, dim=0, eps=eps)
+        out["across_tracks_norm"][keep_g] = _nan_pearson(pred_n, obs_n, dim=1, eps=eps)
+        out["norm_gene_mask"] = keep_g
+    return out
+
+
 def gene_expression_correlations(
     pred: Tensor,
     obs: Tensor,
     *,
+    track_strands: "Sequence[str] | None" = None,
     eps: float = 1e-8,
 ) -> dict[str, float]:
     """The three AlphaGenome gene-expression correlations.
@@ -208,37 +299,28 @@ def gene_expression_correlations(
     Args:
         pred: ``[G, C]`` predicted (log-space) gene × track expression.
         obs: ``[G, C]`` observed (log-space) gene × track expression. NaN cells
-            (e.g. strand-incompatible) are handled pairwise.
+            are dropped pairwise for the raw metric; genes with any NaN are left
+            out of the normalized metrics.
+        track_strands: per-track strands of strand-matched input. When given,
+            ``+``/``-`` pairs are merged into one sense column first (see
+            :func:`collapse_strand_pairs`). Without it, strand-matched stranded
+            input has no complete genes and the normalized metrics are NaN.
         eps: numerical epsilon.
 
     Returns:
-        Dict with mean correlations:
+        Dict with mean correlations (undefined entries ignored):
           * ``across_genes`` — raw, per-track across genes
           * ``across_genes_norm`` — quantile-normalized + gene-mean-centered,
             per-track across genes
           * ``across_tracks_norm`` — same normalized data, per-gene across tracks
     """
-    if pred.shape != obs.shape:
-        raise ValueError(f"pred {tuple(pred.shape)} and obs {tuple(obs.shape)} must match")
-
-    # Raw / across genes: correlate over genes (dim=0), one r per track, mean.
-    raw = _nan_pearson(pred, obs, dim=0, eps=eps)  # [C]
-
-    result = {"across_genes": float(_nanmean(raw))}
-
-    # Normalized variants need a dense matrix; drop genes/tracks that are all-NaN.
-    pred_d, obs_d = _dense_common(pred, obs)
-    if pred_d is not None and pred_d.shape[0] >= 2 and pred_d.shape[1] >= 2:
-        pred_n = normalize_expression(pred_d)
-        obs_n = normalize_expression(obs_d)
-        ag_norm = _nan_pearson(pred_n, obs_n, dim=0, eps=eps)   # [C]
-        at_norm = _nan_pearson(pred_n, obs_n, dim=1, eps=eps)   # [G]
-        result["across_genes_norm"] = float(_nanmean(ag_norm))
-        result["across_tracks_norm"] = float(_nanmean(at_norm))
-    else:
-        result["across_genes_norm"] = float("nan")
-        result["across_tracks_norm"] = float("nan")
-    return result
+    arrays = _gene_expression_correlation_arrays(
+        pred, obs, track_strands=track_strands, eps=eps,
+    )
+    return {
+        key: float(_nanmean(arrays[key]))
+        for key in ("across_genes", "across_genes_norm", "across_tracks_norm")
+    }
 
 
 def _nanmean(x: Tensor) -> Tensor:
@@ -246,34 +328,6 @@ def _nanmean(x: Tensor) -> Tensor:
     if valid.sum() == 0:
         return torch.tensor(float("nan"))
     return x[valid].mean()
-
-
-def _dense_common(pred: Tensor, obs: Tensor):
-    """Drop rows/cols that are entirely NaN in either matrix (for QN)."""
-    finite = ~(torch.isnan(pred) | torch.isnan(obs))
-    keep_g = finite.any(dim=1)
-    keep_c = finite.any(dim=0)
-    if keep_g.sum() < 2 or keep_c.sum() < 2:
-        return None, None
-    pred_d = pred[keep_g][:, keep_c]
-    obs_d = obs[keep_g][:, keep_c]
-    # Remaining NaNs (sparse strand mismatches) → 0 after centering is imperfect;
-    # replace with column means so QN ranks are well-defined.
-    pred_d = _fill_nan_colmean(pred_d)
-    obs_d = _fill_nan_colmean(obs_d)
-    return pred_d, obs_d
-
-
-def _fill_nan_colmean(x: Tensor) -> Tensor:
-    nan = torch.isnan(x)
-    if not nan.any():
-        return x
-    x = x.clone()
-    # column means over non-NaN entries
-    valid = (~nan).float()
-    means = (torch.where(nan, torch.zeros_like(x), x)).sum(0) / valid.sum(0).clamp(min=1)
-    x[nan] = means.repeat(x.shape[0], 1)[nan]
-    return x
 
 
 # --------------------------------------------------------------------------- #
@@ -488,7 +542,7 @@ def aggregate_genes(
     """Aggregate predictions over gene **bodies** (exons + introns).
 
     Loss-style per-gene counts, using the same gene-body masks as the training
-    gene-LFC loss (via :class:`GeneMaskExtractor`). Linear space.
+    gene-LFC loss (via :class:`~alphagenome_pytorch.extensions.finetuning.gene_annotation.GeneMaskExtractor`). Linear space.
 
     Args:
         predictions: ``[B, S, C]`` (or ``[S, C]``) RNA-seq tensor. ``S`` must span
@@ -552,7 +606,7 @@ def gene_expression(
     Args:
         predictions: ``[B, S, C]`` (or ``[S, C]``) RNA-seq tensor in experimental
             (linear) space.
-        annotation: a :class:`GeneAnnotation` built from a GTF/parquet that
+        annotation: a :class:`~alphagenome_pytorch.variant_scoring.annotations.GeneAnnotation` built from a GTF/parquet that
             includes exon rows.
         interval: ``(chrom, start, end)`` (0-based half-open).
         track_metadata: per-track metadata (for labels + strand matching).
@@ -637,7 +691,7 @@ def _build_exon_window(
 ) -> _ExonWindow:
     """Select genes in ``interval`` (≥``min_exon_fraction`` exon rule) + exon ranges.
 
-    This is the only pandas-heavy step in the metric; :func:`_get_exon_window`
+    This is the only pandas-heavy step in the metric; ``_get_exon_window``
     memoizes it so it runs once per unique window across the whole run.
     """
     import pandas as pd
@@ -807,13 +861,13 @@ def gene_expression_values(
 
     Args:
         predictions: ``[S, C]`` or ``[1, S, C]`` predictions for one window.
-        annotation: a :class:`GeneAnnotation` with exon rows.
+        annotation: a :class:`~alphagenome_pytorch.variant_scoring.annotations.GeneAnnotation` with exon rows.
         interval: ``(chrom, start, end)`` of this window.
         track_strands: per-track strand chars for strand matching (optional).
         window_cache: optional dict memoizing the per-window annotation lookup
             (the only pandas-heavy step). Pass the same dict for the pred and obs
             calls of a window, and reuse it across epochs, to build each window's
-            exon selection exactly once. See :func:`_get_exon_window`.
+            exon selection exactly once. See ``_get_exon_window``.
     """
     if predictions.dim() == 2:
         predictions = predictions.unsqueeze(0)
@@ -855,13 +909,16 @@ def _strand_match_values(
 def combine_gene_expression(
     windows: "Sequence[tuple[Sequence[str], Tensor, Tensor]]",
     *,
+    track_strands: "Sequence[str] | None" = None,
     eps: float = 1e-8,
 ) -> dict[str, float]:
     """Combine per-window ``(gene_ids, pred[G,C], obs[G,C])`` into gene-expression correlations.
 
     Genes are deduplicated by id across windows (first occurrence wins), avoiding
-    duplicate genes across overlapping windows. Returns the three correlation
-    flavors plus ``n_genes``.
+    duplicate genes across overlapping windows. Pass the ``track_strands`` used
+    for strand matching so ``+``/``-`` pairs are merged before correlating (see
+    :func:`gene_expression_correlations`). Returns the three correlation flavors
+    plus ``n_genes``.
     """
     seen: dict[str, int] = {}
     pred_rows: list[Tensor] = []
@@ -884,7 +941,9 @@ def combine_gene_expression(
         }
     pred_m = torch.stack(pred_rows, dim=0)  # [G_total, C]
     obs_m = torch.stack(obs_rows, dim=0)
-    result = gene_expression_correlations(pred_m, obs_m, eps=eps)
+    result = gene_expression_correlations(
+        pred_m, obs_m, track_strands=track_strands, eps=eps,
+    )
     result["n_genes"] = len(pred_rows)
     return result
 
@@ -902,7 +961,7 @@ class GeneCountAccumulator:
     :class:`GeneCounts` (``.to_anndata()`` for an AnnData).
 
     Args:
-        annotation: a :class:`GeneAnnotation`; exon rows required for
+        annotation: a :class:`~alphagenome_pytorch.variant_scoring.annotations.GeneAnnotation`; exon rows required for
             ``over="exons"``.
         resolution: bp per prediction bin (1 or 128).
         over: ``"exons"`` (default) or ``"gene_body"``.

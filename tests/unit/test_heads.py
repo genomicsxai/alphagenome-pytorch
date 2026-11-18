@@ -486,6 +486,26 @@ class TestSpliceSitesJunctionHead:
         assert bool(mask[0].all())
         assert bool(mask[1].all())
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA autocast runs einsum in bfloat16; CPU does not")
+    def test_autocast_matches_float32_at_large_positions(self):
+        """RoPE runs in float32 under bfloat16 autocast, as in JAX; bfloat16 cannot resolve positions near 2**20."""
+        from alphagenome_pytorch.heads import SpliceSitesJunctionHead
+
+        torch.manual_seed(0)
+        S, T = 2**20, 4
+        head = SpliceSitesJunctionHead(in_channels=16, hidden_dim=32, num_tissues=T).cuda().eval()
+        embeddings = torch.randn(1, 16, S, device='cuda')
+        organism_index = torch.tensor([1], device='cuda')
+        positions = torch.tensor([[[500_001, 600_123, 900_777], [700_007, 800_031, 1_000_003],
+                                   [-1, -1, -1], [-1, -1, -1]]], device='cuda')
+
+        with torch.no_grad():
+            ref = head(embeddings, organism_index, splice_site_positions=positions)['pred_counts']
+            with torch.autocast('cuda', dtype=torch.bfloat16):
+                out = head(embeddings, organism_index, splice_site_positions=positions)['pred_counts']
+
+        torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=1e-3)
+
     def test_rope_params_initialized_nonzero(self):
         # Upstream switched zero-init → trunc-normal so the junction head
         # converges when fine-tuned from scratch.

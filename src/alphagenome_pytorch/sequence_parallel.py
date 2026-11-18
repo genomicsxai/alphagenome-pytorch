@@ -14,6 +14,8 @@ Architecture:
         gather donor/acceptor positions → splice junction head
 """
 
+from __future__ import annotations
+
 import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_fn

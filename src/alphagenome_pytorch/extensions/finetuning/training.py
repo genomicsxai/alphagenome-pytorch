@@ -610,11 +610,13 @@ class ProfilingStats:
             lines.append(
                 f"\n{name}:\n"
                 f"  Mean:  {arr.mean()*1000:.2f} ms (+/- {arr.std()*1000:.2f} ms)\n"
-                f"  Total: {arr.sum():.2f} s ({len(times)} samples)"
+                f"  Total: {arr.sum():.2f} s ({len(times)} "
+                f"sample{'s' if len(times) != 1 else ''})"
             )
 
         lines.append(f"\n{'=' * 70}")
-        lines.append(f"TOTAL TIME: {total_time:.2f} s for {n_batches} batches")
+        lines.append(f"TOTAL TIME: {total_time:.2f} s for {n_batches} "
+                     f"batch{'es' if n_batches != 1 else ''}")
         lines.append(f"AVG TIME PER BATCH: {total_time/n_batches*1000:.2f} ms")
 
         # Breakdown percentages
@@ -714,13 +716,16 @@ def _gene_expr_metrics(
     *,
     modality: str,
     world_size: int = 1,
+    track_strands: list[str] | None = None,
 ) -> dict[str, float]:
     """Reduce accumulated per-window ``(gene_ids, pred, obs)`` to gene-expression correlations.
 
     Gathers windows across ranks (DDP), deduplicates genes, and returns the three
     correlation flavors plus the gene count under ``{modality}_gene_log_expr_*``
-    keys. Pure given ``gene_expr_windows`` (the ``world_size == 1`` path needs no
-    distributed context), so it is unit-testable without a model.
+    keys. ``track_strands`` must be the strands the windows were matched with, so
+    ``+``/``-`` track pairs are merged before correlating. Pure given
+    ``gene_expr_windows`` (the ``world_size == 1`` path needs no distributed
+    context), so it is unit-testable without a model.
     """
     from alphagenome_pytorch.aggregation import combine_gene_expression
 
@@ -730,7 +735,7 @@ def _gene_expr_metrics(
         dist.all_gather_object(gathered, gene_expr_windows)
         all_windows = [w for part in gathered if part for w in part]
 
-    ge = combine_gene_expression(all_windows)
+    ge = combine_gene_expression(all_windows, track_strands=track_strands)
     prefix = f"{modality}_gene_log_expr_pearson"
     return {
         f"{prefix}_across_genes": ge["across_genes"],
@@ -848,7 +853,8 @@ def train_epoch_ddp(
     profile_stats = ProfilingStats() if do_profile else None
 
     if do_profile:
-        print(f"\n*** PROFILING ENABLED for first {profile_batches} batches ***\n")
+        print(f"\n*** PROFILING ENABLED for first {profile_batches} "
+              f"batch{'es' if profile_batches != 1 else ''} ***\n")
 
     # Only show progress bar on rank 0
     if is_main_process(rank):
@@ -1388,7 +1394,8 @@ def train_epoch_multihead(
     profile_stats = ProfilingStats() if do_profile else None
 
     if do_profile:
-        print(f"\n*** PROFILING ENABLED for first {profile_batches} batches ***\n")
+        print(f"\n*** PROFILING ENABLED for first {profile_batches} "
+              f"batch{'es' if profile_batches != 1 else ''} ***\n")
 
     if is_main_process(rank):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
@@ -1940,6 +1947,7 @@ def validate_multihead(
     if gene_expr_enabled:
         metrics.update(_gene_expr_metrics(
             gene_expr_windows, modality=gene_expr_modality, world_size=world_size,
+            track_strands=gene_expr_track_strands,
         ))
 
     return avg_loss, metrics
