@@ -118,8 +118,8 @@ class AlphaGenomeLoss(nn.Module):
         positional_weight: Weight for positional component of multinomial loss.
             JAX production uses 5.0 (default), matching Borzoi.
         num_segments: Exact number of equal segments for resolution-keyed
-            outputs when no segment size is supplied. Defaults to eight.
-            Use "auto" to choose the largest valid count up to eight.
+            outputs when no segment size is supplied. The default "auto"
+            chooses the largest valid count up to eight.
         min_segment_size: Optional minimum segment size in output bins for
             resolution-keyed outputs.
     """
@@ -135,7 +135,7 @@ class AlphaGenomeLoss(nn.Module):
         gene_cross_track_weight: float = 5.0,
         track_strands: Optional[Dict[str, Sequence[str]]] = None,
         *,
-        num_segments: losses.SegmentCount = losses.DEFAULT_NUM_SEGMENTS,
+        num_segments: losses.SegmentCount = "auto",
         min_segment_size: Optional[int] = None,
     ):
         super().__init__()
@@ -189,18 +189,22 @@ class AlphaGenomeLoss(nn.Module):
     def forward(
         self,
         outputs: Dict[str, Any],
-        targets: Dict[str, torch.Tensor],
+        targets: Dict[str, Union[torch.Tensor, Dict[int, torch.Tensor]]],
         organism_index: torch.Tensor,
-        masks: Optional[Dict[str, torch.Tensor]] = None,
+        masks: Optional[Dict[str, Union[torch.Tensor, Dict[int, torch.Tensor]]]] = None,
         gene_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Compute per-head losses and aggregate.
 
         Args:
             outputs: Model outputs dict. Each head maps to resolution dict or tensor.
-            targets: Target values dict with same structure as outputs.
+            targets: Targets per head. For track heads with resolution-keyed
+                outputs, a target dict supervises the matching resolutions.
+                A single tensor is at the finest output resolution and is
+                sum-pooled for coarser outputs.
             organism_index: Organism indices (B,). Required for target scaling.
-            masks: Optional boolean masks dict for each head.
+            masks: Optional boolean masks per head, shared across resolutions
+                or keyed for each supervised resolution.
             gene_mask: Optional `[B, S, 2, G]` gene-body mask for the gene
                 LFC training loss. Only consumed by heads with a non-zero
                 entry in `self.gene_loss_weights`.
@@ -229,6 +233,9 @@ class AlphaGenomeLoss(nn.Module):
                 gene_mask=gene_mask,
             )
 
+            if head_loss is None:
+                continue
+
             head_losses[f'{head}_loss'] = head_loss
             total_loss = total_loss + self.head_weights.get(head, 1.0) * head_loss
 
@@ -239,11 +246,11 @@ class AlphaGenomeLoss(nn.Module):
         self,
         head: str,
         output: Any,
-        target: torch.Tensor,
-        mask: Optional[torch.Tensor],
+        target: Union[torch.Tensor, Dict[int, torch.Tensor]],
+        mask: Optional[Union[torch.Tensor, Dict[int, torch.Tensor]]],
         organism_index: torch.Tensor,
         gene_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         """Compute loss for a single head.
 
         IMPORTANT: Assumes output is in model space (scaled predictions)
@@ -317,23 +324,27 @@ class AlphaGenomeLoss(nn.Module):
             
             return donor_ratios_loss + acceptor_ratios_loss + 0.2 * (accept_total_loss + donor_total_loss)
 
-        # Handle resolution dict outputs (e.g., {1: tensor, 128: tensor}).
-        # Sum the loss over every resolution present, as upstream
-        # GenomeTracksHead.loss does. A target given as a single tensor is
-        # taken to be at the finest resolution and sum-pooled for the others.
         if isinstance(output, dict):
-            res_keys = sorted(k for k in output.keys() if isinstance(k, int))
-            if res_keys:
+            resolutions = sorted(key for key in output if isinstance(key, int))
+            if resolutions:
+                keyed_targets = isinstance(target, dict)
+                target_resolution = None if keyed_targets else resolutions[0]
+                if keyed_targets:
+                    resolutions = [res for res in resolutions if res in target]
+                    if not resolutions:
+                        return None
+
                 head_loss = 0.0
-                for resolution in res_keys:
+                for resolution in resolutions:
                     head_loss = head_loss + self._compute_track_loss(
                         head,
                         output[resolution],
-                        target[resolution] if isinstance(target, dict) else target,
+                        target[resolution] if keyed_targets else target,
                         mask[resolution] if isinstance(mask, dict) else mask,
                         organism_index,
                         resolution=resolution,
                         gene_mask=gene_mask,
+                        target_resolution=target_resolution,
                     )
                 return head_loss
 
@@ -351,6 +362,8 @@ class AlphaGenomeLoss(nn.Module):
         organism_index: torch.Tensor,
         resolution: Optional[int],
         gene_mask: Optional[torch.Tensor] = None,
+        *,
+        target_resolution: Optional[int] = None,
     ) -> torch.Tensor:
         """Compute the loss of a genome track or contact map head at one resolution."""
         # Default mask if not provided
@@ -377,11 +390,27 @@ class AlphaGenomeLoss(nn.Module):
             # We need to determine channels_last for scale/multinomial_loss.
             is_channels_last = (mask.shape[-2] == 1)
 
-        # Sum-pool a finer-resolution target to this output's resolution
         seq_axis = -2 if is_channels_last else -1
-        if resolution is not None and target.shape[seq_axis] != output.shape[seq_axis]:
-            factor = target.shape[seq_axis] // output.shape[seq_axis]
-            target = target.unflatten(seq_axis, (output.shape[seq_axis], factor)).sum(seq_axis)
+        if resolution is not None and target_resolution is not None and resolution != target_resolution:
+            factor, remainder = divmod(resolution, target_resolution)
+            if remainder:
+                raise ValueError(
+                    f"Cannot pool {head} targets from {target_resolution} bp to {resolution} bp."
+                )
+            output_bins = output.shape[seq_axis]
+            target_bins = target.shape[seq_axis]
+            if target_bins != output_bins * factor:
+                raise ValueError(
+                    f"{head} at {resolution} bp needs {output_bins * factor} target bins "
+                    f"at {target_resolution} bp, got {target_bins}."
+                )
+            target = target.unflatten(seq_axis, (output_bins, factor)).sum(seq_axis)
+
+        if resolution is not None and target.shape != output.shape:
+            raise ValueError(
+                f"{head} at {resolution} bp expects target shape {tuple(output.shape)}, "
+                f"got {tuple(target.shape)}."
+            )
 
         # Contact maps use MSE (no scaling needed)
         if head == 'contact_maps':

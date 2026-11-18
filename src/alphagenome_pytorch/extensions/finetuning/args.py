@@ -44,7 +44,7 @@ DEFAULTS = {
     "count_weight": 1.0,
     "num_workers": 4,
     "max_grad_norm": 1.0,
-    "num_segments": 8,
+    "num_segments": "auto",
     "min_segment_size": None,
     # Logging
     "wandb_project": "alphagenome-finetune",

@@ -735,9 +735,11 @@ def _report_loss_segmentation(args: argparse.Namespace, world_size: int, rank: i
                 )
             except ValueError as exc:
                 raise ValueError(f"Loss segmentation at {resolution} bp ({scope}) failed. {exc}") from exc
+            count = bins // size
             print_rank0(
                 f"Loss segmentation at {resolution} bp ({scope}) uses "
-                f"{bins // size} segments of {size} bins each.",
+                f"{count} segment{'s' if count != 1 else ''} of "
+                f"{size} bin{'s' if size != 1 else ''} each.",
                 rank,
             )
 

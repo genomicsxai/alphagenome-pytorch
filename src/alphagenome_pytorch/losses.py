@@ -17,7 +17,7 @@ SegmentCount = int | Literal["auto"]
 
 def _compute_multinomial_resolution(
     seq_len: int,
-    num_segments: SegmentCount = DEFAULT_NUM_SEGMENTS,
+    num_segments: SegmentCount = "auto",
     min_segment_size: Optional[int] = None,
 ) -> int:
     """Return bins per segment for an exact count or automatic sizing."""

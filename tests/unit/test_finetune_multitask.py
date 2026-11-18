@@ -53,12 +53,12 @@ class TestComputeMultinomialResolution:
     def test_min_segment_size(self):
         assert _compute_multinomial_resolution(64, num_segments=4, min_segment_size=16) == 16
         with pytest.raises(ValueError, match="exactly 8 equal segments of at least 16"):
-            _compute_multinomial_resolution(64, min_segment_size=16)
+            _compute_multinomial_resolution(64, num_segments=8, min_segment_size=16)
 
     @pytest.mark.parametrize("bins", [4, 30, 35])
     def test_exact_segments_require_equal_groups(self, bins):
         with pytest.raises(ValueError, match=rf"{bins} output bins cannot form exactly 8"):
-            _compute_multinomial_resolution(bins)
+            _compute_multinomial_resolution(bins, num_segments=8)
 
     def test_auto_fits_context_and_minimum(self):
         assert _compute_multinomial_resolution(30, "auto") == 5
@@ -71,6 +71,17 @@ class TestComputeMultinomialResolution:
 
 @pytest.mark.unit
 class TestLossSegmentation:
+    def test_omitted_segment_count_keeps_short_output_valid(self, capsys):
+        args = parse_args(_required_cli_args()[1:] + [
+            "--bigwig", "atac.bw", "--modality", "atac", "--sequence-length", "512",
+            "--resolutions", "128",
+        ])
+
+        finetune_module._report_loss_segmentation(args, world_size=1, rank=0)
+
+        assert args.num_segments == "auto"
+        assert "128 bp (full context) uses 4 segments of 1 bin each" in capsys.readouterr().out
+
     def test_exact_count_error_names_failing_output(self):
         args = parse_args(_required_cli_args()[1:] + [
             "--bigwig", "atac.bw", "--modality", "atac", "--sequence-length", "3840",
