@@ -411,9 +411,11 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
                        help="ReduceLROnPlateau: lower bound on the learning rate")
     train.add_argument("--augment-rc", action="store_true", default=DEFAULTS["augment_rc"],
                        help="TRAIN-only reverse-complement augmentation (prob 0.5). Sequence is "
-                            "reverse-complemented; targets reverse along length and swap declared "
-                            "+/- strand pairs (--strand-pairs); unstranded tracks reverse only. "
-                            "Val/test are never augmented.")
+                            "reverse-complemented; targets reverse along length and swap +/- "
+                            "strand pairs, from --strand-pairs or else derived from the track "
+                            "strands (--track-strands / modalities.<head>.strand; i-th '+' pairs "
+                            "with i-th '-'). A stranded track left unpaired is an error; "
+                            "unstranded tracks reverse only. Val/test are never augmented.")
     train.add_argument("--augment-shift-bp", type=int, default=DEFAULTS["augment_shift_bp"],
                        help="TRAIN-only max random genomic shift in bp (+/-), applied identically to "
                             "all track types. 0 disables. Val/test are never shifted.")
@@ -796,6 +798,14 @@ def postprocess_args(
                 f"strand string for '{modality}' contains invalid chars "
                 f"{invalid}; allowed: '+', '-', '.'"
             )
+
+    # Sequence parallelism shards one sample across ranks, but each rank draws its
+    # own augmentation, so the shards would come from different windows / strands.
+    if getattr(args, "sequence_parallel", False) and (args.augment_rc or args.augment_shift_bp):
+        parser.error(
+            "--augment-rc / --augment-shift-bp are not supported with --sequence-parallel: "
+            "each rank would draw a different shift/reverse-complement for the same sample"
+        )
 
     # Validate gene-LFC config consistency.
     if args.gene_loss_weight > 0:

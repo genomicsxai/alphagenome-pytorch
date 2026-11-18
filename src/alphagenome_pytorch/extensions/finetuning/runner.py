@@ -124,6 +124,7 @@ from alphagenome_pytorch.extensions.finetuning import (
     setup_preemption_handler,
 )
 from alphagenome_pytorch.extensions.finetuning.adapters import get_adapter_params
+from alphagenome_pytorch.extensions.finetuning.datasets import resolve_rc_strand_pairs
 from alphagenome_pytorch.extensions.finetuning.checkpointing import (
     compute_base_model_weights_hash_from_file,
     save_checkpoint, load_checkpoint, save_delta_checkpoint,
@@ -220,17 +221,24 @@ def create_datasets(
 
         # Project the BED windows used by the dataset (after centering/expansion
         # to args.sequence_length) so derive_g_max sees the same intervals
-        # GenomicDataset will request at __getitem__.
-        all_intervals: list[tuple[str, int, int]] = []
-        for bed in (args.train_bed, args.val_bed):
+        # GenomicDataset will request at __getitem__. Train windows are padded
+        # by the augmentation shift: a shifted window can fully contain a gene
+        # the unshifted one does not, which would overflow an unpadded g_max.
+        half_len = args.sequence_length // 2
+        shift_pad = max(0, int(args.augment_shift_bp or 0))
+        g_max = 0
+        n_intervals = 0
+        for bed, pad_bp in ((args.train_bed, shift_pad), (args.val_bed, 0)):
             raw_intervals, _ = _load_intervals_from_bed(bed)
-            half_len = args.sequence_length // 2
-            for chrom, s, e in raw_intervals:
-                center = (s + e) // 2
-                all_intervals.append((chrom, center - half_len, center + half_len))
-        g_max = derive_g_max(gene_mask_extractor, all_intervals)
+            intervals = [
+                (chrom, (s + e) // 2 - half_len, (s + e) // 2 + half_len)
+                for chrom, s, e in raw_intervals
+            ]
+            g_max = max(g_max, derive_g_max(gene_mask_extractor, intervals, pad_bp=pad_bp))
+            n_intervals += len(intervals)
         print_rank0(
-            f"Gene LFC: scanned {len(all_intervals)} intervals, g_max={g_max}",
+            f"Gene LFC: scanned {n_intervals} intervals "
+            f"(train padded +/-{shift_pad}bp for shift augmentation), g_max={g_max}",
             rank,
         )
 
@@ -252,17 +260,28 @@ def create_datasets(
         gme = gene_mask_extractor if attach_gene_mask else None
         gme_g_max = g_max if attach_gene_mask else None
         # Augmentation is TRAIN-ONLY. Reverse-complement is strand-aware: sequence is RC'd, targets
-        # reverse along length and swap the declared +/- strand pairs (same --strand-pairs info
-        # track-means uses); unstranded tracks reverse only. Shift slides the window for all tracks
-        # identically. Val/test datasets below get neither.
+        # reverse along length and swap +/- strand pairs, taken from --strand-pairs or derived from
+        # the per-track strands (--track-strands / modalities.<head>.strand); a stranded track with
+        # no partner is an error. Unstranded tracks reverse only. Shift slides the window for all
+        # tracks identically. MultimodalDataset draws once per sample for every modality.
+        # Val/test datasets below get neither.
         strand_pairs = None
-        if getattr(args, "modality_strand_pairs", None):
-            strand_pairs = args.modality_strand_pairs.get(modality)
+        explicit_pairs = (getattr(args, "modality_strand_pairs", None) or {}).get(modality)
+        if args.augment_rc:
+            strand_pairs = resolve_rc_strand_pairs(
+                len(bigwigs),
+                strands=(getattr(args, "modality_strands", None) or {}).get(modality),
+                strand_pairs=explicit_pairs,
+                modality=modality,
+            )
         if args.augment_rc or args.augment_shift_bp:
             n_pairs = len(strand_pairs) if strand_pairs else 0
             n_unstranded = len(bigwigs) - 2 * n_pairs
+            pair_source = "--strand-pairs" if explicit_pairs else "track strands"
             rc_note = (
-                f"rc=on ({n_pairs} strand-pair(s) swapped, {n_unstranded} unstranded reversed-only)"
+                f"rc=on ({n_pairs} strand-pair(s) swapped"
+                f"{f' from {pair_source}' if n_pairs else ''}, "
+                f"{n_unstranded} unstranded reversed-only)"
                 if args.augment_rc else "rc=off"
             )
             print_rank0(

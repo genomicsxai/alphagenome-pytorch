@@ -380,6 +380,99 @@ def _load_intervals_from_bed(
     return intervals, chromosomes
 
 
+# =============================================================================
+# Training augmentation helpers
+# =============================================================================
+
+
+def resolve_rc_strand_pairs(
+    n_tracks: int,
+    strands: "str | None" = None,
+    strand_pairs: "list[tuple[int, int]] | None" = None,
+    modality: str = "",
+) -> "list[tuple[int, int]] | None":
+    """Return the ``(plus_idx, minus_idx)`` track pairs to swap under reverse-complement.
+
+    Under RC a ``+`` strand track must take its ``-`` partner's signal, so every
+    stranded track needs a partner. The pairs come from, in order of precedence:
+
+    1. ``strand_pairs``: the explicit ``--strand-pairs`` / config ``strand_pairs``.
+    2. ``strands``: the per-track ``+``/``-``/``.`` string (``--track-strands`` or
+       ``modalities.<head>.strand``). The i-th ``+`` track pairs with the i-th ``-``
+       track in column order, the same convention as
+       :func:`alphagenome_pytorch.aggregation.collapse_strand_pairs`.
+
+    Tracks in no pair are treated as unstranded and are only reversed.
+
+    Raises:
+        ValueError: if a stranded track would be left without a partner, the
+            ``+``/``-`` counts differ (so no pairing can be derived), or an explicit
+            pair does not join one ``+`` track to one ``-`` track. Silently reversing
+            a stranded track without the swap trains on the wrong strand.
+    """
+    where = f" for '{modality}'" if modality else ""
+    if strands is not None and len(strands) != n_tracks:
+        raise ValueError(
+            f"strand string{where} has {len(strands)} entries but there are {n_tracks} tracks"
+        )
+    stranded = [i for i, s in enumerate(strands or "") if s in "+-"]
+
+    if strand_pairs:
+        pairs = [(int(p), int(m)) for p, m in strand_pairs]
+        flat = [i for pair in pairs for i in pair]
+        if any(not 0 <= i < n_tracks for i in flat) or len(set(flat)) != len(flat):
+            raise ValueError(
+                f"strand_pairs{where} must use distinct track indices in [0, {n_tracks}); "
+                f"got {pairs}"
+            )
+        if strands is not None:
+            for p, m in pairs:
+                if {strands[p], strands[m]} != {"+", "-"}:
+                    raise ValueError(
+                        f"strand pair ({p}, {m}){where} joins tracks with strands "
+                        f"'{strands[p]}' and '{strands[m]}'; each pair must be one '+' "
+                        "and one '-' track"
+                    )
+            unpaired = sorted(set(stranded) - set(flat))
+            if unpaired:
+                raise ValueError(
+                    f"stranded tracks {unpaired}{where} are not in any strand pair, so "
+                    "reverse-complement augmentation would reverse them without swapping "
+                    "strands. Add them to --strand-pairs or drop --augment-rc."
+                )
+        return pairs
+
+    if not stranded:
+        return None
+    plus = [i for i, s in enumerate(strands) if s == "+"]
+    minus = [i for i, s in enumerate(strands) if s == "-"]
+    if len(plus) != len(minus):
+        raise ValueError(
+            f"cannot derive reverse-complement strand pairs{where} from strands "
+            f"'{strands}': {len(plus)} '+' vs {len(minus)} '-' tracks. Pass "
+            "--strand-pairs explicitly or drop --augment-rc."
+        )
+    return list(zip(plus, minus))
+
+
+def _process_aug_rng(owner: Any) -> np.random.Generator:
+    """Return ``owner``'s augmentation RNG, (re)built once per process.
+
+    Seeded from ``torch.initial_seed()``, which DataLoader sets to
+    ``base_seed + worker_id`` in each worker and ``--seed`` (plus the rank offset)
+    controls in the main process. So workers and ranks draw different streams
+    and a seeded run is reproducible. Keyed on the PID so an RNG created before
+    a fork is not shared by every worker.
+    """
+    import os
+
+    pid = os.getpid()
+    if getattr(owner, "_aug_rng", None) is None or getattr(owner, "_aug_rng_pid", None) != pid:
+        owner._aug_rng = np.random.default_rng(torch.initial_seed())
+        owner._aug_rng_pid = pid
+    return owner._aug_rng
+
+
 class GenomicDataset(Dataset):
     """Dataset for genomic fine-tuning (ATAC, RNA-seq, etc).
 
@@ -413,6 +506,20 @@ class GenomicDataset(Dataset):
         use_mmap: If True, treat bigwig_files as paths to mmap directories
             created by ``convert_bigwig_to_mmap()``. Provides fastest reads
             with minimal memory overhead.
+        augment_rc: Training only. Reverse-complement each sample with
+            probability 0.5. The sequence is reverse-complemented, targets are
+            reversed along length and ``strand_pairs`` channels are swapped.
+        augment_shift_bp: Training only. Shift each window by a uniform
+            random offset in ``[-augment_shift_bp, augment_shift_bp]``, clamped
+            to the chromosome. 0 disables.
+        strand_pairs: ``(plus_idx, minus_idx)`` track pairs swapped under RC
+            (see :func:`resolve_rc_strand_pairs`). Tracks in no pair are
+            treated as unstranded and only reversed.
+
+    Augmentation is drawn once per sample by :meth:`sample_augmentation` and
+    applied by :meth:`get`. Wrap datasets in :class:`MultimodalDataset` to share
+    one draw across modalities; indexing a GenomicDataset directly draws its
+    own.
 
     Example:
         >>> from alphagenome_pytorch.extensions.finetuning.datasets import (
@@ -471,21 +578,19 @@ class GenomicDataset(Dataset):
         self.cache_signals = cache_signals
         self.max_io_workers = max_io_workers
         self.use_mmap = use_mmap
-        # Training-time augmentation (leave off for val/test); RNG is created per worker on first use.
-        # Random shift slides the window within the chromosome. Reverse-complement is applied jointly
-        # to sequence and targets: sequence is reverse-complemented, targets are reversed along length
-        # AND their strand-paired channels are swapped -- a '+' track becomes its '-' partner under RC.
-        # `strand_pairs` is the declared list of (plus_idx, minus_idx) track indices (from
-        # --strand-pairs / --track-strands, the same info track-means uses); tracks not in any pair are
-        # treated as UNSTRANDED (reversed only). With no pairs, RC is a plain length reversal.
-        self.augment_rc = augment_rc
+        # Training-time augmentation (leave off for val/test). Under RC a '+' track takes its '-'
+        # partner's channel; `strand_pairs` lists those partners (resolve_rc_strand_pairs derives
+        # them from --strand-pairs or the per-track strands). Tracks in no pair are reversed only.
+        self.augment_rc = bool(augment_rc)
         self.augment_shift_bp = max(0, int(augment_shift_bp))
         self._aug_rng = None
-        # Build the RC channel permutation over the track axis: identity, then swap each strand pair.
+        self._aug_rng_pid = None
+        # RC channel permutation over the track axis: identity, then swap each strand pair.
         self._rc_perm = None
         if strand_pairs:
+            pairs = resolve_rc_strand_pairs(len(bigwig_files), strand_pairs=strand_pairs)
             perm = list(range(len(bigwig_files)))
-            for plus_idx, minus_idx in strand_pairs:
+            for plus_idx, minus_idx in pairs:
                 perm[plus_idx], perm[minus_idx] = minus_idx, plus_idx
             self._rc_perm = np.asarray(perm, dtype=np.int64)
 
@@ -718,10 +823,57 @@ class GenomicDataset(Dataset):
     def __len__(self) -> int:
         return len(self._positions_list)
 
+    @property
+    def augments(self) -> bool:
+        """True when this dataset applies training augmentation."""
+        return bool(self.augment_rc or self.augment_shift_bp)
+
+    def sample_augmentation(self, idx: int, rng: np.random.Generator) -> tuple[int, bool]:
+        """Draw one ``(shift, do_rc)`` augmentation for sample ``idx``.
+
+        The shift is uniform in ``[-augment_shift_bp, augment_shift_bp]``,
+        narrowed so the shifted window stays inside the chromosome. ``do_rc``
+        is True with probability 0.5 when ``augment_rc`` is on. Returns
+        ``(0, False)`` when augmentation is off.
+        """
+        shift = 0
+        if self.augment_shift_bp:
+            chrom, start, end = self._positions_list[idx]
+            lo = max(-self.augment_shift_bp, -start)
+            hi = min(self.augment_shift_bp, self._chrom_sizes[chrom] - end)
+            if hi >= lo:
+                shift = int(rng.integers(lo, hi + 1))
+        do_rc = self.augment_rc and bool(rng.random() < 0.5)
+        return shift, do_rc
+
     def __getitem__(
         self, idx: int
     ) -> "tuple[torch.Tensor, dict[int, torch.Tensor]] | tuple[torch.Tensor, dict[int, torch.Tensor], torch.Tensor]":
-        """Get a single sample.
+        """Get a single sample, drawing this dataset's own augmentation.
+
+        See :meth:`get` for the return value. :class:`MultimodalDataset` does not
+        call this; it draws once per sample and passes the draw to :meth:`get`.
+        """
+        shift, do_rc = 0, False
+        if self.augments:
+            shift, do_rc = self.sample_augmentation(idx, _process_aug_rng(self))
+        return self.get(idx, shift=shift, do_rc=do_rc)
+
+    def get(
+        self, idx: int, shift: int = 0, do_rc: bool = False
+    ) -> "tuple[torch.Tensor, dict[int, torch.Tensor]] | tuple[torch.Tensor, dict[int, torch.Tensor], torch.Tensor]":
+        """Read sample ``idx`` with a given augmentation applied (no randomness).
+
+        Sequence, targets and gene mask are read from the same window and
+        transformed together, so they stay aligned.
+
+        Args:
+            idx: Sample index.
+            shift: Genomic offset in bp added to the window start and end.
+            do_rc: Reverse-complement the sample: the sequence is
+                reverse-complemented, targets are reversed along length with
+                ``strand_pairs`` channels swapped, and the gene mask is reversed
+                with its plus/minus slots swapped.
 
         Returns:
             Tuple of (sequence, targets_dict) by default, or
@@ -736,22 +888,14 @@ class GenomicDataset(Dataset):
         """
         self._ensure_handles()
         chrom, start, end = self._positions_list[idx]
-
-        # Training augmentation (off for val/test). Random shift slides the window within the
-        # chromosome; reverse-complement is decided here and applied jointly to sequence and targets
-        # below so they stay aligned. RNG is per worker (created on first use).
-        do_rc = False
-        if self.augment_shift_bp or self.augment_rc:
-            if self._aug_rng is None:
-                self._aug_rng = np.random.default_rng()
-            if self.augment_shift_bp:
-                lo = max(-self.augment_shift_bp, -start)
-                hi = min(self.augment_shift_bp, self._chrom_sizes[chrom] - end)
-                if hi >= lo:
-                    shift = int(self._aug_rng.integers(lo, hi + 1))
-                    start += shift
-                    end += shift
-            do_rc = self.augment_rc and bool(self._aug_rng.random() < 0.5)
+        if shift:
+            start += int(shift)
+            end += int(shift)
+            if start < 0 or end > self._chrom_sizes[chrom]:
+                raise ValueError(
+                    f"shift {shift} moves window {idx} to {chrom}:{start}-{end}, outside the "
+                    f"chromosome (length {self._chrom_sizes[chrom]})"
+                )
 
         # Get one-hot sequence
         sequence = self._get_sequence(chrom, start, end)
@@ -1037,6 +1181,19 @@ class MultimodalDataset(Dataset):
         # Use first dataset for sequence access
         self._primary_dataset = next(iter(datasets.values()))
 
+        # One augmentation draw per sample is shared by every modality, so all
+        # modalities must agree on what may be drawn.
+        aug_configs = {
+            name: (ds.augment_rc, ds.augment_shift_bp) for name, ds in datasets.items()
+        }
+        if len(set(aug_configs.values())) > 1:
+            raise ValueError(
+                "All datasets must share augment_rc / augment_shift_bp, since one "
+                f"augmentation draw is applied to every modality. Got: {aug_configs}"
+            )
+        self._aug_rng = None
+        self._aug_rng_pid = None
+
     def __len__(self) -> int:
         return self._length
 
@@ -1051,25 +1208,28 @@ class MultimodalDataset(Dataset):
             tuple is extended to (sequence, modality_targets, gene_mask)
             using the gene_mask from the first such dataset (gene_mask is
             sample-level, not per-modality, so any one source suffices).
-        """
-        # Get sequence (and possibly gene_mask) from primary dataset.
-        primary_result = self._primary_dataset[idx]
-        if len(primary_result) == 3:
-            sequence, _, gene_mask = primary_result
-        else:
-            sequence, _ = primary_result
-            gene_mask = None
 
-        # Get targets from all datasets. If the primary didn't have a
-        # gene_mask but another dataset does, use the first one we find.
+        Augmentation (training only) is drawn once here and applied to every
+        modality, and each dataset is read exactly once, so the sequence,
+        every modality's targets and the gene mask come from the same window.
+        """
+        primary = self._primary_dataset
+        shift, do_rc = 0, False
+        if primary.augments:
+            shift, do_rc = primary.sample_augmentation(idx, _process_aug_rng(self))
+
+        # The sequence comes from the primary (first) dataset's read; the
+        # gene_mask from the first dataset that yields one.
+        sequence = None
+        gene_mask = None
         modality_targets: dict[str, dict[int, torch.Tensor]] = {}
         for modality, dataset in self.datasets.items():
-            result = dataset[idx]
+            result = dataset.get(idx, shift=shift, do_rc=do_rc)
+            if dataset is primary:
+                sequence = result[0]
+            modality_targets[modality] = result[1]
             if len(result) == 3 and gene_mask is None:
-                _, targets_dict, gene_mask = result
-            else:
-                targets_dict = result[1]
-            modality_targets[modality] = targets_dict
+                gene_mask = result[2]
 
         # Optional trailing extras, in a fixed order the collate can sniff by
         # type: gene_mask (Tensor) then coords (tuple). Both are optional.
@@ -1077,7 +1237,8 @@ class MultimodalDataset(Dataset):
         if gene_mask is not None:
             extras.append(gene_mask)
         if self.return_coords:
-            extras.append(self._primary_dataset._positions_list[idx])
+            chrom, start, end = primary._positions_list[idx]
+            extras.append((chrom, start + shift, end + shift))
 
         if extras:
             return (sequence, modality_targets, *extras)
@@ -1152,5 +1313,6 @@ __all__ = [
     "convert_bigwig_to_mmap",
     "load_bigwigs_parallel",
     "compute_track_means",
+    "resolve_rc_strand_pairs",
     "DEFAULT_MAX_IO_WORKERS",
 ]
