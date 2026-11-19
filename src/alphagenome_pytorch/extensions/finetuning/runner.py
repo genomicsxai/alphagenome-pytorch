@@ -128,6 +128,7 @@ from alphagenome_pytorch.extensions.finetuning import (
     setup_preemption_handler,
 )
 from alphagenome_pytorch.extensions.finetuning.adapters import get_adapter_params
+from alphagenome_pytorch.extensions.finetuning.datasets import resolve_rc_strand_pairs
 from alphagenome_pytorch.extensions.finetuning.checkpointing import (
     compute_base_model_weights_hash_from_file,
     save_checkpoint, load_checkpoint, save_delta_checkpoint,
@@ -291,19 +292,25 @@ def create_datasets(
 
         # Project the BED windows used by the dataset (after centering/expansion
         # to args.sequence_length) so derive_g_max sees the same intervals
-        # GenomicDataset will request at __getitem__.
-        all_intervals: list[tuple[str, int, int]] = []
-        for bed in (args.train_bed, args.val_bed):
+        # GenomicDataset will request at __getitem__. Train windows are padded
+        # by the augmentation shift: a shifted window can fully contain a gene
+        # the unshifted one does not, which would overflow an unpadded g_max.
+        half_len = args.sequence_length // 2
+        shift_pad = max(0, int(args.augment_shift_bp or 0))
+        g_max = 0
+        n_intervals = 0
+        for bed, pad_bp in ((args.train_bed, shift_pad), (args.val_bed, 0)):
             raw_intervals, _ = _load_intervals_from_bed(bed)
-            half_len = args.sequence_length // 2
-            for chrom, s, e in raw_intervals:
-                center = (s + e) // 2
-                all_intervals.append((chrom, center - half_len, center + half_len))
-        g_max = derive_g_max(gene_mask_extractor, all_intervals)
-        n_intervals = len(all_intervals)
+            intervals = [
+                (chrom, (s + e) // 2 - half_len, (s + e) // 2 + half_len)
+                for chrom, s, e in raw_intervals
+            ]
+            g_max = max(g_max, derive_g_max(gene_mask_extractor, intervals, pad_bp=pad_bp))
+            n_intervals += len(intervals)
         print_rank0(
             f"Gene LFC: scanned {n_intervals} "
-            f"interval{'s' if n_intervals != 1 else ''}, g_max={g_max}",
+            f"interval{'s' if n_intervals != 1 else ''} "
+            f"(train padded +/-{shift_pad}bp for shift augmentation), g_max={g_max}",
             rank,
         )
 
@@ -357,6 +364,36 @@ def create_datasets(
         )
         gme = gene_mask_extractor if attach_gene_mask else None
         gme_g_max = g_max if attach_gene_mask else None
+        # Augmentation is TRAIN-ONLY. Reverse-complement is strand-aware: sequence is RC'd, targets
+        # reverse along length and swap +/- strand pairs, taken from --strand-pairs or derived from
+        # the per-track strands (--track-strands / modalities.<head>.strand); a stranded track with
+        # no partner is an error. Unstranded tracks reverse only. Shift slides the window for all
+        # tracks identically. MultimodalDataset draws once per sample for every modality.
+        # Val/test datasets below get neither.
+        strand_pairs = None
+        explicit_pairs = (getattr(args, "modality_strand_pairs", None) or {}).get(modality)
+        if args.augment_rc:
+            strand_pairs = resolve_rc_strand_pairs(
+                len(bigwigs),
+                strands=(getattr(args, "modality_strands", None) or {}).get(modality),
+                strand_pairs=explicit_pairs,
+                modality=modality,
+            )
+        if args.augment_rc or args.augment_shift_bp:
+            n_pairs = len(strand_pairs) if strand_pairs else 0
+            n_unstranded = len(bigwigs) - 2 * n_pairs
+            pair_source = "--strand-pairs" if explicit_pairs else "track strands"
+            rc_note = (
+                f"rc=on ({n_pairs} strand-pair(s) swapped"
+                f"{f' from {pair_source}' if n_pairs else ''}, "
+                f"{n_unstranded} unstranded reversed-only)"
+                if args.augment_rc else "rc=off"
+            )
+            print_rank0(
+                f"Augment[{modality}] (train only): shift=+/-{args.augment_shift_bp}bp (all tracks); "
+                f"{rc_note}",
+                rank,
+            )
         train_datasets[modality] = GenomicDataset(
             genome_fasta=genome,
             bigwig_files=bigwigs,
@@ -368,6 +405,9 @@ def create_datasets(
             max_io_workers=max_io_workers,
             gene_mask_extractor=gme,
             g_max=gme_g_max,
+            augment_rc=args.augment_rc,
+            augment_shift_bp=args.augment_shift_bp,
+            strand_pairs=strand_pairs,
         )
         val_datasets[modality] = GenomicDataset(
             genome_fasta=genome,
@@ -880,15 +920,23 @@ def create_model(
 
     # Wrap with DDP if multi-GPU
     if world_size > 1:
-        model = DDP(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            # Splice-head control flow can differ by interval/rank, so a
-            # parameter used on one step is not guaranteed to be used on all.
-            find_unused_parameters=True,
-        )
-        print_rank0("Model wrapped with DistributedDataParallel", rank)
+        ddp_kwargs = {"device_ids": [local_rank], "output_device": local_rank}
+        # Full/LoRA/Locon unfreeze the trunk, but training only a subset of the model's outputs
+        # (e.g. the 1 bp RNA head while the 128 bp output embedder is unused) leaves some trainable
+        # params with no gradient, which plain DDP aborts on. find_unused_parameters=True handles
+        # that; it is compatible with the model's use_reentrant=False activation checkpointing
+        # (static_graph is not -- the used set is not identical every iteration). Splice-head
+        # control flow can also differ by interval/rank (e.g. no junction positions in a window),
+        # so splice modalities need it even with a frozen trunk. Frozen-trunk runs without splice
+        # heads (linear-probe/encoder-only) never have unused trainable params: keep the fast path.
+        if args.mode not in ("linear-probe", "encoder-only") or any(
+            m in SPLICE_MODALITIES for m in args.modalities
+        ):
+            ddp_kwargs["find_unused_parameters"] = True
+        model = DDP(model, **ddp_kwargs)
+        print_rank0("Model wrapped with DistributedDataParallel"
+                    + (" (find_unused_parameters=True)" if ddp_kwargs.get("find_unused_parameters") else ""),
+                    rank)
 
     # Get head references from the underlying model before optional compile.
     model_module = unwrap_training_model(model)
@@ -1126,6 +1174,18 @@ def main(args: argparse.Namespace | None = None) -> None:
     )
     model_module = unwrap_training_model(model)
 
+    # Warm-start (two-phase): initialise weights from a prior finetuned checkpoint (e.g. a
+    # linear-probe best_model.pth) WITHOUT restoring optimizer/epoch, so full FT starts from the
+    # trained head + trunk instead of a fresh random head. Skipped when resuming (the resume
+    # checkpoint already carries the weights).
+    if getattr(args, "init_weights", None) and not (resume_path and Path(resume_path).exists()):
+        print_rank0(f"Warm-start: loading model weights from {args.init_weights}", rank)
+        init_ckpt = torch.load(args.init_weights, map_location="cpu", weights_only=False)
+        init_sd = init_ckpt.get("model_state_dict", init_ckpt)
+        missing, unexpected = model_module.load_state_dict(init_sd, strict=False)
+        print_rank0(f"  warm-start: {len(missing)} missing, {len(unexpected)} unexpected keys "
+                    f"(both should be ~0 for a same-architecture probe checkpoint)", rank)
+
     # Build per-modality strand-channel masks for the gene LFC loss (B3.2).
     # Empty dict when gene_loss_weight is 0; populated only for modalities
     # whose strand info was supplied (today: rna_seq via --track-strands or
@@ -1185,7 +1245,11 @@ def main(args: argparse.Namespace | None = None) -> None:
     # unless --drop-incomplete-accumulation trimmed the loader to whole windows.
     steps_per_epoch = -(-len(train_loader) // args.gradient_accumulation_steps)
     total_steps = args.epochs * steps_per_epoch
-    scheduler = create_lr_scheduler(optimizer, args.warmup_steps, total_steps, schedule=args.lr_schedule)
+    scheduler = create_lr_scheduler(
+        optimizer, args.warmup_steps, total_steps, schedule=args.lr_schedule,
+        plateau_factor=args.plateau_factor, plateau_patience=args.plateau_patience,
+        plateau_min_lr=args.plateau_min_lr,
+    )
     effective_batch_size = args.batch_size * args.gradient_accumulation_steps * world_size
     print_rank0(f"Gradient accumulation: {args.gradient_accumulation_steps}", rank)
     print_rank0(f"Effective batch size: {effective_batch_size}", rank)
@@ -1588,6 +1652,10 @@ def main(args: argparse.Namespace | None = None) -> None:
                 torch.cuda.synchronize()
 
             current_lr = scheduler.get_last_lr()[0]
+            # Plateau schedule: reduce LR (for the NEXT epoch) when val loss stalls. The per-step
+            # scheduler.step() inside train_epoch only drives warmup; the reduction is metric-driven.
+            if hasattr(scheduler, "step_metric"):
+                scheduler.step_metric(val_loss)
             is_best = val_loss < best_val_loss
 
             # Print epoch summary

@@ -306,14 +306,20 @@ class TestParseArgsStrandPairs:
 class TestMultimodalDataset:
     """Tests for MultimodalDataset wrapper."""
 
-    def test_length(self):
-        mock_ds1 = MagicMock()
-        mock_ds1.__len__ = MagicMock(return_value=100)
-        mock_ds1.__getitem__ = MagicMock(return_value=(torch.randn(256, 4), {128: torch.randn(256, 5)}))
+    @staticmethod
+    def _mock_ds(length, result=None):
+        """Stand-in GenomicDataset: no augmentation, get() returns ``result``."""
+        ds = MagicMock()
+        ds.__len__ = MagicMock(return_value=length)
+        ds.augment_rc = False
+        ds.augment_shift_bp = 0
+        ds.augments = False
+        ds.get = MagicMock(return_value=result)
+        return ds
 
-        mock_ds2 = MagicMock()
-        mock_ds2.__len__ = MagicMock(return_value=100)
-        mock_ds2.__getitem__ = MagicMock(return_value=(torch.randn(256, 4), {128: torch.randn(256, 3)}))
+    def test_length(self):
+        mock_ds1 = self._mock_ds(100, (torch.randn(256, 4), {128: torch.randn(256, 5)}))
+        mock_ds2 = self._mock_ds(100, (torch.randn(256, 4), {128: torch.randn(256, 3)}))
 
         dataset = MultimodalDataset({"atac": mock_ds1, "rna_seq": mock_ds2})
         assert len(dataset) == 100
@@ -333,13 +339,8 @@ class TestMultimodalDataset:
         targets1 = {128: torch.randn(256, 5)}
         targets2 = {128: torch.randn(256, 3)}
 
-        mock_ds1 = MagicMock()
-        mock_ds1.__len__ = MagicMock(return_value=10)
-        mock_ds1.__getitem__ = MagicMock(return_value=(seq, targets1))
-
-        mock_ds2 = MagicMock()
-        mock_ds2.__len__ = MagicMock(return_value=10)
-        mock_ds2.__getitem__ = MagicMock(return_value=(seq, targets2))
+        mock_ds1 = self._mock_ds(10, (seq, targets1))
+        mock_ds2 = self._mock_ds(10, (seq, targets2))
 
         dataset = MultimodalDataset({"atac": mock_ds1, "rna_seq": mock_ds2})
         result_seq, result_targets = dataset[0]
@@ -349,6 +350,10 @@ class TestMultimodalDataset:
         assert "rna_seq" in result_targets
         assert 128 in result_targets["atac"]
         assert 128 in result_targets["rna_seq"]
+        # Each dataset is read exactly once per sample, with the same (null) draw:
+        # reading the primary twice is what let sequence and targets diverge.
+        mock_ds1.get.assert_called_once_with(0, shift=0, do_rc=False)
+        mock_ds2.get.assert_called_once_with(0, shift=0, do_rc=False)
 
 
 @pytest.mark.unit
@@ -651,3 +656,44 @@ class TestLoadTrackMetadataForFinetune:
             str(csv), {"atac": ["bw0", "bw1"]}, rank=0, organism="mouse",
         )
         assert all(int(r["organism"]) == 1 for r in rows)
+
+
+@pytest.mark.unit
+class TestCreateDatasetsAugmentation:
+    """RC strand pairs reach the train dataset when only track strands are declared."""
+
+    def _args(self, monkeypatch, mock_data_dir, *extra):
+        d = mock_data_dir
+        monkeypatch.setattr(sys, "argv", [
+            "finetune.py",
+            "--genome", str(d / "mock_genome.fa"),
+            "--train-bed", str(d / "mock_positions.bed"),
+            "--val-bed", str(d / "mock_positions.bed"),
+            "--pretrained-weights", "model.pth",
+            "--modality", "rna_seq",
+            "--bigwig", str(d / "mock_rnaseq_track1.bw"), str(d / "mock_rnaseq_track2.bw"),
+            "--sequence-length", "131072",
+            *extra,
+        ])
+        return parse_args()
+
+    def test_track_strands_give_rc_pairs(self, monkeypatch, mock_data_dir):
+        args = self._args(monkeypatch, mock_data_dir, "--augment-rc", "--track-strands", "+-")
+        train, val, _, _ = finetune_module.create_datasets(args, rank=0)
+        assert train.datasets["rna_seq"]._rc_perm.tolist() == [1, 0]
+        assert not val.datasets["rna_seq"].augments
+
+    def test_unpairable_strands_rejected(self, monkeypatch, mock_data_dir):
+        args = self._args(monkeypatch, mock_data_dir, "--augment-rc", "--track-strands", "++")
+        with pytest.raises(ValueError, match="cannot derive"):
+            finetune_module.create_datasets(args, rank=0)
+
+    def test_unstranded_rc_reverses_only(self, monkeypatch, mock_data_dir):
+        args = self._args(monkeypatch, mock_data_dir, "--augment-rc")
+        train, _, _, _ = finetune_module.create_datasets(args, rank=0)
+        assert train.datasets["rna_seq"]._rc_perm is None
+
+    def test_augmentation_rejected_with_sequence_parallel(self, monkeypatch, mock_data_dir):
+        with pytest.raises(SystemExit):
+            self._args(monkeypatch, mock_data_dir, "--augment-shift-bp", "100",
+                       "--sequence-parallel")

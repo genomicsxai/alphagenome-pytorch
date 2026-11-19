@@ -257,3 +257,81 @@ class TestMultimodalDatasetGeneMask:
         seq, modality_targets, gene_mask, coords = result
         assert gene_mask.shape == (2048, 2, 4)
         assert coords == rna._positions_list[0]
+
+
+def _write_bigwig(path, start, end, value):
+    bw = pyBigWig.open(str(path), "w")
+    bw.addHeader([(CHROM, CHROM_SIZE)])
+    bw.addEntries([CHROM], [start], ends=[end], values=[value])
+    bw.close()
+    return str(path)
+
+
+@pytest.mark.unit
+class TestGeneMaskAugmentation:
+    """Gene mask under the train-time augmentation (PR #58 review)."""
+
+    def test_rc_moves_gene_mask_and_strand_tracks_together(
+        self, fasta_file, bed_file, extractor, tmp_dir
+    ):
+        """With pairs derived from track strands '+-' (no --strand-pairs), RC swaps the
+        gene-mask strand slots and the target strand channels consistently."""
+        from alphagenome_pytorch.extensions.finetuning.datasets import resolve_rc_strand_pairs
+
+        plus_bw = _write_bigwig(tmp_dir / "plus.bw", 3600, 3700, 5.0)    # inside GENE-IN (+)
+        minus_bw = _write_bigwig(tmp_dir / "minus.bw", 4200, 4300, 7.0)
+        ds = GenomicDataset(
+            genome_fasta=fasta_file, bigwig_files=[plus_bw, minus_bw],
+            bed_file=bed_file, sequence_length=2048, resolutions=(1,),
+            gene_mask_extractor=extractor, g_max=4, augment_rc=True,
+            strand_pairs=resolve_rc_strand_pairs(2, strands="+-"),
+        )
+        _, t_fwd, m_fwd = ds.get(0)
+        _, t_rc, m_rc = ds.get(0, do_rc=True)
+
+        # GENE-IN is a '+' gene; on the reverse-complemented sequence it is a '-' gene.
+        assert m_fwd[:, 0, 0].any() and not m_fwd[:, 1, 0].any()
+        assert torch.equal(m_rc[:, 1, 0], torch.flip(m_fwd[:, 0, 0], dims=[0]))
+        assert not m_rc[:, 0, 0].any()
+        # Its '+' track moves into the '-' channel with it (and vice versa), reversed.
+        assert torch.equal(t_rc[1][:, 1], torch.flip(t_fwd[1][:, 0], dims=[0]))
+        assert torch.equal(t_rc[1][:, 0], torch.flip(t_fwd[1][:, 1], dims=[0]))
+        # So the strand-matched signal under the gene is unchanged by RC.
+        fwd_signal = (t_fwd[1][:, 0] * m_fwd[:, 0, 0]).sum()
+        rc_signal = (t_rc[1][:, 1] * m_rc[:, 1, 0]).sum()
+        assert fwd_signal > 0
+        assert torch.equal(fwd_signal, rc_signal)
+
+    def test_g_max_padded_by_shift_covers_every_shifted_window(
+        self, fasta_file, bigwig_file, bed_file
+    ):
+        """A shift can bring a second gene fully inside the window (3072-5120)."""
+        from alphagenome_pytorch.extensions.finetuning.gene_annotation import derive_g_max
+
+        table = pd.DataFrame({
+            "Chromosome": [CHROM, CHROM],
+            "Start": [3500, 5150],
+            "End": [4500, 5300],            # GENE-EDGE ends 180 bp past the window
+            "Strand": ["+", "-"],
+            "gene_id": ["GENE-IN", "GENE-EDGE"],
+            "gene_name": ["in", "edge"],
+            "gene_type": ["protein_coding", "protein_coding"],
+        })
+        ext = GeneMaskExtractor(table)
+        window = [(CHROM, 3072, 5120)]
+        assert derive_g_max(ext, window) == 1
+        g_max = derive_g_max(ext, window, pad_bp=300)
+        assert g_max == 2
+
+        def ds(g):
+            return GenomicDataset(
+                genome_fasta=fasta_file, bigwig_files=[bigwig_file], bed_file=bed_file,
+                sequence_length=2048, resolutions=(1,), gene_mask_extractor=ext,
+                g_max=g, augment_shift_bp=300,
+            )
+
+        with pytest.raises(ValueError, match="exceeding g_max"):
+            ds(1).get(0, shift=200)                 # the crash the unpadded scan allowed
+        padded = ds(g_max)
+        for shift in range(-300, 301, 25):
+            padded.get(0, shift=shift)

@@ -94,6 +94,59 @@ class TestCreateLrScheduler:
         lr_at_mid = scheduler.get_last_lr()[0]
         assert 0.4e-3 < lr_at_mid < 0.6e-3
 
+    def test_plateau_warmup_then_hold(self):
+        """Plateau schedule warms up per-step, then holds at base LR (no per-step decay)."""
+        model = torch.nn.Linear(10, 10)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        scheduler = create_lr_scheduler(
+            optimizer, warmup_steps=100, total_steps=1000, schedule="plateau"
+        )
+
+        assert scheduler.get_last_lr()[0] == 0.0            # step 0
+        for _ in range(50):
+            scheduler.step()
+        assert 0.4e-3 < scheduler.get_last_lr()[0] < 0.6e-3  # mid-warmup
+        for _ in range(50):
+            scheduler.step()
+        assert 0.9e-3 < scheduler.get_last_lr()[0] < 1.1e-3  # end of warmup -> base
+        for _ in range(500):                                 # plateau does NOT decay per step
+            scheduler.step()
+        assert scheduler.get_last_lr()[0] == pytest.approx(1e-3, rel=1e-6)
+
+    def test_plateau_reduces_on_stalled_val(self):
+        """step_metric halves the LR after `patience` epochs without improvement."""
+        model = torch.nn.Linear(10, 10)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        scheduler = create_lr_scheduler(
+            optimizer, warmup_steps=0, total_steps=0, schedule="plateau",
+            plateau_factor=0.5, plateau_patience=2,
+        )
+
+        # Improving val loss: LR stays at base.
+        for val in (1.0, 0.9, 0.8):
+            scheduler.step_metric(val)
+        assert scheduler.get_last_lr()[0] == pytest.approx(1e-3, rel=1e-6)
+
+        # Stalled val loss for > patience epochs: LR halves.
+        for val in (0.8, 0.8, 0.8):
+            scheduler.step_metric(val)
+        assert scheduler.get_last_lr()[0] == pytest.approx(0.5e-3, rel=1e-3)
+
+    def test_plateau_state_dict_roundtrips(self):
+        """state_dict / load_state_dict restore step count and plateau state (for resume)."""
+        model = torch.nn.Linear(10, 10)
+        opt1 = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        s1 = create_lr_scheduler(opt1, warmup_steps=10, total_steps=0, schedule="plateau")
+        for _ in range(10):
+            s1.step()
+        s1.step_metric(1.0)
+        state = s1.state_dict()
+
+        opt2 = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        s2 = create_lr_scheduler(opt2, warmup_steps=10, total_steps=0, schedule="plateau")
+        s2.load_state_dict(state)
+        assert s2.state_dict()["step"] == state["step"]
+
 
 @pytest.mark.unit
 class TestComputeFinetuningLoss:
