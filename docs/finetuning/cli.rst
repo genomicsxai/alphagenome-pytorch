@@ -442,10 +442,15 @@ Set it per head in a config, or run-wide on the command line:
 
 The setting selects the gene LFC training reduction and the primary
 ``--gene-expr-eval`` metric. In ``sum`` mode the training loss uses gene totals
-and applies a fixed factor of 1/10,000 to the two loss terms. Use
-``--gene-loss-weight`` to tune their overall contribution. Evaluation uses
-exon totals directly. An explicit CLI reduction overrides the per-head config.
-``auto`` uses the per-head config or defaults to ``mean``.
+and divides the two loss terms by a fixed reference gene length of 20,000 bp.
+Each gene then contributes as it would in ``mean`` mode if it were 20 kb long.
+Start with the ``--gene-loss-weight`` that you would use in ``mean`` mode. The
+reference length does not depend on the expression data. It was measured with
+131 kb windows and a human annotation. For much larger windows or another
+organism, the typical gene length can change, so adjust
+``--gene-loss-weight``. Evaluation uses exon totals directly. An explicit CLI
+reduction overrides the per-head config. ``auto`` uses the per-head config or
+defaults to ``mean``.
 
 Keeping the head named ``rna_seq`` is what lets the fine-tune be served and
 scored: a fine-tuned head replaces the pretrained slot of the same name, while

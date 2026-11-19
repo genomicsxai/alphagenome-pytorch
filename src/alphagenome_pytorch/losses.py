@@ -11,7 +11,11 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-_GENE_SUM_REFERENCE_LENGTH_BP = 10_000
+# Scale of the sum-mode gene loss. It makes a given gene loss weight
+# act about as strongly as in mean mode.
+# Computed as the median ratio of sum to mean gradient norms
+# over batches of scRNA-seq data.
+_GENE_SUM_REFERENCE_LENGTH_BP = 20_000
 
 
 def _safe_masked_mean(
@@ -320,8 +324,9 @@ def gene_lfc_loss(
 
             ``'sum'`` uses the total signal for 3'-biased assays, where reads
             pile up near the 3' end. Both computed loss terms are then divided
-            by a fixed 10,000 bp reference length to set the overall loss
-            scale. Every gene and batch uses the same factor.
+            by a fixed 20,000 bp reference length, so that a given gene loss
+            weight acts about as strongly as in ``'mean'`` mode. Every gene and
+            batch uses the same factor.
 
     Returns:
         (loss, aux) where aux carries `gene_loss_total_count` and

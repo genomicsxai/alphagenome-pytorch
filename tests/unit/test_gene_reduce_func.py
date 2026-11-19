@@ -126,8 +126,8 @@ class TestGeneLossReduceFunc:
         raw_loss, raw_gradient = loss_and_gradient(1, "mean")
         for length in (100, 10_000):
             loss, gradient = loss_and_gradient(length, "sum")
-            torch.testing.assert_close(loss, raw_loss / 10_000)
-            torch.testing.assert_close(gradient, raw_gradient / 10_000)
+            torch.testing.assert_close(loss, raw_loss / 20_000)
+            torch.testing.assert_close(gradient, raw_gradient / 20_000)
 
     def test_no_genes_in_window_is_safe(self):
         """Empty masks happen at window edges; the scalar divisor must not
