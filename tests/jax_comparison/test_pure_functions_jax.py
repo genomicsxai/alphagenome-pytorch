@@ -27,7 +27,7 @@ class TestPureFunctions:
         x_np = np.random.randn(2, 64, 768).astype(np.float32)
 
         jax_out = np.array(jax_layers.gelu(jnp.array(x_np)))
-        pt_out = pt_layers.gelu(torch.tensor(x_np)).numpy()
+        pt_out = pt_layers.QuickGELU()(torch.tensor(x_np)).numpy()
 
         result = compute_metrics("gelu", pt_out, jax_out, corr_threshold=0.999999)
 
@@ -217,4 +217,3 @@ class TestUtilityFunctions:
 
         assert result.passed, f"generate_splice_site_positions correlation {result.pearson_corr:.6f} < 0.9999"
         
-

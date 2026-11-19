@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from . import layers
 
 
@@ -31,6 +30,7 @@ class OutputEmbedder(nn.Module):
 
         self.organism_embed = nn.Embedding(num_organisms, out_channels)
         self.norm = layers.RMSBatchNorm(channels=out_channels)
+        self.activation = layers.QuickGELU()
 
     def forward(self, x, organism_index, skip_x=None, channels_last=False):
         # x: (B, C, S) - NCL format
@@ -56,7 +56,7 @@ class OutputEmbedder(nn.Module):
         emb = self.organism_embed(organism_index).unsqueeze(2)
         out = out + emb
         
-        out = layers.gelu(out)
+        out = self.activation(out)
 
         if channels_last:
             # (B, C, S) -> (B, S, C)
@@ -76,6 +76,7 @@ class OutputPair(nn.Module):
         self.num_organisms = num_organisms
         self.organism_embed = nn.Embedding(num_organisms, dim)
         self.norm = layers.LayerNorm(normalized_shape=dim, rms_norm=True)
+        self.activation = layers.QuickGELU()
 
     def forward(self, x, organism_index):
         # x: (B, S, S, D) - pair activations
@@ -88,4 +89,4 @@ class OutputPair(nn.Module):
         emb = self.organism_embed(organism_index)  # (B, D)
         x = x + emb[:, None, None, :]
 
-        return layers.gelu(x)
+        return self.activation(x)

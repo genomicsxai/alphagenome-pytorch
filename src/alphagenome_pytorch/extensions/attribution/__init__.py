@@ -1,8 +1,8 @@
 """Nucleotide attribution methods for AlphaGenome models.
 
-Pure-Torch attribution primitives (gradient x input, saturation ISM) and a
-small method registry for wiring them into serving / scripts. No dependency
-on variant scoring, FASTA, or REST.
+Pure-Torch attribution primitives (DeepLIFT, gradient x input, saturation ISM)
+and a small method registry for wiring them into serving / scripts. No
+dependency on variant scoring, FASTA, or REST.
 
 Example:
     >>> from alphagenome_pytorch.extensions.attribution import (
@@ -17,6 +17,7 @@ Example:
     ... )
 """
 
+from .deeplift import prepare_model_for_deeplift
 from .gradient import gradient_x_input
 from .heads import HeadSelector, default_head_selector
 from .ism import saturation_ism
@@ -33,6 +34,7 @@ __all__ = [
     "default_head_selector",
     "get_method",
     "gradient_x_input",
+    "prepare_model_for_deeplift",
     "reduce_window",
     "saturation_ism",
     "target_slice_for_resolution",
