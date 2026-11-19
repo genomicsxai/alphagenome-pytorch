@@ -8,6 +8,7 @@ unmutated reference.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Sequence
 
 import numpy as np
@@ -49,19 +50,21 @@ def _ism_pass(
     is_ref = onehot_np.sum(axis=1) > 0.5
     ref_idx = onehot_np.argmax(axis=1)  # 0..3 (meaningless when not is_ref)
 
+    # Autocast on whichever device the input lives on. Hard-coding "cuda" would
+    # silently drop to full precision on CPU/MPS -- or worse, leave a bf16
+    # activation cast unmatched by any weight cast.
+    amp_context = (
+        torch.autocast(device_type=device.type, dtype=autocast_dtype)
+        if autocast_dtype is not None
+        else nullcontext()
+    )
+
     # Reference scalar per track.
-    with torch.no_grad():
-        if autocast_dtype is not None and device.type == "cuda":
-            with torch.autocast(device_type="cuda", dtype=autocast_dtype):
-                ref_pred = head_selector(
-                    model, onehot, organism_index,
-                    output_type=output_type, resolution=resolution,
-                )
-        else:
-            ref_pred = head_selector(
-                model, onehot, organism_index,
-                output_type=output_type, resolution=resolution,
-            )
+    with torch.no_grad(), amp_context:
+        ref_pred = head_selector(
+            model, onehot, organism_index,
+            output_type=output_type, resolution=resolution,
+        )
     ref_window = ref_pred[:, target_slice, :][:, :, list(track_indices)]
     ref_scalar = reduce_window(ref_window, reduction).float().cpu().numpy()[0]  # (T,)
 
@@ -92,18 +95,11 @@ def _ism_pass(
             batch[i, L_pos, alt_b] = 1.0
         batch_org = organism_index.expand(B).contiguous()
 
-        with torch.no_grad():
-            if autocast_dtype is not None and device.type == "cuda":
-                with torch.autocast(device_type="cuda", dtype=autocast_dtype):
-                    pred = head_selector(
-                        model, batch, batch_org,
-                        output_type=output_type, resolution=resolution,
-                    )
-            else:
-                pred = head_selector(
-                    model, batch, batch_org,
-                    output_type=output_type, resolution=resolution,
-                )
+        with torch.no_grad(), amp_context:
+            pred = head_selector(
+                model, batch, batch_org,
+                output_type=output_type, resolution=resolution,
+            )
         alt_window = pred[:, target_slice, :][:, :, track_idx_list]
         alt_scalar = reduce_window(alt_window, reduction).float().cpu().numpy()  # (B, T)
 

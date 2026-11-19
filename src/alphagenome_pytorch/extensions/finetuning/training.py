@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.amp import autocast
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -39,6 +38,79 @@ NUM_SEGMENTS = 8
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
+
+
+def model_compute_dtype(model: nn.Module) -> torch.dtype | None:
+    """Return the model's declared compute dtype through DDP and compile wrappers."""
+    inner = getattr(model, "_orig_mod", model)
+    inner = getattr(inner, "module", inner)
+    policy = getattr(inner, "dtype_policy", None)
+    return getattr(policy, "compute_dtype", None)
+
+
+def _autocast_enabled(device_type: str) -> bool:
+    try:
+        return torch.is_autocast_enabled(device_type)
+    except TypeError:
+        # Older PyTorch builds expose separate queries for CUDA and CPU.
+        if device_type == "cuda":
+            return torch.is_autocast_enabled()
+        if device_type == "cpu":
+            return torch.is_autocast_cpu_enabled()
+    except RuntimeError:
+        # Some backends have no autocast support on this PyTorch build.
+        return False
+    return False
+
+
+def validate_bfloat16_autocast(device: torch.device) -> None:
+    """Check that a requested bf16 policy can use autocast on this device."""
+    message = f"bfloat16 autocast is unavailable on {device}. Use --dtype float32."
+    try:
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            if _autocast_enabled(device.type):
+                return
+    except RuntimeError as exc:
+        raise ValueError(message) from exc
+    # Some backends warn and disable autocast instead of raising.
+    raise ValueError(message)
+
+
+def amp_context_for(
+    model: nn.Module,
+    device: torch.device | str,
+    use_amp: bool,
+) -> torch.autocast | nullcontext:
+    """Autocast matching the model's dtype policy on the device actually in use.
+
+    Both arguments have to be derived, not assumed:
+
+    * **device type.** A hard-coded ``"cuda"`` makes this context disable itself
+      on every other device, while the model still casts its activations to
+      ``compute_dtype`` (``AlphaGenome._compute_embeddings_ncl`` casts the input
+      one-hot itself). Nothing then casts the *weights*, so ``DnaEmbedder.conv1``
+      meets bf16 input with fp32 weights and a CPU or MPS run dies on the first
+      batch. ``model.encode``/``model.predict`` already derive it this way,
+      which is why inference works off-GPU and training did not.
+    * **dtype.** A hard-coded ``bfloat16`` computes in bf16 even under
+      ``--dtype float32``, so the flag would only change the model's internal
+      policy and not the loop around it.
+
+    ``use_amp`` (``--no-amp``) stays the master switch.
+    """
+    device_type = torch.device(device).type
+    compute_dtype = model_compute_dtype(model)
+    if compute_dtype is None:
+        # Models without a policy previously only received CUDA autocast.
+        if device_type != "cuda":
+            return nullcontext()
+        compute_dtype = torch.bfloat16
+
+    if use_amp and compute_dtype != torch.float32:
+        return torch.autocast(device_type=device_type, dtype=compute_dtype)
+    if _autocast_enabled(device_type):
+        return torch.autocast(device_type=device_type, enabled=False)
+    return nullcontext()
 
 
 def collate_genomic(
@@ -319,11 +391,9 @@ def train_epoch(
             "gene_loss_weight > 0 requires strand_channel_mask to be set."
         )
 
-    # Set up autocast context (bfloat16 on CUDA, no-op on CPU)
-    if use_amp and device.type == "cuda":
-        amp_context = autocast(device_type="cuda", dtype=torch.bfloat16)
-    else:
-        amp_context = nullcontext()
+    # Autocast matching the dtype policy on this device (a no-op under --no-amp
+    # or a float32 policy).
+    amp_context = amp_context_for(model, device, use_amp)
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
     for batch_idx, batch_data in enumerate(pbar):
@@ -442,11 +512,9 @@ def validate(
     if invalid := (set(resolutions) - {1, 128}):
         raise ValueError(f"Invalid resolutions {invalid}, must be 1 or 128")
 
-    # Set up autocast context (bfloat16 on CUDA, no-op on CPU)
-    if use_amp and device.type == "cuda":
-        amp_context = autocast(device_type="cuda", dtype=torch.bfloat16)
-    else:
-        amp_context = nullcontext()
+    # Autocast matching the dtype policy on this device (a no-op under --no-amp
+    # or a float32 policy).
+    amp_context = amp_context_for(model, device, use_amp)
 
     with torch.no_grad():
         for sequences, targets_dict in tqdm(val_loader, desc="Validation"):
@@ -580,10 +648,12 @@ class ProfilingStats:
 # =============================================================================
 
 
-def _cuda_sync(device: torch.device) -> None:
-    """Synchronize CUDA if on GPU (no-op on CPU)."""
+def _synchronize_device(device: torch.device) -> None:
+    """Wait for queued accelerator work before recording a batch timing."""
     if device.type == "cuda":
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
 
 def _unpack_batch(batch_data) -> tuple:
@@ -798,25 +868,25 @@ def train_epoch_ddp(
 
         # --- Data loading time (time since last batch ended) ---
         if is_profiling and batch_idx > 0:
-            _cuda_sync(device)
+            _synchronize_device(device)
             t_data_load = time.perf_counter() - t_batch_start
             profile_stats.add("1_data_loading", t_data_load)
 
         # --- Transfer to GPU ---
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
             t0 = time.perf_counter()
 
         sequences = sequences.to(device)
         organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
             profile_stats.add("2_to_device", time.perf_counter() - t0)
 
         # --- Forward pass ---
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
             t0 = time.perf_counter()
 
         # When backbone is frozen (no LoRA), we can save memory by not building
@@ -827,16 +897,16 @@ def train_epoch_ddp(
             # Run only the CNN encoder; skip transformer, decoder, OutputEmbedders.
             # Backbone is always frozen in encoder-only mode.
             with torch.no_grad():
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                with amp_context_for(model, device, use_amp):
                     outputs = model(sequences, organism_idx, encoder_only=True)
             embeddings_dict = {128: outputs["encoder_output"].detach()}
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            with amp_context_for(model, device, use_amp):
                 predictions = head(
                     embeddings_dict, organism_idx, return_scaled=True, channels_last=True
                 )
         elif frozen_backbone:
             with torch.no_grad():
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                with amp_context_for(model, device, use_amp):
                     outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
             # Detach embeddings to ensure no gradients flow back to backbone
@@ -846,13 +916,13 @@ def train_epoch_ddp(
                 if emb_key in outputs:
                     embeddings_dict[res] = outputs[emb_key].detach()
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            with amp_context_for(model, device, use_amp):
                 predictions = head(
                     embeddings_dict, organism_idx, return_scaled=True, channels_last=True
                 )
         else:
             # LoRA enabled: gradients need to flow through backbone
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            with amp_context_for(model, device, use_amp):
                 outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
                 embeddings_dict = {}
@@ -866,12 +936,12 @@ def train_epoch_ddp(
                 )
 
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
             profile_stats.add("3_forward", time.perf_counter() - t0)
 
         # --- Loss computation ---
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
             t0 = time.perf_counter()
 
         loss = torch.tensor(0.0, device=device)
@@ -916,12 +986,12 @@ def train_epoch_ddp(
         scaled_loss = loss / accumulation_steps
 
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
             profile_stats.add("4_loss", time.perf_counter() - t0)
 
         # --- Backward pass ---
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
             t0 = time.perf_counter()
 
         # --- Optimizer step (only every accumulation_steps batches) ---
@@ -939,12 +1009,12 @@ def train_epoch_ddp(
             scaled_loss.backward()
 
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
             profile_stats.add("5_backward", time.perf_counter() - t0)
 
         if is_accumulation_step or is_last_batch:
             if is_profiling:
-                _cuda_sync(device)
+                _synchronize_device(device)
                 t0 = time.perf_counter()
 
             # Get trainable parameters for gradient clipping
@@ -957,7 +1027,7 @@ def train_epoch_ddp(
             optimizer.zero_grad()
 
             if is_profiling:
-                _cuda_sync(device)
+                _synchronize_device(device)
                 profile_stats.add("6_optimizer", time.perf_counter() - t0)
 
         # Update totals
@@ -1008,7 +1078,7 @@ def train_epoch_ddp(
 
         # Mark end of batch for next iteration's data loading measurement
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
         t_batch_start = time.perf_counter()
 
     # Reduce loss across all processes
@@ -1100,10 +1170,11 @@ def validate_ddp(
             resolutions = tuple(resolution_weights.keys())
 
             if encoder_only:
-                outputs = model(sequences, organism_idx, encoder_only=True)
+                with amp_context_for(model, device, use_amp):
+                    outputs = model(sequences, organism_idx, encoder_only=True)
                 embeddings_dict = {128: outputs["encoder_output"]}
             else:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                with amp_context_for(model, device, use_amp):
                     outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
                 embeddings_dict = {}
@@ -1112,7 +1183,7 @@ def validate_ddp(
                     if emb_key in outputs:
                         embeddings_dict[res] = outputs[emb_key]
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            with amp_context_for(model, device, use_amp):
                 # Get predictions in MODEL space for loss computation
                 head_module = head.module if hasattr(head, "module") else head
                 predictions_scaled = head(
@@ -1345,24 +1416,24 @@ def train_epoch_multihead(
         is_profiling = do_profile and batch_idx < profile_batches
 
         if is_profiling and batch_idx > 0:
-            _cuda_sync(device)
+            _synchronize_device(device)
             t_data_load = time.perf_counter() - t_batch_start
             profile_stats.add("1_data_loading", t_data_load)
 
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
             t0 = time.perf_counter()
 
         sequences = sequences.to(device)
         organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
             profile_stats.add("2_to_device", time.perf_counter() - t0)
 
         # Forward through backbone
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
             t0 = time.perf_counter()
 
         # Collect all needed resolutions across all modalities
@@ -1374,12 +1445,12 @@ def train_epoch_multihead(
         if encoder_only:
             # Run only the CNN encoder; backbone is always frozen in encoder-only mode.
             with torch.no_grad():
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                with amp_context_for(model, device, use_amp):
                     outputs = model(sequences, organism_idx, encoder_only=True)
             embeddings_dict = {128: outputs["encoder_output"].detach()}
         elif frozen_backbone:
             with torch.no_grad():
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                with amp_context_for(model, device, use_amp):
                     outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
             embeddings_dict = {}
@@ -1388,7 +1459,7 @@ def train_epoch_multihead(
                 if emb_key in outputs:
                     embeddings_dict[res] = outputs[emb_key].detach()
         else:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            with amp_context_for(model, device, use_amp):
                 outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
             embeddings_dict = {}
@@ -1398,12 +1469,12 @@ def train_epoch_multihead(
                     embeddings_dict[res] = outputs[emb_key]
 
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
             profile_stats.add("3_forward_backbone", time.perf_counter() - t0)
 
         # Forward through each head and compute losses
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
             t0 = time.perf_counter()
 
         loss = torch.tensor(0.0, device=device)
@@ -1417,7 +1488,7 @@ def train_epoch_multihead(
             res_weights = resolution_weights.get(modality, {})
             targets_dict = modality_targets[modality]
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            with amp_context_for(model, device, use_amp):
                 predictions = head(
                     embeddings_dict, organism_idx, return_scaled=True, channels_last=True
                 )
@@ -1492,12 +1563,12 @@ def train_epoch_multihead(
         scaled_loss = loss / accumulation_steps
 
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
             profile_stats.add("4_heads_and_loss", time.perf_counter() - t0)
 
         # Backward
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
             t0 = time.perf_counter()
 
         # Optimizer step
@@ -1515,12 +1586,12 @@ def train_epoch_multihead(
             scaled_loss.backward()
 
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
             profile_stats.add("5_backward", time.perf_counter() - t0)
 
         if is_accumulation_step or is_last_batch:
             if is_profiling:
-                _cuda_sync(device)
+                _synchronize_device(device)
                 t0 = time.perf_counter()
 
             trainable_params = []
@@ -1534,7 +1605,7 @@ def train_epoch_multihead(
             optimizer.zero_grad()
 
             if is_profiling:
-                _cuda_sync(device)
+                _synchronize_device(device)
                 profile_stats.add("6_optimizer", time.perf_counter() - t0)
 
         raw_loss = loss.item()
@@ -1576,7 +1647,7 @@ def train_epoch_multihead(
             print()
 
         if is_profiling:
-            _cuda_sync(device)
+            _synchronize_device(device)
         t_batch_start = time.perf_counter()
 
     # Reduce across processes
@@ -1728,10 +1799,11 @@ def validate_multihead(
             resolutions = tuple(all_resolutions)
 
             if encoder_only:
-                outputs = model(sequences, organism_idx, encoder_only=True)
+                with amp_context_for(model, device, use_amp):
+                    outputs = model(sequences, organism_idx, encoder_only=True)
                 embeddings_dict = {128: outputs["encoder_output"]}
             else:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                with amp_context_for(model, device, use_amp):
                     outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
                 embeddings_dict = {}
@@ -1752,7 +1824,7 @@ def validate_multihead(
 
                 head_module = head.module if hasattr(head, "module") else head
 
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                with amp_context_for(model, device, use_amp):
                     predictions_scaled = head(
                         embeddings_dict, organism_idx, return_scaled=True, channels_last=True
                     )
@@ -2026,7 +2098,7 @@ def train_epoch_sequence_parallel(
 
         if frozen_backbone:
             with torch.no_grad():
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                with amp_context_for(model, device, use_amp):
                     embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = sequence_parallel.forward(
                         model=model_module,
                         sequence=sequences,
@@ -2038,7 +2110,7 @@ def train_epoch_sequence_parallel(
             embeddings_128bp = embeddings_128bp.detach()
             embeddings_dict = _build_embeddings_dict(embeddings_1bp, embeddings_128bp, need_1bp)
         else:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            with amp_context_for(model, device, use_amp):
                 embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = sequence_parallel.forward(
                     model=model_module,
                     sequence=sequences,
@@ -2060,7 +2132,7 @@ def train_epoch_sequence_parallel(
             res_weights = resolution_weights.get(modality, {})
             targets_dict = modality_targets[modality]
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            with amp_context_for(model, device, use_amp):
                 # contact_maps head takes embeddings_pair directly; all other
                 # GenomeTracksHead variants take embeddings_dict.
                 if modality == "contact_maps":

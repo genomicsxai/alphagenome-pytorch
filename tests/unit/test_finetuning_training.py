@@ -312,3 +312,190 @@ class TestModalityConfigs:
         """Test that config.name matches the dict key."""
         for key, config in MODALITY_CONFIGS.items():
             assert config.name == key, f"Config name '{config.name}' doesn't match key '{key}'"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "requested, expected",
+    [("cuda:2", [torch.device("cuda:2")]), ("mps", ["mps"]), ("cpu", [])],
+)
+def test_profile_synchronizes_selected_accelerator(monkeypatch, requested, expected):
+    from alphagenome_pytorch.extensions.finetuning.training import _synchronize_device
+
+    calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize", calls.append)
+    monkeypatch.setattr(torch.mps, "synchronize", lambda: calls.append("mps"))
+
+    _synchronize_device(torch.device(requested))
+
+    assert calls == expected
+
+
+@pytest.mark.unit
+class TestAmpContext:
+    """The autocast the loops run under has to follow the model and the device.
+
+    A hard-coded ``device_type="cuda"`` disabled itself on any other device
+    while the model still cast its activations to bf16, so the first conv of
+    the DNA embedder met fp32 weights and a CPU run died on batch one.
+    """
+
+    class _Policy:
+        def __init__(self, compute_dtype):
+            self.compute_dtype = compute_dtype
+
+    class _Model(torch.nn.Module):
+        def __init__(self, compute_dtype):
+            super().__init__()
+            self.dtype_policy = TestAmpContext._Policy(compute_dtype)
+
+    def test_device_type_follows_the_device(self):
+        from alphagenome_pytorch.extensions.finetuning.training import amp_context_for
+
+        ctx = amp_context_for(self._Model(torch.bfloat16), torch.device("cpu"), True)
+        assert ctx.device == "cpu"
+        assert ctx._enabled is True
+
+    def test_accepts_a_device_string(self):
+        from alphagenome_pytorch.extensions.finetuning.training import amp_context_for
+
+        assert amp_context_for(self._Model(torch.bfloat16), "cpu", True).device == "cpu"
+
+    @pytest.mark.parametrize(
+        "compute_dtype, use_amp",
+        [(torch.float32, True), (torch.bfloat16, False)],
+        ids=["float32-policy", "no-amp"],
+    )
+    def test_disables_ambient_autocast(self, compute_dtype, use_amp):
+        from alphagenome_pytorch.extensions.finetuning.training import amp_context_for
+
+        policy_model = self._Model(compute_dtype)
+        layer = torch.nn.Linear(2, 2)
+        sample = torch.ones(1, 2)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            assert layer(sample).dtype == torch.bfloat16
+            with amp_context_for(policy_model, "cpu", use_amp):
+                assert layer(sample).dtype == torch.float32
+
+    def test_float32_skips_autocast_on_older_mps(self, monkeypatch):
+        from alphagenome_pytorch.extensions.finetuning.training import amp_context_for
+
+        def unavailable(*args, **kwargs):
+            pytest.fail("A float32 policy must not construct MPS autocast on this build")
+
+        monkeypatch.setattr(torch, "is_autocast_enabled", lambda: False)
+        monkeypatch.setattr(torch, "autocast", unavailable)
+
+        with amp_context_for(self._Model(torch.float32), "mps", True):
+            pass
+
+    @pytest.mark.parametrize("raises", [True, False], ids=["unsupported", "disabled"])
+    def test_bfloat16_autocast_reports_unsupported_mps(self, monkeypatch, raises):
+        from contextlib import nullcontext
+
+        from alphagenome_pytorch.extensions.finetuning.training import (
+            validate_bfloat16_autocast,
+        )
+
+        def unavailable(**kwargs):
+            if raises:
+                raise RuntimeError("unsupported autocast device")
+            return nullcontext()
+
+        monkeypatch.setattr(torch, "autocast", unavailable)
+        monkeypatch.setattr(torch, "is_autocast_enabled", lambda device_type: False)
+
+        with pytest.raises(ValueError, match=r"unavailable on mps.*--dtype float32"):
+            validate_bfloat16_autocast(torch.device("mps"))
+
+    def test_unwraps_compile_and_ddp_wrappers(self):
+        """The loops see the wrapped model, so the policy lookup has to reach
+        through both layers the runner adds (base -> DDP -> compile)."""
+        from alphagenome_pytorch.extensions.finetuning.training import (
+            model_compute_dtype,
+        )
+
+        base = self._Model(torch.float32)
+
+        class _DDP(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+        class _Compiled(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self._orig_mod = module
+
+        assert model_compute_dtype(_Compiled(_DDP(base))) is torch.float32
+
+    def test_model_without_policy_does_not_enable_cpu_amp(self):
+        from alphagenome_pytorch.extensions.finetuning.training import amp_context_for
+
+        model = torch.nn.Linear(2, 2)
+        sample = torch.ones(1, 2)
+        with amp_context_for(model, "cpu", True):
+            assert model(sample).dtype == torch.float32
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            with amp_context_for(model, "cpu", True):
+                assert model(sample).dtype == torch.bfloat16
+
+    def test_model_without_policy_retains_cuda_bfloat16(self, monkeypatch):
+        from alphagenome_pytorch.extensions.finetuning.training import amp_context_for
+
+        monkeypatch.setattr(torch, "autocast", lambda **kwargs: kwargs)
+        assert amp_context_for(torch.nn.Linear(2, 2), "cuda:0", True) == {
+            "device_type": "cuda", "dtype": torch.bfloat16,
+        }
+
+    @pytest.mark.parametrize("multihead", [False, True], ids=["ddp", "multihead"])
+    @pytest.mark.parametrize("use_amp", [False, True], ids=["fp32", "bf16"])
+    def test_encoder_only_validation_respects_amp(self, multihead, use_amp):
+        from alphagenome_pytorch.extensions.finetuning.training import (
+            validate_ddp,
+            validate_multihead,
+        )
+
+        expected_dtype = torch.bfloat16 if use_amp else torch.float32
+
+        class Encoder(self._Model):
+            def __init__(self):
+                super().__init__(torch.bfloat16)
+                self.conv = torch.nn.Conv1d(4, 2, kernel_size=1)
+
+            def forward(self, sequences, organism_index, *, encoder_only):
+                assert encoder_only
+                features = self.conv(sequences.transpose(1, 2))
+                assert features.dtype == expected_dtype
+                return {"encoder_output": features}
+
+        class EmptyHead(torch.nn.Module):
+            def forward(self, *args, **kwargs):
+                return {}
+
+        model = Encoder()
+        options = dict(
+            val_loader=[(torch.zeros(1, 8, 4), {})],
+            device=torch.device("cpu"),
+            positional_weight=1.0,
+            count_weight=1.0,
+            use_amp=use_amp,
+            compute_pearson=False,
+            encoder_only=True,
+        )
+        if multihead:
+            validate_multihead(
+                model, {}, modality_weights={}, resolution_weights={}, **options
+            )
+        else:
+            validate_ddp(model, EmptyHead(), resolution_weights={128: 1.0}, **options)
+
+    def test_no_hardcoded_cuda_autocast_remains(self):
+        """Guard against reintroducing the literal in a new loop."""
+        import inspect
+
+        import alphagenome_pytorch.extensions.finetuning.training as training
+
+        source = inspect.getsource(training)
+        assert 'device_type="cuda"' not in source
+        assert "device_type='cuda'" not in source

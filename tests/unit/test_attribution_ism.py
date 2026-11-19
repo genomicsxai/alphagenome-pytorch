@@ -195,6 +195,41 @@ class TestSaturationISM:
             atol=1e-5,
         )
 
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "autocast_dtype, ambient_autocast, expected_dtype",
+        [
+            (None, False, torch.float32),
+            (None, True, torch.bfloat16),
+            (torch.bfloat16, False, torch.bfloat16),
+        ],
+    )
+    def test_autocast_applies_to_reference_and_mutants(
+        self, autocast_dtype, ambient_autocast, expected_dtype
+    ):
+        model = nn.Linear(4, 1)
+        forward_dtypes = []
+
+        def head_selector(model, onehot, organism_index, **kwargs):
+            output = model(onehot)
+            forward_dtypes.append(output.dtype)
+            return output
+
+        with torch.autocast("cpu", dtype=torch.bfloat16, enabled=ambient_autocast):
+            saturation_ism(
+                model,
+                onehot=_make_onehot("A"),
+                organism_index=0,
+                output_type="x",
+                resolution=1,
+                target_slice=slice(0, 1),
+                track_indices=[0],
+                batch_size=2,
+                autocast_dtype=autocast_dtype,
+                head_selector=head_selector,
+            )
+        assert forward_dtypes == [expected_dtype] * 3
+
     def test_strand_averaged(self):
         """Strand averaging should produce a finite result without crashing."""
         model = _BaseWeightedModel()

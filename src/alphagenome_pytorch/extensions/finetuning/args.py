@@ -363,9 +363,9 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
     model.add_argument(
         "--dtype",
         type=str,
-        default="bfloat16",
+        default=None,
         choices=["bfloat16", "float32"],
-        help="Model dtype",
+        help="Model dtype (defaults to bfloat16 on CUDA with AMP, float32 otherwise)",
     )
     model.add_argument(
         "--head-init-scheme",
@@ -408,7 +408,13 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
     train.add_argument("--seed", type=int, default=None, help="Random seed")
 
     # Distributed/Sequence Parallel arguments
-    dist = parser.add_argument_group("Distributed")
+    dist = parser.add_argument_group("Device and distributed training")
+    dist.add_argument(
+        "--device",
+        default="auto",
+        help="Training device (auto, cpu, mps, cuda, or cuda:N). Auto tries CUDA, "
+        "MPS, then CPU. With torchrun, use auto or cuda.",
+    )
     dist.add_argument(
         "--sequence-parallel",
         action="store_true",
@@ -569,6 +575,7 @@ def postprocess_args(
         "locon_rank",
         "locon_alpha",
         "locon_targets",
+        "device",
         "dtype",
         "head_init_scheme",
         "gradient_checkpointing",
@@ -639,6 +646,11 @@ def postprocess_args(
             args.no_amp = not bool(config_data["use_amp"])
         elif "no_amp" in config_data:
             args.no_amp = bool(config_data["no_amp"])
+
+    try:
+        _validate_dtype(args.dtype, use_amp=not args.no_amp)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if "--cache-genome" not in cli_flags and "--cache-signals" not in cli_flags:
         if bool(config_data.get("no_cache", False)):
@@ -848,3 +860,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     tokens = list(argv) if argv is not None else sys.argv[1:]
     return postprocess_args(args, parser, tokens)
+
+
+def _validate_dtype(dtype: str | None, *, use_amp: bool) -> None:
+    if dtype is not None and dtype not in ("bfloat16", "float32"):
+        raise ValueError(f"Invalid dtype {dtype!r}. Choose bfloat16 or float32.")
+    if dtype == "bfloat16" and not use_amp:
+        raise ValueError(
+            "--no-amp conflicts with --dtype bfloat16. "
+            "Use --dtype float32 or enable AMP."
+        )
+
+
+def resolve_dtype(dtype: str | None, *, cuda: bool, use_amp: bool) -> str:
+    """Choose a default compute dtype after resolving the training device."""
+    _validate_dtype(dtype, use_amp=use_amp)
+    if dtype is not None:
+        return dtype
+    return "bfloat16" if cuda and use_amp else "float32"

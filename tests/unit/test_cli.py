@@ -744,7 +744,7 @@ class TestFinetuneCommand:
         sub = parser._subparsers._group_actions[0].choices["finetune"]
         text = sub.format_help()
         for flag in ("--mode", "--genome", "--bigwig", "--lora-rank",
-                     "--sequence-parallel", "--pretrained-weights"):
+                     "--sequence-parallel", "--pretrained-weights", "--device"):
             assert flag in text, f"{flag} missing from 'agt finetune --help'"
         assert "finetune_args" not in text
 
@@ -768,7 +768,7 @@ class TestFinetuneCommand:
             cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=300,
         )
         assert proc.returncode == 0, f"stderr:\n{proc.stderr}"
-        for flag in ("--mode", "--sequence-parallel", "--pretrained-weights"):
+        for flag in ("--mode", "--sequence-parallel", "--pretrained-weights", "--device"):
             assert flag in proc.stdout, f"{flag} missing from help"
 
     def test_flag_parity_with_standalone_script_parser(self):
@@ -795,9 +795,9 @@ class TestFinetuneCommand:
         args = parser.parse_args([
             "finetune", "--mode", "lora", "--modality", "atac", "--bigwig", "a.bw",
             "--genome", "g.fa", "--train-bed", "t.bed", "--val-bed", "v.bed",
-            "--pretrained-weights", "w.pth",
+            "--pretrained-weights", "w.pth", "--device", "mps",
         ])
-        args._argv = ["finetune", "--mode", "lora"]
+        args._argv = ["finetune", "--mode", "lora", "--device", "mps"]
 
         seen = {}
         fake_runner = types.ModuleType("runner")
@@ -808,6 +808,7 @@ class TestFinetuneCommand:
             rc = ft_cli.run(args)
         assert rc == 0
         assert seen["args"].mode == "lora"
+        assert seen["args"].device == "mps"
         # postprocess_args ran: derived fields are present
         assert seen["args"].modalities == ["atac"]
 

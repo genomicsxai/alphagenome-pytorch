@@ -12,41 +12,68 @@ import torch.distributed as dist
 from torch import Tensor
 
 
-def setup_distributed() -> tuple[int, int, int, torch.device]:
-    """Initialize distributed training environment.
+def resolve_device(
+    requested: str, *, local_rank: int = 0, requires_cuda: bool = False
+) -> torch.device:
+    """Resolve a fine-tuning device, using the rank for unindexed CUDA requests."""
+    if requested == "auto":
+        if not requires_cuda and not torch.cuda.is_available():
+            return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        requested = "cuda"
 
-    Auto-detects if launched via torchrun/torch.distributed.run.
+    invalid_device = f"Invalid fine-tuning device {requested!r}. Use auto, cpu, mps, cuda, or cuda:N."
+    try:
+        device = torch.device(requested)
+    except (RuntimeError, TypeError) as exc:
+        raise ValueError(invalid_device) from exc
+    if device.type not in ("cpu", "cuda", "mps") or (
+        device.type != "cuda" and device.index is not None
+    ):
+        raise ValueError(invalid_device)
 
-    Returns:
-        Tuple of (rank, world_size, local_rank, device).
-        Returns (0, 1, 0, cuda:0 or cpu) if not in distributed mode.
+    if requires_cuda and device != torch.device("cuda"):
+        raise ValueError(
+            "NCCL fine-tuning requires --device auto or cuda. "
+            "LOCAL_RANK selects the CUDA device for each process."
+        )
 
-    Example:
-        >>> rank, world_size, local_rank, device = setup_distributed()
-        >>> if world_size > 1:
-        ...     model = DDP(model, device_ids=[local_rank])
-    """
-    if not dist.is_initialized():
-        if "RANK" in os.environ:
-            # Launched with torchrun or torch.distributed.run
-            dist.init_process_group(backend="nccl")
-            rank = int(os.environ["RANK"])
-            world_size = int(os.environ["WORLD_SIZE"])
-            local_rank = int(os.environ["LOCAL_RANK"])
-        else:
-            # Single GPU mode
-            rank = 0
-            world_size = 1
-            local_rank = 0
-    else:
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA is unavailable for fine-tuning.")
+        index = local_rank if device.index is None else device.index
+        if not 0 <= index < torch.cuda.device_count():
+            raise ValueError(f"CUDA device cuda:{index} is not visible to PyTorch.")
+        return torch.device("cuda", index)
+
+    if device.type == "mps" and not torch.backends.mps.is_available():
+        raise ValueError("MPS is unavailable. Choose --device cpu or an available accelerator.")
+    return device
+
+
+def setup_distributed(requested_device: str = "auto") -> tuple[int, int, int, torch.device]:
+    """Resolve the device and initialize NCCL when launched via torchrun."""
+    initialized = dist.is_initialized()
+    launch_nccl = not initialized and "RANK" in os.environ
+    if initialized:
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    elif launch_nccl:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+    else:
+        rank, world_size, local_rank = 0, 1, 0
 
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
+    device = resolve_device(
+        requested_device,
+        local_rank=local_rank,
+        requires_cuda=launch_nccl or (initialized and dist.get_backend() == "nccl"),
+    )
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    if launch_nccl:
+        dist.init_process_group(backend="nccl")
 
     return rank, world_size, local_rank, device
 
