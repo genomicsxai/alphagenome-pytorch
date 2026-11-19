@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from alphagenome_pytorch.variant_scoring import Interval
-from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+from alphagenome_pytorch.annotations import GeneAnnotation
 
 
 def _annotation(rows: list[dict]) -> GeneAnnotation:

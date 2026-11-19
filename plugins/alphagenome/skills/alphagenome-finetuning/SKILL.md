@@ -137,7 +137,7 @@ strand-matched, genes with ≥50% of exons in-window) and emits
 plus `rna_seq_gene_log_expr_n_genes`. It needs an annotation that actually
 contains **exon rows**, so a gene-only `--gtf` is not enough on its own.
 
-Both `--gtf` and `--gene-expr-annotation` accept parquet or GTF/GFF. Convert
+Both `--gtf` and `--gene-expr-annotation` accept parquet or GTF. Convert
 once (`python scripts/convert_gtf_to_parquet.py --input x.gtf --output
 x.parquet`) and point `--gtf` at the parquet: it loads in seconds instead of
 minutes on every run's startup path, and since the converter keeps every

@@ -810,7 +810,7 @@ def main(args: argparse.Namespace | None = None) -> None:
     # pandas-heavy gene lookup runs once per window for the whole run.
     gene_expr_window_cache: dict = {}
     if getattr(args, "gene_expr_eval", False):
-        from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+        from alphagenome_pytorch.annotations import GeneAnnotation
 
         ann_path = args.gene_expr_annotation or args.gtf
         print_rank0(f"Loading annotation for gene-expression eval: {ann_path}", rank)

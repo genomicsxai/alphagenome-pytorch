@@ -17,7 +17,7 @@ from ..types import Interval, OutputType, Variant, VariantScore
 from .base import BaseVariantScorer
 
 if TYPE_CHECKING:
-    from ..annotations import GeneAnnotation
+    from ...annotations import GeneAnnotation
 
 
 class GeneMaskMode(Enum):

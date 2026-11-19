@@ -834,7 +834,7 @@ def predict_full_chromosomes_to_anndata(
         A :class:`~alphagenome_pytorch.aggregation.GeneCounts` with ``B == 1`` (whole run collapsed to one table).
     """
     from ...aggregation import GeneCountAccumulator
-    from ...variant_scoring.annotations import GeneAnnotation
+    from ...annotations import GeneAnnotation
 
     config = config or TilingConfig()
     progress = _progress_logger(show_progress)

@@ -12,7 +12,7 @@ from .base import BaseVariantScorer
 from ...utils.splicing import unstack_junction_predictions
 
 if TYPE_CHECKING:
-    from ..annotations import GeneAnnotation
+    from ...annotations import GeneAnnotation
 
 # Supported output types for splicing scorer
 SUPPORTED_SPLICING_OUTPUT_TYPES = frozenset([

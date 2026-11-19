@@ -22,6 +22,8 @@ from typing import Tuple
 import numpy as np
 import pandas as pd
 
+from ...annotations import read_annotation
+
 
 # Maximum genes per training window. Mirrors upstream's
 # `GeneVariantScorer.pad_num_genes=256` ceiling. If a window exceeds this we
@@ -29,36 +31,10 @@ import pandas as pd
 PAD_NUM_GENES_CEILING = 256
 
 
-_PARQUET_SUFFIXES = (".parquet", ".pq")
-
 # Everything `_GeneBodyAnnotationExtractor` needs, plus `Feature` to select gene
 # rows. Read only these from parquet; a GENCODE frame carries ~25 more columns.
 _REQUIRED_COLUMNS = frozenset({"Chromosome", "Start", "End", "Strand", "Feature", "gene_id"})
 _OPTIONAL_COLUMNS = ("gene_name", "gene_type")
-
-
-def _read_annotation_frame(path: str) -> pd.DataFrame:
-    """Read a GTF/GFF (via pyranges) or a parquet into a GTF-layout DataFrame."""
-    if not str(path).lower().endswith(_PARQUET_SUFFIXES):
-        import pyranges  # local import: heavy dep, only needed for GTF input
-
-        pr = pyranges.read_gtf(path)
-        return pr.df if hasattr(pr, "df") else pr  # pyranges 0.x → .df, 1.x → DataFrame
-
-    # Project to the columns we actually use. Falling back to a full read keeps
-    # this working for parquets written with a different engine or schema.
-    try:
-        import pyarrow.parquet as pq
-
-        available = set(pq.ParquetFile(path).schema_arrow.names)
-        if _REQUIRED_COLUMNS <= available:
-            columns = sorted(_REQUIRED_COLUMNS) + [
-                c for c in _OPTIONAL_COLUMNS if c in available
-            ]
-            return pd.read_parquet(path, columns=columns)
-    except Exception:
-        pass
-    return pd.read_parquet(path)
 
 
 def load_gene_table(
@@ -72,7 +48,7 @@ def load_gene_table(
     `_GeneBodyAnnotationExtractor` requires.
 
     Args:
-        annotation_path: Path to a GTF/GFF readable by `pyranges.read_gtf`, or a
+        annotation_path: Path to a GTF (optionally gzipped), or a
             `.parquet` written by `scripts/convert_gtf_to_parquet.py`. Prefer the
             parquet: it loads in seconds where a GENCODE GTF takes minutes, and
             the same file also serves `GeneAnnotation` for the exon-based
@@ -81,7 +57,9 @@ def load_gene_table(
             `gene_type == "protein_coding"`. Set False for assemblies /
             annotations that don't have or use that biotype.
     """
-    df = _read_annotation_frame(annotation_path)
+    df = read_annotation(
+        annotation_path, columns=sorted(_REQUIRED_COLUMNS) + list(_OPTIONAL_COLUMNS)
+    )
 
     missing = _REQUIRED_COLUMNS - set(df.columns)
     if missing:

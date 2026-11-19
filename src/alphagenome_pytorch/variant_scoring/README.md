@@ -70,7 +70,7 @@ cd ../..
 ```
 
 ### 2. Convert to Parquet (Recommended)
-Parquet files load 50-100x faster than GTF/GFF.
+Parquet files load 50-100x faster than GTF.
 
 ```bash
 # Convert Gene Annotations

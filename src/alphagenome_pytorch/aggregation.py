@@ -36,7 +36,7 @@ region must divide by *bases*, not by elements, or it comes out ``resolution``×
 too large. That is what ``bin_size`` is for.
 
 This buys **unit consistency**, not exact agreement between resolutions. Region
-means at 128bp remain an approximation: :meth:`alphagenome_pytorch.variant_scoring.annotations.GeneAnnotation.get_exon_bin_ranges`
+means at 128bp remain an approximation: :meth:`alphagenome_pytorch.annotations.GeneAnnotation.get_exon_bin_ranges`
 includes every bin an exon *touches*, and such a boundary bin is an already-summed
 total that mixes exonic and non-exonic bases. No choice of divisor can separate
 them after the fact. Only regions whose boundaries land on bin edges agree exactly
@@ -56,7 +56,7 @@ from .metrics import pearson_r
 if TYPE_CHECKING:  # avoid importing heavy / optional modules at import time
     import pandas as pd
     from .named_outputs import TrackMetadata
-    from .variant_scoring.annotations import GeneAnnotation
+    from .annotations import GeneAnnotation
 
 
 __all__ = [
@@ -606,7 +606,7 @@ def gene_expression(
     Args:
         predictions: ``[B, S, C]`` (or ``[S, C]``) RNA-seq tensor in experimental
             (linear) space.
-        annotation: a :class:`~alphagenome_pytorch.variant_scoring.annotations.GeneAnnotation` built from a GTF/parquet that
+        annotation: a :class:`~alphagenome_pytorch.annotations.GeneAnnotation` built from a GTF/parquet that
             includes exon rows.
         interval: ``(chrom, start, end)`` (0-based half-open).
         track_metadata: per-track metadata (for labels + strand matching).
@@ -861,7 +861,7 @@ def gene_expression_values(
 
     Args:
         predictions: ``[S, C]`` or ``[1, S, C]`` predictions for one window.
-        annotation: a :class:`~alphagenome_pytorch.variant_scoring.annotations.GeneAnnotation` with exon rows.
+        annotation: a :class:`~alphagenome_pytorch.annotations.GeneAnnotation` with exon rows.
         interval: ``(chrom, start, end)`` of this window.
         track_strands: per-track strand chars for strand matching (optional).
         window_cache: optional dict memoizing the per-window annotation lookup
@@ -961,7 +961,7 @@ class GeneCountAccumulator:
     :class:`GeneCounts` (``.to_anndata()`` for an AnnData).
 
     Args:
-        annotation: a :class:`~alphagenome_pytorch.variant_scoring.annotations.GeneAnnotation`; exon rows required for
+        annotation: a :class:`~alphagenome_pytorch.annotations.GeneAnnotation`; exon rows required for
             ``over="exons"``.
         resolution: bp per prediction bin (1 or 128).
         over: ``"exons"`` (default) or ``"gene_body"``.

@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from alphagenome_pytorch.variant_scoring import Interval, Variant
-from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+from alphagenome_pytorch.annotations import GeneAnnotation
 
 
 def _make_annotation(tmp_path, rows):
