@@ -274,6 +274,19 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
 
+    data.add_argument(
+        "--target-total",
+        type=str,
+        default=None,
+        help=(
+            "Normalize coverage targets in memory to this genome-wide total "
+            "(e.g. 100M). RNA-seq pairs declared with --strand-pairs share "
+            "one factor. Other coverage tracks scale individually. ChIP "
+            "keeps its fold-change units. Predictions use the scaled units. "
+            "Default: use the stored values."
+        ),
+    )
+
     # Gene LFC loss arguments (Decima-style cross-track loss for RNA-seq).
     gene_lfc = parser.add_argument_group("Gene LFC loss")
     gene_lfc.add_argument(
@@ -616,6 +629,7 @@ def postprocess_args(
         "min_segment_size",
         "num_workers",
         "track_means_samples",
+        "target_total",
         "profile_batches",
         "compile",
         "seed",
@@ -847,6 +861,16 @@ def postprocess_args(
                 f"strand string for '{modality}' contains invalid chars "
                 f"{invalid}; allowed: '+', '-', '.'"
             )
+
+    if args.target_total is not None:
+        from alphagenome_pytorch.extensions.finetuning.signal_scaling import parse_target
+
+        try:
+            args.target_total = parse_target(str(args.target_total))
+        except ValueError as e:
+            parser.error(f"--target-total: {e}")
+        if args.target_total <= 0:
+            parser.error("--target-total must be positive")
 
     # Validate gene-LFC config consistency.
     if args.gene_loss_weight > 0:

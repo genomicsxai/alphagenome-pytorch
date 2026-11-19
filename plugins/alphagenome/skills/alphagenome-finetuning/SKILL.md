@@ -168,11 +168,18 @@ feature, that single file drives both the gene-body masks and the exon metric.
 # Normalize signal depth across tracks to a common total (e.g. 100M)
 agt preprocess scale-bigwig --input *.bw --output scaled/ --target 100M
 # (add --dry-run to just print the scale factor)
+# Stranded RNA-seq: scale each +/- pair together so the pair sums to 100M
+agt preprocess scale-bigwig --input s_plus.bw s_minus.bw --output scaled/ --target 100M --together
 
 # Convert BigWigs to a memory-mapped format for faster training I/O
 agt preprocess bigwig-to-mmap --input *.bw --output mmap/ --chromosomes chr1 chr2
 ```
 Training reads `.bw` directly, so this is only for depth normalization or I/O speed.
+Use `agt finetune --target-total 100M` to scale targets and track means in
+memory. RNA-seq pairs declared with `--strand-pairs` share a factor. CAGE and
+PRO-cap scale per strand, ATAC and DNase scale per track, and ChIP keeps its
+fold-change units. Fine-tuning depth normalization requires non-negative
+signal in the tracks it scales. Predictions use the scaled units.
 
 ## 6. Python API (when the CLI doesn't fit)
 

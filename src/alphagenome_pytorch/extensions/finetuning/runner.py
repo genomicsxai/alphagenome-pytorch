@@ -167,9 +167,45 @@ def unwrap_training_model(model: nn.Module) -> nn.Module:
 # =============================================================================
 
 
+# ChIP fold change over control already has its own units.
+UNSCALED_MODALITIES = frozenset({"chip_tf", "chip_histone"})
+
+
+def compute_modality_track_scales(args: argparse.Namespace) -> dict[str, list[float]]:
+    """Per-track factors for ``--target-total``, keyed by modality.
+
+    rna_seq strand pairs share one factor so each pair sums to the target,
+    as in AlphaGenome. Every other track is scaled on its own, even when
+    ``strand_pairs`` is set: the paper scales CAGE and PRO-cap per strand.
+    ChIP modalities get no entry, so their targets and means stay as stored.
+    """
+    from alphagenome_pytorch.extensions.finetuning.signal_scaling import (
+        bigwig_total_signal,
+        track_scale_factors,
+    )
+
+    scales: dict[str, list[float]] = {}
+    print(f"Computing scale factors to --target-total {args.target_total:g}...")
+    for modality, bigwigs in args.modality_to_bigwigs.items():
+        if modality in UNSCALED_MODALITIES:
+            print(f"  {modality}: left unscaled (fold change over control)")
+            continue
+        totals = [bigwig_total_signal(bw, require_nonnegative=True) for bw in bigwigs]
+        pairs = args.modality_strand_pairs.get(modality) if modality == "rna_seq" else None
+        try:
+            scales[modality] = track_scale_factors(totals, args.target_total, pairs)
+        except ValueError as exc:
+            raise ValueError(f"{modality} BigWigs ({', '.join(map(str, bigwigs))}): {exc}") from exc
+        for bw, total, factor in zip(bigwigs, totals, scales[modality]):
+            print(f"  {modality}: {Path(bw).name}: total={total:.0f}, scale_factor={factor:.6g}")
+    return scales
+
+
 def create_datasets(
     args: argparse.Namespace,
     rank: int,
+    *,
+    modality_track_scales: dict[str, list[float]] | None = None,
 ) -> tuple:
     """Create training and validation datasets.
 
@@ -246,8 +282,10 @@ def create_datasets(
     train_datasets = {}
     val_datasets = {}
 
+    modality_track_scales = modality_track_scales or {}
     for modality, bigwigs in args.modality_to_bigwigs.items():
         resolutions = args.modality_resolutions[modality]
+        track_scales = modality_track_scales.get(modality)
         # Attach the gene-mask extractor only to the modality that consumes
         # the gene LFC loss (rna_seq today).
         attach_gene_mask = (
@@ -268,6 +306,7 @@ def create_datasets(
             max_io_workers=max_io_workers,
             gene_mask_extractor=gme,
             g_max=gme_g_max,
+            track_scales=track_scales,
         )
         val_datasets[modality] = GenomicDataset(
             genome_fasta=genome,
@@ -280,6 +319,7 @@ def create_datasets(
             max_io_workers=max_io_workers,
             gene_mask_extractor=gme,
             g_max=gme_g_max,
+            track_scales=track_scales,
         )
 
     train_dataset = MultimodalDataset(train_datasets)
@@ -843,6 +883,21 @@ def main(args: argparse.Namespace | None = None) -> None:
         print_rank0(f"Distributed training with {world_size} GPUs", rank)
     print_rank0(f"Device: {device}", rank)
 
+    target_total = getattr(args, "target_total", None)
+    modality_track_scales: dict[str, list[float]] = {}
+    if target_total is not None:
+        # Broadcast failures as well as factors so every rank can exit.
+        error = None
+        if is_main_process(rank):
+            try:
+                modality_track_scales = compute_modality_track_scales(args)
+            except (OSError, ValueError, RuntimeError) as exc:
+                error = str(exc)
+        modality_track_scales, error = broadcast_object((modality_track_scales, error), src=0)
+        if error is not None:
+            cleanup_distributed()
+            raise ValueError(f"--target-total: {error}")
+
     # Output directory
     run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(args.output_dir) / run_name
@@ -864,7 +919,9 @@ def main(args: argparse.Namespace | None = None) -> None:
         resume_path = Path(args.resume)
 
     # Create datasets
-    train_dataset, val_dataset, modality_track_names, modality_resolutions = create_datasets(args, rank)
+    train_dataset, val_dataset, modality_track_names, modality_resolutions = create_datasets(
+        args, rank, modality_track_scales=modality_track_scales
+    )
 
     # Optional gene-expression validation metric for rna_seq.
     # Load a GeneAnnotation WITH exon rows (decoupled from --gene-loss-weight,
@@ -982,6 +1039,12 @@ def main(args: argparse.Namespace | None = None) -> None:
         base_model_weights_hash=base_model_weights_hash,
     )
 
+    if modality_track_scales:
+        metadata_kwargs.update(
+            target_total=target_total,
+            modality_track_scales=modality_track_scales,
+        )
+
     # Build resolution weights per modality.
     # encoder-only mode always operates at 128bp (encoder output resolution).
     resolution_weights_per_modality: dict[str, dict[int, float]] = {}
@@ -1017,6 +1080,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 sequence_length=args.sequence_length,
                 max_samples=args.track_means_samples,
                 strand_pair_groups=args.modality_strand_pairs.get(modality),
+                track_scales=modality_track_scales.get(modality),
             )
             print(f"  {modality}: mean={modality_track_means[modality].mean():.4f}")
     modality_track_means = broadcast_object(modality_track_means, src=0)
@@ -1102,34 +1166,42 @@ def main(args: argparse.Namespace | None = None) -> None:
     if resume_path and resume_path.exists():
         print_rank0(f"Resuming from: {resume_path}", rank)
 
-        # Check if it's a delta checkpoint
-        if is_delta_checkpoint(resume_path):
-            # Delta checkpoint - load adapter + head weights only
-            # skip_prepare=True because create_model already set up adapters/heads
-            _, metadata = load_delta_checkpoint(
+        delta = is_delta_checkpoint(resume_path)
+        if delta:
+            # create_model already set up the adapters and heads.
+            _, checkpoint_metadata = load_delta_checkpoint(
                 resume_path,
                 model=model_module,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 skip_prepare=True,
             )
-            start_epoch = metadata.get("epoch", 0) + 1
-            best_val_loss = metadata.get("best_val_loss", metadata.get("val_loss", float("inf")))
-            wandb_run_id = metadata.get("wandb_run_id")
-            print_rank0(f"  Resumed from delta checkpoint at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}", rank)
         else:
-            # Full checkpoint
-            ckpt = load_checkpoint(
+            checkpoint_metadata = load_checkpoint(
                 resume_path,
                 model=model_module,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 device="cpu",
             )
-            start_epoch = ckpt["epoch"] + 1
-            best_val_loss = ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf")))
-            wandb_run_id = ckpt.get("wandb_run_id")
-            print_rank0(f"  Resumed at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}", rank)
+        if (checkpoint_metadata.get("modality_track_scales") or {}) != modality_track_scales:
+            cleanup_distributed()
+            raise ValueError(
+                "Resume input scales differ from the checkpoint. Use the same "
+                "BigWigs, strand pairs, and --target-total as the original run."
+            )
+
+        epoch = checkpoint_metadata.get("epoch", 0) if delta else checkpoint_metadata["epoch"]
+        start_epoch = epoch + 1
+        best_val_loss = checkpoint_metadata.get(
+            "best_val_loss", checkpoint_metadata.get("val_loss", float("inf"))
+        )
+        wandb_run_id = checkpoint_metadata.get("wandb_run_id")
+        checkpoint_kind = "delta checkpoint" if delta else "checkpoint"
+        print_rank0(
+            f"  Resumed from {checkpoint_kind} at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}",
+            rank,
+        )
 
     # Config for logging
     config = {
@@ -1165,6 +1237,8 @@ def main(args: argparse.Namespace | None = None) -> None:
         "max_grad_norm": args.max_grad_norm,
         "num_segments": args.num_segments,
         "min_segment_size": args.min_segment_size,
+        "target_total": target_total,
+        "modality_track_scales": modality_track_scales or None,
         "total_steps": total_steps,
         "n_trainable_params": sum(p.numel() for p in trainable_params),
         "n_total_params": sum(p.numel() for p in model_module.parameters()),
