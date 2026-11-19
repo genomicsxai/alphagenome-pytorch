@@ -116,7 +116,7 @@ class TestComputeGeneLFCMath:
         tissue distribution, which is non-zero for any non-degenerate target.
         Test that:
           - aux['gene_loss_total_count'] ≈ 0 (Poisson at optimum)
-          - aux['gene_loss_positional'] is finite and >= 0
+          - aux['gene_loss_cross_track'] is finite and >= 0
           - perturbing preds away from targets strictly increases total loss
         """
         loss_fn = _make_loss_fn(num_tracks=4)
@@ -134,8 +134,8 @@ class TestComputeGeneLFCMath:
             f"Poisson term should be ~0 at pred==target, "
             f"got {aux['gene_loss_total_count'].item()}"
         )
-        assert torch.isfinite(aux["gene_loss_positional"])
-        assert aux["gene_loss_positional"].item() >= 0
+        assert torch.isfinite(aux["gene_loss_cross_track"])
+        assert aux["gene_loss_cross_track"].item() >= 0
 
         # Perturbing preds must strictly increase the total loss.
         perturbed = preds.clone()

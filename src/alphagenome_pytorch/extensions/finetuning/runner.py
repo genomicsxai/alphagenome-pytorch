@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import traceback
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -287,6 +288,116 @@ def create_datasets(
     print_rank0(f"Train: {len(train_dataset):,}  Val: {len(val_dataset):,}", rank)
 
     return train_dataset, val_dataset, modality_track_names, args.modality_resolutions
+
+
+#: Above this many tracks in a head, per-track metric series stop being
+#: readable in a dashboard and fall back to a histogram.
+MAX_NAMED_TRACK_SERIES = 32
+
+
+def track_names_for_metric(
+    key: str,
+    modality_track_names: "Mapping[str, Sequence[str]]",
+) -> "list[str] | None":
+    """Track names for a ``{modality}_...`` metric key, or None if unmatched."""
+    for modality in modality_track_names:
+        if key.startswith(f"{modality}_"):
+            return list(modality_track_names[modality])
+    return None
+
+
+def format_epoch_summary(
+    epoch: int,
+    train_loss: float,
+    val_loss: float,
+    per_modality_train_loss: "Mapping[str, float]",
+    val_metrics: "Mapping[str, Any]",
+) -> str:
+    """One-line epoch summary over the scalar validation metrics.
+
+    Non-scalars are skipped by type, not by name. A per-track metric is a list,
+    and formatting one with ``:.4f`` raises ``unsupported format string passed
+    to list.__format__`` -- which, at the epoch boundary, killed the run after a
+    full epoch of training.
+    """
+    summary = f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}"
+    for mod, mod_loss in per_modality_train_loss.items():
+        summary += f", {mod}_train={mod_loss:.4f}"
+    for key, val in val_metrics.items():
+        if isinstance(val, (list, tuple, dict)):
+            continue
+        if key.endswith("_values") or key.endswith("_std"):
+            continue
+        if "pearson" in key or "_loss" in key:
+            summary += f", {key}={val:.4f}"
+    return summary
+
+
+def split_val_metrics(
+    val_metrics: "Mapping[str, Any]",
+    modality_track_names: "Mapping[str, Sequence[str]]",
+    *,
+    gene_expr_sample_names: Sequence[str] | None = None,
+) -> tuple[dict[str, Any], dict[str, list[float]], dict[str, list[tuple[int, str, float]]]]:
+    """Split validation metrics into epoch scalars, histograms, and track rows.
+
+    Per-track lists become one named series per track when the head is small
+    enough to read that way: a histogram shows the spread but not *which* track
+    is failing, which is the whole question for e.g. a suspected dead minus
+    strand. Wider heads fall back to a histogram.
+    """
+    extra: dict[str, Any] = {}
+    histograms: dict[str, list[float]] = {}
+    track_metrics: dict[str, list[tuple[int, str, float]]] = {}
+    for key, val in val_metrics.items():
+        if key.endswith("_per_track"):
+            base = key[: -len("_per_track")]
+            names = (
+                gene_expr_sample_names if base.endswith("_gene_log_expr_pearson_one_vs_rest_lfc")
+                else track_names_for_metric(key, modality_track_names)
+            )
+            named = names is not None and len(names) == len(val)
+            labels = names if named else [f"track_{i}" for i in range(len(val))]
+            if val:
+                track_metrics[base] = [(i, name, value) for i, (name, value) in enumerate(zip(labels, val))]
+                if not named or len(val) > MAX_NAMED_TRACK_SERIES:
+                    histograms[f"{base}_per_track_values"] = list(val)
+        elif key.endswith("_values"):
+            histograms[key] = val
+        elif "pearson" in key:
+            extra[key] = val
+        else:
+            extra[f"val_loss_{key}"] = val
+    return extra, histograms, track_metrics
+
+
+def should_save_epoch_checkpoint(epoch: int, save_every: int) -> bool:
+    """Whether ``--save-every`` asks for a ``checkpoint_epoch{N}`` file at *epoch*.
+
+    ``save_every=0`` turns per-epoch checkpoints off; the best model is still
+    saved. The zero check comes first: ``epoch % 0`` raised ZeroDivisionError
+    right after the first best-model save, which killed the run.
+    """
+    return save_every > 0 and epoch % save_every == 0
+
+
+def resolve_gene_loss_settings(args) -> "tuple[dict[str, float], dict[str, str]]":
+    """Per-modality gene-LFC weights and within-gene reductions.
+
+    Only a stranded rna_seq head gets entries; other modalities stay absent, so
+    the training loop's ``.get(modality, default)`` falls back for them. The
+    reduction is resolved once during argument post-processing
+    (``args.modality_gene_reduce_funcs``) and only read here, so the loss and
+    the gene-expression validation metric cannot score the head two ways.
+    """
+    weights: dict[str, float] = {}
+    reduce_funcs: dict[str, str] = {}
+    if args.gene_loss_weight > 0 and "rna_seq" in args.modality_strands:
+        weights["rna_seq"] = args.gene_loss_weight
+        reduce_funcs["rna_seq"] = (
+            getattr(args, "modality_gene_reduce_funcs", None) or {}
+        ).get("rna_seq", "mean")
+    return weights, reduce_funcs
 
 
 ORGANISM_NAME_TO_INDEX = {"human": 0, "mouse": 1}
@@ -760,7 +871,11 @@ def main(args: argparse.Namespace | None = None) -> None:
     # which only needs a gene-only body table) and stream per-window coords to
     # the val loop so it can build exon masks.
     gene_expr_annotation = None
+    modality_gene_reduce_funcs = getattr(args, "modality_gene_reduce_funcs", {})
+    gene_expr_reduce_func = modality_gene_reduce_funcs.get("rna_seq", "mean")
     gene_expr_track_strands = None
+    gene_expr_strand_pairs = None
+    gene_expr_sample_names = None
     # Per-window exon-mask cache, created once and reused every val epoch so the
     # pandas-heavy gene lookup runs once per window for the whole run.
     gene_expr_window_cache: dict = {}
@@ -781,13 +896,12 @@ def main(args: argparse.Namespace | None = None) -> None:
                 f"GTF/parquet that includes exon features."
             )
         gene_expr_track_strands = list(args.modality_strands["rna_seq"])
-        # The metric merges each '+' track with its '-' partner (by order).
-        if gene_expr_track_strands.count("+") != gene_expr_track_strands.count("-"):
-            raise ValueError(
-                "--gene-expr-eval needs RNA-seq tracks in +/- pairs, got strands "
-                f"{''.join(gene_expr_track_strands)}"
-            )
         val_dataset.return_coords = True
+        print_rank0(
+            f"Gene-expression metric: within-gene reduction "
+            f"'{gene_expr_reduce_func}' (mean and sum both reported)",
+            rank,
+        )
 
     # Optional rich track metadata (overrides BigWig stems with parquet names
     # and embeds the catalog into checkpoints / exported delta weights).
@@ -804,6 +918,35 @@ def main(args: argparse.Namespace | None = None) -> None:
             track_metadata_rows, args.modality_strands, modality_track_names,
             organism=args.organism, rank=rank,
         )
+
+    explicit_strand_pairs = getattr(args, "modality_explicit_strand_pairs", {})
+    if gene_expr_track_strands is not None:
+        from alphagenome_pytorch.aggregation import (
+            gene_expression_samples,
+            metadata_strand_pair_ids,
+            resolve_strand_pairs,
+        )
+
+        names = modality_track_names["rna_seq"]
+        rows = track_metadata_rows or []
+        pair_ids = metadata_strand_pair_ids(rows, "rna_seq", len(names))
+        gene_expr_strand_pairs = resolve_strand_pairs(
+            gene_expr_track_strands,
+            strand_pairs=explicit_strand_pairs.get("rna_seq"),
+            strand_pair_ids=pair_ids,
+        )
+        samples = gene_expression_samples(names, gene_expr_track_strands, gene_expr_strand_pairs, pair_ids)
+        gene_expr_sample_names = [sample_id for sample_id, _ in samples]
+        ids_by_index = {
+            index: sample_id
+            for sample_id, indices in samples if len(indices) == 2
+            for index in indices
+        }
+        for row in rows:
+            head = str(row.get("output_name") or row.get("output_type") or "").lower()
+            index = row.get("track_index")
+            if head == "rna_seq" and index in ids_by_index:
+                row["strand_pair_id"] = ids_by_index[index]
 
     # The organism this fine-tune trains, resolved once here and reused for both
     # checkpoint metadata and the training/validation forward pass so producer
@@ -832,6 +975,8 @@ def main(args: argparse.Namespace | None = None) -> None:
         modality=args.modalities,
         resolutions=modality_resolutions,
         track_metadata=track_metadata_rows,
+        strand_pairs=explicit_strand_pairs,
+        gene_reduce_funcs=modality_gene_reduce_funcs,
         organism=organism_name,
         organism_indices=[organism_index],
         base_model_weights_hash=base_model_weights_hash,
@@ -901,12 +1046,9 @@ def main(args: argparse.Namespace | None = None) -> None:
                 _build_strand_channel_mask(strands).to(device)
             )
 
-    # Per-modality gene_loss_weights dict. Today only rna_seq receives a
-    # non-zero entry; other modalities are absent from the dict and the
-    # training loop's `gene_loss_weights.get(modality, 0.0)` returns 0.0.
-    gene_loss_weights: dict[str, float] = {}
-    if args.gene_loss_weight > 0:
-        gene_loss_weights["rna_seq"] = args.gene_loss_weight
+    gene_loss_weights, gene_reduce_funcs = resolve_gene_loss_settings(args)
+    if gene_reduce_funcs:
+        print_rank0(f"Gene LFC within-gene reduction: {gene_reduce_funcs}", rank)
 
     # Sequence parallelism setup
     sequence_parallel = None
@@ -1154,6 +1296,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     log_fn=logger.log_step if is_main_process(rank) else None,
                     encoder_only=encoder_only,
                     gene_loss_weights=gene_loss_weights,
+                    gene_reduce_funcs=gene_reduce_funcs,
                     gene_cross_track_weight=args.gene_cross_track_weight,
                     strand_channel_masks=gene_strand_channel_masks,
                     organism=organism_index,
@@ -1186,6 +1329,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     log_fn=logger.log_step if is_main_process(rank) else None,
                     encoder_only=encoder_only,
                     gene_loss_weights=gene_loss_weights,
+                    gene_reduce_funcs=gene_reduce_funcs,
                     gene_cross_track_weight=args.gene_cross_track_weight,
                     strand_channel_masks=gene_strand_channel_masks,
                     organism=organism_index,
@@ -1215,7 +1359,9 @@ def main(args: argparse.Namespace | None = None) -> None:
                 encoder_only=encoder_only,
                 organism=organism_index,
                 gene_annotation=gene_expr_annotation,
+                gene_expr_reduce_func=gene_expr_reduce_func,
                 gene_expr_track_strands=gene_expr_track_strands,
+                gene_expr_strand_pairs=gene_expr_strand_pairs,
                 gene_expr_window_cache=gene_expr_window_cache,
             )
 
@@ -1226,33 +1372,9 @@ def main(args: argparse.Namespace | None = None) -> None:
             current_lr = scheduler.get_last_lr()[0]
             is_best = val_loss < best_val_loss
 
-            # Print epoch summary
-            if is_main_process(rank):
-                summary = f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}"
-                # Always print per-modality losses (we always have multimodal dataset format now)
-                for mod, mod_loss in per_modality_train_loss.items():
-                    summary += f", {mod}_train={mod_loss:.4f}"
-                for key, val in val_metrics.items():
-                    if key.endswith("_values") or key.endswith("_std"):
-                        continue
-                    if "pearson" in key or "_loss" in key:
-                        summary += f", {key}={val:.4f}"
-                print(summary)
-
-            # Log epoch
-            extra = {}
-            histograms = {}
-            for key, val in val_metrics.items():
-                if key.endswith("_values"):
-                    histograms[key] = val
-                elif "pearson" in key:
-                    extra[key] = val
-                else:
-                    extra[f"val_loss_{key}"] = val
-
-            logger.log_epoch(epoch, train_loss, val_loss, current_lr, is_best, extra, histograms)
-
-            # Save checkpoints
+            # Save checkpoints BEFORE reporting: an epoch is hours of compute,
+            # and reporting is where the avoidable exceptions live (a W&B
+            # outage, an unformattable metric). Nothing below depends on it.
             if is_main_process(rank) and not args.no_save_checkpoints:
                 # Delta saves require a transfer_config (full mode now also
                 # builds one, so this only skips the delta write in legacy
@@ -1291,7 +1413,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                         )
                         print(f"  Saved best delta checkpoint (val_loss={val_loss:.4f})")
 
-                if epoch % args.save_every == 0:
+                if should_save_epoch_checkpoint(epoch, args.save_every):
                     if write_full:
                         save_checkpoint(
                             path=output_dir / f"checkpoint_epoch{epoch}.pth",
@@ -1318,6 +1440,26 @@ def main(args: argparse.Namespace | None = None) -> None:
                             **metadata_kwargs,
                             wandb_run_id=logger.wandb_run_id,
                         )
+
+            # Report the epoch. Never fatal: the checkpoint is already on disk,
+            # so a formatting or W&B failure costs a line in the dashboard, not
+            # the run.
+            try:
+                if is_main_process(rank):
+                    print(format_epoch_summary(
+                        epoch, train_loss, val_loss,
+                        per_modality_train_loss, val_metrics,
+                    ))
+                extra, histograms, track_metrics = split_val_metrics(
+                    val_metrics, modality_track_names, gene_expr_sample_names=gene_expr_sample_names,
+                )
+                logger.log_epoch(
+                    epoch, train_loss, val_loss, current_lr, is_best, extra, histograms,
+                    track_metrics=track_metrics,
+                )
+            except Exception as exc:  # noqa: BLE001 - reporting must not kill training
+                traceback.print_exc()
+                print_rank0(f"Epoch {epoch} reporting failed ({exc}); training continues", rank)
 
             barrier()
 

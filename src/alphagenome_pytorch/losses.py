@@ -11,6 +11,13 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
+# Scale of the sum-mode gene loss. It makes a given gene loss weight
+# act about as strongly as in mean mode.
+# Computed as the median ratio of sum to mean gradient norms
+# over batches of scRNA-seq data.
+_GENE_SUM_REFERENCE_LENGTH_BP = 20_000
+
+
 def _safe_masked_mean(
     x: Tensor,
     mask: Optional[Tensor] = None,
@@ -284,13 +291,13 @@ def gene_lfc_loss(
     gene_mask: Tensor,
     strand_channel_mask: Tensor,
     gene_cross_track_weight: float = 5.0,
+    reduce_func: str = "mean",
 ) -> Tuple[Tensor, Dict[str, Tensor]]:
     """Cross-track gene-level loss (Decima-style).
 
     PyTorch port of upstream JAX `GenomeTracksHead._compute_cross_track_loss`
     (google-deepmind/alphagenome_research, commit fd44ed0). Aggregates
-    predictions and targets within gene boundaries, length-normalizes per
-    gene, then computes:
+    predictions and targets within gene boundaries, then computes:
       - Poisson NLL on the per-gene total expression across active tracks.
       - Multinomial NLL on the cross-track (tissue) distribution per gene,
         weighted by `gene_cross_track_weight` (paper default 5.0).
@@ -309,25 +316,55 @@ def gene_lfc_loss(
         strand_channel_mask: Boolean track strand-compatibility mask,
             shape `[2, 1, C]`. Built from per-track strand metadata.
         gene_cross_track_weight: Inner multiplier on the multinomial term.
+        reduce_func: How to reduce signal within a gene body.
+
+            ``'mean'`` (default, matches upstream JAX) divides each gene by its
+            own masked length, giving a per-bp rate. Correct for full-length
+            assays, where coverage is spread along the transcript.
+
+            ``'sum'`` uses the total signal for 3'-biased assays, where reads
+            pile up near the 3' end. Both computed loss terms are then divided
+            by a fixed 20,000 bp reference length, so that a given gene loss
+            weight acts about as strongly as in ``'mean'`` mode. Every gene and
+            batch uses the same factor.
 
     Returns:
         (loss, aux) where aux carries `gene_loss_total_count` and
-        `gene_loss_positional` for logging/diagnostics.
+        `gene_loss_cross_track` for logging/diagnostics.
+
+        `gene_loss_cross_track` is the multinomial term, and it is a
+        distribution over **tracks**, not positions: each gene's signal is
+        normalized by its own total across the strand-compatible tracks, so the
+        term asks whether a gene's split across cell types is right once its
+        overall level is accounted for. The upstream JAX implementation names
+        this local `loss_positional`, by analogy with the per-position
+        multinomial in the main loss; the name is kept out of the logs here
+        because the two quantities are not the same thing, and
+        `gene_cross_track_weight` (which scales this term) already says so.
     """
     if gene_mask.dim() != 4:
         raise ValueError(
             f"gene_mask must have shape [B, S, 2, G]; got {tuple(gene_mask.shape)}"
         )
 
+    if reduce_func not in ('mean', 'sum'):
+        raise ValueError(
+            f"reduce_func must be 'mean' or 'sum'; got {reduce_func!r}"
+        )
+
     gene_mask_f = gene_mask.float()
 
-    # gene_length: [B, 2, G] (sum over S)
+    # gene_length: [B, 2, G] (sum over S). Only genes fully contained in the
+    # window get a mask column (GeneMaskExtractor drops overhanging genes), so
+    # this is the complete gene body length, never a clipped portion.
     gene_length = gene_mask_f.sum(dim=-3)
-    safe_gene_length = gene_length.unsqueeze(-1).clamp(min=1.0)  # [B, 2, G, 1]
-
-    # Aggregate within gene boundaries, length-normalized: [B, 2, G, C]
-    y_true = torch.einsum('bsc,bszg->bzgc', targets.float(), gene_mask_f) / safe_gene_length
-    y_pred = torch.einsum('bsc,bszg->bzgc', predictions.float(), gene_mask_f) / safe_gene_length
+    # Aggregate within gene boundaries: [B, 2, G, C]
+    y_true = torch.einsum('bsc,bszg->bzgc', targets.float(), gene_mask_f)
+    y_pred = torch.einsum('bsc,bszg->bzgc', predictions.float(), gene_mask_f)
+    if reduce_func == 'mean':
+        divisor = gene_length.unsqueeze(-1).clamp(min=1.0)  # [B, 2, G, 1]
+        y_true = y_true / divisor
+        y_pred = y_pred / divisor
 
     batch_size, _, num_channels = predictions.shape
 
@@ -364,12 +401,16 @@ def gene_lfc_loss(
 
     # Multinomial NLL on cross-track distribution per gene.
     prob_predictions = y_pred / (total_pred + 1e-7)
-    loss_positional = -y_true * torch.log(prob_predictions + 1e-7)
-    loss_positional = _safe_masked_mean(loss_positional, combined_mask)
+    loss_cross_track = -y_true * torch.log(prob_predictions + 1e-7)
+    loss_cross_track = _safe_masked_mean(loss_cross_track, combined_mask)
 
-    loss = loss_total_count + gene_cross_track_weight * loss_positional
+    if reduce_func == 'sum':
+        loss_total_count = loss_total_count / _GENE_SUM_REFERENCE_LENGTH_BP
+        loss_cross_track = loss_cross_track / _GENE_SUM_REFERENCE_LENGTH_BP
+
+    loss = loss_total_count + gene_cross_track_weight * loss_cross_track
     aux = {
         'gene_loss_total_count': loss_total_count,
-        'gene_loss_positional': loss_positional,
+        'gene_loss_cross_track': loss_cross_track,
     }
     return loss, aux

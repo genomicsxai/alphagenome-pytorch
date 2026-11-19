@@ -63,7 +63,9 @@ __all__ = [
     "aggregate_intervals",
     "normalize_expression",
     "collapse_strand_pairs",
+    "resolve_strand_pairs",
     "gene_expression_correlations",
+    "gene_expression_fold_change_correlations",
     "GeneCounts",
     "GeneCountAccumulator",
     "aggregate_genes",
@@ -200,40 +202,104 @@ def normalize_expression(matrix: Tensor) -> Tensor:
     return qn
 
 
-def collapse_strand_pairs(values: Tensor, track_strands: "Sequence[str]") -> Tensor:
-    """Merge strand-matched ``+``/``-`` track pairs into one sense column each.
+def resolve_strand_pairs(
+    track_strands: Sequence[str],
+    *,
+    strand_pairs: Sequence[tuple[int, int]] | None = None,
+    strand_pair_ids: Sequence[str | None] | None = None,
+) -> list[tuple[int, int]]:
+    """Resolve biological pairs from explicit indices or shared metadata IDs."""
+    _validate_track_strands(track_strands)
+    stranded = {i for i, strand in enumerate(track_strands) if strand != "."}
+    if strand_pairs is None:
+        if not stranded:
+            return []
+        if strand_pair_ids is None or len(strand_pair_ids) != len(track_strands):
+            raise ValueError("Stranded gene-expression metrics require explicit --strand-pairs or shared strand_pair_id metadata.")
+        groups: dict[str, dict[str, int]] = {}
+        for index, (strand, pair_id) in enumerate(zip(track_strands, strand_pair_ids)):
+            if strand == ".":
+                continue
+            if not pair_id:
+                raise ValueError(f"Stranded track {index} has no strand_pair_id. Supply explicit --strand-pairs or metadata.")
+            group = groups.setdefault(pair_id, {})
+            if strand in group:
+                raise ValueError(f"strand_pair_id {pair_id!r} has more than one {strand!r} track.")
+            group[strand] = index
+        strand_pairs = []
+        for pair_id, group in groups.items():
+            if set(group) != {"+", "-"}:
+                raise ValueError(f"strand_pair_id {pair_id!r} must identify one '+' and one '-' track.")
+            strand_pairs.append((group["+"], group["-"]))
 
-    After strand matching, a stranded ``[G, C]`` matrix is NaN in every
-    off-strand cell, so no gene has a complete row and the normalized
-    correlations are undefined. Pairing the i-th ``+`` track with the i-th
-    ``-`` track (in column order, e.g. interleaved ``+,-,+,-`` per sample) and
-    keeping each gene's sense value gives a dense ``[G, P + D]`` matrix: one
-    column per pair, followed by the ``D`` unstranded (``'.'``) tracks.
+    used: set[int] = set()
+    for plus, minus in strand_pairs:
+        if (plus not in stranded or minus not in stranded
+                or track_strands[plus] != "+" or track_strands[minus] != "-"):
+            raise ValueError(f"Strand pair ({plus}, {minus}) must index a '+' track and then a '-' track.")
+        if plus in used or minus in used:
+            raise ValueError("Each stranded track must belong to exactly one explicit pair.")
+        used.update((plus, minus))
+    if used != stranded:
+        raise ValueError(f"Explicit strand pairs leave stranded tracks unpaired: {sorted(stranded - used)}.")
+    return list(strand_pairs)
 
-    Args:
-        values: ``[G, C]`` strand-matched values (off-strand cells NaN).
-        track_strands: per-track ``'+'``/``'-'``/``'.'`` labels, length ``C``.
-    """
-    strands = [str(t) for t in track_strands]
-    _validate_track_strands(strands)
-    if values.shape[-1] != len(strands):
+
+def metadata_strand_pair_ids(
+    rows: Sequence[dict[str, Any]], modality: str, n_tracks: int,
+) -> list[str | None]:
+    """Read explicit pair IDs in track-index order from a metadata catalog."""
+    by_index = {
+        int(row["track_index"]): row.get("strand_pair_id")
+        for row in rows
+        if str(row.get("output_name") or row.get("output_type") or "").lower() == modality.lower()
+        and row.get("track_index") is not None
+    }
+    return [str(value) if isinstance(value, str) and value.strip() else None
+            for value in (by_index.get(i) for i in range(n_tracks))]
+
+
+def gene_expression_samples(
+    track_names: Sequence[str],
+    track_strands: Sequence[str],
+    strand_pairs: Sequence[tuple[int, int]],
+    strand_pair_ids: Sequence[str | None],
+) -> list[tuple[str, tuple[int, ...]]]:
+    """Return sample identities and source track indices in collapsed matrix order."""
+    labels = [
+        strand_pair_ids[p] if strand_pair_ids[p] == strand_pair_ids[m] else None
+        for p, m in strand_pairs
+    ]
+    if not all(labels) or len(set(labels)) != len(labels):
+        labels = [
+            f"{track_names[p]} / {track_names[m]} [{p},{m}]" for p, m in strand_pairs
+        ]
+    samples: list[tuple[str, tuple[int, ...]]] = [
+        (str(label), pair) for label, pair in zip(labels, strand_pairs)
+    ]
+    samples.extend(
+        (track_names[i], (i,)) for i, strand in enumerate(track_strands) if strand == "."
+    )
+    return samples
+
+
+def collapse_strand_pairs(
+    values: Tensor,
+    track_strands: Sequence[str],
+    *,
+    strand_pairs: Sequence[tuple[int, int]] | None = None,
+    strand_pair_ids: Sequence[str | None] | None = None,
+) -> Tensor:
+    """Keep one sense value per explicitly identified pair, then unstranded tracks."""
+    if values.shape[-1] != len(track_strands):
         raise ValueError(
-            f"track_strands has {len(strands)} entries but values have "
+            f"track_strands has {len(track_strands)} entries but values have "
             f"{values.shape[-1]} tracks."
         )
-    plus = [i for i, t in enumerate(strands) if t == "+"]
-    minus = [i for i, t in enumerate(strands) if t == "-"]
-    unstranded = [i for i, t in enumerate(strands) if t == "."]
-    if len(plus) != len(minus):
-        raise ValueError(
-            f"cannot pair {len(plus)} '+' tracks with {len(minus)} '-' tracks."
-        )
-    # nanmean: the sense value for stranded genes, the average for '.' genes.
-    columns = [values[:, [p, m]].nanmean(dim=1) for p, m in zip(plus, minus)]
-    columns.extend(values[:, i] for i in unstranded)
-    if not columns:
-        return values[:, :0]
-    return torch.stack(columns, dim=1)
+    pairs = resolve_strand_pairs(track_strands, strand_pairs=strand_pairs, strand_pair_ids=strand_pair_ids)
+    columns = [values[:, [p, m]].nanmean(dim=1) for p, m in pairs]
+    columns.extend(values[:, i] for i, strand in enumerate(track_strands) if strand == ".")
+    return torch.stack(columns, dim=1) if columns else values[:, :0]
 
 
 def _gene_expression_correlation_arrays(
@@ -241,6 +307,7 @@ def _gene_expression_correlation_arrays(
     obs: Tensor,
     *,
     track_strands: "Sequence[str] | None" = None,
+    strand_pairs: Sequence[tuple[int, int]] | None = None,
     eps: float = 1e-8,
 ) -> dict[str, Tensor]:
     """Per-track and per-gene values behind :func:`gene_expression_correlations`.
@@ -258,8 +325,8 @@ def _gene_expression_correlation_arrays(
     if pred.shape != obs.shape:
         raise ValueError(f"pred {tuple(pred.shape)} and obs {tuple(obs.shape)} must match")
     if track_strands is not None:
-        pred = collapse_strand_pairs(pred, track_strands)
-        obs = collapse_strand_pairs(obs, track_strands)
+        pred = collapse_strand_pairs(pred, track_strands, strand_pairs=strand_pairs)
+        obs = collapse_strand_pairs(obs, track_strands, strand_pairs=strand_pairs)
     pred = pred.float()
     obs = obs.float()
 
@@ -292,6 +359,7 @@ def gene_expression_correlations(
     obs: Tensor,
     *,
     track_strands: "Sequence[str] | None" = None,
+    strand_pairs: Sequence[tuple[int, int]] | None = None,
     eps: float = 1e-8,
 ) -> dict[str, float]:
     """The three AlphaGenome gene-expression correlations.
@@ -302,7 +370,7 @@ def gene_expression_correlations(
             are dropped pairwise for the raw metric; genes with any NaN are left
             out of the normalized metrics.
         track_strands: per-track strands of strand-matched input. When given,
-            ``+``/``-`` pairs are merged into one sense column first (see
+            explicit ``strand_pairs`` are merged into one sense column first (see
             :func:`collapse_strand_pairs`). Without it, strand-matched stranded
             input has no complete genes and the normalized metrics are NaN.
         eps: numerical epsilon.
@@ -315,11 +383,84 @@ def gene_expression_correlations(
           * ``across_tracks_norm`` — same normalized data, per-gene across tracks
     """
     arrays = _gene_expression_correlation_arrays(
-        pred, obs, track_strands=track_strands, eps=eps,
+        pred, obs, track_strands=track_strands, strand_pairs=strand_pairs, eps=eps,
     )
     return {
         key: float(_nanmean(arrays[key]))
         for key in ("across_genes", "across_genes_norm", "across_tracks_norm")
+    }
+
+
+def _leave_one_out_mean(x: Tensor) -> Tensor:
+    """NaN-aware mean over all *other* columns, ``[G, C] -> [G, C]``.
+
+    Column ``c`` of the result is the mean of columns ``!= c``, ignoring NaN.
+    Entries with no other valid column are NaN.
+    """
+    valid = ~torch.isnan(x)
+    x0 = torch.where(valid, x, torch.zeros_like(x))
+    rest_sum = x0.sum(dim=1, keepdim=True) - x0
+    rest_cnt = valid.sum(dim=1, keepdim=True) - valid.long()
+    out = rest_sum / rest_cnt.clamp(min=1).float()
+    return torch.where(rest_cnt > 0, out, torch.full_like(out, float("nan")))
+
+
+def gene_expression_fold_change_correlations(
+    pred: Tensor,
+    obs: Tensor,
+    *,
+    eps: float = 1e-8,
+) -> dict[str, float | list[float]]:
+    """One-vs-rest log2 fold-change correlation, per track.
+
+    Inspired by Borzoi Prime’s differential-expression evaluation. For each track,
+    take the ratio of that track to the mean of the remaining tracks -- formed
+    *within* predictions and *within* observations, not across them -- and
+    correlate the two log2 ratio vectors across genes. One r per track.
+
+    This is the metric that says whether fine-tuning learned anything
+    cell-type-specific. Absolute expression is largely inherited from the
+    pretrained trunk; the differential between samples is what an adapter has to
+    add, so this number can sit near zero while ``across_genes`` looks healthy.
+
+    Pass one sense column per sample for stranded libraries. This metric
+    correlates the supplied fold changes using Pearson. Borzoi Prime's
+    six-cell-type fold-change benchmark uses Spearman and adds track-specific
+    pseudocounts before forming the ratios.
+
+    Args:
+        pred: ``[G, C]`` predicted gene x track expression, ``log1p`` space.
+        obs: ``[G, C]`` observed gene x track expression, ``log1p`` space.
+        eps: numerical epsilon.
+
+    Returns:
+        ``one_vs_rest_lfc`` (mean over tracks) and ``one_vs_rest_lfc_per_track``
+        (one entry per track). NaN when there are fewer than two tracks, or
+        fewer than two genes with a defined ratio on both sides.
+    """
+    if pred.shape != obs.shape:
+        raise ValueError(f"pred {tuple(pred.shape)} and obs {tuple(obs.shape)} must match")
+
+    n_genes, n_tracks = pred.shape
+    if n_tracks < 2 or n_genes < 2:
+        return {
+            "one_vs_rest_lfc": float("nan"),
+            "one_vs_rest_lfc_per_track": [float("nan")] * n_tracks,
+        }
+
+    def _log_ratio(x: Tensor) -> Tensor:
+        # log1p space -> linear, so the ratio is a fold change in the measured
+        # units rather than a difference of logs (they differ at low counts).
+        lin = torch.expm1(x.float())
+        rest = _leave_one_out_mean(lin)
+        ok = (lin > 0) & (rest > 0)
+        ratio = torch.where(ok, lin / rest.clamp(min=eps), torch.full_like(lin, float("nan")))
+        return torch.log2(ratio)
+
+    per_track = _nan_pearson(_log_ratio(pred), _log_ratio(obs), dim=0, eps=eps)  # [C]
+    return {
+        "one_vs_rest_lfc": float(_nanmean(per_track)),
+        "one_vs_rest_lfc_per_track": [float(v) for v in per_track],
     }
 
 
@@ -847,6 +988,7 @@ def gene_expression_values(
     *,
     min_exon_fraction: float = 0.5,
     log: str | None = "log1p",
+    reduce: str = "mean",
     track_strands: "Sequence[str] | None" = None,
     window_cache: dict | None = None,
 ):
@@ -863,6 +1005,14 @@ def gene_expression_values(
         predictions: ``[S, C]`` or ``[1, S, C]`` predictions for one window.
         annotation: a :class:`~alphagenome_pytorch.annotations.GeneAnnotation` with exon rows.
         interval: ``(chrom, start, end)`` of this window.
+        reduce: ``"mean"`` (default) for length-normalized coverage, matching
+            the AlphaGenome paper metric, or ``"sum"`` for total exon signal.
+            ``"sum"`` is the right estimate for a 3'-biased library, where
+            reads pile up at the 3' end and do not scale with gene length.
+            Only the ``across_*`` correlations depend on this choice; the
+            one-vs-rest fold change is invariant, since every track of a gene
+            shares the same divisor (see
+            :func:`gene_expression_fold_change_correlations`).
         track_strands: per-track strand chars for strand matching (optional).
         window_cache: optional dict memoizing the per-window annotation lookup
             (the only pandas-heavy step). Pass the same dict for the pred and obs
@@ -877,7 +1027,7 @@ def gene_expression_values(
         annotation, interval, predictions.shape[1],
         min_exon_fraction=min_exon_fraction, cache=window_cache,
     )
-    counts = _aggregate_exon_window(predictions, window, reduce="mean", log=log)
+    counts = _aggregate_exon_window(predictions, window, reduce=reduce, log=log)
     values = counts[0]  # [G, C]
     if track_strands is not None and values.numel() > 0:
         values = _strand_match_values(values, window.gene_strands, track_strands)
@@ -910,13 +1060,15 @@ def combine_gene_expression(
     windows: "Sequence[tuple[Sequence[str], Tensor, Tensor]]",
     *,
     track_strands: "Sequence[str] | None" = None,
+    strand_pairs: Sequence[tuple[int, int]] | None = None,
     eps: float = 1e-8,
-) -> dict[str, float]:
+) -> dict[str, float | int | list[float]]:
     """Combine per-window ``(gene_ids, pred[G,C], obs[G,C])`` into gene-expression correlations.
 
     Genes are deduplicated by id across windows (first occurrence wins), avoiding
     duplicate genes across overlapping windows. Pass the ``track_strands`` used
-    for strand matching so ``+``/``-`` pairs are merged before correlating (see
+    for strand matching and explicit ``strand_pairs`` so the metrics share the
+    same sample columns (see
     :func:`gene_expression_correlations`). Returns the three correlation flavors
     plus ``n_genes``.
     """
@@ -933,17 +1085,26 @@ def combine_gene_expression(
             pred_rows.append(pred[gi].float().cpu())
             obs_rows.append(obs[gi].float().cpu())
     if len(pred_rows) < 2:
+        if track_strands is not None:
+            pairs = resolve_strand_pairs(track_strands, strand_pairs=strand_pairs)
+            n_tracks = len(pairs) + track_strands.count(".")
+        else:
+            n_tracks = pred_rows[0].shape[-1] if pred_rows else 0
         return {
             "across_genes": float("nan"),
             "across_genes_norm": float("nan"),
             "across_tracks_norm": float("nan"),
+            "one_vs_rest_lfc": float("nan"),
+            "one_vs_rest_lfc_per_track": [float("nan")] * n_tracks,
             "n_genes": len(pred_rows),
         }
     pred_m = torch.stack(pred_rows, dim=0)  # [G_total, C]
     obs_m = torch.stack(obs_rows, dim=0)
-    result = gene_expression_correlations(
-        pred_m, obs_m, track_strands=track_strands, eps=eps,
-    )
+    if track_strands is not None:
+        pred_m = collapse_strand_pairs(pred_m, track_strands, strand_pairs=strand_pairs)
+        obs_m = collapse_strand_pairs(obs_m, track_strands, strand_pairs=strand_pairs)
+    result = gene_expression_correlations(pred_m, obs_m, eps=eps)
+    result.update(gene_expression_fold_change_correlations(pred_m, obs_m, eps=eps))
     result["n_genes"] = len(pred_rows)
     return result
 

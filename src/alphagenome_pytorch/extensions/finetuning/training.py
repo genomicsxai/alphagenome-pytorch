@@ -197,6 +197,7 @@ def compute_finetuning_loss(
     gene_mask: Tensor | None = None,
     gene_loss_weight: float = 0.0,
     gene_cross_track_weight: float = 5.0,
+    gene_reduce_func: str = "mean",
     strand_channel_mask: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Compute combined loss across resolutions.
@@ -224,6 +225,9 @@ def compute_finetuning_loss(
         gene_loss_weight: Outer weight on the gene LFC term (paper: 0.1).
             Default 0.0 disables the term entirely (no behavioral change vs.
             the pre-B3.2 loss path).
+        gene_reduce_func: Within-gene reduction for the gene LFC term,
+            'mean' (per-bp rate, full-length assays) or 'sum' (total signal,
+            3'-biased assays). See `losses.gene_lfc_loss`.
         gene_cross_track_weight: Inner weight on the multinomial component
             of the gene LFC term (paper default: 5.0).
         strand_channel_mask: Optional `[2, 1, C]` track strand-compatibility
@@ -309,11 +313,12 @@ def compute_finetuning_loss(
                 gene_mask=gene_mask,
                 strand_channel_mask=strand_channel_mask,
                 gene_cross_track_weight=gene_cross_track_weight,
+                reduce_func=gene_reduce_func,
             )
             res_loss = res_loss + gene_loss_weight * gene_loss
             loss_dict["loss_gene_lfc"] = gene_loss
             loss_dict["loss_gene_total_count"] = gene_aux["gene_loss_total_count"]
-            loss_dict["loss_gene_positional"] = gene_aux["gene_loss_positional"]
+            loss_dict["loss_gene_cross_track"] = gene_aux["gene_loss_cross_track"]
 
         total_loss = total_loss + weight * res_loss
         loss_dict[f"loss_{res}bp"] = res_loss
@@ -339,6 +344,7 @@ def train_epoch(
     *,
     gene_loss_weight: float = 0.0,
     gene_cross_track_weight: float = 5.0,
+    gene_reduce_func: str = "mean",
     strand_channel_mask: Tensor | None = None,
     organism: int = 0,
 ) -> float:
@@ -366,6 +372,8 @@ def train_epoch(
             RNA-seq). Default 0.0 disables. Requires `train_loader` to yield
             3-tuples (sequence, targets, gene_mask) and `strand_channel_mask`
             to be set.
+        gene_reduce_func: Within-gene reduction for the gene LFC term
+            ('mean' or 'sum'). See `losses.gene_lfc_loss`.
         gene_cross_track_weight: Inner multinomial weight inside the gene LFC
             term (paper default: 5.0).
         strand_channel_mask: `[2, 1, C]` track strand-compatibility mask,
@@ -440,6 +448,7 @@ def train_epoch(
                 gene_mask=gene_mask,
                 gene_loss_weight=gene_loss_weight,
                 gene_cross_track_weight=gene_cross_track_weight,
+                gene_reduce_func=gene_reduce_func,
                 strand_channel_mask=strand_channel_mask,
             )
 
@@ -679,16 +688,20 @@ def _accumulate_gene_expr_windows(
     coords: list,
     annotation: Any,
     track_strands: list[str] | None,
+    reduce: str = "mean",
     window_cache: dict | None = None,
 ) -> None:
     """Append per-window ``(gene_ids, pred[G,C], obs[G,C])`` for the val metric.
 
     For each window in the batch, build exon masks (≥50%-exon rule, strand-matched
-    to ``track_strands``) and aggregate log-mean exon coverage for the predicted
-    and observed RNA-seq signal. Windows with no qualifying gene are skipped.
-    ``window_cache`` (a plain dict reused across batches and epochs) memoizes the
-    per-window annotation lookup so it runs once per unique window, and lets the
-    pred and obs calls of a window share it.
+    to ``track_strands``) and aggregate log exon coverage for the predicted and
+    observed RNA-seq signal. ``reduce`` picks the within-gene reduction: ``mean``
+    divides by exon length (the paper metric, right for full-length libraries),
+    ``sum`` does not (right for 3'-biased libraries). Windows with no qualifying
+    gene are skipped. ``window_cache`` (a plain dict reused across batches and
+    epochs) memoizes the per-window annotation lookup so it runs once per unique
+    window, and lets the pred and obs calls of a window share it — including the
+    calls for a second ``reduce``, which then costs only the masked matmul.
     """
     from alphagenome_pytorch.aggregation import gene_expression_values
 
@@ -696,50 +709,77 @@ def _accumulate_gene_expr_windows(
     for b in range(batch_size):
         interval = tuple(coords[b])
         pred_vals, gene_ids, _ = gene_expression_values(
-            pred_unscaled[b], annotation, interval,
-            log="log1p", track_strands=track_strands, window_cache=window_cache,
+            pred_unscaled[b], annotation, interval, log="log1p", reduce=reduce,
+            track_strands=track_strands, window_cache=window_cache,
         )
         if pred_vals.numel() == 0:
             continue
         obs_vals, _, _ = gene_expression_values(
-            targets[b], annotation, interval,
-            log="log1p", track_strands=track_strands, window_cache=window_cache,
+            targets[b], annotation, interval, log="log1p", reduce=reduce,
+            track_strands=track_strands, window_cache=window_cache,
         )
         windows.append((gene_ids, pred_vals.float().cpu(), obs_vals.float().cpu()))
 
 
+#: Within-gene reductions the gene-expression metric reports, in a fixed order
+#: so every rank runs the same number of collectives.
+GENE_EXPR_REDUCE_FUNCS: tuple[str, ...] = ("mean", "sum")
+
+
 def _gene_expr_metrics(
-    gene_expr_windows: list,
+    gene_expr_windows: dict[str, list],
     *,
     modality: str,
+    primary: str = "mean",
     world_size: int = 1,
     track_strands: list[str] | None = None,
-) -> dict[str, float]:
+    strand_pairs: list[tuple[int, int]] | None = None,
+) -> dict[str, Any]:
     """Reduce accumulated per-window ``(gene_ids, pred, obs)`` to gene-expression correlations.
 
-    Gathers windows across ranks (DDP), deduplicates genes, and returns the three
+    Gathers windows across ranks (DDP), deduplicates genes, and returns the
     correlation flavors plus the gene count under ``{modality}_gene_log_expr_*``
-    keys. ``track_strands`` must be the strands the windows were matched with, so
-    ``+``/``-`` track pairs are merged before correlating. Pure given
-    ``gene_expr_windows`` (the ``world_size == 1`` path needs no distributed
-    context), so it is unit-testable without a model.
+    keys. Explicit strand pairs apply to both reductions. Pure given ``gene_expr_windows`` (the ``world_size == 1`` path needs no
+    distributed context), so it is unit-testable without a model.
+
+    ``gene_expr_windows`` maps a within-gene reduction to its accumulated
+    windows. Both reductions are reported, each under its own
+    ``..._pearson_{mean,sum}_*`` key, so a run is comparable with a run whose
+    library type differs. ``primary`` -- the head's own reduction -- also
+    populates the unsuffixed keys, which is what the training loop prints and
+    what existing dashboards already plot. The one-vs-rest fold change is
+    emitted once, unsuffixed: every track of a gene shares the same divisor, so
+    the ratio is identical under both reductions.
     """
     from alphagenome_pytorch.aggregation import combine_gene_expression
 
-    all_windows = gene_expr_windows
-    if world_size > 1:
-        gathered: list = [None] * world_size
-        dist.all_gather_object(gathered, gene_expr_windows)
-        all_windows = [w for part in gathered if part for w in part]
+    results: dict[str, dict] = {}
+    for reduce_func in GENE_EXPR_REDUCE_FUNCS:
+        windows = gene_expr_windows.get(reduce_func, [])
+        if world_size > 1:
+            gathered: list = [None] * world_size
+            dist.all_gather_object(gathered, windows)
+            windows = [w for part in gathered if part for w in part]
+        results[reduce_func] = combine_gene_expression(
+            windows, track_strands=track_strands, strand_pairs=strand_pairs,
+        )
 
-    ge = combine_gene_expression(all_windows, track_strands=track_strands)
     prefix = f"{modality}_gene_log_expr_pearson"
-    return {
+    metrics: dict[str, Any] = {}
+    for reduce_func, ge in results.items():
+        for key in ("across_genes", "across_genes_norm", "across_tracks_norm"):
+            metrics[f"{prefix}_{reduce_func}_{key}"] = ge[key]
+
+    ge = results[primary]
+    metrics.update({
         f"{prefix}_across_genes": ge["across_genes"],
         f"{prefix}_across_genes_norm": ge["across_genes_norm"],
         f"{prefix}_across_tracks_norm": ge["across_tracks_norm"],
+        f"{prefix}_one_vs_rest_lfc": ge["one_vs_rest_lfc"],
+        f"{prefix}_one_vs_rest_lfc_per_track": ge["one_vs_rest_lfc_per_track"],
         f"{modality}_gene_log_expr_n_genes": ge["n_genes"],
-    }
+    })
+    return metrics
 
 
 def _compute_multinomial_resolution(
@@ -1281,6 +1321,9 @@ def validate_ddp(
                     all_profile_r = gather_tensors(all_profile_r, world_size, device)
 
                 metrics[f"{res}bp_profile_pearson_r_mean"] = all_profile_r.mean().item()
+                metrics[f"{res}bp_profile_pearson_r_per_track"] = (
+                    torch.nanmean(all_profile_r, dim=0).tolist()
+                )
                 metrics[f"{res}bp_profile_pearson_r_std"] = all_profile_r.std().item()
                 # Store full distribution for wandb histogram
                 metrics[f"{res}bp_profile_pearson_r_values"] = all_profile_r.flatten().tolist()
@@ -1298,6 +1341,7 @@ def validate_ddp(
                 if all_pred_counts.shape[0] > 1:
                     count_r = pearson_r(all_pred_counts, all_true_counts, dim=0)  # (tracks,)
                     metrics[f"{res}bp_count_pearson_r"] = count_r.mean().item()
+                    metrics[f"{res}bp_count_pearson_r_per_track"] = count_r.tolist()
                 else:
                     metrics[f"{res}bp_count_pearson_r"] = float("nan")
 
@@ -1331,6 +1375,7 @@ def train_epoch_multihead(
     encoder_only: bool = False,
     *,
     gene_loss_weights: dict[str, float] | None = None,
+    gene_reduce_funcs: dict[str, str] | None = None,
     gene_cross_track_weight: float = 5.0,
     strand_channel_masks: dict[str, Tensor] | None = None,
     organism: int = 0,
@@ -1405,6 +1450,7 @@ def train_epoch_multihead(
     accumulated_batches = 0
 
     gene_loss_weights = gene_loss_weights or {}
+    gene_reduce_funcs = gene_reduce_funcs or {}
 
     for batch_idx, batch_data in enumerate(pbar):
         # collate_multimodal yields an optional extras dict (gene_mask/coords).
@@ -1530,6 +1576,7 @@ def train_epoch_multihead(
                 # has a non-zero entry in `gene_loss_weights`. Mirrors
                 # upstream which threads gene_mask only through res=1.
                 gene_w = gene_loss_weights.get(modality, 0.0)
+                gene_agg = gene_reduce_funcs.get(modality, "mean")
                 if (
                     res == 1
                     and gene_w > 0
@@ -1544,11 +1591,12 @@ def train_epoch_multihead(
                         gene_mask=gene_mask,
                         strand_channel_mask=strand_channel_masks[modality],
                         gene_cross_track_weight=gene_cross_track_weight,
+                        reduce_func=gene_agg,
                     )
                     res_loss = res_loss + weight * gene_w * gene_loss
                     loss_components[f"{modality}_gene_lfc"] = gene_loss.item()
                     loss_components[f"{modality}_gene_total_count"] = gene_aux["gene_loss_total_count"].item()
-                    loss_components[f"{modality}_gene_positional"] = gene_aux["gene_loss_positional"].item()
+                    loss_components[f"{modality}_gene_cross_track"] = gene_aux["gene_loss_cross_track"].item()
 
                 modality_loss = modality_loss + res_loss
                 loss_components[f"{modality}_loss_{res}bp"] = res_loss.item()
@@ -1687,7 +1735,9 @@ def validate_multihead(
     organism: int = 0,
     gene_annotation: Any = None,
     gene_expr_track_strands: list[str] | None = None,
+    gene_expr_strand_pairs: list[tuple[int, int]] | None = None,
     gene_expr_modality: str = "rna_seq",
+    gene_expr_reduce_func: str = "mean",
     gene_expr_resolution: int | None = None,
     gene_expr_window_cache: dict | None = None,
 ) -> tuple[float, dict[str, Any]]:
@@ -1713,7 +1763,7 @@ def validate_multihead(
         gene_annotation: Optional ``GeneAnnotation`` (with exon rows) enabling the
             gene-expression validation metric for
             ``gene_expr_modality``. When set (and ``compute_pearson``), per-window
-            log-mean exon coverage is aggregated for predictions and observed
+            log exon coverage is aggregated for predictions and observed
             targets, deduplicated across windows, and three Pearson correlations
             are emitted: ``{modality}_gene_log_expr_pearson_{across_genes,
             across_genes_norm, across_tracks_norm}``.
@@ -1722,6 +1772,12 @@ def validate_multihead(
             correct metric when tracks are stranded.
         gene_expr_modality: Modality the gene-expression metric applies to
             (default ``"rna_seq"``).
+        gene_expr_reduce_func: The head's within-gene reduction, ``'mean'``
+            (length-normalized, full-length libraries) or ``'sum'`` (3'-biased
+            libraries). Both are always reported under ``..._pearson_mean_*``
+            and ``..._pearson_sum_*``; this one also fills the unsuffixed keys.
+            Pass the same value the gene LFC loss uses, so the loss and the
+            metric agree about what a head is estimating.
         gene_expr_resolution: Resolution of the head output the metric reads.
             Defaults to 128 under ``encoder_only`` (those heads emit 128bp only)
             and 1 otherwise. The metric itself is resolution-agnostic — it
@@ -1778,7 +1834,12 @@ def validate_multihead(
                 + (" (encoder_only forces 128bp)" if encoder_only else "")
                 + ". Pass gene_expr_resolution matching an emitted resolution."
             )
-    gene_expr_windows: list[tuple[list[str], Tensor, Tensor]] = []
+    # One accumulator per within-gene reduction: both are reported, and the
+    # second costs only a masked matmul because the per-window annotation
+    # lookup is shared through `gene_expr_window_cache`.
+    gene_expr_windows: dict[str, list[tuple[list[str], Tensor, Tensor]]] = {
+        reduce_func: [] for reduce_func in GENE_EXPR_REDUCE_FUNCS
+    }
 
     if is_main_process(rank):
         pbar = tqdm(val_loader, desc="Validation")
@@ -1881,15 +1942,17 @@ def validate_multihead(
                             and res == gene_expr_resolution
                             and coords is not None
                         ):
-                            _accumulate_gene_expr_windows(
-                                gene_expr_windows,
-                                pred_unscaled=pred_unscaled,
-                                targets=targets,
-                                coords=coords,
-                                annotation=gene_annotation,
-                                track_strands=gene_expr_track_strands,
-                                window_cache=gene_expr_window_cache,
-                            )
+                            for reduce_func in GENE_EXPR_REDUCE_FUNCS:
+                                _accumulate_gene_expr_windows(
+                                    gene_expr_windows[reduce_func],
+                                    pred_unscaled=pred_unscaled,
+                                    targets=targets,
+                                    coords=coords,
+                                    annotation=gene_annotation,
+                                    track_strands=gene_expr_track_strands,
+                                    reduce=reduce_func,
+                                    window_cache=gene_expr_window_cache,
+                                )
 
                 weighted_modality_loss = modality_loss * modality_weight
                 loss = loss + weighted_modality_loss
@@ -1926,6 +1989,13 @@ def validate_multihead(
                     if world_size > 1:
                         all_profile_r = gather_tensors(all_profile_r, world_size, device)
                     metrics[f"{modality}_{res}bp_profile_pearson_r_mean"] = all_profile_r.mean().item()
+                    # Per track, not per (region, track): the flattened
+                    # `_values` list below mixes both axes, so it cannot say
+                    # *which* track is underperforming. Named per-track scalars
+                    # are what diagnose e.g. a dead minus strand.
+                    metrics[f"{modality}_{res}bp_profile_pearson_r_per_track"] = (
+                        torch.nanmean(all_profile_r, dim=0).tolist()
+                    )
                     metrics[f"{modality}_{res}bp_profile_pearson_r_std"] = all_profile_r.std().item()
                     metrics[f"{modality}_{res}bp_profile_pearson_r_values"] = all_profile_r.flatten().tolist()
 
@@ -1938,15 +2008,21 @@ def validate_multihead(
                     if all_pred_counts.shape[0] > 1:
                         count_r = pearson_r(all_pred_counts, all_true_counts, dim=0)
                         metrics[f"{modality}_{res}bp_count_pearson_r"] = count_r.mean().item()
+                        metrics[f"{modality}_{res}bp_count_pearson_r_per_track"] = count_r.tolist()
                     else:
                         metrics[f"{modality}_{res}bp_count_pearson_r"] = float("nan")
 
     # Exon-based gene-expression metric: gather per-window
-    # (gene_ids, pred, obs) across ranks, dedup genes, and emit three Pearsons.
+    # (gene_ids, pred, obs) across ranks, dedup genes, and emit the Pearsons
+    # under both within-gene reductions.
     if gene_expr_enabled:
         metrics.update(_gene_expr_metrics(
-            gene_expr_windows, modality=gene_expr_modality, world_size=world_size,
+            gene_expr_windows,
+            modality=gene_expr_modality,
+            primary=gene_expr_reduce_func,
+            world_size=world_size,
             track_strands=gene_expr_track_strands,
+            strand_pairs=gene_expr_strand_pairs,
         ))
 
     return avg_loss, metrics
@@ -1980,6 +2056,7 @@ def train_epoch_sequence_parallel(
     encoder_only: bool = False,
     *,
     gene_loss_weights: dict[str, float] | None = None,
+    gene_reduce_funcs: dict[str, str] | None = None,
     gene_cross_track_weight: float = 5.0,
     strand_channel_masks: dict[str, Tensor] | None = None,
     organism: int = 0,
@@ -2057,6 +2134,7 @@ def train_epoch_sequence_parallel(
         pbar = train_loader
 
     gene_loss_weights = gene_loss_weights or {}
+    gene_reduce_funcs = gene_reduce_funcs or {}
 
     for batch_idx, batch_data in enumerate(pbar):
         # collate_multimodal yields an optional extras dict (gene_mask/coords).
@@ -2190,6 +2268,7 @@ def train_epoch_sequence_parallel(
                 # S to match this rank's local shard, exactly as we sliced
                 # targets above.
                 gene_w = gene_loss_weights.get(modality, 0.0)
+                gene_agg = gene_reduce_funcs.get(modality, "mean")
                 if (
                     res == 1
                     and gene_w > 0
@@ -2210,11 +2289,12 @@ def train_epoch_sequence_parallel(
                         gene_mask=local_gene_mask,
                         strand_channel_mask=strand_channel_masks[modality],
                         gene_cross_track_weight=gene_cross_track_weight,
+                        reduce_func=gene_agg,
                     )
                     res_loss = res_loss + weight * gene_w * gene_loss
                     loss_components[f"{modality}_gene_lfc"] = gene_loss.item()
                     loss_components[f"{modality}_gene_total_count"] = gene_aux["gene_loss_total_count"].item()
-                    loss_components[f"{modality}_gene_positional"] = gene_aux["gene_loss_positional"].item()
+                    loss_components[f"{modality}_gene_cross_track"] = gene_aux["gene_loss_cross_track"].item()
 
                 modality_loss = modality_loss + res_loss
                 loss_components[f"{modality}_loss_{res}bp"] = res_loss.item()

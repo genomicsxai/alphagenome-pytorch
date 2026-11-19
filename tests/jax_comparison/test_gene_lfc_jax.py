@@ -103,6 +103,10 @@ def _jax_gene_lfc(
     loss_total_count = loss_total_count / jnp.maximum(jnp.max(num_active), 1.0)
 
     prob_predictions = y_pred.astype(jnp.float32) / (total_pred + 1e-7)
+    # `loss_positional` is upstream's name for this term, kept here so the
+    # transcription stays line-for-line with the JAX source. The PyTorch side
+    # logs it as `gene_loss_cross_track`: it is a multinomial over tracks, not
+    # over positions.
     loss_positional = -y_true * jnp.log(prob_predictions + 1e-7)
     # Upstream renamed `_safe_masked_mean` → `safe_masked_mean` in fd44ed0;
     # fall back to the private name for older checkouts.

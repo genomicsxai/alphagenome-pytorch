@@ -289,6 +289,23 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     gene_lfc.add_argument(
+        "--gene-reduce-func",
+        type=str,
+        default="auto",
+        choices=["auto", "mean", "sum"],
+        help=(
+            "How signal is reduced within a gene body, for BOTH the gene LFC "
+            "loss and the --gene-expr-eval metric. 'auto' (default) resolves "
+            "to the per-head 'gene_reduce_func' from --config, else 'mean'. "
+            "'mean' suits full-length libraries: coverage spreads along the "
+            "transcript, so the per-bp rate is the expression estimate. 'sum' "
+            "suits 3'-biased libraries (10x-style pseudobulk): reads pile up "
+            "at the 3' end, so total signal is the estimate and dividing by "
+            "gene length injects a spurious 1/length weight. Passing 'mean' "
+            "or 'sum' here overrides the per-head config value."
+        ),
+    )
+    gene_lfc.add_argument(
         "--gene-cross-track-weight",
         type=float,
         default=5.0,
@@ -438,7 +455,13 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
     out = parser.add_argument_group("Output")
     out.add_argument("--output-dir", type=str, default=DEFAULTS["output_dir"])
     out.add_argument("--run-name", type=str, default=None)
-    out.add_argument("--save-every", type=int, default=DEFAULTS["save_every"])
+    out.add_argument(
+        "--save-every",
+        type=int,
+        default=DEFAULTS["save_every"],
+        help="Write checkpoint_epoch{N} every N epochs. 0 writes none; the "
+             "best model is still saved.",
+    )
     out.add_argument("--no-save-checkpoints", action="store_true", help="Skip saving model checkpoints (keeps logs/config)")
 
     # Resume arguments
@@ -614,6 +637,7 @@ def postprocess_args(
         "track_strands",
         "gene_loss_weight",
         "gene_cross_track_weight",
+        "gene_reduce_func",
         "gene_expr_annotation",
         "organism",
         "sequence_parallel",
@@ -621,13 +645,24 @@ def postprocess_args(
     ):
         _apply_config_scalar(attr, config_data)
 
+    if args.gene_reduce_func not in ("auto", "mean", "sum"):
+        parser.error(
+            f"--gene-reduce-func must be 'auto', 'mean', or 'sum'; "
+            f"got {args.gene_reduce_func!r}."
+        )
+
     if "--gene-expr-eval" not in cli_flags and "gene_expr_eval" in config_data:
         args.gene_expr_eval = bool(config_data["gene_expr_eval"])
 
     # Checkpoint-shape validation runs *after* the merge: `save_delta`,
-    # `no_full_checkpoint` and `mode` can all arrive from the YAML config, so
-    # validating earlier would inspect pre-merge values and let an invalid
-    # config through.
+    # `no_full_checkpoint`, `save_every` and `mode` can all arrive from the
+    # YAML config, so validating earlier would inspect pre-merge values and let
+    # an invalid config through.
+    if args.save_every < 0:
+        parser.error(
+            f"--save-every must be >= 0 (0 disables per-epoch checkpoints); "
+            f"got {args.save_every}."
+        )
     if args.no_full_checkpoint and not args.save_delta:
         parser.error(
             "--no-full-checkpoint requires --save-delta (otherwise the run "
@@ -696,6 +731,14 @@ def postprocess_args(
             spec["strand"] = strand_val
         if "strand_pairs" in mod_cfg and mod_cfg["strand_pairs"] is not None:
             spec["strand_pairs"] = mod_cfg["strand_pairs"]
+        if "gene_reduce_func" in mod_cfg and mod_cfg["gene_reduce_func"] is not None:
+            reduce_func = str(mod_cfg["gene_reduce_func"]).strip()
+            if reduce_func not in ("mean", "sum"):
+                parser.error(
+                    f"modalities.{modality}.gene_reduce_func must be 'mean' or "
+                    f"'sum'; got {mod_cfg['gene_reduce_func']!r}"
+                )
+            spec["gene_reduce_func"] = reduce_func
         modality_specs[modality] = spec
 
     cli_modality_to_bigwigs: dict[str, list[str]] = {}
@@ -743,6 +786,11 @@ def postprocess_args(
     args.modality_weight_dict = {}
     args.modality_strands: dict[str, str] = {}
     args.modality_strand_pairs = {}
+    args.modality_explicit_strand_pairs = {}
+    # Within-gene reduction per head, resolved once here so the gene LFC loss
+    # and the gene-expression metric cannot disagree about a head. Precedence:
+    # --gene-reduce-func (global override) > per-head config > 'mean'.
+    args.modality_gene_reduce_funcs: dict[str, str] = {}
     for modality in args.modalities:
         spec = modality_specs.get(modality, {})
         if "bigwig" not in spec or not spec["bigwig"]:
@@ -757,6 +805,13 @@ def postprocess_args(
         raw_pairs = cli_strand_pairs.get(modality, spec.get("strand_pairs"))
         args.modality_strand_pairs[modality] = _normalize_strand_pairs(
             raw_pairs, len(args.modality_to_bigwigs[modality]), modality, parser
+        )
+        if raw_pairs is not None and raw_pairs != "auto":
+            args.modality_explicit_strand_pairs[modality] = args.modality_strand_pairs[modality]
+        args.modality_gene_reduce_funcs[modality] = (
+            spec.get("gene_reduce_func", "mean")
+            if args.gene_reduce_func == "auto"
+            else args.gene_reduce_func
         )
 
     # `--track-strands` CLI flag overrides any YAML strand for rna_seq.

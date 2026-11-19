@@ -349,11 +349,82 @@ def test_native_only_requires_native_track_selector(script_module, monkeypatch, 
         script_module.main()
 
 
+@pytest.mark.parametrize(
+    ("metadata", "override", "expected"),
+    [
+        ({"gene_reduce_funcs": {"rna_seq": "sum"}}, [], "sum"),
+        ({"gene_reduce_funcs": {"rna_seq": "sum"}}, ["--gene-reduce-func", "mean"], "mean"),
+        ({}, [], "mean"),
+        ({"gene_reduce_funcs": None}, [], "mean"),
+        ({"gene_reduce_funcs": {"atac": "sum"}}, [], "mean"),
+    ],
+)
+def test_evaluator_gene_reduction_precedence(script_module, monkeypatch, metadata, override, expected):
+    monkeypatch.setattr(sys, "argv", [
+        "evaluate_checkpoint.py", "--pretrained-weights", "base.pth", "--output-dir", "out",
+        *override,
+    ])
+    args = script_module.parse_args()
+    assert script_module.resolve_gene_reduce_func(args.gene_reduce_func, metadata, "rna_seq") == expected
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected_pairs"),
+    [
+        ([], [(0, 3), (1, 2)]),
+        (["--strand-pairs", "0,2;1,3"], [(0, 2), (1, 3)]),
+    ],
+)
+def test_evaluator_reuses_saved_strand_pairs(
+    script_module, monkeypatch, tmp_path, flags, expected_pairs,
+):
+    from types import SimpleNamespace
+
+    names = ["a_plus", "b_plus", "b_minus", "a_minus"]
+    metadata = {
+        "modality": "rna_seq", "track_names": names, "resolutions": (1,),
+        "epoch": 1, "val_loss": 0.0, "strand_pairs": {"rna_seq": [(0, 3), (1, 2)]},
+        "track_metadata": [
+            {"output_name": "rna_seq", "track_index": index, "strand": strand}
+            for index, strand in enumerate("++--")
+        ],
+    }
+    model = SimpleNamespace(finetuned_organism_context=None, num_organisms=1)
+    monkeypatch.setattr(script_module, "load_finetuned_model", lambda *_: (model, metadata))
+    monkeypatch.setattr(script_module, "select_organism_index", lambda *_, **__: 0)
+    monkeypatch.setattr(
+        script_module, "GenomicDataset",
+        lambda **_: SimpleNamespace(_positions_list=[("chr1", 0, 128)]),
+    )
+    monkeypatch.setattr(script_module, "DataLoader", lambda *_, **__: None)
+    monkeypatch.setattr(script_module, "evaluate_split", lambda *_, **__: ({}, {}, 0.0))
+    captured = {}
+
+    def gene_metrics(*_, **kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(script_module, "compute_gene_expression_metrics", gene_metrics)
+    monkeypatch.setattr(sys, "argv", [
+        "evaluate_checkpoint.py", "--checkpoint", "model.pth", "--pretrained-weights", "base.pth",
+        "--output-dir", str(tmp_path), "--test-bed", "test.bed", "--max-regions", "0",
+        "--gene-annotation", "genes.parquet", "--bigwig", *names, *flags,
+    ])
+    script_module.main()
+    assert captured["strand_pairs"] == expected_pairs
+
+
 def test_gene_expression_metrics_match_validation_metric(tmp_path):
     """--gene-annotation reports the same numbers as --gene-expr-eval."""
+    import json
+
     import pandas as pd
 
-    from alphagenome_pytorch.aggregation import combine_gene_expression, gene_expression_values
+    from alphagenome_pytorch.aggregation import (
+        combine_gene_expression,
+        gene_expression_values,
+        resolve_strand_pairs,
+    )
     from alphagenome_pytorch.annotations import GeneAnnotation
 
     script = _load_script_module()
@@ -372,13 +443,17 @@ def test_gene_expression_metrics_match_validation_metric(tmp_path):
 
     rng = np.random.default_rng(0)
     positions = [("chr1", 0, 256)]
-    preds = {1: rng.gamma(1.0, 2.0, size=(1, 256, 4)).astype(np.float32)}
+    preds = {1: rng.gamma(1.0, 2.0, size=(1, 256, 5)).astype(np.float32)}
     targets = {1: (preds[1] * rng.lognormal(0, 0.3, size=preds[1].shape)).astype(np.float32)}
-    strands = script.resolve_track_strands("+-+-", {}, "rna_seq", 4)
+    strands = script.resolve_track_strands("++--.", {}, "rna_seq", 5)
+    pairs = [(1, 2), (0, 3)]
+    pair_ids = ["A", "B", "B", "A", None]
+    track_names = ["A+", "B+", "B-", "A-", "C"]
 
     metrics = script.compute_gene_expression_metrics(
         preds, targets, positions, modality="rna_seq",
-        annotation_path=str(annotation_path), track_strands=strands,
+        annotation_path=str(annotation_path), track_strands=strands, strand_pairs=pairs,
+        track_names=track_names, strand_pair_ids=pair_ids,
     )
 
     annotation = GeneAnnotation(pd.DataFrame(rows))
@@ -388,8 +463,41 @@ def test_gene_expression_metrics_match_validation_metric(tmp_path):
     obs, _, _ = gene_expression_values(
         torch.from_numpy(targets[1][0]), annotation, positions[0], track_strands=strands,
     )
-    expected = combine_gene_expression([(gene_ids, pred, obs)], track_strands=strands)
+    expected = combine_gene_expression(
+        [(gene_ids, pred, obs)], track_strands=strands, strand_pairs=pairs,
+    )
     assert metrics["rna_seq_gene_log_expr_n_genes"] == expected["n_genes"] == 8
+    prefix = "rna_seq_gene_log_expr_pearson_one_vs_rest_lfc"
+    values = metrics[f"{prefix}_per_track"]
+    assert values == pytest.approx(expected["one_vs_rest_lfc_per_track"])
+    path = tmp_path / "summary.json"
+    script.save_summary_json(None, None, {}, None, None, path, gene_expression=metrics)
+    rows = json.loads(path.read_text())["gene_expression"][f"{prefix}_by_sample"]
+    assert rows == [
+        {"sample_id": "B", "track_indices": [1, 2], "value": values[0]},
+        {"sample_id": "A", "track_indices": [0, 3], "value": values[1]},
+        {"sample_id": "C", "track_indices": [4], "value": values[2]},
+    ]
+
+    metadata_pairs = resolve_strand_pairs(strands, strand_pair_ids=pair_ids)
+    assert metadata_pairs == [(0, 3), (1, 2)]
+    from_metadata = script.compute_gene_expression_metrics(
+        preds, targets, positions, modality="rna_seq",
+        annotation_path=str(annotation_path), track_strands=strands,
+        strand_pairs=metadata_pairs, track_names=track_names, strand_pair_ids=pair_ids,
+        reduce_func=script.resolve_gene_reduce_func(
+            None, {"gene_reduce_funcs": {"rna_seq": "sum"}}, "rna_seq",
+        ),
+    )
+    summary_prefix = "rna_seq_gene_log_expr_pearson"
+    assert from_metadata["gene_reduce_func"] == "sum"
+    assert from_metadata[f"{summary_prefix}_across_genes"] == from_metadata[f"{summary_prefix}_sum_across_genes"]
+    reordered_rows = from_metadata[f"{prefix}_by_sample"]
+    for actual, expected_row in zip(reordered_rows, [rows[1], rows[0], rows[2]], strict=True):
+        assert actual["sample_id"] == expected_row["sample_id"]
+        assert actual["track_indices"] == expected_row["track_indices"]
+        assert actual["value"] == pytest.approx(expected_row["value"])
+    assert "rna_seq_gene_log_expr_pearson_sum_across_genes" in metrics
     for key in ("across_genes", "across_genes_norm", "across_tracks_norm"):
         assert metrics[f"rna_seq_gene_log_expr_pearson_{key}"] == pytest.approx(expected[key])
         assert not np.isnan(expected[key])

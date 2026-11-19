@@ -177,7 +177,7 @@ def test_compute_finetuning_loss_with_gene_mask_backward(setup_files):
     assert loss.item() > 0
     assert "loss_gene_lfc" in loss_dict
     assert "loss_gene_total_count" in loss_dict
-    assert "loss_gene_positional" in loss_dict
+    assert "loss_gene_cross_track" in loss_dict
 
     loss.backward()
     assert preds_1bp.grad is not None

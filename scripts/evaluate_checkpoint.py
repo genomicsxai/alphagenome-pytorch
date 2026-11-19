@@ -27,7 +27,7 @@ Usage examples:
         --pretrained-weights model_fold1.pth \
         --genome GRCh38.fa --bigwig sample_fwd.bw sample_rev.bw \
         --test-bed test.bed --output-dir eval/ --metrics \
-        --gene-annotation gencode.v46.annotation.parquet --track-strands +-
+        --gene-annotation gencode.v46.annotation.parquet --track-strands +- --strand-pairs 0,1
 
     # Native/pretrained model metrics only
     python scripts/evaluate_checkpoint.py \
@@ -59,6 +59,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from dataclasses import dataclass
 import json
 import logging
@@ -796,6 +797,13 @@ def resolve_track_strands(
     return strands
 
 
+def resolve_gene_reduce_func(explicit: str | None, ckpt_meta: dict, modality: str) -> str:
+    """Select the primary gene-expression reduction for evaluation."""
+    if explicit is not None:
+        return explicit
+    return (ckpt_meta.get("gene_reduce_funcs") or {}).get(modality, "mean")
+
+
 def compute_gene_expression_metrics(
     preds: dict[int, np.ndarray],
     targets: dict[int, np.ndarray],
@@ -804,12 +812,18 @@ def compute_gene_expression_metrics(
     modality: str,
     annotation_path: str,
     track_strands: list[str],
+    strand_pairs: list[tuple[int, int]] | None = None,
+    track_names: Sequence[str] | None = None,
+    strand_pair_ids: Sequence[str | None] | None = None,
+    reduce_func: str = "mean",
 ) -> dict:
     """Gene-expression correlations, computed exactly as --gene-expr-eval does.
 
     Uses the finest available resolution over each full input window.
     """
+    from alphagenome_pytorch.aggregation import gene_expression_samples
     from alphagenome_pytorch.extensions.finetuning.training import (
+        GENE_EXPR_REDUCE_FUNCS,
         _accumulate_gene_expr_windows,
         _gene_expr_metrics,
     )
@@ -819,22 +833,35 @@ def compute_gene_expression_metrics(
     if not annotation.has_exon_annotations():
         sys.exit(f"Error: --gene-annotation has no exon rows: {annotation_path}")
     resolution = min(preds)
-    windows: list = []
-    _accumulate_gene_expr_windows(
-        windows,
-        pred_unscaled=torch.from_numpy(np.ascontiguousarray(preds[resolution])),
-        targets=torch.from_numpy(np.ascontiguousarray(targets[resolution])),
-        coords=positions,
-        annotation=annotation,
-        track_strands=track_strands,
-        window_cache={},
-    )
+    windows: dict[str, list] = {reduce: [] for reduce in GENE_EXPR_REDUCE_FUNCS}
+    pred = torch.from_numpy(np.ascontiguousarray(preds[resolution]))
+    target = torch.from_numpy(np.ascontiguousarray(targets[resolution]))
+    cache: dict = {}
+    for reduce, accumulated in windows.items():
+        _accumulate_gene_expr_windows(
+            accumulated, pred_unscaled=pred, targets=target, coords=positions,
+            annotation=annotation, track_strands=track_strands, reduce=reduce,
+            window_cache=cache,
+        )
     metrics = _gene_expr_metrics(
-        windows, modality=modality, track_strands=track_strands,
+        windows, modality=modality, primary=reduce_func,
+        track_strands=track_strands, strand_pairs=strand_pairs,
     )
+    prefix = f"{modality}_gene_log_expr_pearson_one_vs_rest_lfc"
+    names = track_names or [f"track_{i}" for i in range(len(track_strands))]
+    pair_ids = strand_pair_ids if strand_pair_ids is not None else [None] * len(track_strands)
+    samples = gene_expression_samples(names, track_strands, strand_pairs or [], pair_ids)
+    metrics[f"{prefix}_by_sample"] = [
+        {
+            "sample_id": sample_id,
+            "track_indices": list(indices),
+            "value": value if np.isfinite(value) else None,
+        }
+        for (sample_id, indices), value in zip(samples, metrics[f"{prefix}_per_track"], strict=True)
+    ]
     for key, value in metrics.items():
         log.info("  %s: %s", key, value)
-    return {"resolution_bp": resolution, **metrics}
+    return {"resolution_bp": resolution, "gene_reduce_func": reduce_func, **metrics}
 
 
 # =============================================================================
@@ -898,6 +925,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    p.add_argument(
+        "--strand-pairs",
+        help="Explicit zero-based plus,minus indices for stranded gene-expression "
+             "metrics, e.g. '0,3;1,2'. Overrides saved pairs or strand_pair_id metadata.",
+    )
+
+    p.add_argument(
+        "--gene-reduce-func", choices=("mean", "sum"),
+        help="Override the checkpoint's within-gene reduction for the unsuffixed "
+             "gene-expression metrics. Defaults to mean for older checkpoints.",
+    )
+
     # Native head comparison
     p.add_argument(
         "--native-biosample",
@@ -952,7 +991,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-predictions", action="store_true")
     p.add_argument("--device", default=None, help="Device (default: auto)")
 
-    return p.parse_args()
+    args = p.parse_args()
+    if args.strand_pairs is not None:
+        from alphagenome_pytorch.extensions.finetuning.args import _normalize_strand_pairs
+
+        if args.strand_pairs == "auto":
+            p.error("--strand-pairs requires explicit plus,minus indices for evaluation.")
+        args.strand_pairs = _normalize_strand_pairs(
+            args.strand_pairs, len(args.bigwig or []), "gene-expression evaluation", p,
+        )
+    return args
 
 
 def parse_resolutions(raw: str | None) -> tuple[int, ...]:
@@ -1209,12 +1257,22 @@ def main() -> None:
                 )
 
         if args.gene_annotation:
+            from alphagenome_pytorch.aggregation import metadata_strand_pair_ids, resolve_strand_pairs
+
+            track_strands = resolve_track_strands(args.track_strands, ckpt_meta, modality, len(args.bigwig))
+            pair_ids = metadata_strand_pair_ids(
+                ckpt_meta.get("track_metadata") or [], modality, len(track_strands),
+            )
+            saved_pairs = (ckpt_meta.get("strand_pairs") or {}).get(modality)
+            strand_pairs = resolve_strand_pairs(
+                track_strands, strand_pairs=args.strand_pairs or saved_pairs, strand_pair_ids=pair_ids,
+            )
             gene_metrics = compute_gene_expression_metrics(
                 ft_preds, targets, positions, modality=modality,
-                annotation_path=args.gene_annotation,
-                track_strands=resolve_track_strands(
-                    args.track_strands, ckpt_meta, modality, len(args.bigwig),
-                ),
+                annotation_path=args.gene_annotation, track_strands=track_strands,
+                strand_pairs=strand_pairs, strand_pair_ids=pair_ids,
+                track_names=track_names or [Path(path).stem for path in args.bigwig],
+                reduce_func=resolve_gene_reduce_func(args.gene_reduce_func, ckpt_meta, modality),
             )
 
         # Native evaluation on same data

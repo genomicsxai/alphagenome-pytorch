@@ -395,9 +395,9 @@ Other useful pieces:
   correlation flavors (`across_genes`, `across_genes_norm`, `across_tracks_norm`)
   that `agt finetune --gene-expr-eval` reports each validation epoch, and
   `scripts/evaluate_checkpoint.py --gene-annotation` reports on a test set. For
-  strand-matched stranded tracks, pass `track_strands` so each `+`/`-` pair is
-  merged into one sense column (`collapse_strand_pairs`); the normalized
-  flavors use only genes with a complete row.
+  stranded tracks, pass `track_strands` and explicit `strand_pairs` so each
+  sample contributes one sense column. The normalized metrics use genes
+  with one value for every sample.
 
 Three things that bite:
 

@@ -178,7 +178,7 @@ For reproducible experiments, use ``--config config.yaml``.
 
       output_dir: finetuning_output      # Output directory
       run_name: my_experiment            # Run name (default: timestamp)
-      save_every: 1                      # Save checkpoint every N epochs
+      save_every: 1                      # Save checkpoint every N epochs (0 = never)
 
       # =============================================================================
       # Resume Configuration
@@ -248,7 +248,8 @@ Output goes to ``<output-dir>/<run-name>``, defaulting to
    ├── checkpoint_epoch2.pth
    ├── config.json             # the training hyperparameters for this run
    ├── training_log.csv        # per-step metrics
-   └── epoch_log.csv           # per-epoch metrics
+   ├── epoch_log.csv           # per-epoch scalar metrics
+   └── epoch_track_metrics.csv # per-epoch track metrics
 
 Two things about this are worth knowing before you start a long run:
 
@@ -279,6 +280,10 @@ Flags that change what is written:
        disables the preemption checkpoint.
    * - ``--save-every N``
      - Write a per-epoch checkpoint every N epochs instead of every epoch.
+       ``--save-every 0`` writes no per-epoch checkpoints. The best-model
+       checkpoint is still written. ``--resume auto`` then finds only a
+       preemption checkpoint, so after a crash, pass the best-model checkpoint
+       to ``--resume``.
 
 .. note::
 
@@ -341,7 +346,7 @@ Supported Modalities
      - 1bp, 128bp
      - No
    * - ``rna_seq``
-     - RNA-seq gene expression
+     - RNA-seq gene expression (any library; see :ref:`rna-3p-libraries`)
      - 1bp, 128bp
      - Yes
    * - ``chip_tf``
@@ -400,9 +405,57 @@ the CLI with ``-m``:
 Gene-Level RNA-seq
 ------------------
 
-Two optional, independent features aggregate the ``rna_seq`` head over genes:
-a **cross-track gene LFC loss** during training, and a **gene-expression
+Two optional, independent features aggregate the ``rna_seq`` head over genes: a
+**cross-track gene LFC loss** during training, and a **gene-expression
 correlation metric** during validation. Both are off by default.
+
+.. _rna-3p-libraries:
+
+3'-biased libraries
+^^^^^^^^^^^^^^^^^^^
+
+A 10x-style pseudobulk track is still the ``rna_seq`` head. What changes is how
+signal is reduced inside a gene body, and that is one setting:
+
+* **mean** (the default) divides by gene length. Correct for full-length
+  libraries, where coverage is spread along the transcript, so signal per bp is
+  the expression estimate.
+* **sum** keeps total signal. Correct for 3'-biased libraries, where reads pile
+  up at the 3' end. Dividing by gene length would inject a spurious 1/length
+  weight — and in the loss it down-weights long genes in *both* terms, not just
+  the Poisson one.
+
+Set it per head in a config, or run-wide on the command line:
+
+.. code-block:: yaml
+
+   modalities:
+     rna_seq:
+       bigwig: [mic_plus.bw, mic_minus.bw]
+       strand: "+-"
+       gene_reduce_func: sum     # 3'-biased library
+
+.. code-block:: bash
+
+   agt finetune --modality rna_seq --bigwig mic_plus.bw mic_minus.bw \
+       --gene-reduce-func sum ...
+
+The setting selects the gene LFC training reduction and the primary
+``--gene-expr-eval`` metric. In ``sum`` mode the training loss uses gene totals
+and divides the two loss terms by a fixed reference gene length of 20,000 bp.
+Each gene then contributes as it would in ``mean`` mode if it were 20 kb long.
+Start with the ``--gene-loss-weight`` that you would use in ``mean`` mode. The
+reference length does not depend on the expression data. It was measured with
+131 kb windows and a human annotation. For much larger windows or another
+organism, the typical gene length can change, so adjust
+``--gene-loss-weight``. Evaluation uses exon totals directly. An explicit CLI
+reduction overrides the per-head config. ``auto`` uses the per-head config or
+defaults to ``mean``.
+
+Keeping the head named ``rna_seq`` is what lets the fine-tune be served and
+scored: a fine-tuned head replaces the pretrained slot of the same name, while
+serving and ``agt score`` address heads by output type, not by your name for
+the library.
 
 Gene LFC loss
 ^^^^^^^^^^^^^
@@ -427,6 +480,10 @@ Flag                                    Default     Meaning
                                                     ``0.0`` disables the term entirely.
 ``--gene-cross-track-weight W``         ``5.0``     Inner multinomial weight (paper default). Only
                                                     used when ``--gene-loss-weight > 0``.
+``--gene-reduce-func MODE``             ``auto``    ``auto`` | ``mean`` | ``sum``. Within-gene
+                                                    reduction for the loss *and* the metric;
+                                                    ``auto`` takes the per-head config value, else
+                                                    ``mean`` (see :ref:`rna-3p-libraries`).
 ``--gtf PATH``                          *(none)*    Annotation, parquet or GTF;
                                                     ``protein_coding`` **gene** rows build the
                                                     per-window gene-body masks. Prefer parquet —
@@ -445,9 +502,11 @@ Gene-expression validation metric
 
 ``--gene-expr-eval`` reports how well predicted gene expression correlates with
 the observed tracks each validation epoch. The quantity is the AlphaGenome
-definition — log-transformed mean coverage over a gene's **annotated exons**,
+definition — log-transformed coverage over a gene's **annotated exons**,
 strand-matched, keeping genes with at least 50% of their exons inside the
-window — not the gene-body aggregation the LFC loss uses.
+window. Exons, not the gene bodies the LFC loss aggregates; the within-gene
+reduction, however, is the head's own ``gene_reduce_func``, so the metric
+scores what the loss optimizes.
 
 .. code-block:: bash
 
@@ -455,7 +514,7 @@ window — not the gene-body aggregation the LFC loss uses.
        --genome hg38.fa --pretrained-weights model.pth \
        --train-bed train.bed --val-bed val.bed \
        --modality rna_seq --bigwig rna_plus.bw rna_minus.bw \
-       --track-strands '+-' \
+       --track-strands '+-' --strand-pairs 'rna_seq:0,1' \
        --gene-expr-eval --gene-expr-annotation gencode.v46.parquet
 
 Emitted metric keys. The three ``*_pearson_*`` keys appear in the per-epoch
@@ -469,8 +528,63 @@ Key                                                     Meaning
 ``rna_seq_gene_log_expr_pearson_across_genes_norm``     Same after quantile normalization + gene-mean
                                                         centering (specificity view)
 ``rna_seq_gene_log_expr_pearson_across_tracks_norm``    Normalized data correlated per gene across tracks
+``rna_seq_gene_log_expr_pearson_one_vs_rest_lfc``       One-vs-rest log2 fold change, per track, averaged
+``rna_seq_gene_log_expr_pearson_{mean,sum}_*``           The three ``across_*`` keys above under **both**
+                                                        within-gene reductions, always reported, so runs
+                                                        on different library types stay comparable. The
+                                                        unsuffixed keys repeat the head's own reduction.
 ``rna_seq_gene_log_expr_n_genes``                       Genes contributing, deduplicated across windows
 ======================================================= =====================================================
+
+The one-vs-rest fold change is emitted once, without a reduction suffix: every
+track of a gene is divided by the same gene length, so it cancels in the ratio
+and both reductions give the identical number.
+
+One-vs-rest fold change
+"""""""""""""""""""""""
+
+For each track, the ratio of that track to the mean of the remaining tracks —
+formed *within* the predictions and *within* the observations, then correlated
+across genes. It is computed automatically whenever the metric runs and there
+are at least two tracks, and is also emitted per track as
+``..._one_vs_rest_lfc/<track name>``.
+
+Watch it alongside ``across_genes``. Absolute expression is largely inherited
+from the pretrained trunk, which already knows which genes are highly expressed;
+the differential between samples is what an adapter has to add. A run where
+``across_genes`` looks healthy while this stays near zero has learned nothing
+cell-type-specific.
+
+Stranded gene-expression metrics require explicit sample identities. Set
+``strand_pair_id`` to the same value on a sample’s two rows in the
+``--track-metadata`` parquet, or pass explicit zero-based plus/minus indices
+with ``--strand-pairs 'rna_seq:0,3;1,2'``. Each stranded track must have exactly
+one partner. Full and delta training checkpoints save explicit pair indices
+for each head, even when ``--gene-expr-eval`` is disabled. The evaluator uses
+those pairs if present, then falls back to the recorded ``strand_pair_id``
+values. Pass ``--strand-pairs '0,3;1,2'`` to override either source.
+Its ``*_one_vs_rest_lfc_by_sample`` output includes the sample ID, zero-based
+source track indices, and correlation.
+
+The evaluator uses the checkpoint's recorded ``gene_reduce_func`` for the
+unsuffixed metrics and reports the selected reduction in its JSON output.
+Older checkpoints default to ``mean``. Pass ``--gene-reduce-func mean`` or
+``--gene-reduce-func sum`` to override the default.
+
+Per-track metric series
+^^^^^^^^^^^^^^^^^^^^^^^
+
+``epoch_track_metrics.csv`` records a row for every track and metric at each
+epoch, including wide heads. Count and profile correlations use the original
+output tracks. Gene fold-change correlations use one sense column per sample.
+``epoch_log.csv`` contains the scalar summaries. W&B shows named series for
+heads with up to 32 tracks and histograms for wider heads.
+
+This is what distinguishes "three good ``+`` tracks and three dead ``-`` tracks"
+from a uniform ceiling across every track — the first means the targets or the
+strand wiring are wrong, the second means capacity, learning rate or context.
+Both show up at the first validation epoch, so a broken run can be stopped
+there rather than after every epoch has been spent.
 
 Requirements that are checked before training starts:
 

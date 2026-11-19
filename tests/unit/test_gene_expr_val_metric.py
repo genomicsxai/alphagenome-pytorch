@@ -77,7 +77,14 @@ def test_accumulate_builds_windows_and_dedups():
     out = combine_gene_expression(windows)
     assert out["n_genes"] == 2  # deduped across the two identical windows
     assert out["across_genes"] == pytest.approx(1.0, abs=1e-4)
-    assert set(out) == {"across_genes", "across_genes_norm", "across_tracks_norm", "n_genes"}
+    assert set(out) == {
+        "across_genes",
+        "across_genes_norm",
+        "across_tracks_norm",
+        "one_vs_rest_lfc",
+        "one_vs_rest_lfc_per_track",
+        "n_genes",
+    }
 
 
 def test_accumulate_strand_matching_nans_incompatible_cells():
@@ -143,6 +150,35 @@ def test_accumulate_window_cache_builds_once_per_window():
     assert len(cache) == 1
 
 
+def test_accumulate_honors_reduce():
+    """`sum` is `mean` times each gene's exon length. Without `reduce` reaching
+    the aggregation, both calls would return identical values and a 3'-biased
+    head would be scored on a per-bp rate it never optimized."""
+    ann = _make_annotation()
+    pred = _position_preds(batch=1)
+    exon_bp = {"ENSGA": 4.0, "ENSGB": 6.0}  # A: [102,104)+[106,108); B: [110,116)
+
+    values = {}
+    for reduce_func in ("mean", "sum"):
+        windows: list = []
+        _accumulate_gene_expr_windows(
+            windows,
+            pred_unscaled=pred,
+            targets=pred,
+            coords=[INTERVAL],
+            annotation=ann,
+            track_strands=None,
+            reduce=reduce_func,
+        )
+        gene_ids, vals, _ = windows[0]
+        values[reduce_func] = (gene_ids, torch.expm1(vals))  # back to linear
+
+    gene_ids, mean_vals = values["mean"]
+    _, sum_vals = values["sum"]
+    lengths = torch.tensor([[exon_bp[g]] for g in gene_ids])
+    torch.testing.assert_close(sum_vals, mean_vals * lengths)
+
+
 # --------------------------------------------------------------------------- #
 # _gene_expr_metrics: the reduce/emit step (single-rank path)
 # --------------------------------------------------------------------------- #
@@ -154,11 +190,21 @@ def test_gene_expr_metrics_emits_named_keys():
         (["g0", "g1", "g2"], pred[:3], truth[:3]),
         (["g3", "g4", "g5"], pred[3:], truth[3:]),
     ]
-    m = _gene_expr_metrics(windows, modality="rna_seq", world_size=1)
+    m = _gene_expr_metrics(
+        {"mean": windows, "sum": windows}, modality="rna_seq", world_size=1
+    )
     assert set(m) == {
         "rna_seq_gene_log_expr_pearson_across_genes",
         "rna_seq_gene_log_expr_pearson_across_genes_norm",
         "rna_seq_gene_log_expr_pearson_across_tracks_norm",
+        "rna_seq_gene_log_expr_pearson_one_vs_rest_lfc",
+        "rna_seq_gene_log_expr_pearson_one_vs_rest_lfc_per_track",
+        "rna_seq_gene_log_expr_pearson_mean_across_genes",
+        "rna_seq_gene_log_expr_pearson_mean_across_genes_norm",
+        "rna_seq_gene_log_expr_pearson_mean_across_tracks_norm",
+        "rna_seq_gene_log_expr_pearson_sum_across_genes",
+        "rna_seq_gene_log_expr_pearson_sum_across_genes_norm",
+        "rna_seq_gene_log_expr_pearson_sum_across_tracks_norm",
         "rna_seq_gene_log_expr_n_genes",
     }
     assert m["rna_seq_gene_log_expr_n_genes"] == 6
@@ -166,9 +212,10 @@ def test_gene_expr_metrics_emits_named_keys():
 
 
 def test_gene_expr_metrics_modality_prefix_and_empty():
-    m = _gene_expr_metrics([], modality="cage", world_size=1)
+    m = _gene_expr_metrics({}, modality="cage", world_size=1)
     assert m["cage_gene_log_expr_n_genes"] == 0
     assert math.isnan(m["cage_gene_log_expr_pearson_across_genes"])
+    assert math.isnan(m["cage_gene_log_expr_pearson_sum_across_genes"])
 
 
 class TestGeneExprResolutionSelection:
@@ -224,10 +271,13 @@ def test_gene_expr_metrics_merges_strand_pairs():
         stranded[g, g % 2::2] = values[g]
     windows = [(genes, stranded, stranded + 0.01 * torch.rand(6, 4))]
 
+    windows_by_reduce = {"mean": windows, "sum": windows}
     merged = _gene_expr_metrics(
-        windows, modality="rna_seq", track_strands=["+", "-", "+", "-"],
+        windows_by_reduce, modality="rna_seq", track_strands=["+", "-", "+", "-"],
+        strand_pairs=[(0, 1), (2, 3)],
     )
-    unmerged = _gene_expr_metrics(windows, modality="rna_seq")
+    unmerged = _gene_expr_metrics(windows_by_reduce, modality="rna_seq")
+    assert len(merged["rna_seq_gene_log_expr_pearson_one_vs_rest_lfc_per_track"]) == 2
     key = "rna_seq_gene_log_expr_pearson_across_genes_norm"
     assert not math.isnan(merged[key])
     assert math.isnan(unmerged[key])

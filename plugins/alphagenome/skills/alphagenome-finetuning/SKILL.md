@@ -56,6 +56,17 @@ Requires the finetuning extra: `pip install 'alphagenome-pytorch[finetuning]'`.
 
 Repeat `--modality`/`--bigwig` in pairs for multi-modality training.
 
+**3'-biased RNA (e.g. 10x pseudobulk) is still `--modality rna_seq`.** Only the
+within-gene reduction changes. Full-length libraries use a **mean** (the
+default): coverage spreads along the transcript, so signal per bp is the
+expression estimate. 3'-biased libraries need a **sum**: reads pile up at the
+3' end, total signal is the estimate, and dividing by gene length injects a
+spurious 1/length weight. Set `gene_reduce_func: sum` under
+`modalities.rna_seq` in `--config`, or pass `--gene-reduce-func sum`. The one
+value drives both the gene LFC loss and the `--gene-expr-eval` metric. Do not
+invent a separate head name for the library type: serving and `agt score`
+address heads by output type, so only a head named `rna_seq` is reachable.
+
 ## 4. Defaults worth knowing
 
 `--resolutions` defaults to `1` (1bp only) — set `--resolutions 128` for
@@ -73,10 +84,11 @@ Training: `--epochs 10`, `--batch-size 1`, `--lr 1e-4`, `--weight-decay 0.1`,
 **What a run writes.** Output goes to `<output-dir>/<run-name>`, defaulting to
 `finetuning_output/<timestamp>`. A default run produces `best_model.pth` (on val
 improvement), `checkpoint_epoch{N}.pth` (every epoch — `--save-every` defaults to
-1), plus `config.json`, `training_log.csv`, `epoch_log.csv`. **`--save-delta` is
-off by default**, so a default run yields nothing shareable — `agt adapters
-export` needs a delta and rejects `best_model.pth`. No `transfer_config.json` is
-written; the config is embedded in each checkpoint.
+1; `0` turns them off), plus `config.json`, `training_log.csv`,
+`epoch_log.csv`. **`--save-delta` is off by default**, so a default run yields
+nothing shareable — `agt adapters export` needs a delta and rejects
+`best_model.pth`. No `transfer_config.json` is written; the config is embedded
+in each checkpoint.
 
 `--no-full-checkpoint` (deltas only, requires `--save-delta`) and
 `--no-save-checkpoints` (no weights at all, logs only) sound alike but differ:
@@ -124,7 +136,8 @@ There is **no `--overlap-lowres` flag**; the low-res overlap is computed as
     --gtf gencode.v46.annotation.gtf --track-strands '+-'
 
 # Exon-based gene-expression correlations, reported each validation epoch
---gene-expr-eval --gene-expr-annotation gencode.v46.parquet --track-strands '+-'
+--gene-expr-eval --gene-expr-annotation gencode.v46.parquet --track-strands '+-' \
+    --strand-pairs 'rna_seq:0,1'
 ```
 
 The loss aggregates over **gene bodies** (exons + introns) and needs `--gtf`,
@@ -133,9 +146,16 @@ The loss aggregates over **gene bodies** (exons + introns) and needs `--gtf`,
 
 The eval metric aggregates over **annotated exons** (log mean coverage,
 strand-matched, genes with ≥50% of exons in-window) and emits
-`rna_seq_gene_log_expr_pearson_{across_genes,across_genes_norm,across_tracks_norm}`
-plus `rna_seq_gene_log_expr_n_genes`. It needs an annotation that actually
-contains **exon rows**, so a gene-only `--gtf` is not enough on its own.
+`rna_seq_gene_log_expr_pearson_{across_genes,across_genes_norm,across_tracks_norm,one_vs_rest_lfc}`
+plus `rna_seq_gene_log_expr_n_genes`. `one_vs_rest_lfc` is each track against
+the mean of the rest (ratios formed within predictions and within observations,
+then correlated across genes) — watch it next to `across_genes`, because
+absolute expression is mostly inherited from the pretrained trunk while the
+differential between samples is what the adapter has to learn. It needs an annotation that actually
+contains **exon rows**, so a gene-only `--gtf` is not enough on its own. Stranded
+metrics also require explicit pair indices or a shared `strand_pair_id` for
+each sample in the track metadata. Per-track metrics go to
+`epoch_track_metrics.csv`.
 
 Both `--gtf` and `--gene-expr-annotation` accept parquet or GTF. Convert
 once (`python scripts/convert_gtf_to_parquet.py --input x.gtf --output
