@@ -271,15 +271,16 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
 
     Accepts either a singleton :class:`LocalDnaModelAdapter` (the
     official-client-compatible mode) or a :class:`ServedModelRouter` (catalog
-    mode). In catalog mode, every RPC must include the metadata header
-    ``alphagenome-model-id``; missing it returns FAILED_PRECONDITION and
-    unknown ids return NOT_FOUND.
+    mode). The ``alphagenome-model-id`` request header selects a catalog
+    entry. With a declared version, a native base entry can be selected
+    implicitly.
     """
 
     def __init__(
         self,
         adapter,
         *,
+        model_version: str | None = None,
         bytes_per_chunk: int = 0,
         compression_type: tensor_pb2.CompressionType = tensor_pb2.COMPRESSION_TYPE_NONE,
     ):
@@ -292,11 +293,12 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
         else:
             self.router = None
             self.adapter = adapter
+        self.model_version = model_version
         self.bytes_per_chunk = bytes_per_chunk
         self.compression_type = compression_type
 
     @contextlib.contextmanager
-    def _acquire(self, context):
+    def _acquire(self, context, requested_version: str | None = None):
         """Yield the per-request adapter, holding the router lock in catalog mode.
 
         Enforces catalog-mode metadata rules by raising typed exceptions —
@@ -311,7 +313,17 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
         body so a concurrent RPC cannot re-swap it mid-forward. Keep only the
         model computation inside the block; stream after release.
         """
+        # GetMetadata has no version field and passes None.
+        if requested_version is not None and (requested_version or self.model_version):
+            requested = requested_version or "ALL_FOLDS"
+            if requested != self.model_version:
+                available = self.model_version or "undeclared"
+                raise ValueError(
+                    f"Requested model_version {requested!r}, but the loaded "
+                    f"AlphaGenome 1 checkpoint version is {available!r}."
+                )
         if self.router is None:
+            self._send_model_version(context)
             yield self.adapter
             return
         from alphagenome_pytorch.extensions.serving.router import (
@@ -323,6 +335,11 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
             if k.lower() == _MODEL_ID_METADATA_KEY:
                 model_id = v
                 break
+        if model_id is None and self.model_version:
+            model_id = next(
+                (mid for mid in self.router.model_ids if self.router.get_entry(mid).kind == "base"),
+                None,
+            )
         if model_id is None:
             raise _CatalogModelIdMissing(
                 f"Catalog mode requires '{_MODEL_ID_METADATA_KEY}' metadata. "
@@ -334,13 +351,18 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
             raise _CatalogModelNotFound(
                 f"Unknown model id: {model_id!r}. Available: {self.router.model_ids}"
             ) from None
+        self._send_model_version(context)
         with self.router.acquire(resolved) as adapter:
             yield adapter
+
+    def _send_model_version(self, context):
+        if self.model_version:
+            context.send_initial_metadata((("alphagenome-model-version", self.model_version),))
 
     def PredictSequence(self, request_iterator, context):
         try:
             request = _first_request(request_iterator, 'PredictSequence')
-            with self._acquire(context) as adapter:
+            with self._acquire(context, request.model_version) as adapter:
                 output = adapter.predict_sequence(
                     sequence=request.sequence,
                     organism=_organism_or_none(request.organism),
@@ -361,7 +383,7 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
         try:
             request = _first_request(request_iterator, 'PredictInterval')
             interval = genome.Interval.from_proto(request.interval)
-            with self._acquire(context) as adapter:
+            with self._acquire(context, request.model_version) as adapter:
                 output = adapter.predict_interval(
                     interval=interval,
                     organism=_organism_or_none(request.organism),
@@ -383,7 +405,7 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
             request = _first_request(request_iterator, 'PredictVariant')
             interval = genome.Interval.from_proto(request.interval)
             variant = genome.Variant.from_proto(request.variant)
-            with self._acquire(context) as adapter:
+            with self._acquire(context, request.model_version) as adapter:
                 output = adapter.predict_variant(
                     interval=interval,
                     variant=variant,
@@ -417,7 +439,7 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
             request = _first_request(request_iterator, 'ScoreVariant')
             interval = genome.Interval.from_proto(request.interval)
             variant = genome.Variant.from_proto(request.variant)
-            with self._acquire(context) as adapter:
+            with self._acquire(context, request.model_version) as adapter:
                 scores = adapter.score_variant(
                     interval=interval,
                     variant=variant,
@@ -446,7 +468,7 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
                 if request.HasField('interval_variant')
                 else None
             )
-            with self._acquire(context) as adapter:
+            with self._acquire(context, request.model_version) as adapter:
                 scores_nested = adapter.score_ism_variants(
                     interval=interval,
                     ism_interval=ism_interval,
@@ -500,12 +522,16 @@ def serve_grpc(
     bytes_per_chunk: int = 0,
     compression_type: tensor_pb2.CompressionType = tensor_pb2.COMPRESSION_TYPE_NONE,
     wait: bool = True,
+    model_version: str | None = None,
+    tls: tuple[bytes, bytes] | None = None,
 ) -> grpc.Server:
     """Start a local gRPC server that implements ``DnaModelService``.
 
     ``target`` may be a :class:`LocalDnaModelAdapter` (singleton mode) or a
     :class:`ServedModelRouter` (catalog mode). Catalog mode requires every
-    request to pass ``alphagenome-model-id`` metadata.
+    request to pass ``alphagenome-model-id`` metadata unless a declared version
+    and a native base entry allow implicit selection. ``tls`` contains the PEM
+    private key and certificate chain, in that order.
     """
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=max_workers),
@@ -517,6 +543,7 @@ def serve_grpc(
     dna_model_service_pb2_grpc.add_DnaModelServiceServicer_to_server(
         LocalDnaModelService(
             adapter=target,
+            model_version=model_version,
             bytes_per_chunk=bytes_per_chunk,
             compression_type=compression_type,
         ),
@@ -524,7 +551,11 @@ def serve_grpc(
     )
 
     bind_address = f'{host}:{port}'
-    bound_port = server.add_insecure_port(bind_address)
+    if tls is None:
+        bound_port = server.add_insecure_port(bind_address)
+    else:
+        credentials = grpc.ssl_server_credentials([tls])
+        bound_port = server.add_secure_port(bind_address, credentials)
     if bound_port == 0:
         raise RuntimeError(
             f'Failed to bind gRPC server to {bind_address}; the port may already be in use.'

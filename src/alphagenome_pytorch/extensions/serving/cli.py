@@ -493,6 +493,18 @@ def run(args: argparse.Namespace) -> int:
             "agt serve: --adapter-catalog and --checkpoint are mutually exclusive."
         )
 
+    model_version = getattr(args, "model_version", None)
+    cert = getattr(args, "grpc_tls_cert", None)
+    key = getattr(args, "grpc_tls_key", None)
+    if (cert is None) != (key is None):
+        raise SystemExit("agt serve: --grpc-tls-cert and --grpc-tls-key must be supplied together.")
+    if cert and args.disable_grpc:
+        raise SystemExit("agt serve: gRPC TLS requires an enabled gRPC listener.")
+    try:
+        tls = (key.read_bytes(), cert.read_bytes()) if cert else None
+    except OSError as exc:
+        raise SystemExit(f"agt serve: could not read gRPC TLS credentials: {exc}") from exc
+
     if catalog_path:
         target = _build_catalog_router(args)
         LOGGER.info("Catalog mode: serving %d models", len(target.model_ids))
@@ -501,12 +513,18 @@ def run(args: argparse.Namespace) -> int:
 
     grpc_server = None
     if not args.disable_grpc:
-        grpc_server = serve_grpc(target, host=args.host, port=args.grpc_port, wait=False)
+        grpc_server = serve_grpc(
+            target, host=args.host, port=args.grpc_port, wait=False,
+            model_version=model_version, tls=tls,
+        )
         LOGGER.info('gRPC ready at %s:%d', args.host, args.grpc_port)
 
     rest_server = None
     if args.rest_port is not None:
-        rest_server = serve_rest(target, host=args.host, port=args.rest_port, wait=False)
+        rest_server = serve_rest(
+            target, host=args.host, port=args.rest_port, wait=False,
+            model_version=model_version,
+        )
         LOGGER.info('REST ready at http://%s:%d', args.host, args.rest_port)
 
     if grpc_server is None and rest_server is None:

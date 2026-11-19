@@ -17,10 +17,10 @@ from alphagenome_pytorch.extensions.serving.scorer import VariantScorer
 from .serving_fakes import FakeAnndataModule, FakeRuntime, FakeScoringModel
 
 
-def _start_grpc(adapter):
+def _start_grpc(adapter, **service_options):
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
     dna_model_service_pb2_grpc.add_DnaModelServiceServicer_to_server(
-        LocalDnaModelService(adapter),
+        LocalDnaModelService(adapter, **service_options),
         server,
     )
     port = server.add_insecure_port('127.0.0.1:0')
@@ -78,6 +78,32 @@ def _catalog_predict_request():
         organism=dna_model_pb2.ORGANISM_HOMO_SAPIENS,
         requested_outputs=[dna_output.OutputType.DNASE.to_proto()],
     )
+
+
+@pytest.mark.parametrize(
+    ("loaded", "requested", "success"),
+    [
+        ("FOLD_1", "FOLD_1", True),
+        ("FOLD_1", "ALL_FOLDS", False),
+        ("FOLD_1", "", False),
+        ("FOLD_1", "TYPO", False),
+        ("ALL_FOLDS", "", True),
+        (None, "FOLD_1", False),
+    ],
+)
+def test_model_version_selection(loaded, requested, success):
+    adapter = LocalDnaModelAdapter(FakeRuntime())
+    request = _catalog_predict_request()
+    request.model_version = requested
+    for stub in _start_grpc(adapter, model_version=loaded):
+        call = stub.PredictSequence(iter([request]))
+        if success:
+            assert list(call)
+            assert ("alphagenome-model-version", loaded) in call.initial_metadata()
+        else:
+            with pytest.raises(grpc.RpcError) as exc_info:
+                list(call)
+            assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
 
 
 def test_catalog_missing_model_id_is_failed_precondition(catalog_grpc_server):
