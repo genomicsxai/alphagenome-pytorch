@@ -457,13 +457,16 @@ class VariantScoringModel:
                     alt_outputs['embeddings_1bp'],
                     variant.start, ref_len, alt_len, interval.start,
                 )
-                alt_outputs['splice_sites']['probs'] = align_alternate(
-                    alt_outputs['splice_sites']['probs'],
-                    variant.start, ref_len, alt_len, interval.start,
-                )
 
             ref_probs = ref_outputs['splice_sites']['probs']
             alt_probs = alt_outputs['splice_sites']['probs']
+            if variant.is_indel:
+                # Junction positions use REF coordinates; leave the published
+                # ALT probabilities in native coordinates for other scorers,
+                # which perform their own alignment exactly once.
+                alt_probs = align_alternate(
+                    alt_probs, variant.start, ref_len, alt_len, interval.start,
+                )
             
             # Use max(Ref, Alt) to determine sites
             unified_positions = generate_splice_site_positions(
