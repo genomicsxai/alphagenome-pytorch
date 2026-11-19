@@ -243,6 +243,8 @@ class GeneMaskExtractor:
 def derive_g_max(
     extractor: GeneMaskExtractor,
     intervals: list[Tuple[str, int, int]],
+    *,
+    pad_bp: int = 0,
 ) -> int:
     """Scan training intervals once to pick a fixed `G_max`.
 
@@ -252,16 +254,23 @@ def derive_g_max(
     Adding intervals later without re-running this scan and exceeding
     the previous max will raise at `GenomicDataset.__getitem__`.
 
+    `pad_bp` widens each interval by that many bp on both sides (start
+    clamped at 0) before counting. Pass the dataset's `augment_shift_bp`:
+    only genes fully inside a window count, so a shifted window can contain
+    a gene the unshifted one does not, but never a gene outside the widened
+    interval. The result is then an upper bound for every shift.
+
     Any single window with more than `PAD_NUM_GENES_CEILING` genes raises
     during the scan via the extractor's own bound check; this function
     therefore needs no additional cap.
 
-    Reuses the extractor's LRU cache so masks built here are still warm
-    when training begins.
+    With `pad_bp=0` this reuses the extractor's LRU cache, so masks built
+    here are still warm when training begins.
     """
+    pad_bp = max(0, int(pad_bp))
     observed_max = 0
     for chrom, start, end in intervals:
-        mask, _ = extractor.extract(chrom, start, end)
+        mask, _ = extractor.extract(chrom, max(0, start - pad_bp), end + pad_bp)
         observed_max = max(observed_max, mask.shape[-1])
     return observed_max
 
