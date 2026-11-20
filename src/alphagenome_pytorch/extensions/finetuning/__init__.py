@@ -50,7 +50,6 @@ if TYPE_CHECKING:
     from alphagenome_pytorch.extensions.finetuning.datasets import (
         ATACDataset,
         CachedGenome,
-        DistillationDataset,
         GenomicDataset,
         MultimodalDataset,
         RNASeqDataset,
@@ -84,7 +83,7 @@ def __getattr__(name):
         return getattr(training, name)
     if name in ("ATACDataset", "RNASeqDataset", "GenomicDataset", "CachedGenome",
                 "compute_track_means", "MultimodalDataset", "collate_multimodal",
-                "SplicingDataset", "DistillationDataset"):
+                "SplicingDataset"):
         from alphagenome_pytorch.extensions.finetuning import datasets
         return getattr(datasets, name)
     if name in ("convert_bigwigs_to_mmap", "convert_single_bigwig"):
@@ -116,7 +115,6 @@ __all__ = [
     "GenomicDataset",
     "MultimodalDataset",
     "SplicingDataset",
-    "DistillationDataset",
     "collate_multimodal",
     "CachedGenome",
     "compute_track_means",

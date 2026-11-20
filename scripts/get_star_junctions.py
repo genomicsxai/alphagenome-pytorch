@@ -229,7 +229,6 @@ def main() -> None:
     print(f"  pysam unique:    {len(unique_dict):,} junctions")
 
     # Map unique counts onto the total DataFrame
-    key = ["chrom", "intron_start", "intron_end"]
     total_df["n_unique"] = total_df.apply(
         lambda r: unique_dict.get((r["chrom"], r["intron_start"], r["intron_end"]), 0),
         axis=1,

@@ -161,68 +161,6 @@ def gtf_splice_sites_to_junctions(gtf_file: str) -> pd.DataFrame:
     return result.reset_index(drop=True)
 
 
-def junctions_to_splice_sites(junctions: pd.DataFrame) -> pd.DataFrame:
-    """Extract unique splice site positions from a junctions DataFrame.
-
-    Each junction has a donor and an acceptor site. A site is defined by
-    (chrom, position, strand, role) where role is 'donor' or 'acceptor'.
-    Exon coordinates (1-based): intron_start - 1 (left) and intron_end + 1
-    (right). The donor is the left site on the + strand and the right site on
-    the - strand.
-
-    Args:
-        junctions: DataFrame from read_star_junctions (or a subset).
-
-    Returns:
-        DataFrame with columns: chrom, position, strand, role.
-        Rows are unique splice sites.
-    """
-    exon = junctions[["chrom", "strand"]].assign(
-        exon_start=junctions["intron_start"] - 1,
-        exon_end=junctions["intron_end"] + 1,
-    )
-    return junctions_to_site_table(exon)
-
-
-def compute_splice_site_usage(
-    all_junctions: pd.DataFrame,
-    chrom: str,
-    position: int,
-    strand: str,
-) -> dict:
-    """Compute splice-site usage for a single position.
-
-    Usage = reads at this site / total reads across all junctions on the same
-    chrom/strand.  The denominator is the sum of all junction read counts on
-    that chrom/strand, so values are in [0, 1] and reflect the relative
-    importance of this site compared to all splicing activity nearby.
-
-    Args:
-        all_junctions: Full junctions DataFrame (with 'exon_start', 'exon_end',
-            'strand', 'count' columns).
-        chrom: Chromosome name.
-        position: 1-based exon coordinate of the splice site.
-        strand: Strand ('+' or '-').
-
-    Returns:
-        Dict with keys: position, splice_site_usage, total_reads.
-    """
-    chrom_mask = (all_junctions["chrom"] == chrom) & (all_junctions["strand"] == strand)
-
-    donor_mask = chrom_mask & (all_junctions["exon_start"] == position)
-    acceptor_mask = chrom_mask & (all_junctions["exon_end"] == position)
-
-    site_reads = float(all_junctions.loc[donor_mask | acceptor_mask, "count"].sum())
-    total_reads = float(all_junctions.loc[chrom_mask, "count"].sum())
-    usage = 0.0 if total_reads == 0 else site_reads / total_reads
-
-    return {
-        "position": position,
-        "splice_site_usage": usage,
-        "total_reads": total_reads,
-    }
-
-
 def filter_intervals_with_junctions(
     intervals: pd.DataFrame,
     junctions: pd.DataFrame,
@@ -261,40 +199,6 @@ def filter_intervals_with_junctions(
     filtered = intervals.loc[keep_interval].reset_index(drop=True)
     overlaps = pd.concat(keep_junc, ignore_index=True).drop_duplicates()
     return filtered, overlaps
-
-
-def splice_sites_to_array(
-    splice_sites: pd.DataFrame,
-    seq_len: int,
-    start: int,
-) -> np.ndarray:
-    """Convert splice sites to a boolean array over the sequence.
-
-    Args:
-        splice_sites: DataFrame with columns chrom, position, strand, role.
-        seq_len: Length of the sequence window.
-        start: 1-based genomic start of the window (positions are 1-based).
-
-    Returns:
-        Boolean array of shape (3, seq_len):
-            row 0: donor sites
-            row 1: acceptor sites
-            row 2: any splice site (donor OR acceptor)
-    """
-    arr = np.zeros((3, seq_len), dtype=bool)
-    if splice_sites.empty:
-        return arr
-
-    for _, site in splice_sites.iterrows():
-        idx = int(site["position"]) - start  # convert to 0-based relative index
-        if 0 <= idx < seq_len:
-            if site["role"] == "donor":
-                arr[0, idx] = True
-            elif site["role"] == "acceptor":
-                arr[1, idx] = True
-            arr[2, idx] = True
-
-    return arr
 
 
 # 5-class label indices matching the JAX SpliceSitesClassificationHead
@@ -400,7 +304,6 @@ def junctions_to_ssu_approx_arrays_by_strand(
 
     donor_alpha, acceptor_alpha, donor_beta2, acceptor_beta2 = compute_alpha_beta2(local)
 
-    end = start + seq_len  # 0-based exclusive
 
     def _place(alpha_series: pd.Series, beta2_series: pd.Series, role: str) -> None:
         for (ch, pos, strand), alpha in alpha_series.items():
@@ -588,7 +491,6 @@ def junctions_to_classification_array(
     arr[:, _CLASS_NONE] = 1.0  # default all positions to None
 
     # Collect all unique sites across samples
-    end = start + seq_len  # 0-based exclusive
     rows = []
     for junc_df in all_juncs_list:
         local = junc_df.loc[junc_df["chrom"] == chrom]
@@ -948,121 +850,3 @@ def normalize_junctions_tissue_level(
 
     return normalized
 
-
-def junctions_to_usage_array(
-    junc_df: pd.DataFrame,
-    chrom: str,
-    start: int,
-    seq_len: int,
-) -> np.ndarray:
-    """Build a per-position usage array for one sample within a window.
-
-    Each splice site position receives the fraction of total junction reads
-    (within the window) that pass through that site.  A junction contributes
-    its fractional count to both its donor and acceptor positions, so the
-    array values sum to ≤ 2.0 and each individual value is in [0, 1].
-
-    Args:
-        junc_df: Junction DataFrame for one sample with columns: chrom,
-            exon_start (1-based), exon_end (1-based), strand, count.
-        chrom: Chromosome name of the window.
-        start: 0-based genomic start of the window.
-        seq_len: Length of the window in base pairs.
-
-    Returns:
-        Float32 array of shape (seq_len,).
-    """
-    arr = np.zeros(seq_len, dtype=np.float32)
-    end = start + seq_len  # 0-based exclusive
-
-    mask = (
-        (junc_df["chrom"] == chrom)
-        & (junc_df["exon_start"] > start)   # exon_start is 1-based; >start ≡ ≥start+1
-        & (junc_df["exon_start"] <= end)
-        & (junc_df["exon_end"] > start)
-        & (junc_df["exon_end"] <= end)
-    )
-    local = junc_df.loc[mask]
-    if local.empty:
-        return arr
-
-    total = float(local["count"].sum())
-    if total == 0:
-        return arr
-
-    for _, junc in local.iterrows():
-        frac = junc["count"] / total
-        donor_idx = int(junc["exon_start"]) - 1 - start   # 1-based → 0-based relative
-        accept_idx = int(junc["exon_end"]) - 1 - start
-        if 0 <= donor_idx < seq_len:
-            arr[donor_idx] += frac
-        if 0 <= accept_idx < seq_len:
-            arr[accept_idx] += frac
-
-    return arr
-
-
-def junctions_to_usage_arrays_by_strand(
-    junc_df: pd.DataFrame,
-    chrom: str,
-    start: int,
-    seq_len: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build per-position usage arrays per strand for one sample within a window.
-
-    Returns separate usage arrays for positive and negative strands.
-    Each array represents the fraction of that strand's junction reads
-    passing through each splice site position.
-
-    Args:
-        junc_df: Junction DataFrame with columns: chrom, exon_start (1-based),
-            exon_end (1-based), strand, count.
-        chrom: Chromosome name of the window.
-        start: 0-based genomic start of the window.
-        seq_len: Length of the window in base pairs.
-
-    Returns:
-        Tuple of two float32 arrays of shape (seq_len,):
-            - pos_arr: usage for positive strand
-            - neg_arr: usage for negative strand
-    """
-    pos_arr = np.zeros(seq_len, dtype=np.float32)
-    neg_arr = np.zeros(seq_len, dtype=np.float32)
-    end = start + seq_len  # 0-based exclusive
-
-    mask = (
-        (junc_df["chrom"] == chrom)
-        & (junc_df["exon_start"] > start)
-        & (junc_df["exon_start"] <= end)
-        & (junc_df["exon_end"] > start)
-        & (junc_df["exon_end"] <= end)
-    )
-    local = junc_df.loc[mask]
-    if local.empty:
-        return pos_arr, neg_arr
-
-    # Compute total reads per strand
-    pos_total = float(local[local["strand"] == "+"]["count"].sum())
-    neg_total = float(local[local["strand"] == "-"]["count"].sum())
-
-    # Build usage arrays per strand
-    for _, junc in local.iterrows():
-        donor_idx = int(junc["exon_start"]) - 1 - start
-        accept_idx = int(junc["exon_end"]) - 1 - start
-
-        if junc["strand"] == "+":
-            if pos_total > 0:
-                frac = junc["count"] / pos_total
-                if 0 <= donor_idx < seq_len:
-                    pos_arr[donor_idx] += frac
-                if 0 <= accept_idx < seq_len:
-                    pos_arr[accept_idx] += frac
-        elif junc["strand"] == "-":
-            if neg_total > 0:
-                frac = junc["count"] / neg_total
-                if 0 <= donor_idx < seq_len:
-                    neg_arr[donor_idx] += frac
-                if 0 <= accept_idx < seq_len:
-                    neg_arr[accept_idx] += frac
-
-    return pos_arr, neg_arr

@@ -37,7 +37,6 @@ import torch.nn as nn
 
 from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.heads import (
-    GenomeTracksHead,
     SpliceSitesClassificationHead,
     SpliceSitesUsageHead,
     SpliceSitesJunctionHead,

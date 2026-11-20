@@ -663,7 +663,7 @@ def main() -> None:
 
     df_spliser = None
     if args.bam is not None:
-        print(f"Computing SpliSER-equivalent (all counts from BAM) …")
+        print("Computing SpliSER-equivalent (all counts from BAM) …")
         df_spliser = compute_spliser_counts(args.bam, junctions, args.mapq)
         print(f"  {len(df_spliser):,} sites with BAM counts")
 

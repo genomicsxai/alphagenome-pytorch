@@ -1369,7 +1369,6 @@ class SplicingDataset(Dataset):
             to the classification labels (``"probs"``).
     """
 
-    N_CLASSIFICATION_CLASSES = 5
 
     def __init__(
         self,
@@ -1632,176 +1631,6 @@ class SplicingDataset(Dataset):
         }
         return sequence, targets_dict
 
-    @property
-    def n_classification_tracks(self) -> int:
-        """Number of classification channels (always 5)."""
-        return self.N_CLASSIFICATION_CLASSES
-
-    @property
-    def n_usage_tracks(self) -> int:
-        """Number of usage channels (2 per sample: positive and negative strand)."""
-        n = len(self.ssu_files) if self.ssu_files is not None else len(self.star_junction_files)
-        return 2 * n
-
-
-class DistillationDataset(Dataset):
-    """Dataset that serves pretrained model outputs as finetuning targets.
-
-    Loads raw model output tensors saved by generate_oracle_targets.py as .npz
-    files.  The interface mirrors MultimodalDataset so it can be dropped in
-    anywhere collate_multimodal is used.
-
-    Supported modalities (controlled by the ``modalities`` argument):
-        - ``rna_seq``           — shape (seq_len, 2): HepG2 fwd/rev tracks
-        - ``splice_site``       — shape (seq_len, 5): continuous donor/acceptor probs
-        - ``splice_usage``      — shape (seq_len, 2): HepG2 fwd/rev usage
-        - ``splice_junctions``  — junction_positions + junction_counts tensors
-
-    For sequence-based modalities the targets_dict follows the same
-    ``{resolution: tensor}`` convention as GenomicDataset.  For the junction
-    modality it follows the same string-key dict as SplicingDataset.
-
-    Args:
-        manifest_path: Path to ``distillation_manifest.parquet`` written by
-            generate_oracle_targets.py.
-        genome_fasta: Reference genome FASTA (path or CachedGenome) used to
-            load one-hot sequences.
-        sequence_length: Must match the sequence length used during oracle
-            generation.
-        modalities: Subset of modalities to return.  Defaults to all present.
-        rna_seq_hepg2_indices: ``(fwd_idx, rev_idx)`` within-head track
-            indices for the HepG2 rna_seq tracks to slice from the full
-            rna_seq array.  Defaults to ``(0, 1)`` which works when the npz
-            was written with only fwd/rev already sliced.
-        usage_hepg2_indices: ``(fwd_idx, rev_idx)`` for splice_usage.
-        junction_hepg2_tissue_idx: tissue index for splice_junctions.
-        resolutions: Output resolutions for sequence-based modalities (rna_seq,
-            splice_usage).  Each resolution > 1 sums adjacent 1-bp bins, matching
-            GenomicDataset behaviour.  Defaults to ``[1]``.  splice_site and
-            splice_junctions are always returned at 1-bp resolution regardless.
-    """
-
-    _SEQUENCE_MODALITIES = {"rna_seq", "splice_site", "splice_usage"}
-    _JUNCTION_MODALITY = "splice_junctions"
-    _ALL_MODALITIES = _SEQUENCE_MODALITIES | {_JUNCTION_MODALITY}
-
-    def __init__(
-        self,
-        manifest_path: str,
-        genome_fasta,
-        sequence_length: int = 1_048_576,
-        modalities: list[str] | None = None,
-        rna_seq_hepg2_indices: tuple[int, int] = (0, 1),
-        usage_hepg2_indices: tuple[int, int] = (0, 1),
-        junction_hepg2_tissue_idx: int = 0,
-        resolutions: list[int] | tuple[int, ...] | None = None,
-    ):
-        import pandas as pd
-        manifest = pd.read_parquet(manifest_path)
-        self._npz_dir = Path(manifest_path).parent
-        self._records = manifest.to_dict("records")
-        self._sequence_length = sequence_length
-        self._modalities = list(modalities) if modalities is not None else list(self._ALL_MODALITIES)
-        self._rna_fwd_idx, self._rna_rev_idx = rna_seq_hepg2_indices
-        self._usg_fwd_idx, self._usg_rev_idx = usage_hepg2_indices
-        self._junc_t = junction_hepg2_tissue_idx
-        self._resolutions = list(resolutions) if resolutions is not None else [1]
-
-        if isinstance(genome_fasta, str):
-            _ensure_genomic_deps()
-            self._fasta_path = genome_fasta
-            self._fasta = None  # lazy open per worker
-        else:
-            self._fasta_path = None
-            self._fasta = genome_fasta  # CachedGenome
-
-    def _ensure_fasta(self):
-        if self._fasta is None:
-            import pyfaidx
-            self._fasta = pyfaidx.Fasta(self._fasta_path)
-
-    def __len__(self) -> int:
-        return len(self._records)
-
-    def _bin_to_resolutions(self, arr: np.ndarray) -> dict[int, torch.Tensor]:
-        """Return {resolution: tensor} for each requested resolution.
-
-        Resolution 1 is returned as-is; higher resolutions are produced by
-        summing adjacent bins, matching the GenomicDataset convention.
-        """
-        result = {}
-        for res in self._resolutions:
-            if res == 1:
-                result[res] = torch.from_numpy(arr)
-            else:
-                out_len = self._sequence_length // res
-                binned = arr.reshape(out_len, res, arr.shape[-1]).sum(axis=1)
-                result[res] = torch.from_numpy(binned)
-        return result
-
-    def __getitem__(
-        self, idx: int
-    ) -> tuple[torch.Tensor, dict[str, dict]]:
-        """Return (sequence, modality_targets) matching MultimodalDataset output."""
-        self._ensure_fasta()
-        rec = self._records[idx]
-        chrom    = rec["chrom"]
-        seq_start = int(rec["seq_start"])
-        seq_end   = int(rec["seq_end"])
-
-        # One-hot sequence
-        seq_str = str(self._fasta[chrom][max(0, seq_start):seq_end]).upper()
-        if seq_start < 0:
-            seq_str = "N" * (-seq_start) + seq_str
-        from alphagenome_pytorch.utils.sequence import sequence_to_onehot
-        sequence = torch.from_numpy(sequence_to_onehot(seq_str)).float()  # (S, 4)
-
-        # Load npz
-        npz_path = self._npz_dir / rec["npz"]
-        data = np.load(npz_path, allow_pickle=False)
-
-        modality_targets: dict[str, dict] = {}
-
-        for mod in self._modalities:
-            if mod == "rna_seq" and "rna_seq" in data:
-                rna = data["rna_seq"]  # (S, n_tracks)
-                fwd = rna[:, self._rna_fwd_idx]
-                rev = rna[:, self._rna_rev_idx]
-                arr1 = np.stack([fwd, rev], axis=-1).astype(np.float32)  # (S, 2)
-                modality_targets["rna_seq"] = self._bin_to_resolutions(arr1)
-
-            elif mod == "splice_site" and "splice_sites_classification" in data:
-                cls_arr = data["splice_sites_classification"]  # (S, 5)
-                modality_targets["splice_site"] = {"probs": torch.from_numpy(cls_arr.astype(np.float32))}
-
-            elif mod == "splice_usage" and "splice_sites_usage" in data:
-                usg = data["splice_sites_usage"]  # (S, n_tracks)
-                fwd = usg[:, self._usg_fwd_idx]
-                rev = usg[:, self._usg_rev_idx]
-                arr1 = np.stack([fwd, rev], axis=-1).astype(np.float32)  # (S, 2)
-                modality_targets["splice_usage"] = {"usage": torch.from_numpy(arr1)}
-
-            elif mod == "splice_junctions" and "junction_positions" in data:
-                pssp = data["junction_positions"]         # (4, P)  int32
-                counts = data["junction_counts"]          # (P, P, 2T)  float32
-                n_tissues = counts.shape[2] // 2
-                t = min(self._junc_t, n_tissues - 1)
-                # Slice to HepG2 tissue: fwd strand = index t, rev = t + n_tissues
-                junc_matrix = np.stack(
-                    [counts[:, :, t], counts[:, :, t + n_tissues]], axis=-1
-                ).astype(np.float32)  # (P, P, 2)
-                modality_targets["splice_junctions"] = {
-                    "junction_positions": torch.from_numpy(pssp),
-                    "junction_matrix":    torch.from_numpy(junc_matrix),
-                    # Provide dummy probs/usage to satisfy any downstream checks
-                    "probs": torch.zeros(self._sequence_length, 5),
-                    "usage": torch.zeros(self._sequence_length, 2),
-                }
-
-        return sequence, modality_targets
-
-
-# Backward-compatible aliases
 ATACDataset = GenomicDataset
 RNASeqDataset = GenomicDataset
 
@@ -1810,7 +1639,6 @@ __all__ = [
     "GenomicDataset",
     "MultimodalDataset",
     "SplicingDataset",
-    "DistillationDataset",
     "collate_multimodal",
     "ATACDataset",
     "RNASeqDataset",

@@ -3017,7 +3017,7 @@ def validate_multihead(
                         if isinstance(head_module, SpliceSitesClassificationHead):
                             if 1 in predictions_scaled and "probs" in targets_dict:
                                 _logits_flat = predictions_scaled[1].float().reshape(-1, 5)  # (B*S, 5)
-                                _true_flat   = targets_dict["probs"].float().reshape(-1, 5)  # (B*S, 5)
+                                _true_flat   = targets_dict["probs"].float().reshape(-1, 5).to(_logits_flat.device)  # (B*S, 5)
                                 # Splice-site classes only: column 4 (no site) is one-hot at every background position.
                                 _active_flat = _true_flat[:, :4].any(dim=-1)                 # (B*S,)
                                 n_active = int(_active_flat.sum().item())
