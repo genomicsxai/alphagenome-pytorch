@@ -243,8 +243,9 @@ def cross_entropy_loss(
     """Cross entropy loss on counts.
 
     Mirrors upstream JAX `cross_entropy_loss` post-fix (see
-    google-deepmind/alphagenome_research@de264f5): adds eps smoothing to
-    targets and predictions, and skips fully-masked reduction axes so they
+    google-deepmind/alphagenome_research@de264f5): eps is used only for
+    normalization/log-stability at each sum()/log() site, not added to the
+    raw counts upfront, and fully-masked reduction axes are skipped so they
     do not propagate NaNs from 0/0 normalization.
 
     Args:
@@ -257,23 +258,68 @@ def cross_entropy_loss(
     Returns:
         Scalar loss.
     """
-    y_true = y_true.float() + eps
-    y_pred = y_pred.float() + eps
+    y_true = y_true.float()
+    y_pred = y_pred.float()
     mask = mask.expand_as(y_true).bool()
     assert y_true.shape == y_pred.shape == mask.shape
 
-    # For axes where every element is masked, set the mask to True so the
-    # per-axis normalization does not divide by zero; we then drop those rows
-    # from the final mean via `axis_mask`.
+    y_true = torch.where(mask, y_true.float(), torch.zeros_like(y_true.float()))
+    p_true = y_true / torch.clamp(y_true.sum(dim=axis, keepdim=True), min=eps)
+
+    y_pred = y_pred.float()
+    masked_pred = torch.where(mask, y_pred, torch.zeros_like(y_pred))
+    log_normalizer = torch.log((masked_pred + eps).sum(dim=axis))
+    log_likelihood = (p_true * torch.log(y_pred + eps)).sum(dim=axis)
+    
+    log_loss = log_normalizer - log_likelihood
+    return _safe_masked_mean(log_loss, mask.any(dim=axis))
+
+def cross_entropy_loss_normalized(
+    *,
+    y_true: Tensor,
+    y_pred: Tensor,
+    mask: Tensor,
+    axis: int,
+    eps: float = 1e-7,
+) -> Tensor:
+    """Cross entropy loss on counts — normalized (ratio) formulation.
+
+    Port of the JAX implementation after commit de264f5 in alphagenome_research.
+    Both y_true and y_pred are explicitly normalized to probability ratios within
+    masked positions before computing CE, and eps is added to y_true for label
+    smoothing. Fully-masked axes are handled to prevent NaN propagation.
+
+    Args:
+        y_true: Target counts.
+        y_pred: Predicted counts.
+        mask: Boolean mask.
+        axis: Axis for normalization.
+        eps: Small epsilon for numerical stability and label smoothing.
+
+    Returns:
+        Scalar loss.
+    """
+    mask = mask.expand_as(y_true)
+    assert y_true.shape == y_pred.shape == mask.shape
+
+    y_true = y_true.float() + eps
+    y_pred = y_pred.float() + eps
+
+    # For fully-masked axes, temporarily set mask to True to prevent NaN in
+    # the normalizer; these positions are masked out in the final mean.
     axis_mask = mask.sum(dim=axis, keepdim=True) > 0
-    safe_mask = torch.where(axis_mask, mask, torch.ones_like(mask))
-    safe_mask_f = safe_mask.float()
+    mask_safe = torch.where(axis_mask, mask, torch.ones_like(mask))
 
-    p_true = y_true / (y_true * safe_mask_f).sum(dim=axis, keepdim=True)
-    p_pred = y_pred / (y_pred * safe_mask_f).sum(dim=axis, keepdim=True)
-    log_loss = (-p_true * torch.log(p_pred) * safe_mask_f).sum(dim=axis)
+    p_true = y_true / (y_true * mask_safe).sum(dim=axis, keepdim=True)
+    p_pred = y_pred / (y_pred * mask_safe).sum(dim=axis, keepdim=True)
 
-    return _safe_masked_mean(log_loss, mask=axis_mask.squeeze(axis))
+    log_loss = torch.where(
+        mask_safe,
+        -p_true * torch.log(p_pred),
+        torch.zeros_like(y_true),
+    ).sum(dim=axis)
+
+    return _safe_masked_mean(log_loss, axis_mask.squeeze(dim=axis))
 
 
 def gene_lfc_loss(

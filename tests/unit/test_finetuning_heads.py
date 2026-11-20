@@ -117,7 +117,10 @@ class TestAssayTypes:
 
     def test_all_assay_types_present(self):
         """Test all expected assay types are defined."""
-        expected = {'rna_seq', 'atac', 'dnase', 'procap', 'cage', 'chip_tf', 'chip_histone'}
+        expected = {
+            'rna_seq', 'atac', 'dnase', 'procap', 'cage', 'chip_tf', 'chip_histone',
+            'splice_site', 'splice_usage', 'splice_junctions',
+        }
         assert set(ASSAY_TYPES.keys()) == expected
 
     def test_only_rnaseq_has_squashing(self):
@@ -204,9 +207,14 @@ class TestCreateFinetuningHeadAllModalities:
         with pytest.raises(ValueError, match="Invalid resolution"):
             create_finetuning_head('atac', n_tracks=5, resolutions=(64,))
 
-    @pytest.mark.parametrize("assay_type", list(ASSAY_TYPES.keys()))
+    _GENOME_TRACKS_ASSAY_TYPES = [
+        a for a in ASSAY_TYPES
+        if a not in ('splice_site', 'splice_usage', 'splice_junctions')
+    ]
+
+    @pytest.mark.parametrize("assay_type", _GENOME_TRACKS_ASSAY_TYPES)
     def test_all_modalities_output_non_negative(self, assay_type):
-        """Test all modalities produce non-negative outputs."""
+        """Test all GenomeTracksHead-backed modalities produce non-negative outputs."""
         head = create_finetuning_head(assay_type, n_tracks=3, resolutions=(128,))
         # Input NCL format: (B, C, S)
         embeddings_dict = {128: torch.randn(2, 3072, 100)}
@@ -215,6 +223,39 @@ class TestCreateFinetuningHeadAllModalities:
         outputs = head(embeddings_dict, organism_index)
 
         assert (outputs[128] >= 0).all()
+
+    def test_splice_site_output_non_negative(self):
+        """Splice heads return original head instances with a raw-tensor (not dict) calling
+        convention at fixed resolution 1 — see create_finetuning_head docstring."""
+        head = create_finetuning_head('splice_site', n_tracks=3)
+        embeddings_1bp = torch.randn(2, 1536, 100)  # NCL: (B, C, S)
+        organism_index = torch.tensor([0, 0])
+
+        outputs = head(embeddings_1bp, organism_index)
+
+        assert (outputs['probs'] >= 0).all()
+
+    def test_splice_usage_output_non_negative(self):
+        head = create_finetuning_head('splice_usage', n_tracks=3)
+        embeddings_1bp = torch.randn(2, 1536, 100)  # NCL: (B, C, S)
+        organism_index = torch.tensor([0, 0])
+
+        outputs = head(embeddings_1bp, organism_index)
+
+        assert (outputs['predictions'] >= 0).all()
+
+    def test_splice_junctions_output_non_negative(self):
+        head = create_finetuning_head('splice_junctions', n_tracks=3)
+        embeddings_1bp = torch.randn(2, 1536, 100)  # NCL: (B, C, S)
+        organism_index = torch.tensor([0, 0])
+        positions = torch.randint(0, 100, (2, 4, 5))
+
+        outputs = head(
+            embeddings_1bp, organism_index,
+            splice_site_positions=positions, channels_last=False,
+        )
+
+        assert (outputs['pred_counts'] >= 0).all()
 
 
 @pytest.mark.unit

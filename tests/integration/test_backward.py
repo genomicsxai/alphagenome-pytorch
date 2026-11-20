@@ -483,7 +483,9 @@ class TestSpliceHeadGradients:
             dim=1,
         )
 
-        output = head(embeddings, organism_index, splice_site_positions=splice_positions)
+        output = head(
+            embeddings, organism_index, splice_site_positions=splice_positions, channels_last=False
+        )
         loss = output["pred_counts"].sum()
         loss.backward()
 

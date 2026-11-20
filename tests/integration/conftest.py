@@ -10,11 +10,3 @@ Most fixtures are inherited from the root tests/conftest.py, including:
 - mock_data_dir
 - torch_weights_path
 """
-
-import pytest
-from pathlib import Path
-
-@pytest.fixture(scope="module")
-def mock_data_dir():
-    """Path to mock data directory for finetuning tests."""
-    return Path(__file__).parent.parent / "fixtures" / "mock_data"

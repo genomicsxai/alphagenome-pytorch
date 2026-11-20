@@ -41,22 +41,28 @@ def _required_cli_args() -> list[str]:
 class TestComputeMultinomialResolution:
     """Tests for _compute_multinomial_resolution utility."""
 
-    def test_default_8_segments(self):
-        assert _compute_multinomial_resolution(256) == 32
-        assert _compute_multinomial_resolution(1024) == 128
-        assert _compute_multinomial_resolution(64) == 8
+    def test_fixed_8_segments(self):
+        assert _compute_multinomial_resolution(256, num_segments=8) == 32
+        assert _compute_multinomial_resolution(1024, num_segments=8) == 128
+        assert _compute_multinomial_resolution(64, num_segments=8) == 8
+
+    def test_default_follows_alphagenome_research(self):
+        # Default: fixed 2**17 bp segments (capped at the sequence length).
+        assert _compute_multinomial_resolution(256) == 256
+        assert _compute_multinomial_resolution(2**20) == 2**17
+        assert _compute_multinomial_resolution(2**13, res=128) == 2**10
 
     def test_custom_segments(self):
         assert _compute_multinomial_resolution(256, num_segments=4) == 64
         assert _compute_multinomial_resolution(256, num_segments=16) == 16
 
     def test_min_segment_size(self):
-        assert _compute_multinomial_resolution(64, min_segment_size=16) == 16
-        assert _compute_multinomial_resolution(256, min_segment_size=16) == 32
+        assert _compute_multinomial_resolution(64, num_segments=8, min_segment_size=16) == 16
+        assert _compute_multinomial_resolution(256, num_segments=8, min_segment_size=16) == 32
 
     def test_small_sequence(self):
-        assert _compute_multinomial_resolution(8) == 1
-        assert _compute_multinomial_resolution(4) == 1
+        assert _compute_multinomial_resolution(8, num_segments=8) == 1
+        assert _compute_multinomial_resolution(4, num_segments=8) == 1
 
 
 @pytest.mark.unit
@@ -485,9 +491,9 @@ class TestParseArgsGeneExprEval:
 
     def test_falls_back_to_gtf_annotation(self, monkeypatch):
         self._rna_cli(monkeypatch, [
-            "--gene-expr-eval", "--gtf", "genes.gtf", "--track-strands", "+",
+            "--gene-expr-eval", "--gene-gtf", "genes.gtf", "--track-strands", "+",
         ])
-        args = parse_args()  # --gtf satisfies the annotation requirement
+        args = parse_args()  # --gene-gtf satisfies the annotation requirement
         assert args.gene_expr_eval is True
 
     def test_requires_annotation(self, monkeypatch):

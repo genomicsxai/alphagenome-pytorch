@@ -24,7 +24,10 @@ from alphagenome_pytorch.extensions.finetuning.checkpointing import (
     load_finetuned_model as _canonical_load_finetuned_model,
     select_organism_index,
 )
-from alphagenome_pytorch.extensions.finetuning.training import NUM_SEGMENTS
+from alphagenome_pytorch.extensions.finetuning.training import (
+    NUM_SEGMENTS,
+    _compute_multinomial_resolution,
+)
 from alphagenome_pytorch.extensions.finetuning.transfer import (
     transfer_config_from_dict,
 )
@@ -251,9 +254,7 @@ def evaluate_split(
                 dtype=torch.bool, device=device,
             )
             seq_len = pred.shape[-2]
-            mn_res = max(1, seq_len // NUM_SEGMENTS)
-            while mn_res > 1 and seq_len % mn_res != 0:
-                mn_res -= 1
+            mn_res = _compute_multinomial_resolution(seq_len, NUM_SEGMENTS, res=res)
             ld = multinomial_loss(
                 y_pred=pred, y_true=targets_scaled, mask=mask,
                 multinomial_resolution=mn_res,

@@ -392,7 +392,8 @@ class TestSpliceSitesJunctionHead:
         embeddings = torch.randn(B, in_channels, S)
         organism_index = torch.tensor([0, 1])
 
-        output = head(embeddings, organism_index, splice_site_positions=torch.randint(0, S, (B, 4, P)))
+        output = head(embeddings, organism_index, splice_site_positions=torch.randint(0, S, (B, 4, P)),
+                      channels_last=False)
         assert output['pred_counts'].shape == (B, P, P, 2 * T)
 
     def test_no_splice_site_positions(self):
@@ -454,7 +455,7 @@ class TestSpliceSitesJunctionHead:
         organism_index = torch.tensor([0, 1])
         positions = torch.randint(0, S, (B, 4, P))
 
-        output = head(embeddings, organism_index, splice_site_positions=positions)
+        output = head(embeddings, organism_index, splice_site_positions=positions, channels_last=False)
         mask = output['splice_junction_mask']
 
         # Organism 0 (human): all tissues valid in both strands.
@@ -480,7 +481,7 @@ class TestSpliceSitesJunctionHead:
         organism_index = torch.tensor([0, 1])
         positions = torch.randint(0, S, (B, 4, P))
 
-        output = head(embeddings, organism_index, splice_site_positions=positions)
+        output = head(embeddings, organism_index, splice_site_positions=positions, channels_last=False)
         mask = output['splice_junction_mask']
 
         assert bool(mask[0].all())
@@ -500,9 +501,11 @@ class TestSpliceSitesJunctionHead:
                                    [-1, -1, -1], [-1, -1, -1]]], device='cuda')
 
         with torch.no_grad():
-            ref = head(embeddings, organism_index, splice_site_positions=positions)['pred_counts']
+            ref = head(embeddings, organism_index, splice_site_positions=positions,
+                       channels_last=False)['pred_counts']
             with torch.autocast('cuda', dtype=torch.bfloat16):
-                out = head(embeddings, organism_index, splice_site_positions=positions)['pred_counts']
+                out = head(embeddings, organism_index, splice_site_positions=positions,
+                           channels_last=False)['pred_counts']
 
         torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=1e-3)
 

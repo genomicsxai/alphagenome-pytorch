@@ -392,11 +392,10 @@ class TestCrossEntropyLossSmoothingFix:
         assert torch.isclose(loss, torch.tensor(0.9772524237632751), atol=1e-6)
 
     def test_zero_counts_smoothed(self):
-        """All-zero counts: loss equals entropy of the smoothed uniform distribution.
-
-        With y_true = y_pred = 0 and eps = 1e-7, after smoothing the per-axis
-        distribution is uniform over the axis size (here 3), so the loss is
-        log(3) ≈ 1.0986123. Crucially, no inf from log(0).
+        """All-zero counts: eps only enters via the log_normalizer/log_likelihood
+        terms (not added to the raw counts upfront), matching upstream JAX exactly
+        — golden value from `alphagenome_research.model.losses.cross_entropy_loss`
+        on the same inputs. Crucially, no inf/nan from log(0).
         """
         y = torch.zeros((1, 2, 3))
         mask = torch.ones((1, 2, 3), dtype=torch.bool)
@@ -404,7 +403,7 @@ class TestCrossEntropyLossSmoothingFix:
             y_true=y, y_pred=y, mask=mask, axis=-1,
         )
         assert torch.isfinite(loss)
-        assert torch.isclose(loss, torch.tensor(1.0986123085021973), atol=1e-6)
+        assert torch.isclose(loss, torch.tensor(-15.019484), atol=1e-5)
 
     def test_smoothing_gradient_finite(self):
         """Zero-count predictions must yield finite gradient (no log(0))."""

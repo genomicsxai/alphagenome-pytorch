@@ -11,6 +11,7 @@ import signal
 import struct
 import sys
 import tempfile
+import threading
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -192,9 +193,24 @@ def find_latest_checkpoint(output_dir: Path) -> Path | None:
         return None
 
     # If preempt exists, prefer it when it's newer than the latest epoch
-    # checkpoint (it was saved *after* the last completed epoch).
+    # checkpoint (it was saved *after* the last completed epoch).  Older delta
+    # writers did not persist ``metadata.batch_idx``.  Loading such a partial-
+    # epoch checkpoint and starting its epoch at batch zero would silently
+    # replay already-applied optimizer updates.  When a clean epoch checkpoint
+    # exists, prefer that boundary instead.  (With no epoch checkpoint there is
+    # no clean recovery point to fall back to, so retain the legacy behavior.)
     if preempt is not None:
         if not epoch_ckpts or preempt.stat().st_mtime >= epoch_ckpts[-1].stat().st_mtime:
+            if epoch_ckpts and preempt.name.endswith(".delta.pth"):
+                try:
+                    payload = torch.load(
+                        preempt, map_location="cpu", weights_only=False
+                    )
+                    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+                except Exception:
+                    metadata = {}
+                if "batch_idx" not in metadata:
+                    return epoch_ckpts[-1]
             return preempt
 
     return epoch_ckpts[-1] if epoch_ckpts else None
@@ -242,11 +258,12 @@ def load_checkpoint(
 
 
 class PreemptionHandler:
-    """Handler for graceful preemption via signals (e.g., SIGUSR1 from SLURM).
+    """Handler for graceful preemption via signals.
 
-    When the signal is received, sets a flag. The training loop should check
-    `handler.preempted` and call `handler.save_and_exit()` to save a checkpoint
-    before exiting gracefully.
+    Listens for SIGUSR1 (SLURM preemption), SIGTERM (scancel / kill),
+    and SIGINT (Ctrl+C). When any signal is received, sets a flag. The
+    training loop should check `handler.preempted` and call
+    `handler.save_and_exit()` to save a checkpoint before exiting gracefully.
 
     Note:
         The save function is NOT called inside the signal handler to avoid
@@ -255,7 +272,7 @@ class PreemptionHandler:
         Instead, the training loop should check the flag and save explicitly.
 
     Attributes:
-        preempted: Whether preemption signal was received.
+        preempted: Whether a preemption signal was received.
 
     Example:
         >>> handler = PreemptionHandler(
@@ -271,12 +288,15 @@ class PreemptionHandler:
         ...     # ... training loop ...
     """
 
+    _SIGNALS = (signal.SIGUSR1, signal.SIGTERM, signal.SIGINT)
+
     def __init__(
         self,
         save_fn: Callable[[], None] | None = None,
         rank: int = 0,
         world_size: int = 1,
-        signal_num: int = signal.SIGUSR1,
+        signal_num: int = signal.SIGUSR1,  # kept for backward compatibility, ignored
+        sync_group: Any | None = None,
     ) -> None:
         """Initialize the preemption handler.
 
@@ -284,20 +304,22 @@ class PreemptionHandler:
             save_fn: Function to call to save checkpoint (called from training loop, not signal handler).
             rank: Process rank for distributed training.
             world_size: Total number of processes.
-            signal_num: Signal to handle (default: SIGUSR1, used by SLURM).
+            signal_num: Ignored; all of SIGUSR1, SIGTERM, and SIGINT are always registered.
         """
         self.save_fn = save_fn
         self.rank = rank
         self.world_size = world_size
-        self.signal_num = signal_num
+        self.sync_group = sync_group
         self.preempted = False
-        self._original_handler = None
+        self._original_handlers: dict[int, Any] = {}
+        self._save_thread: threading.Thread | None = None
 
     def _handler(self, signum: int, frame) -> None:
-        """Signal handler that sets preempted flag.
+        """Signal handler that sets preempted flag and triggers an immediate save.
 
-        Note: Does NOT perform I/O to avoid deadlocks. The training loop
-        should check `self.preempted` and call `save_and_exit()` explicitly.
+        The save is dispatched to a background thread so that file I/O does not
+        run inside the signal handler (which would risk deadlocks on locks held
+        by the interrupted thread).
         """
         self.preempted = True
 
@@ -306,15 +328,25 @@ class PreemptionHandler:
             print(f"SIGNAL {signum} received — will save checkpoint and exit.")
             print(f"{'='*60}")
 
+        # Never serialize tensors from this asynchronous handler.  In DDP that
+        # can race an in-flight NCCL collective and deadlock device-to-host
+        # copies.  The training loop observes ``preempted`` at the next safe
+        # batch boundary and calls save_and_exit synchronously.
+
     def save_and_exit(self) -> None:
         """Save checkpoint and synchronize processes.
 
         Call this from the training loop when `preempted` is True.
-        This is safe to call because it runs in the main thread, not
-        inside a signal handler.
+        If the signal handler already dispatched a save thread, this waits
+        for it to finish rather than saving twice.
         """
         if is_main_process(self.rank):
-            if self.save_fn is not None:
+            if self._save_thread is not None and self._save_thread.is_alive():
+                print("Waiting for preemption checkpoint to finish saving...")
+                self._save_thread.join()
+                print("Preemption checkpoint saved.")
+            elif self.save_fn is not None and self._save_thread is None:
+                # Signal was not received (e.g. called directly); save now.
                 print("Saving preemption checkpoint...")
                 self.save_fn()
                 print("Preemption checkpoint saved.")
@@ -322,23 +354,25 @@ class PreemptionHandler:
 
         # Synchronize all processes
         if self.world_size > 1 and dist.is_initialized():
-            dist.barrier()
+            dist.barrier(group=self.sync_group)
 
     def register(self) -> None:
-        """Register the signal handler."""
-        self._original_handler = signal.signal(self.signal_num, self._handler)
+        """Register handlers for SIGUSR1, SIGTERM, and SIGINT."""
+        for sig in self._SIGNALS:
+            self._original_handlers[sig] = signal.signal(sig, self._handler)
 
     def unregister(self) -> None:
-        """Restore the original signal handler."""
-        if self._original_handler is not None:
-            signal.signal(self.signal_num, self._original_handler)
-            self._original_handler = None
+        """Restore original signal handlers."""
+        for sig, original in self._original_handlers.items():
+            signal.signal(sig, original)
+        self._original_handlers.clear()
 
 
 def setup_preemption_handler(
     save_fn: Callable[[], None] | None = None,
     rank: int = 0,
     world_size: int = 1,
+    sync_group: Any | None = None,
 ) -> PreemptionHandler:
     """Set up and register a preemption handler.
 
@@ -360,7 +394,12 @@ def setup_preemption_handler(
         >>> if handler.preempted:
         ...     break
     """
-    handler = PreemptionHandler(save_fn=save_fn, rank=rank, world_size=world_size)
+    handler = PreemptionHandler(
+        save_fn=save_fn,
+        rank=rank,
+        world_size=world_size,
+        sync_group=sync_group,
+    )
     handler.register()
     return handler
 
@@ -380,6 +419,17 @@ _HEAD_PREFIXES = (
     "splice_sites_usage_head.",
     "splice_sites_junction_head.",
 )
+
+_SPECIAL_HEAD_PREFIX_BY_NAME = {
+    "splice_site": "splice_sites_classification_head.",
+    "splice_usage": "splice_sites_usage_head.",
+    "splice_junctions": "splice_sites_junction_head.",
+}
+
+
+def _checkpoint_head_prefix(head_name: str) -> str:
+    """Map a transfer-config head name to its model state-dict prefix."""
+    return _SPECIAL_HEAD_PREFIX_BY_NAME.get(head_name, f"heads.{head_name}.")
 
 
 def _get_adapter_module_names(model: nn.Module) -> set[str]:
@@ -492,7 +542,7 @@ def split_model_state_dict(
     adapter_module_names = _get_adapter_module_names(model)
 
     if new_head_names is not None:
-        head_prefixes = tuple(f"heads.{n}." for n in new_head_names)
+        head_prefixes = tuple(_checkpoint_head_prefix(n) for n in new_head_names)
     else:
         head_prefixes = _HEAD_PREFIXES
 
@@ -517,11 +567,18 @@ def split_model_state_dict(
     # Validate requested heads were found
     if new_head_names is not None:
         for head_name in new_head_names:
-            prefix = f"heads.{head_name}."
+            prefix = _checkpoint_head_prefix(head_name)
             if not any(k.startswith(prefix) for k in heads):
+                ordinary_heads = list(getattr(model, "heads", {}).keys())
+                special_heads = [
+                    name
+                    for name, special_prefix in _SPECIAL_HEAD_PREFIX_BY_NAME.items()
+                    if getattr(model, special_prefix.removesuffix("."), None) is not None
+                ]
                 raise ValueError(
-                    f"Head '{head_name}' from config.new_heads not found in model.heads. "
-                    f"Available heads: {list(model.heads.keys())}"
+                    f"Head '{head_name}' from config.new_heads not found in model.heads "
+                    "or supported special-head attributes. "
+                    f"Available heads: {ordinary_heads + special_heads}"
                 )
 
     return trunk, adapters, heads

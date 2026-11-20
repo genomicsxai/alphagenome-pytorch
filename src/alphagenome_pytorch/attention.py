@@ -40,9 +40,10 @@ def apply_rope(x, positions=None, max_position=_MAX_RELATIVE_DISTANCE, inplace=F
 
     Matches JAX: alphagenome_research.model.attention.apply_rope
 
-    All computations use the input dtype (x.dtype), matching JAX behavior.
-    When using DtypePolicy.mixed_precision(), this means RoPE computes in bfloat16.
-    When using DtypePolicy.full_float32(), this means RoPE computes in float32.
+    Frequencies are constructed in float32, then cast to the actual input
+    dtype for angles and rotations, matching the compiled JAX reference.
+    A mixed-precision model can still supply float32 inputs after affine
+    normalization; autocast must not silently lower those RoPE angles.
 
     Args:
         x: Input tensor (B, S, H, C)
@@ -56,7 +57,7 @@ def apply_rope(x, positions=None, max_position=_MAX_RELATIVE_DISTANCE, inplace=F
     """
     # x: (B, S, H, C)
     B, S, H, C = x.shape
-    compute_dtype = x.dtype  # Match JAX: use input dtype for all RoPE ops
+    compute_dtype = x.dtype
 
     if positions is None:
         positions = torch.arange(S, device=x.device, dtype=compute_dtype).unsqueeze(0)  # (1, S)
@@ -67,16 +68,23 @@ def apply_rope(x, positions=None, max_position=_MAX_RELATIVE_DISTANCE, inplace=F
     # JAX geomspace equivalent: geomspace(1, max_position - num_freq + 1, num_freq).
     # Use torch.exp(linspace * log(base)) instead of torch.logspace so this stays
     # on-device on MPS, which lacks an aten::logspace.out kernel (pytorch/pytorch#141287).
-    # Compute in float32 and cast the sum (matching JAX's .astype).
+    # Keep the denominator and reciprocal in FP32. Rounding the denominator
+    # first changes BF16 inverse frequencies relative to the JAX JIT reference.
     log_end = math.log10(max_position - num_freq + 1)
     base_freqs = torch.exp(
         torch.linspace(0.0, log_end, steps=num_freq,
                        device=x.device, dtype=torch.float32) * math.log(10.0)
     )
-    denom = (torch.arange(num_freq, device=x.device, dtype=torch.float32) + base_freqs).to(compute_dtype)
-    inv_freq = 1.0 / denom
+    denom = torch.arange(num_freq, device=x.device, dtype=torch.float32) + base_freqs
+    # Cast only the completed inverse frequencies to the actual input dtype.
+    inv_freq = (1.0 / denom).to(compute_dtype)
 
-    theta = torch.einsum('bs,f->bsf', positions, inv_freq)
+    # This is an outer product, not a reduction. CUDA autocast may lower einsum
+    # to BF16 even when both operands are FP32. Rounding large genomic angles
+    # before sin/cos corrupts sparse junction RoPE. Elementwise multiplication
+    # preserves the actual input dtype without disabling mixed precision for
+    # any matmuls. This shared function also affects backbone attention.
+    theta = positions.unsqueeze(-1) * inv_freq
     theta = torch.repeat_interleave(theta, 2, dim=-1).unsqueeze(2)  # (B, S, 1, C)
 
     cos_theta = torch.cos(theta)

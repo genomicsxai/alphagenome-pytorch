@@ -105,9 +105,9 @@ class TestHeadsParameter:
         model.contact_maps_head = None
         model.heads = torch.nn.ModuleDict()
 
-        result = model(dna, organism, heads=("splice_junctions",))
+        result = model(dna, organism, heads=("splice_sites_junction",))
 
-        assert "splice_junctions" in result
+        assert "splice_sites_junction" in result
         assert "splice_sites" not in result
 
     def test_default_splice_junction_mask_matches_reference_metadata(self):

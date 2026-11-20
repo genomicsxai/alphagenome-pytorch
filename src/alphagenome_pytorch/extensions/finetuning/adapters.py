@@ -248,7 +248,7 @@ class Locon(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Original output (frozen)
         original_output = self.original_layer(x)
-        
+
         # Locon output
         locon_input = _apply_conv_padding(
             x,
@@ -258,8 +258,49 @@ class Locon(nn.Module):
             dilation=self.dilation,
         )
         lora_output = self.locon_up(self.locon_down(locon_input)) * self.scale
-        
+
         return original_output + lora_output
+
+    def merge_weights(self) -> nn.Conv1d:
+        """Merge Locon weights into original layer for efficient inference.
+
+        Note: This is an approximation that works for 1x1 up-projection.
+        For full correctness, the merged conv may need adjustment.
+
+        Returns:
+            New Conv1d layer with merged weights.
+        """
+        # For 1x1 up-conv, we can merge: W' = W + scale * up @ down
+        # down: (rank, in_channels, kernel_size)
+        # up: (out_channels, rank, 1)
+        # Result should be (out_channels, in_channels, kernel_size)
+
+        with torch.no_grad():
+            # Reshape for matmul: up (out, rank) @ down (rank, in*k) -> (out, in*k)
+            down_w = self.locon_down.weight.data  # (rank, in_channels, kernel_size)
+            up_w = self.locon_up.weight.data.squeeze(-1)  # (out_channels, rank)
+
+            # Merge: (out, rank) @ (rank, in, k) reshaped
+            rank, in_ch, k = down_w.shape
+            down_flat = down_w.view(rank, -1)  # (rank, in*k)
+            merged_delta = (up_w @ down_flat).view(self.out_channels, in_ch, k)
+
+            merged_weight = self.original_layer.weight.data + self.scale * merged_delta
+
+        merged_layer = nn.Conv1d(
+            self.in_channels,
+            self.out_channels,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding_mode,
+            dilation=self.dilation,
+            bias=self.original_layer.bias is not None,
+        )
+        merged_layer.weight.data = merged_weight
+        if self.original_layer.bias is not None:
+            merged_layer.bias.data = self.original_layer.bias.data.clone()
+
+        return merged_layer
 
 
 class IA3(nn.Module):

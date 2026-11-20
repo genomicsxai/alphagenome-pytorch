@@ -70,12 +70,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import itertools
+import math
 import sys
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -99,6 +102,7 @@ from alphagenome_pytorch.extensions.finetuning import (
     CachedGenome,
     GenomicDataset,
     MultimodalDataset,
+    SplicingDataset,
     compute_track_means,
     collate_genomic,
     collate_multimodal,
@@ -138,13 +142,35 @@ from alphagenome_pytorch.extensions.finetuning.transfer import (
     prepare_for_transfer,
     validate_locon_targets,
     transfer_config_to_dict,
+    load_pretrained_head_weights,
 )
 
-from alphagenome_pytorch.extensions.finetuning.args import parse_args
+from alphagenome_pytorch.extensions.finetuning.args import parse_args, SPLICE_MODALITIES
 
 # =============================================================================
 # Utilities
 # =============================================================================
+
+
+class _BatchLimitedLoader:
+    """Reusable length-aware prefix view over a DataLoader.
+
+    The underlying DistributedSampler still owns deterministic shuffling and
+    ``set_epoch``.  This view merely stops each rank after the same number of
+    microbatches so a trailing partial accumulation window is never stepped.
+    """
+
+    def __init__(self, loader, limit: int):
+        if limit < 0 or limit > len(loader):
+            raise ValueError(f"Invalid loader limit {limit} for {len(loader)} batches")
+        self.loader = loader
+        self.limit = limit
+
+    def __len__(self) -> int:
+        return self.limit
+
+    def __iter__(self):
+        return itertools.islice(iter(self.loader), self.limit)
 
 
 def unwrap_training_model(model: nn.Module) -> nn.Module:
@@ -159,6 +185,23 @@ def unwrap_training_model(model: nn.Module) -> nn.Module:
     if isinstance(inner, DDP):
         return inner.module
     return inner
+
+
+_SPLICE_HEAD_ATTRS = {
+    "splice_site": "splice_sites_classification_head",
+    "splice_usage": "splice_sites_usage_head",
+    "splice_junctions": "splice_sites_junction_head",
+}
+
+
+def get_training_head(model: nn.Module, modality: str) -> nn.Module:
+    """Return a genomic-track or splice head from its canonical location."""
+    if modality in _SPLICE_HEAD_ATTRS:
+        head = getattr(model, _SPLICE_HEAD_ATTRS[modality], None)
+        if head is None:
+            raise KeyError(f"Model has no registered head for modality {modality!r}.")
+        return head
+    return model.heads[modality]
 
 
 # =============================================================================
@@ -192,15 +235,41 @@ def create_datasets(
 
     # Build per-modality track names
     modality_track_names: dict[str, list[str]] = {}
-    for modality, bigwigs in args.modality_to_bigwigs.items():
-        modality_track_names[modality] = [Path(bw).stem for bw in bigwigs]
-        n_tracks = len(bigwigs)
-        print_rank0(
-            f"  {modality}: {n_tracks} track{'s' if n_tracks != 1 else ''}, "
-            f"resolutions={args.modality_resolutions[modality]} - "
-            f"{modality_track_names[modality]}",
-            rank,
-        )
+    for modality in args.modalities:
+        if modality in SPLICE_MODALITIES:
+            junc_files = args.modality_to_star_junctions.get(modality, [])
+            ssu_files = args.modality_to_ssu_files.get(modality) or []
+            junc_stems = [Path(p).stem for p in junc_files]
+            ssu_stems = [Path(p).stem for p in ssu_files]
+            usage_stems = ssu_stems if ssu_stems else junc_stems  # fallback to junction stems
+            if modality == "splice_site":
+                modality_track_names[modality] = [
+                    "cls_donor_pos", "cls_acceptor_pos", "cls_donor_neg", "cls_acceptor_neg", "cls_none"
+                ]
+            elif modality == "splice_usage":
+                modality_track_names[modality] = (
+                    [f"{stem}_pos" for stem in usage_stems] + [f"{stem}_neg" for stem in usage_stems]
+                )
+            elif modality == "splice_junctions":
+                modality_track_names[modality] = (
+                    [f"{stem}_pos" for stem in junc_stems] + [f"{stem}_neg" for stem in junc_stems]
+                )
+            print_rank0(
+                f"  {modality}: {len(junc_files)} junction files, {len(ssu_files)} SSU files, "
+                f"resolutions={args.modality_resolutions[modality]}, "
+                f"tracks={len(modality_track_names[modality])}",
+                rank,
+            )
+        else:
+            bigwigs = args.modality_to_bigwigs.get(modality, [])
+            modality_track_names[modality] = [Path(bw).stem for bw in bigwigs]
+            n_tracks = len(bigwigs)
+            print_rank0(
+                f"  {modality}: {n_tracks} track{'s' if n_tracks != 1 else ''}, "
+                f"resolutions={args.modality_resolutions[modality]} - "
+                f"{modality_track_names[modality]}",
+                rank,
+            )
 
     # Optional gene-mask extractor for the gene LFC training loss (B3.2).
     # Only attached to the rna_seq dataset; gene_mask is sample-level so
@@ -217,8 +286,8 @@ def create_datasets(
             _load_intervals_from_bed,
         )
 
-        print_rank0(f"Loading annotation for gene LFC loss: {args.gtf}", rank)
-        gene_table = cached_load_gene_table(args.gtf, filter_protein_coding=True)
+        print_rank0(f"Loading annotation for gene LFC loss: {args.gene_gtf}", rank)
+        gene_table = cached_load_gene_table(args.gene_gtf, filter_protein_coding=True)
         gene_mask_extractor = GeneMaskExtractor(gene_table)
 
         # Project the BED windows used by the dataset (after centering/expansion
@@ -251,8 +320,41 @@ def create_datasets(
     train_datasets = {}
     val_datasets = {}
 
-    for modality, bigwigs in args.modality_to_bigwigs.items():
+    _splice_dataset_cache: dict[tuple, tuple] = {}  # shares datasets across co-expanded sub-modalities
+
+    for modality in args.modalities:
         resolutions = args.modality_resolutions[modality]
+        if modality in SPLICE_MODALITIES:
+            junc_files = args.modality_to_star_junctions.get(modality, [])
+            ssu_files = args.modality_to_ssu_files.get(modality) or []
+            junc_key = (tuple(sorted(junc_files)), tuple(sorted(ssu_files)))
+            if junc_key not in _splice_dataset_cache:
+                _splice_dataset_cache[junc_key] = (
+                    SplicingDataset(
+                        genome_fasta=genome,
+                        bed_file=args.train_bed,
+                        star_junction_files=junc_files,
+                        ssu_files=ssu_files,
+                        sequence_length=args.sequence_length,
+                        filter_to_junctions=False,
+                        gtf_file=args.gtf,
+                        max_splice_sites=args.max_splice_sites,
+                    ),
+                    SplicingDataset(
+                        genome_fasta=genome,
+                        bed_file=args.val_bed,
+                        star_junction_files=junc_files,
+                        ssu_files=ssu_files,
+                        sequence_length=args.sequence_length,
+                        filter_to_junctions=False,
+                        gtf_file=args.gtf,
+                        max_splice_sites=args.max_splice_sites,
+                    ),
+                )
+            train_datasets[modality], val_datasets[modality] = _splice_dataset_cache[junc_key]
+            continue
+
+        bigwigs = args.modality_to_bigwigs.get(modality, [])
         # Attach the gene-mask extractor only to the modality that consumes
         # the gene LFC loss (rna_seq today).
         attach_gene_mask = (
@@ -339,6 +441,32 @@ def organism_index_from_args(args: argparse.Namespace) -> int:
     and ignore the index, so no head capacity is wasted.
     """
     return ORGANISM_NAME_TO_INDEX.get(getattr(args, "organism", None) or "human", 0)
+
+
+def junction_prediction_top_k(
+    junction_position_source: str,
+    junction_top_k: int,
+) -> int | None:
+    """Return top-k only when junction positions are prediction-derived.
+
+    ``_call_splice_head`` historically treated any non-``None`` top-k as a
+    request to replace annotated positions with classification-head top-k
+    positions.  Passing the CLI's positive default unconditionally therefore
+    made ``--junction-position-source annotated`` behave as ``predicted`` while
+    the saved config still claimed ``annotated``.  Resolve that overloaded
+    low-level argument once at the runner boundary so runtime behavior and
+    provenance cannot diverge.
+    """
+    if junction_position_source == "annotated":
+        return None
+    if junction_position_source == "predicted":
+        if junction_top_k <= 0:
+            raise ValueError("junction_top_k must be positive in predicted mode")
+        return int(junction_top_k)
+    raise ValueError(
+        "junction_position_source must be 'annotated' or 'predicted', got "
+        f"{junction_position_source!r}"
+    )
 
 
 def load_track_metadata_for_finetune(
@@ -475,6 +603,53 @@ def apply_training_strands(
     return rows
 
 
+class AlignedShuffleSampler(torch.utils.data.Sampler):
+    """Training-set shuffle that reproduces alphagenome_ft's batch order.
+
+    alphagenome_ft shuffles the train split once per epoch with
+    ``np.random.default_rng(seed + epoch).shuffle(np.arange(n))`` and slices
+    consecutive global batches of ``batch_size * num_devices`` windows, each
+    sharded contiguously across devices. This sampler yields, for ``rank``,
+    the same contiguous per-device slice of every global batch, so with the
+    same seed, epoch, per-device batch size and device count, every optimizer
+    step sees the same set of windows on both frameworks.
+
+    With ``world_size > 1`` the trailing partial global batch is dropped
+    (alphagenome_ft sets ``drop_last`` when sharding over several devices);
+    with one replica it is kept, as on both sides.
+    """
+
+    def __init__(self, dataset, *, seed: int, batch_size: int,
+                 world_size: int = 1, rank: int = 0) -> None:
+        self._n = len(dataset)
+        self._seed = int(seed)
+        self._batch_size = int(batch_size)
+        self._world_size = int(world_size)
+        self._rank = int(rank)
+        self._epoch = 1
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    def _indices(self) -> list[int]:
+        order = np.arange(self._n)
+        np.random.default_rng(self._seed + self._epoch).shuffle(order)
+        if self._world_size == 1:
+            return order.tolist()
+        global_batch = self._batch_size * self._world_size
+        n_full = (self._n // global_batch) * global_batch
+        batches = order[:n_full].reshape(-1, self._world_size, self._batch_size)
+        return batches[:, self._rank, :].reshape(-1).tolist()
+
+    def __iter__(self):
+        return iter(self._indices())
+
+    def __len__(self) -> int:
+        if self._world_size == 1:
+            return self._n
+        return (self._n // (self._batch_size * self._world_size)) * self._batch_size
+
+
 def create_dataloaders(
     train_dataset,
     val_dataset,
@@ -484,18 +659,25 @@ def create_dataloaders(
     rank: int,
     is_multimodal: bool = False,
     sequence_parallel_mode: bool = False,
-) -> tuple[DataLoader, DataLoader, DistributedSampler | None, DistributedSampler | None]:
+    seed: int = 1234,
+) -> tuple[DataLoader, DataLoader, Any, DistributedSampler | None]:
     """Create data loaders with optional distributed samplers.
 
     Args:
         sequence_parallel_mode: If True, use non-distributed sampler (all ranks see same data).
     """
     # In sequence-parallel mode, all ranks must process the same sequence (shards of it)
+    # Train order follows alphagenome_ft (see AlignedShuffleSampler). In
+    # sequence-parallel mode every rank processes the same sequence, so all
+    # ranks use the single-replica order.
     if sequence_parallel_mode:
-        train_sampler = None
+        train_sampler = AlignedShuffleSampler(train_dataset, seed=seed, batch_size=batch_size)
         val_sampler = None
     else:
-        train_sampler = DistributedSampler(train_dataset, shuffle=True) if world_size > 1 else None
+        train_sampler = AlignedShuffleSampler(
+            train_dataset, seed=seed, batch_size=batch_size,
+            world_size=world_size, rank=rank,
+        )
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if world_size > 1 else None
 
     # Always use collate_multimodal since we now always use MultimodalDataset
@@ -590,14 +772,19 @@ def create_model(
     new_heads_config: dict[str, dict] = {}
     for modality, track_names in modality_track_names.items():
         head_res = (128,) if is_encoder_only else modality_resolutions[modality]
+        n_tracks = len(track_names)
+        # splice_junctions' track_names cover both strands (2 per sample), but
+        # the head's n_tracks is num_tissues (samples) -- halve it here.
+        n_tracks_for_head = n_tracks // 2 if modality == "splice_junctions" else n_tracks
         new_heads_config[modality] = {
             "modality": modality,
-            "num_tracks": len(track_names),
+            "num_tracks": n_tracks_for_head,
             "resolutions": list(head_res),
             "encoder_only": is_encoder_only,
             "track_means": modality_track_means.get(modality),
             "num_organisms": 1,
             "init_scheme": args.head_init_scheme,
+            "rope_init": args.rope_init,
         }
 
     # Create heads directly except in active adapter modes, where
@@ -613,12 +800,13 @@ def create_model(
         for modality, track_names in modality_track_names.items():
             head = create_finetuning_head(
                 assay_type=modality,
-                n_tracks=len(track_names),
+                n_tracks=new_heads_config[modality]["num_tracks"],
                 resolutions=tuple(new_heads_config[modality]["resolutions"]),
                 num_organisms=1,
                 track_means=modality_track_means.get(modality),
                 init_scheme=args.head_init_scheme,
                 encoder_only=is_encoder_only,
+                rope_init=args.rope_init,
             )
             add_head(model, modality, head)
             heads[modality] = head
@@ -682,7 +870,7 @@ def create_model(
             )
             model = prepare_for_transfer(model, transfer_config)
             heads = {
-                modality: model.heads[modality]
+                modality: get_training_head(model, modality)
                 for modality in modality_track_names
             }
             for modality, track_names in modality_track_names.items():
@@ -714,6 +902,19 @@ def create_model(
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
 
+    # Active adapter modes create their heads in prepare_for_transfer(), so
+    # pretrained head slices must be loaded after mode setup rather than before.
+    if getattr(args, "pretrained_head_sample_dict", None) and rank == 0:
+        print_rank0("Loading pretrained head weights:", rank)
+        loaded = load_pretrained_head_weights(
+            model,
+            args.pretrained_weights,
+            args.pretrained_head_sample_dict,
+            organism_idx=organism_index_from_args(args),
+        )
+        if not loaded:
+            print_rank0("  Warning: no pretrained head weights were loaded.", rank)
+
     # Move to device
     model = model.to(device)
 
@@ -724,9 +925,13 @@ def create_model(
         # (e.g. the 1 bp RNA head while the 128 bp output embedder is unused) leaves some trainable
         # params with no gradient, which plain DDP aborts on. find_unused_parameters=True handles
         # that; it is compatible with the model's use_reentrant=False activation checkpointing
-        # (static_graph is not -- the used set is not identical every iteration). Frozen-trunk modes
-        # (linear-probe/encoder-only) never have unused trainable params, so keep the fast path.
-        if args.mode not in ("linear-probe", "encoder-only"):
+        # (static_graph is not -- the used set is not identical every iteration). Splice-head
+        # control flow can also differ by interval/rank (e.g. no junction positions in a window),
+        # so splice modalities need it even with a frozen trunk. Frozen-trunk runs without splice
+        # heads (linear-probe/encoder-only) never have unused trainable params: keep the fast path.
+        if args.mode not in ("linear-probe", "encoder-only") or any(
+            m in SPLICE_MODALITIES for m in args.modalities
+        ):
             ddp_kwargs["find_unused_parameters"] = True
         model = DDP(model, **ddp_kwargs)
         print_rank0("Model wrapped with DistributedDataParallel"
@@ -735,7 +940,7 @@ def create_model(
 
     # Get head references from the underlying model before optional compile.
     model_module = unwrap_training_model(model)
-    heads = {modality: model_module.heads[modality] for modality in heads}
+    heads = {modality: get_training_head(model_module, modality) for modality in heads}
 
     # Optionally compile
     if args.compile:
@@ -765,6 +970,10 @@ def main(args: argparse.Namespace | None = None) -> None:
 
     # Setup distributed
     rank, world_size, local_rank, device = setup_distributed()
+    # Keep checkpoint synchronization off the CUDA/NCCL streams used by DDP.
+    checkpoint_sync_group = (
+        torch.distributed.new_group(backend="gloo") if world_size > 1 else None
+    )
 
     # Set seed
     if args.seed is not None:
@@ -794,7 +1003,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 print(f"Auto-resume: found {resume_path}")
             else:
                 print("Auto-resume: no checkpoint found, starting fresh")
-    elif args.resume:
+    elif args.resume and args.resume.lower() != "none":
         resume_path = Path(args.resume)
 
     # Create datasets
@@ -812,7 +1021,7 @@ def main(args: argparse.Namespace | None = None) -> None:
     if getattr(args, "gene_expr_eval", False):
         from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
 
-        ann_path = args.gene_expr_annotation or args.gtf
+        ann_path = args.gene_expr_annotation or args.gene_gtf
         print_rank0(f"Loading annotation for gene-expression eval: {ann_path}", rank)
         gene_expr_annotation = GeneAnnotation(ann_path)
         # The metric aggregates over exons, but --gtf may legitimately be a
@@ -857,6 +1066,15 @@ def main(args: argparse.Namespace | None = None) -> None:
     # (not args.organism) — otherwise a new human checkpoint records "unknown".
     organism_index = organism_index_from_args(args)
     organism_name = "mouse" if organism_index == 1 else "human"
+    junction_forward_top_k = junction_prediction_top_k(
+        args.junction_position_source, args.junction_top_k,
+    )
+    print_rank0(
+        "Junction positions: "
+        f"source={args.junction_position_source}, annotated_k={args.max_splice_sites}, "
+        f"prediction_top_k={junction_forward_top_k}",
+        rank,
+    )
 
     # Hash the pristine base file before any training mutation. Rank 0 performs
     # the I/O once; all ranks receive the identity so every save path records
@@ -903,14 +1121,36 @@ def main(args: argparse.Namespace | None = None) -> None:
         rank,
         is_multimodal=True,  # Always multimodal now
         sequence_parallel_mode=args.sequence_parallel,
+        seed=args.seed,
     )
-    print_rank0(f"Train batches: {len(train_loader):,}, Val batches: {len(val_loader):,}", rank)
+    raw_train_batches = len(train_loader)
+    dropped_train_batches = 0
+    if args.drop_incomplete_accumulation and args.gradient_accumulation_steps > 1:
+        usable_train_batches = (
+            raw_train_batches // args.gradient_accumulation_steps
+        ) * args.gradient_accumulation_steps
+        if usable_train_batches == 0:
+            raise ValueError(
+                "Training loader is smaller than one complete gradient-accumulation window"
+            )
+        dropped_train_batches = raw_train_batches - usable_train_batches
+        train_loader = _BatchLimitedLoader(train_loader, usable_train_batches)
+    print_rank0(
+        f"Train batches: {len(train_loader):,} usable / {raw_train_batches:,} raw "
+        f"({dropped_train_batches:,} tail batch(es) dropped); "
+        f"Val batches: {len(val_loader):,}",
+        rank,
+    )
 
     # Compute track means for each modality (rank 0 computes, then broadcast)
     modality_track_means: dict[str, torch.Tensor | None] = {}
     if is_main_process(rank):
         print("Computing track means...")
         for modality, bigwigs in args.modality_to_bigwigs.items():
+            if not bigwigs:
+                modality_track_means[modality] = None
+                print(f"  {modality}: no bigwig tracks, skipping track means")
+                continue
             modality_track_means[modality] = compute_track_means(
                 bigwigs,
                 args.train_bed,
@@ -1001,7 +1241,10 @@ def main(args: argparse.Namespace | None = None) -> None:
     )
 
     # Scheduler
-    total_steps = (args.epochs * len(train_loader)) // args.gradient_accumulation_steps
+    # Optimizer steps actually taken: a trailing partial window still steps
+    # unless --drop-incomplete-accumulation trimmed the loader to whole windows.
+    steps_per_epoch = -(-len(train_loader) // args.gradient_accumulation_steps)
+    total_steps = args.epochs * steps_per_epoch
     scheduler = create_lr_scheduler(
         optimizer, args.warmup_steps, total_steps, schedule=args.lr_schedule,
         plateau_factor=args.plateau_factor, plateau_patience=args.plateau_patience,
@@ -1017,6 +1260,7 @@ def main(args: argparse.Namespace | None = None) -> None:
     start_epoch = 1
     best_val_loss = float("inf")
     wandb_run_id = None
+    skip_batches = 0
 
     if resume_path and resume_path.exists():
         print_rank0(f"Resuming from: {resume_path}", rank)
@@ -1033,9 +1277,17 @@ def main(args: argparse.Namespace | None = None) -> None:
                 skip_prepare=True,
             )
             start_epoch = metadata.get("epoch", 0) + 1
+            # A preemption/periodic delta records the next dataloader batch in
+            # the unfinished epoch.  Epoch-boundary deltas omit it and retain
+            # the historical behavior (start the following epoch at batch 0).
+            skip_batches = int(metadata.get("batch_idx", 0) or 0)
             best_val_loss = metadata.get("best_val_loss", metadata.get("val_loss", float("inf")))
             wandb_run_id = metadata.get("wandb_run_id")
-            print_rank0(f"  Resumed from delta checkpoint at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}", rank)
+            print_rank0(
+                f"  Resumed from delta checkpoint at epoch {start_epoch}, "
+                f"batch {skip_batches}, best_val_loss={best_val_loss:.4f}",
+                rank,
+            )
         else:
             # Full checkpoint
             ckpt = load_checkpoint(
@@ -1046,9 +1298,14 @@ def main(args: argparse.Namespace | None = None) -> None:
                 device="cpu",
             )
             start_epoch = ckpt["epoch"] + 1
+            skip_batches = ckpt.get("batch_idx", 0)
             best_val_loss = ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf")))
             wandb_run_id = ckpt.get("wandb_run_id")
             print_rank0(f"  Resumed at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}", rank)
+            # ckpt holds a full CPU copy of model_state_dict/optimizer_state_dict;
+            # its values have already been loaded into model/optimizer, so drop it
+            # before DataLoader workers fork to avoid duplicating it across workers.
+            del ckpt
 
     # Config for logging
     config = {
@@ -1071,9 +1328,24 @@ def main(args: argparse.Namespace | None = None) -> None:
         "locon_alpha": args.locon_alpha if args.mode in ("locon", "lora+locon") else None,
         "locon_targets": args.locon_targets if args.mode in ("locon", "lora+locon") else None,
         "head_init_scheme": args.head_init_scheme,
+        "rope_init": args.rope_init,
+        "pretrained_head_samples": args.pretrained_head_sample_dict,
+        "junction_position_source": args.junction_position_source,
+        "junction_top_k": args.junction_top_k,
+        "max_splice_sites": args.max_splice_sites,
+        "splice_site_threshold": args.splice_site_threshold,
+        "junction_prediction_top_k": junction_forward_top_k,
+        "junction_loss": args.junction_loss,
+        "min_alpha_juncs": args.min_alpha_juncs,
+        "gtf": args.gtf,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "drop_incomplete_accumulation": args.drop_incomplete_accumulation,
+        "raw_train_batches_per_epoch": raw_train_batches,
+        "train_batches_per_epoch": len(train_loader),
+        "dropped_train_batches_per_epoch": dropped_train_batches,
+        "optimizer_steps_per_epoch": steps_per_epoch,
         "effective_batch_size": effective_batch_size,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
@@ -1083,6 +1355,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         "count_weight": args.count_weight,
         "max_grad_norm": args.max_grad_norm,
         "num_segments": args.num_segments,
+        "splice_num_segments": args.splice_num_segments,
         "min_segment_size": args.min_segment_size,
         "total_steps": total_steps,
         "n_trainable_params": sum(p.numel() for p in trainable_params),
@@ -1096,6 +1369,8 @@ def main(args: argparse.Namespace | None = None) -> None:
     }
 
     # Logger (rank 0 only)
+    steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
+    resume_step = (start_epoch - 1) * steps_per_epoch + skip_batches // args.gradient_accumulation_steps
     logger = TrainingLogger(
         output_dir=output_dir,
         rank=rank,
@@ -1105,12 +1380,14 @@ def main(args: argparse.Namespace | None = None) -> None:
         run_name=run_name,
         config=config,
         resume_id=wandb_run_id if resume_path else None,
+        initial_step=resume_step,
     )
 
     use_amp = not args.no_amp
 
     # Preemption handler state
     current_epoch = start_epoch
+    _save_state: dict = {"batch_idx": 0}
 
     def _save_preempt():
         """Save preemption checkpoint, honoring --save-delta / --no-full-checkpoint."""
@@ -1128,10 +1405,12 @@ def main(args: argparse.Namespace | None = None) -> None:
                 scheduler=scheduler,
                 best_val_loss=best_val_loss,
                 wandb_run_id=logger.wandb_run_id,
+                batch_idx=_save_state["batch_idx"],
                 **transfer_config_kwargs,
             )
             print(f"Preemption checkpoint saved to {output_dir / 'checkpoint_preempt.pth'}")
         if args.save_delta and transfer_config is not None:
+            print("Saving delta checkpoint...", flush=True)
             save_delta_checkpoint(
                 path=output_dir / "checkpoint_preempt.delta.pth",
                 model=model_module,
@@ -1143,10 +1422,65 @@ def main(args: argparse.Namespace | None = None) -> None:
                 best_val_loss=best_val_loss,
                 **metadata_kwargs,
                 wandb_run_id=logger.wandb_run_id,
+                batch_idx=_save_state["batch_idx"],
             )
             print(f"Preemption delta checkpoint saved to {output_dir / 'checkpoint_preempt.delta.pth'}")
 
-    handler = setup_preemption_handler(_save_preempt, rank, world_size)
+    handler = setup_preemption_handler(
+        _save_preempt, rank, world_size, sync_group=checkpoint_sync_group
+    )
+
+    # Eval-only mode: load checkpoint and run validation, then exit.
+    if args.eval_only:
+        import json
+        if resume_path is None or not resume_path.exists():
+            print_rank0("ERROR: --eval-only requires a checkpoint via --resume; none found", rank)
+            sys.exit(1)
+        print_rank0(f"\n{'=' * 60}", rank)
+        print_rank0(f"Eval-only mode: loaded checkpoint from {resume_path}", rank)
+        print_rank0(f"{'=' * 60}", rank)
+
+        _eval_encoder_only = args.mode == "encoder-only"
+        _eval_validate_kwargs = dict(
+            model=model, heads=heads, device=device,
+            use_amp=use_amp,
+            modality_weights=args.modality_weight_dict,
+            resolution_weights=resolution_weights_per_modality,
+            positional_weight=args.positional_weight,
+            count_weight=args.count_weight,
+            compute_pearson=not args.no_val_pearson,
+            num_segments=args.num_segments,
+            splice_num_segments=args.splice_num_segments,
+            min_segment_size=args.min_segment_size,
+            rank=rank, world_size=world_size,
+            encoder_only=_eval_encoder_only,
+            organism_idx=organism_index,
+            junction_top_k=junction_forward_top_k,
+            splice_site_threshold=args.splice_site_threshold,
+            junction_loss=args.junction_loss,
+            compute_per_sample=args.metrics_per_sample,
+            min_alpha_juncs=args.min_alpha_juncs,
+            metrics_seed=args.seed,
+            gene_annotation=gene_expr_annotation,
+            gene_expr_track_strands=gene_expr_track_strands,
+            gene_expr_window_cache=gene_expr_window_cache,
+        )
+
+        val_loss, val_metrics = validate_multihead(val_loader=val_loader, **_eval_validate_kwargs)
+
+        train_metrics = {}
+        if args.eval_train_pearson:
+            _, train_metrics = validate_multihead(val_loader=train_loader, **_eval_validate_kwargs)
+            train_metrics = {f"train_{k}": v for k, v in train_metrics.items()}
+
+        all_metrics = {**val_metrics, **train_metrics}
+        metrics_file = output_dir / "eval_only_metrics.json"
+        metrics_file.parent.mkdir(parents=True, exist_ok=True)
+        if is_main_process(rank):
+            with open(metrics_file, "w") as f:
+                json.dump(all_metrics, f, indent=2)
+            print(f"\nEval metrics saved to {metrics_file}")
+        sys.exit(0)
 
     # Training loop
     print_rank0("\n" + "=" * 60, rank)
@@ -1180,6 +1514,8 @@ def main(args: argparse.Namespace | None = None) -> None:
                 break
 
             current_epoch = epoch
+            epoch_skip = skip_batches if epoch == start_epoch else 0
+            global_step_offset = (epoch - 1) * steps_per_epoch + epoch_skip // args.gradient_accumulation_steps
 
             # Clear GPU cache between epochs for robustness
             if torch.cuda.is_available():
@@ -1206,6 +1542,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     accumulation_steps=args.gradient_accumulation_steps,
                     frozen_backbone=frozen_backbone,
                     num_segments=args.num_segments,
+                    splice_num_segments=args.splice_num_segments,
                     min_segment_size=args.min_segment_size,
                     train_sampler=train_sampler,
                     rank=rank,
@@ -1217,7 +1554,18 @@ def main(args: argparse.Namespace | None = None) -> None:
                     gene_loss_weights=gene_loss_weights,
                     gene_cross_track_weight=args.gene_cross_track_weight,
                     strand_channel_masks=gene_strand_channel_masks,
-                    organism=organism_index,
+                    organism_idx=organism_index,
+                    junction_top_k=junction_forward_top_k,
+                    splice_site_threshold=args.splice_site_threshold,
+                    junction_loss=args.junction_loss,
+                    min_alpha_juncs=args.min_alpha_juncs,
+                    handler=handler,
+                    save_every_steps=args.save_every_steps,
+                    save_fn=_save_preempt if not args.no_save_checkpoints else None,
+                    global_step_offset=global_step_offset,
+                    skip_batches=epoch_skip,
+                    save_state=_save_state,
+                    checkpoint_sync_group=checkpoint_sync_group,
                 )
             else:
                 # Standard multimodal training (uses multihead functions)
@@ -1242,6 +1590,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     world_size=world_size,
                     max_grad_norm=args.max_grad_norm,
                     num_segments=args.num_segments,
+                    splice_num_segments=args.splice_num_segments,
                     min_segment_size=args.min_segment_size,
                     profile_batches=args.profile_batches if epoch == start_epoch else 0,
                     log_fn=logger.log_step if is_main_process(rank) else None,
@@ -1249,13 +1598,30 @@ def main(args: argparse.Namespace | None = None) -> None:
                     gene_loss_weights=gene_loss_weights,
                     gene_cross_track_weight=args.gene_cross_track_weight,
                     strand_channel_masks=gene_strand_channel_masks,
-                    organism=organism_index,
+                    organism_idx=organism_index,
+                    junction_top_k=junction_forward_top_k,
+                    splice_site_threshold=args.splice_site_threshold,
+                    junction_loss=args.junction_loss,
+                    min_alpha_juncs=args.min_alpha_juncs,
+                    handler=handler,
+                    save_every_steps=args.save_every_steps,
+                    save_fn=_save_preempt if not args.no_save_checkpoints else None,
+                    global_step_offset=global_step_offset,
+                    skip_batches=epoch_skip,
+                    save_state=_save_state,
+                    checkpoint_sync_group=checkpoint_sync_group,
                 )
 
             if handler.preempted:
                 print_rank0("Preemption flag set - saving and exiting.", rank)
                 handler.save_and_exit()
                 break
+
+            # Training for this epoch is complete: a preemption from here on
+            # (validation, checkpoint saving) must resume at the next epoch,
+            # not replay this one (or its last window) on already-updated weights.
+            current_epoch = epoch + 1
+            _save_state["batch_idx"] = 0
 
             # Validation (always use multihead since we always have multimodal dataset format now)
             val_loss, val_metrics = validate_multihead(
@@ -1269,12 +1635,19 @@ def main(args: argparse.Namespace | None = None) -> None:
                 count_weight=args.count_weight,
                 use_amp=use_amp,
                 num_segments=args.num_segments,
+                splice_num_segments=args.splice_num_segments,
                 min_segment_size=args.min_segment_size,
-                compute_pearson=True,
+                compute_pearson=not args.no_val_pearson,
                 rank=rank,
                 world_size=world_size,
                 encoder_only=encoder_only,
-                organism=organism_index,
+                organism_idx=organism_index,
+                junction_top_k=junction_forward_top_k,
+                splice_site_threshold=args.splice_site_threshold,
+                junction_loss=args.junction_loss,
+                compute_per_sample=args.metrics_per_sample,
+                min_alpha_juncs=args.min_alpha_juncs,
+                metrics_seed=args.seed,
                 gene_annotation=gene_expr_annotation,
                 gene_expr_track_strands=gene_expr_track_strands,
                 gene_expr_window_cache=gene_expr_window_cache,
@@ -1290,6 +1663,11 @@ def main(args: argparse.Namespace | None = None) -> None:
             if hasattr(scheduler, "step_metric"):
                 scheduler.step_metric(val_loss)
             is_best = val_loss < best_val_loss
+            if is_best:
+                # Tracked on every rank and regardless of --no-save-checkpoints
+                # (previously only updated inside the save branch, so with saving
+                # off every epoch was "best" and the final summary printed inf).
+                best_val_loss = val_loss
 
             # Print epoch summary
             if is_main_process(rank):
@@ -1307,13 +1685,18 @@ def main(args: argparse.Namespace | None = None) -> None:
             # Log epoch
             extra = {}
             histograms = {}
+            for mod, mod_loss in per_modality_train_loss.items():
+                extra[f"train_{mod}_loss"] = mod_loss
             for key, val in val_metrics.items():
                 if key.endswith("_values"):
                     histograms[key] = val
-                elif "pearson" in key:
-                    extra[key] = val
+                elif key.endswith("_loss"):
+                    # Per-modality validation losses -> val_{modality}_loss.
+                    extra[f"val_{key.removesuffix('_loss')}_loss"] = val
                 else:
-                    extra[f"val_loss_{key}"] = val
+                    # Pearson/auPRC/nonzero-fraction metrics keep their own
+                    # names; "_per_sample" is consumed by log_epoch.
+                    extra[key] = val
 
             logger.log_epoch(epoch, train_loss, val_loss, current_lr, is_best, extra, histograms)
 
@@ -1356,6 +1739,12 @@ def main(args: argparse.Namespace | None = None) -> None:
                         )
                         print(f"  Saved best delta checkpoint (val_loss={val_loss:.4f})")
 
+                # Epoch complete: reset mid-epoch batch tracking so a preemption
+                # signal firing between epochs (before any batch of the next
+                # epoch has run) doesn't report a stale non-zero batch_idx that
+                # would cause the next resume to skip into the wrong epoch.
+                _save_state["batch_idx"] = 0
+
                 if epoch % args.save_every == 0:
                     if write_full:
                         save_checkpoint(
@@ -1384,7 +1773,8 @@ def main(args: argparse.Namespace | None = None) -> None:
                             wandb_run_id=logger.wandb_run_id,
                         )
 
-            barrier()
+            if world_size > 1 and torch.distributed.is_initialized():
+                torch.distributed.barrier(group=checkpoint_sync_group)
 
     except KeyboardInterrupt:
         print_rank0("\nTraining interrupted by user", rank)

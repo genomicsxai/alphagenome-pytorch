@@ -32,7 +32,7 @@ For reproducible experiments, use ``--config config.yaml``.
       genome: /path/to/hg38.fa           # Reference genome FASTA (required)
       train_bed: /path/to/train.bed      # Training regions BED file (required)
       val_bed: /path/to/val.bed          # Validation regions BED file (required)
-      sequence_length: 131072            # Input sequence length (default: 131072)
+      sequence_length: 131072            # Input sequence length (default: 1048576)
 
       # Global output resolutions - can be overridden per-modality
       # Use "1" for 1bp resolution, "128" for 128bp, or "1,128" for both

@@ -20,10 +20,15 @@ from typing import Any
 
 from alphagenome_pytorch.extensions.finetuning.modalities import MODALITY_CONFIGS
 
+# Splice modalities are handled separately from MODALITY_CONFIGS: they have no
+# bigwig files and no fixed resolution/embedding_dim (their heads take
+# star-junctions/ssu inputs instead). See create_finetuning_head's assay_type.
+SPLICE_MODALITIES = {'splice_site', 'splice_usage', 'splice_junctions'}
+
 
 DEFAULTS = {
     # Data
-    "sequence_length": 131072,
+    "sequence_length": 1048576,
     "resolutions": "1",
     # Model
     "lora_rank": 8,
@@ -37,9 +42,9 @@ DEFAULTS = {
     "batch_size": 1,
     "gradient_accumulation_steps": 1,
     "lr": 1e-4,
-    "weight_decay": 0.1,
-    "warmup_steps": 500,
-    "lr_schedule": "cosine",
+    "weight_decay": 0.0,
+    "warmup_steps": 0,
+    "lr_schedule": "constant",
     "plateau_factor": 0.5,
     "plateau_patience": 3,
     "plateau_min_lr": 0.0,
@@ -49,7 +54,8 @@ DEFAULTS = {
     "count_weight": 1.0,
     "num_workers": 4,
     "max_grad_norm": 1.0,
-    "num_segments": 8,
+    "num_segments": None,
+    "splice_num_segments": 1,
     "min_segment_size": None,
     # Logging
     "wandb_project": "alphagenome-finetune",
@@ -161,7 +167,7 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
         "--mode",
         type=str,
         choices=["linear-probe", "lora", "locon", "lora+locon", "full", "encoder-only"],
-        default="lora",
+        default="linear-probe",
         help=(
             "Training mode: "
             "'linear-probe' (frozen backbone, train heads on full transformer embeddings), "
@@ -187,6 +193,41 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
     )
     data.add_argument("--train-bed", type=str, required=False, help="Training positions BED")
     data.add_argument("--val-bed", type=str, required=False, help="Validation positions BED")
+    data.add_argument(
+        "--star-junctions",
+        type=str,
+        nargs="+",
+        action="append",
+        dest="star_junctions",
+        help=(
+            "STAR SJ.out.tab file(s) for splice junction targets. "
+            "Repeat --star-junctions for each --modality splice group. "
+            "The user is responsible for strand-specific ordering."
+        ),
+    )
+    data.add_argument(
+        "--ssu",
+        type=str,
+        nargs="+",
+        action="append",
+        dest="ssu",
+        help=(
+            "SSU parquet file(s) for splice site usage targets. "
+            "Repeat --ssu for each --modality splice group. "
+            "Must match the order of --star-junctions groups."
+        ),
+    )
+    data.add_argument(
+        "--gtf",
+        type=str,
+        default=None,
+        dest="gtf",
+        help=(
+            "GTF or parquet file for canonical splice sites (annotation-only, "
+            "zero usage). Distinct from --gene-gtf, which is used for gene-"
+            "level loss/eval."
+        ),
+    )
     data.add_argument(
         "--track-metadata",
         type=str,
@@ -239,15 +280,17 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
         help="Max threads for parallel BigWig I/O (default: 16)",
     )
     data.add_argument(
-        "--gtf",
+        "--gene-gtf",
         type=str,
         default=None,
+        dest="gene_gtf",
         help=(
             "Path to a Gencode-compatible annotation: a parquet (fast, "
             "recommended) or a GTF/GFF (parsed via pyranges, minutes for hg38). "
             "Required when --gene-loss-weight > 0. The protein_coding gene rows "
             "are used to build per-window gene masks. A parquet with exon rows "
-            "also serves --gene-expr-eval, so one file can cover both."
+            "also serves --gene-expr-eval, so one file can cover both. "
+            "Distinct from --gtf, which is used for splice-site annotation."
         ),
     )
     data.add_argument(
@@ -314,7 +357,7 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
             "over annotated exons, strand-matched, keeping genes with >=50%% of "
             "their exons in-window. Emits rna_seq_gene_log_expr_pearson_* keys. "
             "Requires an annotation with exon rows (--gene-expr-annotation or "
-            "--gtf) and rna_seq strands (--track-strands / config)."
+            "--gene-gtf) and rna_seq strands (--track-strands / config)."
         ),
     )
     gene_eval.add_argument(
@@ -324,8 +367,8 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
         help=(
             "Annotation for --gene-expr-eval: a parquet (fast, recommended) or "
             "GTF/GFF (slow, needs pyranges) that INCLUDES exon rows. If unset, "
-            "falls back to --gtf. Unlike --gtf's gene-only table (gene LFC loss), "
-            "this needs exon features."
+            "falls back to --gene-gtf. Unlike --gene-gtf's gene-only table "
+            "(gene LFC loss), this needs exon features."
         ),
     )
 
@@ -342,14 +385,42 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
         type=str,
         action="append",
         dest="modalities",
-        choices=list(MODALITY_CONFIGS.keys()),
-        help="Assay modality type. Repeat --modality for each --bigwig group in multi-modality mode.",
+        help=(
+            "Assay modality type. Genomic (bigwig-backed): "
+            + ", ".join(sorted(MODALITY_CONFIGS.keys()))
+            + ". Splice (star-junctions/ssu-backed): "
+            + ", ".join(sorted(SPLICE_MODALITIES))
+            + ". Repeat --modality for each --bigwig group in multi-modality mode. "
+            "Splice modalities can be comma-separated in one entry (e.g. "
+            "'splice_site,splice_usage,splice_junctions') to share one "
+            "--star-junctions/--ssu group; they do not require --bigwig."
+        ),
     )
     model.add_argument(
         "--modality-weights",
         type=str,
         default=None,
         help="Optional per-modality loss weights, e.g. 'atac:1.0,rna_seq:0.5'",
+    )
+    model.add_argument(
+        "--pretrained-head-samples",
+        type=str,
+        default=None,
+        help=(
+            "Initialize head conv weights from specific pretrained output tracks. "
+            "Format: 'modality:idx,...' where idx is either a single integer (broadcast "
+            "that pretrained track to all output tracks of the new head) or a "
+            "'|'-separated list of integers/NAs with one entry per output track "
+            "(e.g. 'rna_seq:119,splice_usage:NA|139|NA,splice_junctions:139'). "
+            "Use 'NA' to keep random initialization for a specific output track. "
+            "For genome-track modalities, append '@resolution' to restrict to a single "
+            "resolution head (e.g. 'rna_seq@128:119' loads only the 128bp head, "
+            "'rna_seq:119' loads both). "
+            "Modalities not listed keep random initialization. "
+            "The organism is taken from --organism. For splice_site the index is ignored. "
+            "Default: 'splice_site:0' when the splice_site modality is trained (pass "
+            "'splice_site:NA' to keep it random), otherwise none."
+        ),
     )
     model.add_argument("--lora-rank", type=int, default=DEFAULTS["lora_rank"], help="LoRA rank (0 to disable)")
     model.add_argument("--lora-alpha", type=int, default=DEFAULTS["lora_alpha"], help="LoRA alpha scaling")
@@ -384,6 +455,18 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
         choices=["truncated_normal", "uniform"],
         help="Head weight initialization",
     )
+    model.add_argument(
+        "--rope-init",
+        type=str,
+        default="truncated_normal",
+        choices=["truncated_normal", "zeros"],
+        help=(
+            "RoPE parameter initialization for the splice junction head. "
+            "'truncated_normal' (default) matches the JAX pretrained weight distribution. "
+            "'zeros' replicates the original (buggy) JAX init that blocks gradient flow; "
+            "use only for ablation experiments."
+        ),
+    )
     model.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing")
 
     # Training arguments
@@ -395,6 +478,17 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=DEFAULTS["gradient_accumulation_steps"],
         help="Accumulate gradients over N batches",
+    )
+    train.add_argument(
+        "--drop-incomplete-accumulation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Drop the final per-rank microbatches when they do not fill one complete "
+            "gradient-accumulation window, so every optimizer update uses the "
+            "declared effective batch size (default; matches alphagenome_ft). "
+            "--no-drop-incomplete-accumulation takes an undersized step instead."
+        ),
     )
     train.add_argument("--lr", type=float, default=DEFAULTS["lr"], help="Learning rate")
     train.add_argument("--weight-decay", type=float, default=DEFAULTS["weight_decay"])
@@ -423,15 +517,112 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
                             "all track types. 0 disables. Val/test are never shifted.")
     train.add_argument("--positional-weight", type=float, default=DEFAULTS["positional_weight"])
     train.add_argument("--count-weight", type=float, default=DEFAULTS["count_weight"])
-    train.add_argument("--max-grad-norm", type=float, default=DEFAULTS["max_grad_norm"])
-    train.add_argument("--num-segments", type=int, default=DEFAULTS["num_segments"])
+    train.add_argument("--max-grad-norm", type=float, default=DEFAULTS["max_grad_norm"],
+                       help="Clip gradients to this global norm; 0 or negative disables clipping.")
+    train.add_argument("--num-segments", type=int, default=DEFAULTS["num_segments"],
+                       help="Fixed number of segments for the genome-track multinomial loss. "
+                            "Default: unset = alphagenome_research's fixed 2**17 bp segments "
+                            "(8 at 1 Mb, 1 at 131 kb).")
+    train.add_argument(
+        "--splice-num-segments",
+        type=int,
+        default=DEFAULTS["splice_num_segments"],
+        help=(
+            "Number of sequence partitions for the splice_site classification and "
+            "splice_usage losses; per-partition losses are summed. Default: 1 (single "
+            "global mean, as in alphagenome_research). Independent of --num-segments."
+        ),
+    )
     train.add_argument("--min-segment-size", type=int, default=DEFAULTS["min_segment_size"])
+    train.add_argument(
+        "--junction-position-source",
+        type=str,
+        choices=["annotated", "predicted"],
+        default="annotated",
+        help=(
+            "Source of splice-site positions passed to the junction head. "
+            "'annotated' (default): use positions derived from STAR junction files. "
+            "'predicted': derive positions from the top-k sites scored by the "
+            "splice_site classification head (requires splice_site modality). "
+            "See --junction-top-k / --splice-site-threshold for predicted mode and "
+            "--max-splice-sites for annotated mode."
+        ),
+    )
+    train.add_argument(
+        "--max-splice-sites",
+        type=int,
+        default=256,
+        help=(
+            "Annotated mode: maximum number of STAR-derived splice sites per role "
+            "(Donor+/-, Acceptor+/-); sizes/truncates the dataset positions and "
+            "junction matrix. Default: 256 (matches alphagenome_ft --max-splice-sites)."
+        ),
+    )
+    train.add_argument(
+        "--junction-top-k",
+        type=int,
+        default=512,
+        help=(
+            "Predicted mode only: number of splice sites per role selected from the "
+            "classification head's probabilities. Default: 512, alphagenome_research's "
+            "DEFAULT_NUM_SPLICE_SITES."
+        ),
+    )
+    train.add_argument(
+        "--splice-site-threshold",
+        type=float,
+        default=0.1,
+        help=(
+            "Predicted mode only: drop selected sites whose classification probability "
+            "is below this value (padded with -1). Default: 0.1, alphagenome_research's "
+            "DEFAULT_SPLICE_SITE_THRESHOLD. 0 disables."
+        ),
+    )
+    train.add_argument(
+        "--junction-loss",
+        type=str,
+        default="normalized",
+        choices=["original", "normalized", "sparse"],
+        help=(
+            "Cross-entropy variant for the splice junction head loss. "
+            "'original' matches JAX pre-de264f5: log-space decomposition, "
+            "y_pred not explicitly normalized -- this is the pre-648357d bug "
+            "that computed per-strand losses independently normalized and "
+            "summed them, ~2x-inflating the loss relative to a joint "
+            "normalization; kept only for ablation, not recommended. "
+            "'normalized' (default) matches JAX post-de264f5: both targets and "
+            "predictions normalized to ratios within masked positions before "
+            "computing CE -- this is the fixed/correct formula (648357d). "
+            "'sparse' restricts CE and Poisson to donors/acceptors that have at least "
+            "one observed junction count, avoiding the suppression gradient from the "
+            "many zero-target positions in sparse training data."
+        ),
+    )
     train.add_argument("--num-workers", type=int, default=DEFAULTS["num_workers"])
     train.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision")
     train.add_argument("--track-means-samples", type=int, default=None, help="Samples for track means (default: all)")
     train.add_argument("--profile-batches", type=int, default=0, help="Profile first N batches")
     train.add_argument("--compile", action="store_true", help="Use torch.compile")
-    train.add_argument("--seed", type=int, default=None, help="Random seed")
+    train.add_argument(
+        "--seed", type=int, default=1234,
+        help="Random seed for init and train-set shuffling (default 1234, as alphagenome_ft; "
+             "with matching seed/batch/device count both repos visit windows in the same order)",
+    )
+    train.add_argument("--eval-train-pearson", action="store_true", help="Run an eval pass on train set each epoch to compute Pearson R")
+    train.add_argument("--no-val-pearson", action="store_true", default=False, help="Skip Pearson R computation during validation (faster, lower memory; use --eval-only for full metrics)")
+    train.add_argument("--metrics-per-sample", action="store_true", default=False, help="Also write per-biological-sample rows to epoch_log.csv (splice_junctions and splice_usage only)")
+    train.add_argument(
+        "--min-alpha-juncs",
+        type=int,
+        default=0,
+        help=(
+            "Minimum junction read depth (alpha) for a splice site to contribute to the SSU "
+            "loss.  Positions with 0 <= alpha < threshold are excluded to avoid training on "
+            "low-confidence SSU estimates; background positions (alpha=-1) are kept with "
+            "target=0 to anchor the head. 0 includes all positions. Default: 0."
+        ),
+    )
+    train.add_argument("--eval-only", action="store_true", help="Load checkpoint and run validation metrics without training; outputs to eval_only_metrics.json")
 
     # Distributed/Sequence Parallel arguments
     dist = parser.add_argument_group("Distributed")
@@ -459,6 +650,7 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
     out.add_argument("--output-dir", type=str, default=DEFAULTS["output_dir"])
     out.add_argument("--run-name", type=str, default=None)
     out.add_argument("--save-every", type=int, default=DEFAULTS["save_every"])
+    out.add_argument("--save-every-steps", type=int, default=None, help="Save preemption checkpoint every N optimizer steps (None = disabled)")
     out.add_argument("--no-save-checkpoints", action="store_true", help="Skip saving model checkpoints (keeps logs/config)")
 
     # Resume arguments
@@ -466,8 +658,12 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
     resume.add_argument(
         "--resume",
         type=str,
-        default=None,
-        help="Checkpoint path or 'auto' to find latest",
+        default="auto",
+        help=(
+            "'auto' (default): resume from the latest checkpoint in "
+            "<output-dir>/<run-name> if one exists, else start fresh; 'none': always "
+            "start fresh; or an explicit checkpoint path. Matches alphagenome_ft."
+        ),
     )
     resume.add_argument(
         "--save-delta",
@@ -549,7 +745,7 @@ def postprocess_args(
 
     def _apply_config_scalar(attr: str, config: dict[str, Any], key: str | None = None) -> None:
         flag = f"--{attr.replace('_', '-')}"
-        if flag in cli_flags:
+        if flag in cli_flags or f"--no-{flag[2:]}" in cli_flags:
             return
         config_key = key or attr
         if config_key in config and config[config_key] is not None:
@@ -602,6 +798,7 @@ def postprocess_args(
         "epochs",
         "batch_size",
         "gradient_accumulation_steps",
+        "drop_incomplete_accumulation",
         "lr",
         "weight_decay",
         "warmup_steps",
@@ -615,6 +812,7 @@ def postprocess_args(
         "count_weight",
         "max_grad_norm",
         "num_segments",
+        "splice_num_segments",
         "min_segment_size",
         "num_workers",
         "track_means_samples",
@@ -686,7 +884,7 @@ def postprocess_args(
 
     modality_specs: dict[str, dict[str, Any]] = {}
     for modality, mod_cfg in raw_modalities.items():
-        if modality not in MODALITY_CONFIGS:
+        if modality not in MODALITY_CONFIGS and modality not in SPLICE_MODALITIES:
             parser.error(f"Unknown modality in config: {modality}")
         if not isinstance(mod_cfg, dict):
             parser.error(f"modalities.{modality} must be a mapping")
@@ -725,24 +923,55 @@ def postprocess_args(
                 "--modality is required when --bigwig is provided. "
                 f"Pass one of: {sorted(MODALITY_CONFIGS.keys())}."
             )
-        if len(args.modalities) != len(args.bigwigs):
+        # Splice modalities (splice_site, splice_usage, splice_junctions) do not
+        # take --bigwig -- they use --star-junctions/--ssu instead. A single
+        # --modality entry may bundle several splice sub-modalities via commas
+        # (e.g. 'splice_site,splice_usage,splice_junctions') to share one
+        # --star-junctions/--ssu group; only genomic (bigwig-backed) entries
+        # are counted against --bigwig groups here.
+        genomic_modality_count = sum(
+            1 for m in args.modalities if not any(s in SPLICE_MODALITIES for s in m.split(","))
+        )
+        if genomic_modality_count != len(args.bigwigs):
             parser.error(
-                f"Number of --modality ({len(args.modalities)}) must match number of --bigwig groups ({len(args.bigwigs)}). "
-                "Each --modality should be followed by --bigwig FILES."
+                f"Number of genomic --modality entries ({genomic_modality_count}) must match "
+                f"number of --bigwig groups ({len(args.bigwigs)}). Splice modalities "
+                "(splice_site, splice_usage, splice_junctions) do not require --bigwig."
             )
-        for modality, bigwigs in zip(args.modalities, args.bigwigs):
-            if modality in cli_modality_to_bigwigs:
-                parser.error(f"Duplicate modality: {modality}")
-            cli_modality_to_bigwigs[modality] = bigwigs
+        bigwig_idx = 0
+        for modality_entry in args.modalities:
+            sub_mods = [m.strip() for m in modality_entry.split(",")]
+            is_genomic = not any(m in SPLICE_MODALITIES for m in sub_mods)
+            if is_genomic:
+                if bigwig_idx >= len(args.bigwigs):
+                    parser.error(f"Not enough --bigwig groups for modality {modality_entry}")
+                for sub_mod in sub_mods:
+                    if sub_mod in cli_modality_to_bigwigs:
+                        parser.error(f"Duplicate modality: {sub_mod}")
+                    cli_modality_to_bigwigs[sub_mod] = args.bigwigs[bigwig_idx]
+                bigwig_idx += 1
     elif args.modalities is not None and "--modality" in cli_flags:
-        parser.error("--modality requires matching --bigwig entries")
+        if any(any(s in SPLICE_MODALITIES for s in m.split(",")) for m in args.modalities):
+            pass  # splice-only modalities are allowed without --bigwig
+        else:
+            parser.error("--modality requires matching --bigwig entries")
 
     for modality, bigwigs in cli_modality_to_bigwigs.items():
         merged = dict(modality_specs.get(modality, {}))
         merged["bigwig"] = list(bigwigs)
         modality_specs[modality] = merged
 
-    args.modalities = list(modality_specs.keys())
+    # Preserve original CLI modality entries (which may be comma-separated
+    # splice groups); add any config-only (genomic) modalities not on the CLI.
+    cli_modalities = list(args.modalities or [])
+    config_only_modalities = [
+        m for m in modality_specs
+        if m not in cli_modality_to_bigwigs
+        and m not in {s.strip() for entry in cli_modalities for s in entry.split(",")}
+    ]
+    cli_modalities.extend(config_only_modalities)
+
+    args.modalities = cli_modalities if cli_modalities else list(modality_specs.keys())
     if not args.modalities:
         parser.error("--bigwig is required (or provide modalities in --config)")
 
@@ -763,13 +992,61 @@ def postprocess_args(
     args.modality_weight_dict = {}
     args.modality_strands: dict[str, str] = {}
     args.modality_strand_pairs = {}
+    args.modality_to_star_junctions: dict[str, list[str]] = {}
+    args.modality_to_ssu_files: dict[str, list[str] | None] = {}
+
+    # Expand comma-separated modality entries: "splice_site,splice_junctions"
+    # -> ["splice_site", "splice_junctions"]. All sub-modalities from one entry
+    # share the same --star-junctions/--ssu group (matched by entry order).
+    flat_modalities: list[str] = []
+    flat_modality_specs: dict[str, dict[str, Any]] = {}
+    junc_group_idx = 0
+    for mod_entry in args.modalities:
+        sub_mods = [m.strip() for m in mod_entry.split(",")]
+        spec = modality_specs.get(mod_entry, {})
+        junc_group = None
+        ssu_group = None
+        if any(m in SPLICE_MODALITIES for m in sub_mods):
+            star_junction_groups = args.star_junctions or []
+            ssu_groups = args.ssu or []
+            if junc_group_idx < len(star_junction_groups):
+                junc_group = star_junction_groups[junc_group_idx]
+            if junc_group_idx < len(ssu_groups):
+                ssu_group = ssu_groups[junc_group_idx]
+            junc_group_idx += 1
+        for sub_mod in sub_mods:
+            flat_modalities.append(sub_mod)
+            flat_modality_specs[sub_mod] = {**spec, "junc_group": junc_group, "ssu_group": ssu_group}
+    args.modalities = flat_modalities
+
+    splice_requested = [m for m in args.modalities if m in SPLICE_MODALITIES]
+    if splice_requested and (args.augment_rc or args.augment_shift_bp):
+        parser.error(
+            "--augment-rc / --augment-shift-bp are not supported with splice modalities "
+            f"({', '.join(splice_requested)}): their targets are not shifted or "
+            "reverse-complemented."
+        )
+
     for modality in args.modalities:
-        spec = modality_specs.get(modality, {})
-        if "bigwig" not in spec or not spec["bigwig"]:
-            parser.error(f"No bigwig files specified for modality '{modality}'")
-        args.modality_to_bigwigs[modality] = list(spec["bigwig"])
+        spec = flat_modality_specs.get(modality, modality_specs.get(modality, {}))
+        junc_group = spec.get("junc_group")
+        ssu_group = spec.get("ssu_group")
+        if modality in SPLICE_MODALITIES:
+            # Splice modalities require junction files (no BigWig required).
+            if junc_group is None:
+                parser.error(f"Modality '{modality}' requires --star-junctions files.")
+            args.modality_to_star_junctions[modality] = junc_group
+            args.modality_to_ssu_files[modality] = ssu_group  # None if not provided
+            args.modality_to_bigwigs[modality] = []
+        else:
+            if "bigwig" not in spec or not spec["bigwig"]:
+                parser.error(f"No bigwig files specified for modality '{modality}'")
+            args.modality_to_bigwigs[modality] = list(spec["bigwig"])
         args.modality_resolutions[modality] = spec.get("resolutions", args.global_resolutions)
         args.modality_weight_dict[modality] = float(spec.get("task_weight", 1.0))
+        if modality in SPLICE_MODALITIES:
+            # Strand/strand-pairs config only applies to bigwig-backed tracks.
+            continue
         if spec.get("strand"):
             # str ('+-+-') or a YAML list (['+','-',...]); normalized below.
             args.modality_strands[modality] = spec["strand"]
@@ -823,8 +1100,8 @@ def postprocess_args(
 
     # Validate gene-LFC config consistency.
     if args.gene_loss_weight > 0:
-        if not args.gtf:
-            parser.error("--gene-loss-weight > 0 requires --gtf")
+        if not args.gene_gtf:
+            parser.error("--gene-loss-weight > 0 requires --gene-gtf")
         if "rna_seq" not in args.modality_to_bigwigs:
             parser.error(
                 "--gene-loss-weight > 0 requires rna_seq in --modality / config; "
@@ -839,10 +1116,10 @@ def postprocess_args(
 
     # Validate gene-expression-eval config consistency.
     if getattr(args, "gene_expr_eval", False):
-        if not (args.gene_expr_annotation or args.gtf):
+        if not (args.gene_expr_annotation or args.gene_gtf):
             parser.error(
                 "--gene-expr-eval requires an annotation with exon rows: pass "
-                "--gene-expr-annotation (parquet/GTF) or --gtf."
+                "--gene-expr-annotation (parquet/GTF) or --gene-gtf."
             )
         if "rna_seq" not in args.modality_to_bigwigs:
             parser.error(
@@ -877,7 +1154,48 @@ def postprocess_args(
                 parser.error(f"Unknown modality in --modality-weights: {mod}")
             args.modality_weight_dict[mod] = float(weight.strip())
 
+    # Parse --pretrained-head-samples: comma-separated 'modality:idx' pairs.
+    # idx is either a single int (broadcast) or '|'-separated ints (per-track).
+    if args.pretrained_head_samples is None and "splice_site" in args.modalities:
+        # Default (matches alphagenome_ft): start splice_site from the pretrained
+        # 5-class head. Only applied when that head exists, so non-splice runs
+        # are unaffected.
+        args.pretrained_head_samples = "splice_site:0"
+    args.pretrained_head_sample_dict: dict[str, int | list[int | None] | None] = {}
+    if args.pretrained_head_samples:
+        for item in args.pretrained_head_samples.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if ":" in item:
+                modality, idx_str = item.rsplit(":", 1)
+            else:
+                modality, idx_str = item, "0"
+            modality = modality.strip()
+            try:
+                if "|" in idx_str:
+                    def _parse_idx(x):
+                        x = x.strip()
+                        return None if x.upper() == "NA" else int(x)
+                    args.pretrained_head_sample_dict[modality] = [_parse_idx(x) for x in idx_str.split("|")]
+                else:
+                    args.pretrained_head_sample_dict[modality] = None if idx_str.strip().upper() == "NA" else int(idx_str)
+            except ValueError:
+                parser.error(
+                    f"--pretrained-head-samples: invalid index '{idx_str}' in '{item}', "
+                    f"expected integer, 'NA', or '|'-separated integers/NAs."
+                )
+
     args.is_multimodal = len(args.modalities) > 1
+
+    # We need the splice site classification head to derive junction positions.
+    if args.junction_position_source == "predicted":
+        all_modalities = {m for group in args.modalities for m in group.split(",")}
+        if "splice_site" not in all_modalities:
+            parser.error(
+                "--junction-position-source=predicted requires the 'splice_site' modality "
+                "so the classification head is available to score positions."
+            )
 
     return args
 
