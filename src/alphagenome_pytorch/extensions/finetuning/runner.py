@@ -1657,6 +1657,11 @@ def main(args: argparse.Namespace | None = None) -> None:
             if hasattr(scheduler, "step_metric"):
                 scheduler.step_metric(val_loss)
             is_best = val_loss < best_val_loss
+            if is_best:
+                # Tracked on every rank and regardless of --no-save-checkpoints
+                # (previously only updated inside the save branch, so with saving
+                # off every epoch was "best" and the final summary printed inf).
+                best_val_loss = val_loss
 
             # Print epoch summary
             if is_main_process(rank):
