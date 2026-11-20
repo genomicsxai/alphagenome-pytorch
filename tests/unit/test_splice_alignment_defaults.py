@@ -134,3 +134,33 @@ def test_top_k_ties_resolve_to_lower_index():
     logits = torch.zeros(1, 5, 10)          # all positions tie (p = 0.2 each)
     pos = training._top_k_positions_from_logits(logits, top_k=3, threshold=0.0)
     assert pos[0, 0].tolist() == [0, 1, 2]
+
+
+def _parse_cli(*extra):
+    from alphagenome_pytorch.extensions.finetuning.args import parse_args
+    base = ["--genome", "hg38.fa", "--train-bed", "train.bed", "--val-bed", "val.bed",
+            "--pretrained-weights", "model.pth"]
+    return parse_args(base + list(extra))
+
+
+def test_shared_training_defaults():
+    ns = _parse_cli("--modality", "atac", "--bigwig", "a.bw")
+    assert ns.weight_decay == 0.0
+    assert ns.warmup_steps == 0
+    assert ns.lr_schedule == "constant"
+    assert ns.mode == "linear-probe"
+    assert ns.sequence_length == 1048576
+    assert ns.rope_init == "truncated_normal"
+    assert ns.resume == "auto"
+    # No splice_site head -> no implicit pretrained-head init.
+    assert ns.pretrained_head_sample_dict == {}
+
+
+def test_splice_site_pretrained_init_default_and_opt_out():
+    splice = ["--modality", "splice_site,splice_usage,splice_junctions",
+              "--star-junctions", "s.SJ.out.tab", "--ssu", "s.parquet"]
+    assert _parse_cli(*splice).pretrained_head_sample_dict == {"splice_site": 0}
+    opt_out = _parse_cli(*splice, "--pretrained-head-samples", "splice_site:NA")
+    assert opt_out.pretrained_head_sample_dict == {"splice_site": None}
+    other = _parse_cli(*splice, "--pretrained-head-samples", "splice_usage:3")
+    assert other.pretrained_head_sample_dict == {"splice_usage": 3}

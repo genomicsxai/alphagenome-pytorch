@@ -1003,7 +1003,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 print(f"Auto-resume: found {resume_path}")
             else:
                 print("Auto-resume: no checkpoint found, starting fresh")
-    elif args.resume:
+    elif args.resume and args.resume.lower() != "none":
         resume_path = Path(args.resume)
 
     # Create datasets
@@ -1616,6 +1616,12 @@ def main(args: argparse.Namespace | None = None) -> None:
                 print_rank0("Preemption flag set - saving and exiting.", rank)
                 handler.save_and_exit()
                 break
+
+            # Training for this epoch is complete: a preemption from here on
+            # (validation, checkpoint saving) must resume at the next epoch,
+            # not replay this one (or its last window) on already-updated weights.
+            current_epoch = epoch + 1
+            _save_state["batch_idx"] = 0
 
             # Validation (always use multihead since we always have multimodal dataset format now)
             val_loss, val_metrics = validate_multihead(

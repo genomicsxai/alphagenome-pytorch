@@ -13,8 +13,14 @@ where:
   β2 = reads using a competing site for the same partner
 
 Coordinates are 1-based.  Each splice site is reported with both its exonic
-coordinate (last exon base for donor, first exon base for acceptor) and its
-intronic coordinate (first intron base for donor, last intron base for acceptor).
+coordinate (the exon base adjacent to the intron) and its intronic coordinate
+(the intron base adjacent to the exon).  Roles are in transcript orientation:
+the donor is the 5' end of the intron (left site on +, right site on -), as in
+alphagenome.data.genome.Junction.
+
+Internally, sites are accounted by genomic side: the "donor"/"acceptor" keys
+below mean left/right site; roles are converted to transcript orientation when
+the output table is written.
 
 Usage:
     # Junction-only approximation
@@ -694,6 +700,11 @@ def main() -> None:
     n_b2_zero = int((df["beta2_juncs"] == 0).sum())
     print(f"  sites with β2=0 (uncontested, ssu_approx=1.0): "
           f"{n_b2_zero} ({100 * n_b2_zero / len(df):.1f}%)")
+
+    # Left/right site -> transcript-orientation role (minus-strand donor is the
+    # right site). See module docstring.
+    minus = df["strand"] == "-"
+    df.loc[minus, "role"] = df.loc[minus, "role"].map({"donor": "acceptor", "acceptor": "donor"})
 
     compression_arg = None if args.compression == "none" else args.compression
     df.to_parquet(out_path, index=False, compression=compression_arg)

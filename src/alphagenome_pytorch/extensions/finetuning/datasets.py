@@ -1396,7 +1396,10 @@ class SplicingDataset(Dataset):
             junctions_to_junction_matrix,
             normalize_junctions_per_sample,
             gtf_splice_sites_to_junctions,
+            donor_acceptor_positions,
+            junctions_to_site_table,
         )
+        self._donor_acceptor_positions = donor_acceptor_positions
         self._filter_intervals_with_junctions = filter_intervals_with_junctions
         self._splice_sites_to_classification_array = splice_sites_to_classification_array
         self._junctions_to_classification_array = junctions_to_classification_array
@@ -1425,8 +1428,8 @@ class SplicingDataset(Dataset):
                 junc["chrom"].str.contains("chr", na=False)
                 & junc["strand"].isin(["+", "-"])
             ].drop_duplicates()
-            junc["exon_start"] = junc["intron_start"] - 1  # 1-based donor exon end
-            junc["exon_end"] = junc["intron_end"] + 1      # 1-based acceptor exon start
+            junc["exon_start"] = junc["intron_start"] - 1  # 1-based exon base left of intron
+            junc["exon_end"] = junc["intron_end"] + 1      # 1-based exon base right of intron
             junc["count"] = junc["n_uniquely_mapped_reads"]
             junc = normalize_junctions_per_sample(junc)
             self._all_juncs.append(junc)
@@ -1437,15 +1440,7 @@ class SplicingDataset(Dataset):
         if gtf_file is not None:
             gtf_juncs = gtf_splice_sites_to_junctions(gtf_file)
             self._gtf_juncs = gtf_juncs
-            donors = gtf_juncs[["chrom", "strand"]].copy()
-            donors["position"] = gtf_juncs["exon_start"].values
-            donors["role"] = "donor"
-            acceptors = gtf_juncs[["chrom", "strand"]].copy()
-            acceptors["position"] = gtf_juncs["exon_end"].values
-            acceptors["role"] = "acceptor"
-            self._gtf_sites = pd.concat([donors, acceptors], ignore_index=True).drop_duplicates(
-                subset=["chrom", "position", "strand", "role"]
-            ).reset_index(drop=True)
+            self._gtf_sites = junctions_to_site_table(gtf_juncs)
 
         # Union of all junctions (for interval filtering)
         if self._all_juncs:
@@ -1455,10 +1450,6 @@ class SplicingDataset(Dataset):
             ).drop_duplicates()
         else:
             union_juncs = pd.DataFrame(columns=["chrom", "exon_start", "exon_end", "strand"])
-
-        # Optionally filter intervals to those overlapping at least one junction
-        if filter_to_junctions and not union_juncs.empty:
-            intervals, _ = filter_intervals_with_junctions(intervals, union_juncs)
 
         # Chromosome sizes, for the same bounds check GenomicDataset applies.
         if isinstance(genome_fasta, CachedGenome):
@@ -1486,6 +1477,15 @@ class SplicingDataset(Dataset):
                 n_skipped += 1
                 continue
             positions.append((chrom, start, end))
+        # Optionally keep only windows containing at least one complete junction.
+        # Applied to the expanded windows actually used for training.
+        if filter_to_junctions and positions and not union_juncs.empty:
+            windows = pd.DataFrame(positions, columns=["chrom", "start", "end"])
+            windows, _ = filter_intervals_with_junctions(windows, union_juncs)
+            positions = [
+                (str(c), int(a), int(b))
+                for c, a, b in windows[["chrom", "start", "end"]].itertuples(index=False)
+            ]
         if n_skipped:
             warnings.warn(
                 f"{n_skipped} intervals were skipped because they would exceed "
@@ -1617,8 +1617,9 @@ class SplicingDataset(Dataset):
             )
             local = junc_df.loc[mask].copy()
             if not local.empty:
-                local["d_rel"] = local["exon_start"].astype(int) - 1 - start
-                local["a_rel"] = local["exon_end"].astype(int) - 1 - start
+                donor, acceptor = self._donor_acceptor_positions(local)
+                local["d_rel"] = donor - 1 - start
+                local["a_rel"] = acceptor - 1 - start
             all_junctions.append(local)
 
         targets_dict = {

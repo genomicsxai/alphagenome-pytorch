@@ -68,13 +68,48 @@ def read_star_junctions(path: str) -> pd.DataFrame:
     return df
 
 
+def donor_acceptor_positions(junctions: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Strand-aware 1-based exonic donor and acceptor positions of each junction.
+
+    ``exon_start`` / ``exon_end`` are the genomic left / right exon boundaries
+    of the intron (last base before it, first base after it). The donor is the
+    5' end of the intron in transcript orientation: ``exon_start`` on the +
+    strand and ``exon_end`` on the - strand (``alphagenome.data.genome.Junction``).
+
+    Returns:
+        (donor, acceptor) int64 arrays aligned with ``junctions`` rows.
+    """
+    left = junctions["exon_start"].to_numpy(dtype=np.int64)
+    right = junctions["exon_end"].to_numpy(dtype=np.int64)
+    minus = (junctions["strand"] == "-").to_numpy()
+    return np.where(minus, right, left), np.where(minus, left, right)
+
+
+def junctions_to_site_table(junctions: pd.DataFrame) -> pd.DataFrame:
+    """Unique splice sites [chrom, position, strand, role] from a junctions table.
+
+    ``position`` is the 1-based exonic coordinate; roles are strand-aware
+    (see :func:`donor_acceptor_positions`).
+    """
+    donor, acceptor = donor_acceptor_positions(junctions)
+    base = junctions[["chrom", "strand"]].reset_index(drop=True)
+    donors = base.assign(position=donor, role="donor")
+    acceptors = base.assign(position=acceptor, role="acceptor")
+    return (
+        pd.concat([donors, acceptors], ignore_index=True)
+        .drop_duplicates(subset=["chrom", "position", "strand", "role"])
+        .reset_index(drop=True)
+    )
+
+
 def gtf_splice_sites_to_junctions(gtf_file: str) -> pd.DataFrame:
     """Extract canonical splice junctions from a GENCODE GTF or parquet file.
 
     Junctions are derived from consecutive exon pairs within each transcript.
-    Coordinate convention matches STAR output used by this module:
-        exon_start (1-based) = last base of upstream exon
-        exon_end   (1-based) = first base of downstream exon
+    Coordinate convention matches STAR output used by this module (genomic
+    orientation; donor/acceptor depend on strand, see donor_acceptor_positions):
+        exon_start (1-based) = last exon base left of the intron
+        exon_end   (1-based) = first exon base right of the intron
 
     Returned rows have count=0 (annotation-only, no RNA-seq evidence).
 
@@ -131,9 +166,9 @@ def junctions_to_splice_sites(junctions: pd.DataFrame) -> pd.DataFrame:
 
     Each junction has a donor and an acceptor site. A site is defined by
     (chrom, position, strand, role) where role is 'donor' or 'acceptor'.
-    Exon coordinates (1-based) are derived as:
-        donor   = intron_start - 1  (last base of the upstream exon)
-        acceptor = intron_end + 1   (first base of the downstream exon)
+    Exon coordinates (1-based): intron_start - 1 (left) and intron_end + 1
+    (right). The donor is the left site on the + strand and the right site on
+    the - strand.
 
     Args:
         junctions: DataFrame from read_star_junctions (or a subset).
@@ -142,17 +177,11 @@ def junctions_to_splice_sites(junctions: pd.DataFrame) -> pd.DataFrame:
         DataFrame with columns: chrom, position, strand, role.
         Rows are unique splice sites.
     """
-    donors = junctions[["chrom", "strand"]].copy()
-    donors["position"] = junctions["intron_start"] - 1  # 1-based exon end
-    donors["role"] = "donor"
-
-    acceptors = junctions[["chrom", "strand"]].copy()
-    acceptors["position"] = junctions["intron_end"] + 1  # 1-based exon start
-    acceptors["role"] = "acceptor"
-
-    sites = pd.concat([donors, acceptors], ignore_index=True)
-    sites = sites.drop_duplicates(subset=["chrom", "position", "strand", "role"])
-    return sites.reset_index(drop=True)
+    exon = junctions[["chrom", "strand"]].assign(
+        exon_start=junctions["intron_start"] - 1,
+        exon_end=junctions["intron_end"] + 1,
+    )
+    return junctions_to_site_table(exon)
 
 
 def compute_splice_site_usage(
@@ -201,7 +230,8 @@ def filter_intervals_with_junctions(
     """Keep only intervals that contain at least one complete splice junction.
 
     A junction is 'complete' within an interval if both exon_start and exon_end
-    fall inside [interval.start, interval.end).
+    (1-based) fall inside the 0-based half-open interval, i.e. in
+    (interval.start, interval.end] in 1-based terms.
 
     Args:
         intervals: DataFrame with columns chrom, start, end (0-based half-open).
@@ -217,8 +247,8 @@ def filter_intervals_with_junctions(
         chrom, start, end = interval["chrom"], interval["start"], interval["end"]
         mask = (
             (junctions["chrom"] == chrom)
-            & (junctions["exon_start"] >= start)
-            & (junctions["exon_end"] < end)
+            & (junctions["exon_start"] > start)
+            & (junctions["exon_end"] <= end)
         )
         hits = junctions.loc[mask]
         if len(hits) > 0:
@@ -314,24 +344,26 @@ def compute_alpha_beta2(
         (donor_alpha, acceptor_alpha, donor_beta2, acceptor_beta2) as Series
         indexed by (chrom, position, strand).
     """
+    donor, acceptor = donor_acceptor_positions(junctions)
+    junctions = junctions.assign(donor_pos=donor, acceptor_pos=acceptor)
     donor_alpha = (
-        junctions.groupby(["chrom", "exon_start", "strand"])["count"].sum()
+        junctions.groupby(["chrom", "donor_pos", "strand"])["count"].sum()
         .rename("donor_total")
     )
     acceptor_alpha = (
-        junctions.groupby(["chrom", "exon_end", "strand"])["count"].sum()
+        junctions.groupby(["chrom", "acceptor_pos", "strand"])["count"].sum()
         .rename("acceptor_total")
     )
 
-    j = junctions.join(acceptor_alpha, on=["chrom", "exon_end", "strand"])
-    j = j.join(donor_alpha, on=["chrom", "exon_start", "strand"])
+    j = junctions.join(acceptor_alpha, on=["chrom", "acceptor_pos", "strand"])
+    j = j.join(donor_alpha, on=["chrom", "donor_pos", "strand"])
 
     donor_beta2 = (
-        j.groupby(["chrom", "exon_start", "strand"])["acceptor_total"].sum()
+        j.groupby(["chrom", "donor_pos", "strand"])["acceptor_total"].sum()
         - donor_alpha
     ).rename("donor_beta2")
     acceptor_beta2 = (
-        j.groupby(["chrom", "exon_end", "strand"])["donor_total"].sum()
+        j.groupby(["chrom", "acceptor_pos", "strand"])["donor_total"].sum()
         - acceptor_alpha
     ).rename("acceptor_beta2")
 
@@ -559,27 +591,17 @@ def junctions_to_classification_array(
     end = start + seq_len  # 0-based exclusive
     rows = []
     for junc_df in all_juncs_list:
-        mask = junc_df["chrom"] == chrom
-        local = junc_df.loc[mask]
-        if local.empty:
-            continue
-        # Donors: exon_start is 1-based → 0-based index = exon_start - 1 - start
-        donors = local[["strand", "exon_start"]].copy()
-        donors["role"] = "donor"
-        donors = donors.rename(columns={"exon_start": "pos1based"})
-        # Acceptors: exon_end is 1-based
-        acceptors = local[["strand", "exon_end"]].copy()
-        acceptors["role"] = "acceptor"
-        acceptors = acceptors.rename(columns={"exon_end": "pos1based"})
-        rows.extend([donors, acceptors])
+        local = junc_df.loc[junc_df["chrom"] == chrom]
+        if not local.empty:
+            rows.append(junctions_to_site_table(local))
 
     if not rows:
         return arr
 
     sites = pd.concat(rows, ignore_index=True).drop_duplicates(
-        subset=["strand", "pos1based", "role"]
+        subset=["strand", "position", "role"]
     )
-    _assign_classes_to_arr(arr, sites, start, seq_len, pos_col="pos1based")
+    _assign_classes_to_arr(arr, sites, start, seq_len, pos_col="position")
     return arr
 
 
@@ -608,7 +630,8 @@ def junctions_to_junction_matrix(
         with ``-1``).
       - DataFrames in ``all_juncs_list`` must already be pre-filtered to the
         interval and must contain ``d_rel`` (0-based donor) and ``a_rel``
-        (0-based acceptor) columns.
+        (0-based acceptor) columns, strand-aware as in
+        :func:`donor_acceptor_positions`.
 
     Args:
         all_juncs_list: List of junction DataFrames (one per sample).
@@ -630,11 +653,44 @@ def junctions_to_junction_matrix(
     n_samples = len(all_juncs_list)
 
     if cls_arr is not None:
-        # Derive positions from cls_arr (annotated mode)
-        pos_donor_pos  = np.where(cls_arr[:, 0] > 0)[0][:max_splice_sites]
-        pos_accept_pos = np.where(cls_arr[:, 1] > 0)[0][:max_splice_sites]
-        neg_donor_pos  = np.where(cls_arr[:, 2] > 0)[0][:max_splice_sites]
-        neg_accept_pos = np.where(cls_arr[:, 3] > 0)[0][:max_splice_sites]
+        # Annotated mode: junctions inside the window, with 0-based relative
+        # strand-aware donor/acceptor positions.
+        end = start + seq_len
+        local_juncs = []
+        for junc_df in all_juncs_list:
+            mask = (
+                (junc_df["chrom"] == chrom)
+                & (junc_df["exon_start"] > start)
+                & (junc_df["exon_start"] <= end)
+                & (junc_df["exon_end"] > start)
+                & (junc_df["exon_end"] <= end)
+            )
+            local = junc_df.loc[mask]
+            donor, acceptor = donor_acceptor_positions(local)
+            local_juncs.append(local.assign(d_rel=donor - 1 - start, a_rel=acceptor - 1 - start))
+
+        # Read support per (class, position), summed over samples; used to keep
+        # the best-supported sites when a role has more than max_splice_sites.
+        support: list[dict[int, float]] = [dict() for _ in range(4)]
+        for local in local_juncs:
+            for strand, d_cls, a_cls in (("+", 0, 1), ("-", 2, 3)):
+                part = local.loc[local["strand"] == strand]
+                for d, a, c in zip(part["d_rel"], part["a_rel"], part["count"]):
+                    support[d_cls][int(d)] = support[d_cls].get(int(d), 0.0) + float(c)
+                    support[a_cls][int(a)] = support[a_cls].get(int(a), 0.0) + float(c)
+
+        def _select(cls: int) -> np.ndarray:
+            cand = np.where(cls_arr[:, cls] > 0)[0]
+            if len(cand) > max_splice_sites:
+                # Highest support first, ties by position; then genomic order.
+                order = sorted(cand.tolist(), key=lambda p: (-support[cls].get(p, 0.0), p))
+                cand = np.sort(np.asarray(order[:max_splice_sites], dtype=np.int64))
+            return cand
+
+        pos_donor_pos  = _select(0)
+        pos_accept_pos = _select(1)
+        neg_donor_pos  = _select(2)
+        neg_accept_pos = _select(3)
 
         def _pad(arr: np.ndarray) -> np.ndarray:
             out = np.full(max_splice_sites, -1, dtype=np.int32)
@@ -665,22 +721,13 @@ def junctions_to_junction_matrix(
     )
 
     if cls_arr is not None:
-        # Annotated mode: filter by chrom/window and compute d_rel/a_rel on-the-fly
-        end = start + seq_len
-        for s, junc_df in enumerate(all_juncs_list):
-            mask = (
-                (junc_df["chrom"] == chrom)
-                & (junc_df["exon_start"] > start)
-                & (junc_df["exon_start"] <= end)
-                & (junc_df["exon_end"] > start)
-                & (junc_df["exon_end"] <= end)
-            )
-            local = junc_df.loc[mask]
+        # Annotated mode: window-filtered junctions with d_rel/a_rel from above
+        for s, local in enumerate(local_juncs):
             if local.empty:
                 continue
             for _, junc in local.iterrows():
-                d_rel  = int(junc["exon_start"]) - 1 - start
-                a_rel  = int(junc["exon_end"]) - 1 - start
+                d_rel  = int(junc["d_rel"])
+                a_rel  = int(junc["a_rel"])
                 count  = float(junc["count"])
                 strand = junc["strand"]
                 if strand == "+":

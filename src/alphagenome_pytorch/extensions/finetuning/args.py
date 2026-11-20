@@ -28,7 +28,7 @@ SPLICE_MODALITIES = {'splice_site', 'splice_usage', 'splice_junctions'}
 
 DEFAULTS = {
     # Data
-    "sequence_length": 131072,
+    "sequence_length": 1048576,
     "resolutions": "1",
     # Model
     "lora_rank": 8,
@@ -42,9 +42,9 @@ DEFAULTS = {
     "batch_size": 1,
     "gradient_accumulation_steps": 1,
     "lr": 1e-4,
-    "weight_decay": 0.1,
-    "warmup_steps": 500,
-    "lr_schedule": "cosine",
+    "weight_decay": 0.0,
+    "warmup_steps": 0,
+    "lr_schedule": "constant",
     "plateau_factor": 0.5,
     "plateau_patience": 3,
     "plateau_min_lr": 0.0,
@@ -167,7 +167,7 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
         "--mode",
         type=str,
         choices=["linear-probe", "lora", "locon", "lora+locon", "full", "encoder-only"],
-        default="lora",
+        default="linear-probe",
         help=(
             "Training mode: "
             "'linear-probe' (frozen backbone, train heads on full transformer embeddings), "
@@ -417,7 +417,9 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
             "resolution head (e.g. 'rna_seq@128:119' loads only the 128bp head, "
             "'rna_seq:119' loads both). "
             "Modalities not listed keep random initialization. "
-            "The organism is taken from --organism. For splice_site the index is ignored."
+            "The organism is taken from --organism. For splice_site the index is ignored. "
+            "Default: 'splice_site:0' when the splice_site modality is trained (pass "
+            "'splice_site:NA' to keep it random), otherwise none."
         ),
     )
     model.add_argument("--lora-rank", type=int, default=DEFAULTS["lora_rank"], help="LoRA rank (0 to disable)")
@@ -656,8 +658,12 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
     resume.add_argument(
         "--resume",
         type=str,
-        default=None,
-        help="Checkpoint path or 'auto' to find latest",
+        default="auto",
+        help=(
+            "'auto' (default): resume from the latest checkpoint in "
+            "<output-dir>/<run-name> if one exists, else start fresh; 'none': always "
+            "start fresh; or an explicit checkpoint path. Matches alphagenome_ft."
+        ),
     )
     resume.add_argument(
         "--save-delta",
@@ -1150,6 +1156,11 @@ def postprocess_args(
 
     # Parse --pretrained-head-samples: comma-separated 'modality:idx' pairs.
     # idx is either a single int (broadcast) or '|'-separated ints (per-track).
+    if args.pretrained_head_samples is None and "splice_site" in args.modalities:
+        # Default (matches alphagenome_ft): start splice_site from the pretrained
+        # 5-class head. Only applied when that head exists, so non-splice runs
+        # are unaffected.
+        args.pretrained_head_samples = "splice_site:0"
     args.pretrained_head_sample_dict: dict[str, int | list[int | None] | None] = {}
     if args.pretrained_head_samples:
         for item in args.pretrained_head_samples.split(","):

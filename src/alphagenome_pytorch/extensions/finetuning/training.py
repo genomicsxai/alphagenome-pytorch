@@ -3018,7 +3018,8 @@ def validate_multihead(
                             if 1 in predictions_scaled and "probs" in targets_dict:
                                 _logits_flat = predictions_scaled[1].float().reshape(-1, 5)  # (B*S, 5)
                                 _true_flat   = targets_dict["probs"].float().reshape(-1, 5)  # (B*S, 5)
-                                _active_flat = _true_flat.any(dim=-1)                        # (B*S,)
+                                # Splice-site classes only: column 4 (no site) is one-hot at every background position.
+                                _active_flat = _true_flat[:, :4].any(dim=-1)                 # (B*S,)
                                 n_active = int(_active_flat.sum().item())
                                 parts_logits, parts_true = [], []
                                 if n_active > 0:
@@ -3196,6 +3197,24 @@ def validate_multihead(
                     else:
                         metrics[f"{modality}_{res}bp_count_pearson_r"] = float("nan")
 
+    # Every rank must issue the same gathers in the same order, but which
+    # variants / samples were seen is rank-local (e.g. a shard with no nonzero
+    # usage target). Sync the key sets first, then always gather (an empty
+    # tensor where a rank has nothing), so all metrics use the full val set.
+    def _synced(values) -> list:
+        local = sorted(set(values))
+        if world_size == 1:
+            return local
+        out = [None] * world_size
+        dist.all_gather_object(out, local)
+        return sorted(set().union(*map(set, out)))
+
+    def _gather_cat(chunks, trailing: tuple = ()) -> Tensor:
+        t = torch.cat(chunks, dim=0).float() if chunks else torch.empty((0, *trailing))
+        if world_size > 1:
+            t = gather_tensors(t, world_size, device).cpu()
+        return t
+
     # Compute splice Pearson R for each variant
     # Variants that are count-scale (apply log1p before Pearson)
     _COUNT_VARIANTS = {"full", "nonzero"}
@@ -3207,16 +3226,12 @@ def validate_multihead(
             head_module = heads[modality].module if hasattr(heads[modality], "module") else heads[modality]
             is_junction = isinstance(head_module, SpliceSitesJunctionHead)
 
-            for variant_name, variant_data in accumulated_splice[modality].items():
+            for variant_name in _synced(accumulated_splice[modality]):
                 if variant_name in _AUPRC_VARIANTS:
                     continue
-                if not variant_data["pred"]:
-                    continue
-                all_pred = torch.cat(variant_data["pred"], dim=0)
-                all_true = torch.cat(variant_data["true"], dim=0)
-                if world_size > 1:
-                    all_pred = gather_tensors(all_pred, world_size, device)
-                    all_true = gather_tensors(all_true, world_size, device)
+                variant_data = accumulated_splice[modality].get(variant_name, {"pred": [], "true": []})
+                all_pred = _gather_cat(variant_data["pred"])
+                all_true = _gather_cat(variant_data["true"])
                 if all_pred.shape[0] > 1:
                     # log1p only for raw count variants; PSI variants are already in [0,1]
                     use_log1p = is_junction and variant_name in _COUNT_VARIANTS
@@ -3229,12 +3244,10 @@ def validate_multihead(
                     metrics[metric_key] = r.item()
 
             # Add target nonzero fraction diagnostic for junction head
-            if is_junction and "full" in accumulated_splice[modality]:
-                full_true = accumulated_splice[modality]["full"]["true"]
-                if full_true:
-                    all_true = torch.cat(full_true, dim=0)
-                    nonzero_frac = (all_true > 0).float().mean().item()
-                    metrics[f"{modality}_target_nonzero_frac"] = nonzero_frac
+            if is_junction and "full" in _synced(accumulated_splice[modality]):
+                all_true = _gather_cat(accumulated_splice[modality].get("full", {}).get("true", []))
+                if all_true.numel():
+                    metrics[f"{modality}_target_nonzero_frac"] = (all_true > 0).float().mean().item()
 
     # Compute junction auPRC (binary classification: true junction vs background)
     if compute_pearson:
@@ -3244,14 +3257,11 @@ def validate_multihead(
             head_module = heads[modality].module if hasattr(heads[modality], "module") else heads[modality]
             if not isinstance(head_module, SpliceSitesJunctionHead):
                 continue
-            bincls = accumulated_splice[modality].get("binary_cls", {})
-            if not bincls.get("pred"):
+            if "binary_cls" not in _synced(accumulated_splice[modality]):
                 continue
-            all_pred = torch.cat(bincls["pred"], dim=0)
-            all_true = torch.cat(bincls["true"], dim=0)
-            if world_size > 1:
-                all_pred = gather_tensors(all_pred, world_size, device)
-                all_true = gather_tensors(all_true, world_size, device)
+            bincls = accumulated_splice[modality].get("binary_cls", {})
+            all_pred = _gather_cat(bincls.get("pred", []))
+            all_true = _gather_cat(bincls.get("true", []))
             if all_true.sum() > 0 and all_pred.shape[0] > 1:
                 metrics[f"{modality}_auprc_junction"] = _avg_prec(
                     all_true.cpu().numpy(), all_pred.cpu().numpy()
@@ -3261,19 +3271,20 @@ def validate_multihead(
     if compute_pearson:
 
         if compute_per_sample:
-            # Infer n_s from junction accumulation, fallback to usage
+            # Infer n_s from junction accumulation, fallback to usage (agreed
+            # across ranks: a rank may have seen no junction/usage batch).
             n_s = None
-            junc_modality = None
             for m in heads:
                 if accumulated_junc_ps_pearson[m]:
                     n_s = len(accumulated_junc_ps_pearson[m])
-                    junc_modality = m
                     break
             if n_s is None:
                 for m in heads:
                     if accumulated_usage_ps_pearson[m]:
                         n_s = len(accumulated_usage_ps_pearson[m])
                         break
+            n_s_all = [n for n in _synced([n_s if n_s is not None else -1]) if n >= 0]
+            n_s = max(n_s_all) if n_s_all else None
 
             if n_s is not None:
                 per_sample_metrics = [{} for _ in range(n_s)]
@@ -3283,17 +3294,18 @@ def validate_multihead(
                     hm = heads[modality].module if hasattr(heads[modality], "module") else heads[modality]
                     if not isinstance(hm, SpliceSitesJunctionHead):
                         continue
+                    local_ps = accumulated_junc_ps_pearson[modality]
                     for s in range(n_s):
-                        if not accumulated_junc_ps_pearson[modality] or s >= len(accumulated_junc_ps_pearson[modality]):
-                            continue
                         for variant, metric_key in [
                             ("full",    f"{modality}_pearson_r"),
                             ("nonzero", f"{modality}_pearson_r_nonzero"),
                         ]:
-                            data = accumulated_junc_ps_pearson[modality][s][variant]
-                            if data["pred"]:
-                                all_pred = torch.log1p(torch.cat(data["pred"]))
-                                all_true = torch.log1p(torch.cat(data["true"]))
+                            data = local_ps[s][variant] if s < len(local_ps) else {"pred": [], "true": []}
+                            all_pred = _gather_cat(data["pred"])
+                            all_true = _gather_cat(data["true"])
+                            if all_pred.numel():
+                                all_pred = torch.log1p(all_pred)
+                                all_true = torch.log1p(all_true)
                                 if all_pred.shape[0] > 1:
                                     r = pearson_r(all_pred.unsqueeze(0), all_true.unsqueeze(0), dim=1)
                                     per_sample_metrics[s][metric_key] = r.item()
@@ -3303,13 +3315,12 @@ def validate_multihead(
                     hm = heads[modality].module if hasattr(heads[modality], "module") else heads[modality]
                     if not isinstance(hm, SpliceSitesUsageHead):
                         continue
+                    local_ps = accumulated_usage_ps_pearson[modality]
                     for s in range(n_s):
-                        if not accumulated_usage_ps_pearson[modality] or s >= len(accumulated_usage_ps_pearson[modality]):
-                            continue
-                        data = accumulated_usage_ps_pearson[modality][s]
-                        if data["pred"]:
-                            all_pred = torch.cat(data["pred"])
-                            all_true = torch.cat(data["true"])
+                        data = local_ps[s] if s < len(local_ps) else {"pred": [], "true": []}
+                        all_pred = _gather_cat(data["pred"])
+                        all_true = _gather_cat(data["true"])
+                        if all_pred.numel():
                             if all_pred.shape[0] > 1:
                                 r = pearson_r(all_pred.unsqueeze(0), all_true.unsqueeze(0), dim=1)
                                 per_sample_metrics[s][f"{modality}_pearson_r"] = r.item()
@@ -3327,12 +3338,10 @@ def validate_multihead(
             head_module = heads[modality].module if hasattr(heads[modality], "module") else heads[modality]
             if not isinstance(head_module, SpliceSitesClassificationHead):
                 continue
-            if not accumulated_cls[modality]["logits"]:
-                continue
 
-            # Tensors contain active positions + subsampled background (already (N, 5) shaped).
-            all_logits = torch.cat(accumulated_cls[modality]["logits"], dim=0)  # (N, 5)
-            all_true   = torch.cat(accumulated_cls[modality]["true"],   dim=0)  # (N, 5)
+            # Active positions + subsampled background, gathered from all ranks.
+            all_logits = _gather_cat(accumulated_cls[modality]["logits"], trailing=(5,))  # (N, 5)
+            all_true   = _gather_cat(accumulated_cls[modality]["true"],   trailing=(5,))  # (N, 5)
             probs = F.softmax(all_logits, dim=-1)
             probs_flat = probs.cpu().numpy()
             true_flat  = all_true.cpu().numpy()
