@@ -113,6 +113,150 @@ class TestAlphaGenomeLoss:
         assert 'atac_loss' in result
         assert 'dnase_loss' in result
 
+    def test_forward_sums_all_resolutions(self):
+        """A {1: ..., 128: ...} head gets the sum of both losses, as upstream."""
+        loss_fn = AlphaGenomeLoss(heads=['atac'], multinomial_resolution=2)
+        out_1 = (torch.rand(1, 256, 3) + 0.1).requires_grad_()
+        out_128 = (torch.rand(1, 2, 3) + 0.1).requires_grad_()
+        target_1 = torch.rand(1, 256, 3)
+        target_128 = target_1.reshape(1, 2, 128, 3).sum(dim=2)
+        oi = torch.tensor([0])
+
+        both = loss_fn(
+            {'atac': {1: out_1, 128: out_128}},
+            {'atac': {1: target_1, 128: target_128}},
+            oi,
+        )['loss']
+        only_1 = loss_fn({'atac': {1: out_1}}, {'atac': {1: target_1}}, oi)['loss']
+        only_128 = loss_fn({'atac': {128: out_128}}, {'atac': {128: target_128}}, oi)['loss']
+        torch.testing.assert_close(both, only_1 + only_128)
+
+        both.backward()
+        assert out_128.grad is not None and out_128.grad.abs().sum() > 0
+
+    @pytest.mark.parametrize(
+        'seq_len, segment_sizes, settings',
+        [
+            (512, {1: 64, 128: 1}, {}),
+            (4480, {1: 560, 128: 5}, {'num_segments': 'auto'}),
+            (2048, {1: 512, 128: 4}, {'num_segments': 4, 'min_segment_size': 4}),
+        ],
+    )
+    def test_derived_multinomial_resolution(self, seq_len, segment_sizes, settings):
+        """Segment sizes follow the output lengths and fine-tuning settings."""
+        predictions = {
+            res: torch.rand(1, seq_len // res, 2) + 0.1 for res in segment_sizes
+        }
+        targets = {res: torch.rand_like(pred) for res, pred in predictions.items()}
+        oi = torch.tensor([0])
+
+        derived = AlphaGenomeLoss(heads=['atac'], **settings)(
+            {'atac': predictions}, {'atac': targets}, oi,
+        )
+        explicit = AlphaGenomeLoss(
+            heads=['atac'], multinomial_resolution=segment_sizes,
+        )({'atac': predictions}, {'atac': targets}, oi)
+        torch.testing.assert_close(derived['loss'], explicit['loss'])
+
+    def test_default_multinomial_resolution_for_tensor_output(self):
+        """Unkeyed predictions retain the existing 128-bin segment default."""
+        outputs = {'atac': torch.ones(1, 256, 3)}
+        targets = {'atac': torch.full_like(outputs['atac'], 2.0)}
+        organism_index = torch.tensor([0])
+
+        default_loss = AlphaGenomeLoss(heads=['atac'])(outputs, targets, organism_index)
+        explicit_loss = AlphaGenomeLoss(heads=['atac'], multinomial_resolution=128)(
+            outputs, targets, organism_index,
+        )
+        torch.testing.assert_close(default_loss['loss'], explicit_loss['loss'])
+
+    def test_multinomial_resolution_override(self):
+        """An int applies to every resolution; a dict is looked up per resolution."""
+        outputs = {'atac': {1: torch.rand(1, 256, 3) + 0.1, 128: torch.rand(1, 2, 3) + 0.1}}
+        target_1 = torch.rand(1, 256, 3)
+        targets = {'atac': {1: target_1, 128: target_1.reshape(1, 2, 128, 3).sum(dim=2)}}
+        oi = torch.tensor([0])
+
+        as_int = AlphaGenomeLoss(heads=['atac'], multinomial_resolution=2)(outputs, targets, oi)
+        as_dict = AlphaGenomeLoss(
+            heads=['atac'], multinomial_resolution={1: 2, 128: 2}
+        )(outputs, targets, oi)
+        torch.testing.assert_close(as_int['loss'], as_dict['loss'])
+
+        per_res = AlphaGenomeLoss(
+            heads=['atac'], multinomial_resolution={1: 256, 128: 2}
+        )(outputs, targets, oi)
+        assert not torch.allclose(per_res['loss'], as_int['loss'])
+
+    @pytest.mark.parametrize("channels_last", [True, False])
+    def test_forward_sum_pools_tensor_target_to_coarser_resolutions(self, channels_last):
+        """A single finest-resolution target is sum-pooled for the 128bp output."""
+        loss_fn = AlphaGenomeLoss(heads=['atac'], multinomial_resolution=2)
+        out_1 = torch.rand(1, 256, 3) + 0.1
+        out_128 = torch.rand(1, 2, 3) + 0.1
+        target_1 = torch.rand(1, 256, 3)
+        target_128 = target_1.reshape(1, 2, 128, 3).sum(dim=2)
+        mask = torch.ones(1, 1, 3, dtype=torch.bool)
+        if not channels_last:
+            out_1 = out_1.transpose(1, 2)
+            out_128 = out_128.transpose(1, 2)
+            target_1 = target_1.transpose(1, 2)
+            target_128 = target_128.transpose(1, 2)
+            mask = mask.transpose(1, 2)
+
+        outputs = {'atac': {1: out_1, 128: out_128}}
+        masks = {'atac': mask}
+        oi = torch.tensor([0])
+        from_tensor = loss_fn(outputs, {'atac': target_1}, oi, masks)['loss']
+        from_dict = loss_fn(outputs, {'atac': {1: target_1, 128: target_128}}, oi, masks)['loss']
+        torch.testing.assert_close(from_tensor, from_dict)
+
+    def test_keyed_target_shape_mismatch_raises(self):
+        loss_fn = AlphaGenomeLoss(heads=['atac'], multinomial_resolution=2)
+        outputs = {'atac': {1: torch.ones(1, 8, 2)}}
+        targets = {'atac': {1: torch.ones(1, 16, 2)}}
+        with pytest.raises(ValueError, match=r"atac.*1 bp.*target shape"):
+            loss_fn(outputs, targets, torch.tensor([0]))
+
+    def test_single_target_requires_exact_pooling_ratio(self):
+        loss_fn = AlphaGenomeLoss(heads=['atac'], multinomial_resolution=2)
+        outputs = {'atac': {1: torch.ones(1, 260, 2), 128: torch.ones(1, 2, 2)}}
+        targets = {'atac': torch.ones(1, 260, 2)}
+        with pytest.raises(ValueError, match=r"atac.*128 bp.*256"):
+            loss_fn(outputs, targets, torch.tensor([0]))
+
+    @pytest.mark.parametrize("labeled_resolution", [1, 128])
+    def test_loss_uses_only_labeled_resolutions(self, labeled_resolution):
+        loss_fn = AlphaGenomeLoss(heads=['atac'], multinomial_resolution=2)
+        predictions = {
+            res: (torch.rand(1, length, 3) + 0.1).requires_grad_()
+            for res, length in ((1, 256), (128, 2))
+        }
+        labeled = predictions[labeled_resolution]
+        targets = {'atac': {labeled_resolution: torch.rand_like(labeled)}}
+        mask = torch.ones(1, 1, 3, dtype=torch.bool)
+        masks = {'atac': {labeled_resolution: mask}}
+        oi = torch.tensor([0])
+
+        result = loss_fn({'atac': predictions}, targets, oi, masks)['loss']
+        expected = loss_fn({'atac': {labeled_resolution: labeled}}, targets, oi, masks)['loss']
+        torch.testing.assert_close(result, expected)
+
+        result.backward()
+        assert labeled.grad is not None
+        for resolution in predictions.keys() - {labeled_resolution}:
+            assert predictions[resolution].grad is None
+
+    def test_head_without_matching_labels_is_skipped(self):
+        loss_fn = AlphaGenomeLoss(heads=['atac'])
+        outputs = {'atac': {128: torch.ones(1, 2, 3)}}
+        targets = {'atac': {1: torch.ones(1, 256, 3)}}
+
+        result = loss_fn(outputs, targets, torch.tensor([0]))
+
+        assert 'atac_loss' not in result
+        assert result['loss'].item() == 0.0
+
 
 @pytest.mark.unit
 class TestSpliceLoss:

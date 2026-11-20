@@ -1,10 +1,6 @@
 """Tests for AlphaGenomeLoss head-weight aggregation.
 
-Pins the contract for `DEFAULT_HEAD_WEIGHTS` and the divisor used in
-`AlphaGenomeLoss.forward()`. Mirrors upstream JAX `HeadConfig.loss_weight`
-semantics: a weight of 0.2 down-weights that head's contribution to the
-batch-mean loss by exactly 0.2x relative to a weight-1.0 head with the
-same residual.
+Pins the upstream weighted-sum contract and `DEFAULT_HEAD_WEIGHTS`.
 """
 
 import pytest
@@ -37,8 +33,8 @@ class TestDefaultHeadWeights:
 
 
 @pytest.mark.unit
-class TestAggregationDivisor:
-    """Verify the `sum(w_i * L_i) / num_heads` aggregation contract.
+class TestHeadAggregation:
+    """Verify the `sum(w_i * L_i)` aggregation contract.
 
     We bypass `_compute_head_loss` by monkey-patching it so we can pin
     arbitrary per-head losses and verify the aggregator math directly.
@@ -68,15 +64,12 @@ class TestAggregationDivisor:
         return loss_fn(outputs, targets, organism_index)
 
     def test_junction_enters_at_0p2_with_default_weights(self):
-        """Equal residual on atac vs splice_junctions: junction contributes
-        exactly 0.2 / num_heads of the total, atac contributes 1.0 / num_heads.
-        """
+        """Unit losses contribute 1.0 for ATAC and 0.2 for splice junctions."""
         per_head = {'atac': 1.0, 'splice_junctions': 1.0}
         loss_fn = self._make_loss_with_fixed_per_head(per_head)
         result = self._run(loss_fn, list(per_head.keys()))
 
-        # total = (1.0 * 1.0 + 0.2 * 1.0) / 2 = 0.6
-        assert torch.isclose(result['loss'], torch.tensor(0.6))
+        assert torch.isclose(result['loss'], torch.tensor(1.2))
         assert torch.isclose(result['atac_loss'], torch.tensor(1.0))
         assert torch.isclose(result['splice_junctions_loss'], torch.tensor(1.0))
 
@@ -89,12 +82,10 @@ class TestAggregationDivisor:
         )
         result = self._run(loss_fn, list(per_head.keys()))
 
-        # total = (1.0 + 1.0) / 2 = 1.0
-        assert torch.isclose(result['loss'], torch.tensor(1.0))
+        assert torch.isclose(result['loss'], torch.tensor(2.0))
 
     def test_user_can_zero_head(self):
-        """Setting weight to 0 drops the head's contribution but the divisor
-        still counts it (we average the weighted losses)."""
+        """A head with zero weight contributes zero to the sum."""
         per_head = {'atac': 4.0, 'splice_junctions': 4.0}
         loss_fn = self._make_loss_with_fixed_per_head(
             per_head,
@@ -102,17 +93,16 @@ class TestAggregationDivisor:
         )
         result = self._run(loss_fn, list(per_head.keys()))
 
-        # total = (1.0 * 4 + 0.0 * 4) / 2 = 2.0
-        assert torch.isclose(result['loss'], torch.tensor(2.0))
+        assert torch.isclose(result['loss'], torch.tensor(4.0))
 
     def test_all_default_heads_aggregate(self):
-        """All 11 default heads with unit per-head loss: total = sum(weights)/11."""
+        """With unit head losses, the total equals the sum of the weights."""
         head_names = list(DEFAULT_HEAD_WEIGHTS.keys())
         per_head = {h: 1.0 for h in head_names}
         loss_fn = self._make_loss_with_fixed_per_head(per_head)
         result = self._run(loss_fn, head_names)
 
-        expected = sum(DEFAULT_HEAD_WEIGHTS.values()) / len(head_names)
+        expected = sum(DEFAULT_HEAD_WEIGHTS.values())
         assert torch.isclose(result['loss'], torch.tensor(expected))
 
     def test_partial_override_preserves_other_defaults(self):
@@ -127,8 +117,7 @@ class TestAggregationDivisor:
 
         # atac override applied, splice_junctions still at its 0.2 default.
         assert loss_fn.head_weights['splice_junctions'] == 0.2
-        # total = (2.0 * 1.0 + 0.2 * 1.0) / 2 = 1.1
-        assert torch.isclose(result['loss'], torch.tensor(1.1))
+        assert torch.isclose(result['loss'], torch.tensor(2.2))
 
 
 @pytest.mark.unit

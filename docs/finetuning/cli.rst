@@ -129,8 +129,8 @@ For reproducible experiments, use ``--config config.yaml``.
       count_weight: 1.0                  # Weight for count (Poisson) loss
 
       # Multinomial loss segmentation
-      num_segments: 8                    # Number of segments for loss computation
-      min_segment_size: 64               # Minimum segment size (optional)
+      num_segments: auto                 # 'auto' or an exact loss segment count
+      min_segment_size: 64               # Minimum output bins per segment (optional)
 
       # Gradient clipping
       max_grad_norm: 1.0                 # Max gradient norm for clipping
@@ -219,6 +219,12 @@ config did not mention. Modalities defined only in the config are left alone.
 Per-modality settings such as ``resolutions`` and ``task_weight`` come from the
 config either way, so a command line can override the file list while keeping
 the config's per-modality tuning.
+
+**Loss segments.** By default, ``--num-segments auto`` chooses the largest
+valid count up to eight. Pass a number to require that exact count of equal
+segments. The minimum is measured in output bins at
+each resolution. The CLI validates the split and reports the segment count
+and size before loading training data.
 
 .. _what-a-run-produces:
 

@@ -85,8 +85,8 @@ gradient_accumulation_steps: 4
 lr: 1e-4
 warmup_steps: 500
 lr_schedule: cosine
-num_segments: 8          # multinomial-loss segmentation (optional)
-min_segment_size: 64     # optional floor for segment size
+num_segments: auto       # 'auto' or an exact number of equal loss segments
+min_segment_size: 64     # optional minimum output bins per segment
 
 # LoRA configuration
 lora_rank: 8
@@ -134,7 +134,8 @@ Notes:
 - `modalities.<name>.task_weight` sets per-modality loss weighting.
 - `modalities.<name>.strand_pairs` shares +/- strand track-mean scaling (`auto` or a list of `[plus, minus]` index pairs); CLI `--strand-pairs` overrides it.
 - CLI `--modality-weights` overrides YAML task weights when both are provided.
-- `num_segments` and `min_segment_size` apply to both training and validation multinomial loss.
+- `num_segments` defaults to `auto`, which chooses the largest valid count up to eight. A numeric value requires that exact count of equal segments.
+- `min_segment_size` applies to training and validation at each output resolution. With sequence parallelism, training uses the count per shard and validation uses it per full context.
 
 ## Module Structure
 

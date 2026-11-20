@@ -49,7 +49,7 @@ DEFAULTS = {
     "count_weight": 1.0,
     "num_workers": 4,
     "max_grad_norm": 1.0,
-    "num_segments": 8,
+    "num_segments": "auto",
     "min_segment_size": None,
     # Logging
     "wandb_project": "alphagenome-finetune",
@@ -424,8 +424,18 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
     train.add_argument("--positional-weight", type=float, default=DEFAULTS["positional_weight"])
     train.add_argument("--count-weight", type=float, default=DEFAULTS["count_weight"])
     train.add_argument("--max-grad-norm", type=float, default=DEFAULTS["max_grad_norm"])
-    train.add_argument("--num-segments", type=int, default=DEFAULTS["num_segments"])
-    train.add_argument("--min-segment-size", type=int, default=DEFAULTS["min_segment_size"])
+    train.add_argument(
+        "--num-segments",
+        default=DEFAULTS["num_segments"],
+        metavar="N|auto",
+        help="Exact number of equal loss segments. Use auto for the largest valid count up to eight.",
+    )
+    train.add_argument(
+        "--min-segment-size",
+        type=int,
+        default=DEFAULTS["min_segment_size"],
+        help="Minimum loss segment size in output bins at each resolution.",
+    )
     train.add_argument("--num-workers", type=int, default=DEFAULTS["num_workers"])
     train.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision")
     train.add_argument("--track-means-samples", type=int, default=None, help="Samples for track means (default: all)")
@@ -645,6 +655,19 @@ def postprocess_args(
         "overlap_highres",
     ):
         _apply_config_scalar(attr, config_data)
+
+    if args.num_segments != "auto":
+        if isinstance(args.num_segments, str):
+            try:
+                args.num_segments = int(args.num_segments)
+            except ValueError:
+                parser.error("--num-segments must be a positive integer or 'auto'.")
+        if type(args.num_segments) is not int or args.num_segments < 1:
+            parser.error("--num-segments must be a positive integer or 'auto'.")
+    if args.min_segment_size is not None and (
+        type(args.min_segment_size) is not int or args.min_segment_size < 1
+    ):
+        parser.error("--min-segment-size must be a positive integer.")
 
     if "--gene-expr-eval" not in cli_flags and "gene_expr_eval" in config_data:
         args.gene_expr_eval = bool(config_data["gene_expr_eval"])
