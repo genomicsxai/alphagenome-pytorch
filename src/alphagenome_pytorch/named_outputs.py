@@ -203,6 +203,14 @@ class TrackMetadata:
         return result
 
 
+def _valid_track_mask(
+    tracks: Iterable[TrackMetadata], *, device: torch.device | str | None
+) -> torch.Tensor:
+    return torch.tensor(
+        [not track.is_padding for track in tracks], dtype=torch.bool, device=device
+    )
+
+
 class TrackMetadataCatalog:
     """Track metadata indexed by organism and output name."""
 
@@ -397,6 +405,31 @@ class TrackMetadataCatalog:
         )
         merged = tuple(list(tracks) + list(padding))
         return tuple(dataclasses.replace(track, track_index=i) for i, track in enumerate(merged))
+
+    def valid_track_mask(
+        self,
+        output_name: str,
+        *,
+        organism: int | str,
+        num_tracks: int,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Return a boolean mask where True selects a real channel.
+
+        Supply a single organism and the raw tensor's track width. Metadata
+        must cover every channel in tensor order.
+        """
+        if isinstance(organism, str):
+            name = organism.strip().lower()
+            if name not in _ORGANISM_ALIASES and not name.isdecimal():
+                raise ValueError(f"Unknown organism {organism!r}")
+        elif not isinstance(organism, int):
+            raise TypeError("organism must be a single index or name")
+
+        tracks = self.get_tracks(
+            output_name, organism=organism, num_tracks=num_tracks, strict=True
+        )
+        return _valid_track_mask(tracks, device=device)
 
     def add_tracks(
         self,
@@ -786,11 +819,7 @@ class NamedTrackTensor:
         """
         if device is None:
             device = self.tensor.device
-        return torch.tensor(
-            [not t.is_padding for t in self.tracks],
-            dtype=torch.bool,
-            device=device,
-        )
+        return _valid_track_mask(self.tracks, device=device)
 
     # -------------------------------------------------------------------------
     # Arithmetic operators

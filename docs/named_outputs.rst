@@ -342,6 +342,31 @@ Stripping padding after the fact
    out.atac.strip_padding()            # One head → new NamedOutputHead
    out.atac[128].strip_padding()       # One tensor → new NamedTrackTensor
 
+Computing metrics over real tracks
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For an aligned single-organism batch, pass the same metadata selection to
+``compute_metrics()`` for predictions and targets. Both input tensors have
+shape ``(batch, positions, tracks)`` in raw channel order. The metric excludes
+padding before computing correlations or averaging across tracks.
+
+.. code-block:: python
+
+   from alphagenome_pytorch.metrics import compute_metrics
+   from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
+
+   catalog = TrackMetadataCatalog.load_builtin("human")
+   pred = raw["procap"][128]
+   track_mask = catalog.valid_track_mask(
+       "procap", organism="human", num_tracks=pred.shape[-1]
+   )
+   metrics = compute_metrics(pred, targets, track_mask=track_mask)
+
+For an existing named output with padding retained and the matching catalog
+attached, use ``out.procap[128].padding_mask()`` to get the same mask. A head
+with no real tracks, such as mouse PRO-cap, yields an empty metrics dictionary.
+For mixed-organism batches, group samples by organism before computing metrics.
+
 Checking individual tracks
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
 

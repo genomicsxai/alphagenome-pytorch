@@ -718,6 +718,21 @@ def test_named_track_tensor_padding_mask():
     mask = named.atac[128].padding_mask()
     assert mask.tolist() == [True, True, True, False, False]
     assert mask.dtype == torch.bool
+    torch.testing.assert_close(
+        catalog.valid_track_mask("atac", organism="human", num_tracks=5), mask
+    )
+
+
+@pytest.mark.unit
+def test_catalog_valid_track_mask_requires_matching_metadata():
+    catalog = TrackMetadataCatalog.from_rows(_make_padding_rows())
+
+    with pytest.raises(KeyError, match="No metadata found"):
+        catalog.valid_track_mask("atac", organism="mouse", num_tracks=5)
+    with pytest.raises(ValueError, match="tensor has 4"):
+        catalog.valid_track_mask("atac", organism="human", num_tracks=4)
+    with pytest.raises(ValueError, match="Unknown organism"):
+        catalog.valid_track_mask("atac", organism="typo", num_tracks=5)
 
 
 @pytest.mark.unit
