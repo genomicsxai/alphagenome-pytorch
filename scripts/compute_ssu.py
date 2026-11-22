@@ -254,8 +254,8 @@ def compute_spliser_counts(
     accumulated simultaneously as each read is consumed.
 
     Coordinate note: donor scan pos = exon_start (= iv_s, 0-based intron
-    start); acceptor scan pos = exon_end - 2 (= iv_e - 1, 0-based last
-    intron base).  Both equal the corresponding pysam find_introns keys
+    start); acceptor scan pos = exon_end - 1 (= iv_e, 0-based exclusive
+    intron end).  Both equal the corresponding pysam find_introns keys
     numerically, so results are identical to the find_introns approach.
 
     Returns DataFrame with columns:
@@ -287,13 +287,13 @@ def compute_spliser_counts(
     for chrom, chrom_junc in junctions.groupby("chrom"):
         # ── Target index ───────────────────────────────────────────────
         # donor scan pos    = exon_start      (= iv_s,   0-based intron start)
-        # acceptor scan pos = exon_end - 2    (= iv_e-1, 0-based last intron base)
+        # acceptor scan pos = exon_end - 1    (= iv_e,   0-based end of the intron)
         # Sets deduplicate roles so a site shared by N junctions is only
         # scanned once per read.
         chrom_target_roles: dict[str, dict[int, set[str]]] = {"+": {}, "-": {}}
 
         # Partner/competitor maps for SpliSER-compatible beta2 classification.
-        # donor_to_acc[strand][d_pos]  → {a_pos, ...}   (a_pos = iv_e - 1)
+        # donor_to_acc[strand][d_pos]  → {a_pos, ...}   (a_pos = iv_e)
         # acc_to_donor[strand][a_pos]  → {d_pos, ...}
         donor_to_acc: dict[str, dict] = {"+": defaultdict(set), "-": defaultdict(set)}
         acc_to_donor: dict[str, dict] = {"+": defaultdict(set), "-": defaultdict(set)}
@@ -446,8 +446,8 @@ def compute_spliser_counts(
                             for iv_s_r, iv_e_r in introns
                         )
                     else:  # acceptor
-                        # Alpha: intron ends at target_pos + 1 (= iv_e).
-                        is_alpha_r = any(iv_e_r == target_pos + 1 for _, iv_e_r in introns)
+                        # Alpha: intron ends exactly at target_pos (= iv_e).
+                        is_alpha_r = any(iv_e_r == target_pos for _, iv_e_r in introns)
                         is_in_gap  = any(iv_s_r < target_pos < iv_e_r
                                          for iv_s_r, iv_e_r in introns)
                         a_partners = acc_to_donor[read_strand].get(target_pos, set())
@@ -485,7 +485,7 @@ def compute_spliser_counts(
                         is_alpha_ag  = any(iv_s == target_pos for iv_s, _ in introns)
                         is_in_gap_ag = any(iv_s < target_pos < iv_e for iv_s, iv_e in introns)
                     else:
-                        is_alpha_ag  = any(iv_e == target_pos + 1 for _, iv_e in introns)
+                        is_alpha_ag  = any(iv_e == target_pos for _, iv_e in introns)
                         is_in_gap_ag = any(iv_s < target_pos < iv_e for iv_s, iv_e in introns)
                     is_in_block_ag = any(bs < target_pos < be for bs, be in blocks)
                     if not is_alpha_ag and not is_in_gap_ag and is_in_block_ag:

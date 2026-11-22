@@ -392,10 +392,11 @@ class TestCrossEntropyLossSmoothingFix:
         assert torch.isclose(loss, torch.tensor(0.9772524237632751), atol=1e-6)
 
     def test_zero_counts_smoothed(self):
-        """All-zero counts: eps only enters via the log_normalizer/log_likelihood
-        terms (not added to the raw counts upfront), matching upstream JAX exactly
-        — golden value from `alphagenome_research.model.losses.cross_entropy_loss`
-        on the same inputs. Crucially, no inf/nan from log(0).
+        """All-zero counts: loss equals entropy of the smoothed uniform distribution.
+
+        With y_true = y_pred = 0 and eps = 1e-7, after smoothing the per-axis
+        distribution is uniform over the axis size (here 3), so the loss is
+        log(3) ≈ 1.0986123, as upstream JAX after de264f5. No inf from log(0).
         """
         y = torch.zeros((1, 2, 3))
         mask = torch.ones((1, 2, 3), dtype=torch.bool)
@@ -403,7 +404,15 @@ class TestCrossEntropyLossSmoothingFix:
             y_true=y, y_pred=y, mask=mask, axis=-1,
         )
         assert torch.isfinite(loss)
-        assert torch.isclose(loss, torch.tensor(-15.019484), atol=1e-5)
+        assert torch.isclose(loss, torch.tensor(1.0986123085021973), atol=1e-6)
+
+    def test_pre_de264f5_formula_kept_separately(self):
+        """The pre-fix formula (finetuning --junction-loss original) lives under its own name."""
+        y = torch.zeros((1, 2, 3))
+        mask = torch.ones((1, 2, 3), dtype=torch.bool)
+        legacy = losses.cross_entropy_loss_pre_de264f5(y_true=y, y_pred=y, mask=mask, axis=-1)
+        assert torch.isclose(legacy, torch.tensor(-15.019484), atol=1e-5)
+        assert losses.cross_entropy_loss_normalized is losses.cross_entropy_loss
 
     def test_smoothing_gradient_finite(self):
         """Zero-count predictions must yield finite gradient (no log(0))."""
@@ -600,3 +609,21 @@ class TestGoldenValues:
         assert torch.isclose(result['loss'], torch.tensor(26.4599399567), atol=1e-4)
         assert torch.isclose(result['loss_total'], torch.tensor(17.7364959717), atol=1e-4)
         assert torch.isclose(result['loss_positional'], torch.tensor(8.7234439850), atol=1e-4)
+
+
+def test_cross_entropy_loss_matches_alphagenome_research():
+    """Exact against the JAX reference on random masked counts."""
+    jax_losses = pytest.importorskip("alphagenome_research.model.losses")
+    jnp = pytest.importorskip("jax.numpy")
+    rng = torch.Generator().manual_seed(0)
+    y_true = torch.poisson(torch.full((2, 5, 7), 2.0), generator=rng)
+    y_pred = torch.rand((2, 5, 7), generator=rng) * 3
+    mask = torch.rand((2, 5, 7), generator=rng) > 0.3
+    mask[0, 1] = False                      # one fully-masked row
+    for axis in (1, 2):
+        ours = losses.cross_entropy_loss(y_true=y_true, y_pred=y_pred, mask=mask, axis=axis)
+        ref = jax_losses.cross_entropy_loss(
+            y_true=jnp.asarray(y_true.numpy()), y_pred=jnp.asarray(y_pred.numpy()),
+            mask=jnp.asarray(mask.numpy()), axis=axis,
+        )
+        assert abs(float(ours) - float(ref)) < 1e-5, (axis, float(ours), float(ref))
