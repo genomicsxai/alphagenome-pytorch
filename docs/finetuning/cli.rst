@@ -32,7 +32,7 @@ For reproducible experiments, use ``--config config.yaml``.
       genome: /path/to/hg38.fa           # Reference genome FASTA (required)
       train_bed: /path/to/train.bed      # Training regions BED file (required)
       val_bed: /path/to/val.bed          # Validation regions BED file (required)
-      sequence_length: 131072            # Input sequence length (default: 1048576)
+      sequence_length: 1048576           # Input sequence length
 
       # Global output resolutions - can be overridden per-modality
       # Use "1" for 1bp resolution, "128" for 128bp, or "1,128" for both
@@ -49,8 +49,8 @@ For reproducible experiments, use ``--config config.yaml``.
 
       pretrained_weights: /path/to/model.pth  # Pretrained weights file (required)
 
-      # Training mode: 'linear-probe', 'lora', 'locon', 'lora+locon', or 'full'
-      mode: lora
+      # Training mode: 'linear-probe', 'lora', 'locon', 'lora+locon', 'full', or 'encoder-only'
+      mode: linear-probe
 
       # LoRA configuration (used when mode includes LoRA)
       lora_rank: 8                       # LoRA rank (0 disables LoRA, trains heads only)
@@ -69,7 +69,7 @@ For reproducible experiments, use ``--config config.yaml``.
       head_init_scheme: truncated_normal # 'truncated_normal' or 'uniform'
 
       # Memory optimization
-      gradient_checkpointing: true       # Enable gradient checkpointing
+      gradient_checkpointing: false      # Enable gradient checkpointing
 
       # =============================================================================
       # Modality Configuration
@@ -116,21 +116,21 @@ For reproducible experiments, use ``--config config.yaml``.
 
       epochs: 10                         # Number of training epochs
       batch_size: 1                      # Batch size per GPU
-      gradient_accumulation_steps: 4     # Accumulate gradients over N batches
+      gradient_accumulation_steps: 1     # Accumulate gradients over N batches
 
       # Learning rate and schedule
       lr: 0.0001                         # Learning rate
-      weight_decay: 0.1                  # Weight decay for AdamW
-      warmup_steps: 500                  # Linear warmup steps
-      lr_schedule: cosine                # 'cosine' or 'constant'
+      weight_decay: 0.0                  # Weight decay for AdamW
+      warmup_steps: 0                    # Linear warmup steps
+      lr_schedule: constant              # 'constant', 'cosine', or 'plateau'
 
       # Loss configuration
       positional_weight: 5.0             # Weight for positional (cross-entropy) loss
       count_weight: 1.0                  # Weight for count (Poisson) loss
 
       # Multinomial loss segmentation
-      num_segments: 8                    # Number of segments for loss computation
-      min_segment_size: 64               # Minimum segment size (optional)
+      num_segments: null                 # Fixed segment count; null = 2**17 bp segments (alphagenome_research)
+      min_segment_size: null             # Minimum segment size (optional)
 
       # Gradient clipping
       max_grad_norm: 1.0                 # Max gradient norm for clipping
@@ -149,13 +149,13 @@ For reproducible experiments, use ``--config config.yaml``.
       profile_batches: 0                 # Profile first N batches (0 = disabled)
 
       # Random seed
-      seed: 42                           # Random seed (null for no seeding)
+      seed: 1234                         # Random seed (null for no seeding)
 
       # =============================================================================
       # Logging Configuration
       # =============================================================================
 
-      wandb: true                        # Enable Weights & Biases logging
+      wandb: false                       # Enable Weights & Biases logging
       wandb_project: alphagenome-finetune  # W&B project name
       wandb_entity: null                 # W&B entity (team/user)
       log_every: 50                      # Log every N batches
@@ -165,14 +165,14 @@ For reproducible experiments, use ``--config config.yaml``.
       # =============================================================================
 
       output_dir: finetuning_output      # Output directory
-      run_name: my_experiment            # Run name (default: timestamp)
+      run_name: null                     # Run name (null = timestamp)
       save_every: 1                      # Save checkpoint every N epochs
 
       # =============================================================================
       # Resume Configuration
       # =============================================================================
 
-      resume: null                       # Checkpoint path or 'auto' to find latest
+      resume: auto                       # 'auto' (latest in output_dir/run_name), 'none', or a checkpoint path
       save_delta: false                  # Save delta checkpoints (adapter + head weights only)
       no_full_checkpoint: false          # With save_delta, skip full checkpoint files
       no_save_checkpoints: false         # Write no weights at all (keeps logs)

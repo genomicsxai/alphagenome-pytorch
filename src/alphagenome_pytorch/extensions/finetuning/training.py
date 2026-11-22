@@ -26,7 +26,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 
 from alphagenome_pytorch import losses
-from alphagenome_pytorch.extensions.finetuning.gradient_utils import (
+from alphagenome_pytorch.extensions.finetuning.distributed import (
     average_gradients_across_ranks,
     unique_trainable_parameters,
 )
