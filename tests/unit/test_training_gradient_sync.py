@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from alphagenome_pytorch.extensions.finetuning.gradient_utils import (
+from alphagenome_pytorch.extensions.finetuning.distributed import (
     average_gradients_across_ranks,
     unique_trainable_parameters,
 )

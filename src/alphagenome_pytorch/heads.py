@@ -124,6 +124,18 @@ def _einsum_bf16_inputs_f32_output(equation: str, a: torch.Tensor, b: torch.Tens
         )
 
 
+def _jax_linear_operands(x: torch.Tensor, w: torch.Tensor, b: torch.Tensor):
+    """Weights/bias as JAX ``_MultiOrganismLinear`` uses them, upcast for an fp32 matmul.
+
+    JAX casts ``w`` and ``b`` to the input dtype and runs the product with
+    ``preferred_element_type=float32``: bf16 inputs, fp32 accumulation and an
+    fp32 result. Products of bf16 values are exact in fp32, so rounding the
+    operands to the input dtype and multiplying in fp32 (autocast off)
+    reproduces it; the output stays fp32 instead of being rounded back to bf16.
+    """
+    return w.to(x.dtype).float(), b.to(x.dtype).float()
+
+
 class MultiOrganismLinear(nn.Module):
     """Linear layer with organism-specific weights. Expects NLC format (B, S, C).
 
@@ -178,9 +190,9 @@ class MultiOrganismLinear(nn.Module):
         # x: (B, S, in_features) - NLC format
         w = self.weight[organism_index]  # (B, In, Out)
         b = self.bias[organism_index]    # (B, Out)
-
-        input_dtype = x.dtype
-        out = torch.bmm(x.float(), w.float()).to(input_dtype)
+        w, b = _jax_linear_operands(x, w, b)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            out = torch.bmm(x.float(), w)
         return out + b.unsqueeze(1)
 
 
@@ -229,8 +241,9 @@ class MultiOrganismConv1d(nn.Module):
         b = self.bias[organism_index]    # (B, C_out)
 
         # Batched 1x1 conv via einsum: (B, C_in, S) @ (B, C_out, C_in).T -> (B, C_out, S)
-        input_dtype = x.dtype
-        out = torch.einsum('bcs,boc->bos', x.float(), w.float()).to(input_dtype)
+        w, b = _jax_linear_operands(x, w, b)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            out = torch.einsum('bcs,boc->bos', x.float(), w)
         return out + b.unsqueeze(2)  # bias: (B, C_out, 1)
 
 class GenomeTracksHead(nn.Module):

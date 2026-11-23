@@ -26,14 +26,14 @@ import torch.distributed as dist
 from tqdm import tqdm
 
 from alphagenome_pytorch import losses
-from alphagenome_pytorch.extensions.finetuning.gradient_utils import (
+from alphagenome_pytorch.extensions.finetuning.distributed import (
     average_gradients_across_ranks,
     unique_trainable_parameters,
 )
 from alphagenome_pytorch.losses import (
     multinomial_loss,
-    cross_entropy_loss,
     cross_entropy_loss_normalized,
+    cross_entropy_loss_pre_de264f5,
     cross_entropy_loss_from_logits,
     binary_crossentropy_from_logits,
     poisson_loss,
@@ -466,7 +466,7 @@ def _compute_junction_loss(pos_pred, pos_target, pos_donor_pos, pos_accept_pos,
     mix positions across channels.
 
     Args:
-        junction_loss: "original" uses cross_entropy_loss (JAX pre-de264f5);
+        junction_loss: "original" uses cross_entropy_loss_pre_de264f5 (JAX pre-de264f5);
                        "normalized" uses cross_entropy_loss_normalized (JAX post-de264f5,
                        both targets and predictions normalized to ratios within mask).
     """
@@ -528,12 +528,12 @@ def _compute_junction_loss(pos_pred, pos_target, pos_donor_pos, pos_accept_pos,
         has_a = (sum_tgt_a > 0) & pairs_mask.any(dim=2)  # (B, D, S) donors with outgoing reads
         ce_mask_d = pairs_mask & has_d.unsqueeze(1).expand_as(pairs_mask)
         ce_mask_a = pairs_mask & has_a.unsqueeze(2).expand_as(pairs_mask)
-        donor_ratios_loss    = cross_entropy_loss(y_true=target, y_pred=pred, mask=ce_mask_d, axis=1)
-        acceptor_ratios_loss = cross_entropy_loss(y_true=target, y_pred=pred, mask=ce_mask_a, axis=2)
+        donor_ratios_loss    = cross_entropy_loss_pre_de264f5(y_true=target, y_pred=pred, mask=ce_mask_d, axis=1)
+        acceptor_ratios_loss = cross_entropy_loss_pre_de264f5(y_true=target, y_pred=pred, mask=ce_mask_a, axis=2)
         donor_total_loss  = poisson_loss(y_true=sum_tgt_d, y_pred=sum_pred_d, mask=has_d)
         accept_total_loss = poisson_loss(y_true=sum_tgt_a, y_pred=sum_pred_a, mask=has_a)
     else:
-        _ce = cross_entropy_loss_normalized if junction_loss == "normalized" else cross_entropy_loss
+        _ce = cross_entropy_loss_normalized if junction_loss == "normalized" else cross_entropy_loss_pre_de264f5
         donor_ratios_loss    = _ce(y_true=target, y_pred=pred, mask=pairs_mask, axis=1)
         acceptor_ratios_loss = _ce(y_true=target, y_pred=pred, mask=pairs_mask, axis=2)
         donor_total_loss  = poisson_loss(y_true=sum_tgt_d, y_pred=sum_pred_d, mask=pairs_mask.any(dim=1))
@@ -2552,17 +2552,6 @@ def train_epoch_multihead(
                     junction_loss=junction_loss,
                     min_alpha_juncs=min_alpha_juncs,
                 )
-                # In SP mode, SpliceSitesJunctionHead all-gathers logits at every
-                # rank so all ranks compute the identical full junction loss.  After
-                # dist.all_reduce(SUM) the gradients would be world_size× too large
-                # relative to heads that process only their local sequence shard.
-                # Divide here so the effective gradient matches singlegpu / DDP.
-                if (
-                    sequence_parallel is not None
-                    and world_size > 1
-                    and isinstance(head_module, SpliceSitesJunctionHead)
-                ):
-                    modality_loss = modality_loss / world_size
                 for k, v in splice_components.items():
                     loss_components[f"{modality}_{k}"] = v
             else:
@@ -2637,6 +2626,14 @@ def train_epoch_multihead(
             modality_loss_accum[modality] += modality_loss.item()
 
         scaled_loss = loss / accumulation_steps
+        if sequence_parallel is not None and world_size > 1:
+            # SP gradients are SUM-reduced across ranks (below). Every rank's
+            # loss is either a mean over its equal-size sequence shard (genome
+            # tracks, splice_site, splice_usage) or the full value computed
+            # identically on all ranks (splice_junctions, from all-gathered
+            # logits). Dividing by world_size makes the summed gradient equal
+            # the single-GPU gradient for every head. Logged losses stay unscaled.
+            scaled_loss = scaled_loss / world_size
 
         if is_profiling:
             _cuda_sync(device)
