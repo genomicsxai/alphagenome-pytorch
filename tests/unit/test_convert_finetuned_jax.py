@@ -170,9 +170,9 @@ class TestHeadMapping:
         assert meta["track_names"]["splice_usage"] == ["s0", "s1"]
         assert meta["track_names"]["splice_junctions"] == ["tissue0_pos", "tissue0_neg"]
         assert meta["track_names"]["splice_site"][0] == "cls_donor_pos"
-        rna_rows = [r for r in meta["track_metadata"] if r["output_type"] == "rna_seq"]
-        assert rna_rows[1] == {"strand": "+", "nonzero_mean": 2.0, "output_type": "rna_seq",
-                               "track_name": "HOM_t1", "organism": "human"}
+        rna_rows = [r for r in meta["track_metadata"] if r["output_name"] == "rna_seq"]
+        assert rna_rows[1] == {"strand": "+", "nonzero_mean": 2.0, "output_name": "rna_seq",
+                               "track_index": 1, "track_name": "HOM_t1", "organism": 0}
         assert meta["resolutions"]["rna_seq"] == (1,)
 
 

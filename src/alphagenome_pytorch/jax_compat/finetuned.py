@@ -71,6 +71,7 @@ _SPLICE_CLASS_NAMES = [
 # (alphagenome_ft builds metadata for every dna_client.Organism, in enum order).
 _ORGANISMS = ("HOMO_SAPIENS", "MUS_MUSCULUS")
 _ORGANISM_PT_NAMES = {"HOMO_SAPIENS": "human", "MUS_MUSCULUS": "mouse"}
+_ORGANISM_PT_INDEX = {"HOMO_SAPIENS": 0, "MUS_MUSCULUS": 1}
 _LORA_TARGETS = {"q_proj": "q_proj", "q_layer": "q_proj", "v_proj": "v_proj", "v_layer": "v_proj"}
 _NUM_TOWER_BLOCKS = 9
 _JUNCTION_HIDDEN_DIM = 768
@@ -438,13 +439,15 @@ def build_finetuned_conversion(
             names = [f"{t}_pos" for t in tissues] + [f"{t}_neg" for t in tissues]
             meta_rows = [{**r, "strand": "+"} for r in base] + [{**r, "strand": "-"} for r in base]
         track_names[pt_name] = names
-        for name, row in zip(names, meta_rows):
+        # Rows as the finetuning runner records them (TrackMetadataCatalog.to_rows keys).
+        for index, (name, row) in enumerate(zip(names, meta_rows)):
             row = {k: _json_safe(v) for k, v in row.items() if k != "name"}
             track_metadata.append({
                 **row,
-                "output_type": pt_name,
+                "output_name": pt_name,
+                "track_index": index,
                 "track_name": name,
-                "organism": _ORGANISM_PT_NAMES[org],
+                "organism": _ORGANISM_PT_INDEX[org],
             })
 
     if len(organisms) > 1:
