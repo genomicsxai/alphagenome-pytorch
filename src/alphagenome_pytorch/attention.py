@@ -1,4 +1,3 @@
-import functools
 import math
 import torch
 import torch.nn as nn
@@ -36,20 +35,19 @@ def _apply_rope_inplace(x, cos_theta, sin_theta):
     return x
 
 
-@functools.lru_cache(maxsize=64)
-def _rope_base_freqs(num_freq: int, max_position: int) -> torch.Tensor:
-    """``geomspace(1, max_position - num_freq + 1, num_freq)`` as float32 on CPU.
+def _rope_base_freqs(num_freq: int, max_position: int, device: torch.device) -> torch.Tensor:
+    """``geomspace(1, max_position - num_freq + 1, num_freq)`` as float32 on ``device``.
 
     Computed in float64 and rounded once, so every element is the correctly
-    rounded float32 value on every device. A float32 recipe cannot match
-    JAX bit for bit: JAX's own CPU and GPU geomspace already disagree in the
-    last bit for many elements. Built on CPU (float64) and moved to the
-    input's device by the caller, so MPS (no float64, no logspace) works.
+    rounded float32 value. A float32 recipe cannot match JAX bit for bit:
+    JAX's own CPU and GPU geomspace already disagree in the last bit.
     """
+    table_device = torch.device("cpu") if device.type == "mps" else device  # MPS has no float64
     exponents = torch.linspace(
-        0.0, math.log10(max_position - num_freq + 1), num_freq, dtype=torch.float64,
+        0.0, math.log10(max_position - num_freq + 1), num_freq,
+        dtype=torch.float64, device=table_device,
     )
-    return torch.pow(10.0, exponents).to(torch.float32)
+    return torch.pow(10.0, exponents).to(device=device, dtype=torch.float32)
 
 
 def apply_rope(x, positions=None, max_position=_MAX_RELATIVE_DISTANCE, inplace=False):
@@ -86,7 +84,7 @@ def apply_rope(x, positions=None, max_position=_MAX_RELATIVE_DISTANCE, inplace=F
     # with the table, the addition and the reciprocal in FP32. Keep the
     # denominator and reciprocal in FP32: rounding the denominator first changes
     # BF16 inverse frequencies relative to the JAX JIT reference.
-    base_freqs = _rope_base_freqs(num_freq, int(max_position)).to(x.device)
+    base_freqs = _rope_base_freqs(num_freq, int(max_position), x.device)
     denom = torch.arange(num_freq, device=x.device, dtype=torch.float32) + base_freqs
     # Cast only the completed inverse frequencies to the actual input dtype.
     inv_freq = (1.0 / denom).to(compute_dtype)
