@@ -247,9 +247,10 @@ def create_datasets(
                     "cls_donor_pos", "cls_acceptor_pos", "cls_donor_neg", "cls_acceptor_neg", "cls_none"
                 ]
             elif modality == "splice_usage":
-                modality_track_names[modality] = (
-                    [f"{stem}_pos" for stem in usage_stems] + [f"{stem}_neg" for stem in usage_stems]
-                )
+                # Interleaved per sample, as SplicingDataset stacks the usage channels.
+                modality_track_names[modality] = [
+                    f"{stem}_{strand}" for stem in usage_stems for strand in ("pos", "neg")
+                ]
             elif modality == "splice_junctions":
                 modality_track_names[modality] = (
                     [f"{stem}_pos" for stem in junc_stems] + [f"{stem}_neg" for stem in junc_stems]

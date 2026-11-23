@@ -663,6 +663,16 @@ Requires: ``pip install alphagenome-pytorch[jax]``
    # Convert to safetensors format
    agt convert --input /path/to/jax/checkpoint --output model.safetensors
 
+   # alphagenome_ft finetuned checkpoint dir (auto-detected) -> delta checkpoint
+   agt convert --input /path/to/jax_ft_run/best --output finetuned.delta.pth
+
+A directory with an alphagenome_ft ``config.json`` (``custom_heads``) is converted to a
+``.delta.pth`` for ``load_finetuned_model`` (heads-only or q/v LoRA; genome-track and
+splice heads). Track means come from the config's ``head_metadata``; older checkpoints
+need ``--targets-config targets.yaml`` or ``--track-means HEAD=v1,v2,...``. Use
+``--organism human|mouse`` when a head has several organism slots, and ``--base-weights``
+to record the converted pretrained weights' hash in the delta.
+
 JSON output:
 
 .. code-block:: json

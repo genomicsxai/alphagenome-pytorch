@@ -134,6 +134,28 @@ This also bundles per-organism track means into the checkpoint. It is the same c
 path as `scripts/convert_weights.py` (which takes the checkpoint as a positional
 argument); prefer `agt convert`.
 
+A finetuned [alphagenome_ft](https://github.com/genomicsxai/alphagenome_ft) checkpoint
+directory (`config.json` + `checkpoint/`; heads-only, optionally with q/v backbone LoRA)
+is detected automatically and converted to a delta checkpoint, loaded on top of the
+converted pretrained weights of the same fold:
+
+```bash
+agt convert --input jax_ft_run/best --output finetuned.delta.pth
+# checkpoints saved without head_metadata need the per-track nonzero means:
+agt convert --input jax_ft_run/best --output finetuned.delta.pth \
+    --targets-config targets.yaml        # or: --track-means rna_seq=0.8,1.7
+# heads with several organism slots: pick one with --organism human|mouse
+```
+
+```python
+from alphagenome_pytorch.extensions.finetuning.checkpointing import load_finetuned_model
+model, meta = load_finetuned_model("finetuned.delta.pth", "model_fold_0.safetensors")
+```
+
+Supported heads: genome-track heads (rna_seq, atac, dnase, cage, procap, chip_tf,
+chip_histone) and splice_site / splice_usage / splice_junctions. Custom heads, LoRA on
+other targets, and full/minimal-model checkpoints are rejected with an error.
+
 ## The 30-second version (Python)
 
 ```python
