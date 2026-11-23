@@ -36,6 +36,8 @@ pytest tests/ -n 4 --jax-checkpoint=...
 agt convert --input jax_checkpoint --output model.pth
 # equivalently (the script takes the checkpoint as a positional argument):
 python scripts/convert_weights.py jax_checkpoint --output model.pth
+# alphagenome_ft finetuned checkpoint dir (config.json + checkpoint/) -> delta for load_finetuned_model
+agt convert --input jax_ft_run/best --output finetuned.delta.pth  # [--track-means HEAD=v1,.. | --targets-config]
 ```
 
 ## Architecture
