@@ -242,11 +242,10 @@ def cross_entropy_loss(
 ) -> Tensor:
     """Cross entropy loss on counts.
 
-    Mirrors upstream JAX ``losses.cross_entropy_loss`` after
-    google-deepmind/alphagenome_research@de264f5: eps is added to targets and
-    predictions, both are normalized to ratios over the masked axis, and
-    fully-masked reduction axes are skipped so they do not propagate NaNs
-    from 0/0 normalization.
+    Mirrors JAX ``alphagenome_research.model.losses.cross_entropy_loss``: eps
+    is added to targets and predictions, both are normalized to ratios over
+    the masked axis, and fully-masked reduction axes are skipped so they do
+    not propagate NaNs from 0/0 normalization.
 
     Args:
         y_true: Target counts.
@@ -275,53 +274,6 @@ def cross_entropy_loss(
     log_loss = (-p_true * torch.log(p_pred) * safe_mask_f).sum(dim=axis)
 
     return _safe_masked_mean(log_loss, mask=axis_mask.squeeze(axis))
-
-
-# Same formula under the name the finetuning ``--junction-loss normalized`` uses.
-cross_entropy_loss_normalized = cross_entropy_loss
-
-
-def cross_entropy_loss_pre_de264f5(
-    *,
-    y_true: Tensor,
-    y_pred: Tensor,
-    mask: Tensor,
-    axis: int,
-    eps: float = 1e-7,
-) -> Tensor:
-    """Cross entropy loss on counts, upstream JAX formula *before* de264f5.
-
-    ``log(sum(masked_pred + eps)) - sum(p_true * log(pred + eps))`` with
-    ``p_true = target / max(sum(target), eps)``. Kept only for the finetuning
-    ``--junction-loss original``/``sparse`` ablations; it can be negative and
-    is not a proper cross entropy for all-zero targets. Use
-    :func:`cross_entropy_loss` (the current upstream formula) otherwise.
-
-    Args:
-        y_true: Target counts.
-        y_pred: Predicted counts.
-        mask: Boolean mask.
-        axis: Axis for normalization.
-        eps: Small epsilon for the sum/log stability terms.
-
-    Returns:
-        Scalar loss.
-    """
-    y_true = y_true.float()
-    y_pred = y_pred.float()
-    mask = mask.expand_as(y_true).bool()
-    assert y_true.shape == y_pred.shape == mask.shape
-
-    y_true = torch.where(mask, y_true.float(), torch.zeros_like(y_true.float()))
-    p_true = y_true / torch.clamp(y_true.sum(dim=axis, keepdim=True), min=eps)
-
-    y_pred = y_pred.float()
-    masked_pred = torch.where(mask, y_pred, torch.zeros_like(y_pred))
-    log_normalizer = torch.log((masked_pred + eps).sum(dim=axis))
-    log_likelihood = (p_true * torch.log(y_pred + eps)).sum(dim=axis)
-    
-    log_loss = log_normalizer - log_likelihood
-    return _safe_masked_mean(log_loss, mask.any(dim=axis))
 
 
 def gene_lfc_loss(

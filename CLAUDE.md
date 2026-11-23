@@ -145,8 +145,8 @@ torchrun --nproc_per_node=2 -m alphagenome_pytorch.cli finetune \
   Don't confuse the two; they're read by different code paths.
 - Key finetuning flags: `--rope-init` (`truncated_normal` default matches the JAX
   pretrained distribution; `zeros` replicates the original buggy JAX init, for
-  ablation only), `--junction-loss` (`original`/`normalized`/`sparse` cross-entropy
-  variants), `--junction-position-source` (`annotated` uses STAR-derived positions;
+  ablation only), `--junction-loss` (`normalized` default, as alphagenome_research;
+  `sparse` restricts it to donors/acceptors with observed reads), `--junction-position-source` (`annotated` uses STAR-derived positions;
   `predicted` derives them from the `splice_site` classification head's top-k sites,
   see `--junction-top-k`/`--splice-site-threshold`, defaults 512/0.1 as in
   alphagenome_research; `--max-splice-sites` sizes annotated mode, default 256),

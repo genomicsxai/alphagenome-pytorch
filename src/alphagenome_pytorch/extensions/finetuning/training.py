@@ -32,8 +32,7 @@ from alphagenome_pytorch.extensions.finetuning.distributed import (
 )
 from alphagenome_pytorch.losses import (
     multinomial_loss,
-    cross_entropy_loss_normalized,
-    cross_entropy_loss_pre_de264f5,
+    cross_entropy_loss,
     cross_entropy_loss_from_logits,
     binary_crossentropy_from_logits,
     poisson_loss,
@@ -435,7 +434,7 @@ def _soft_clip_counts(counts: torch.Tensor, clip: float = 10.0) -> torch.Tensor:
 
 def _compute_junction_loss(pos_pred, pos_target, pos_donor_pos, pos_accept_pos,
                             neg_pred, neg_target, neg_donor_pos, neg_accept_pos,
-                            device, junction_loss: str = "original"):
+                            device, junction_loss: str = "normalized"):
     """Junction loss over both strands combined, matching JAX SpliceSitesJunctionHead.loss.
 
     loss = 0.2 * (CE(axis=donor) + CE(axis=acceptor)) + 0.04 * (Poisson(axis=donor) + Poisson(axis=acceptor))
@@ -466,9 +465,9 @@ def _compute_junction_loss(pos_pred, pos_target, pos_donor_pos, pos_accept_pos,
     mix positions across channels.
 
     Args:
-        junction_loss: "original" uses cross_entropy_loss_pre_de264f5 (JAX pre-de264f5);
-                       "normalized" uses cross_entropy_loss_normalized (JAX post-de264f5,
-                       both targets and predictions normalized to ratios within mask).
+        junction_loss: "normalized" applies cross_entropy_loss/poisson_loss over all
+                       valid pairs (as JAX); "sparse" restricts them to donors/acceptors
+                       with at least one observed junction read.
     """
     assert pos_pred.shape == pos_target.shape, (
         f"pos_pred {tuple(pos_pred.shape)} and pos_target {tuple(pos_target.shape)} must match"
@@ -496,23 +495,13 @@ def _compute_junction_loss(pos_pred, pos_target, pos_donor_pos, pos_accept_pos,
     ], dim=-1)
 
     if not pairs_mask.any():
-        if junction_loss == "normalized":
-            # A masked example contributes zero, but keep the autograd graph
-            # connected, matching the JAX loss and supporting junction-only
-            # training batches that happen to have no valid pairs.
-            return torch.where(pairs_mask, pred_counts, torch.zeros_like(pred_counts)).sum() * 0.0
-        return torch.tensor(0.0, device=device, dtype=pred_counts.dtype)
+        # A masked example contributes zero, but keep the autograd graph
+        # connected, matching the JAX loss and supporting junction-only
+        # training batches that happen to have no valid pairs.
+        return torch.where(pairs_mask, pred_counts, torch.zeros_like(pred_counts)).sum() * 0.0
 
     target = torch.where(pairs_mask, target_counts, torch.zeros_like(target_counts))
     pred   = torch.where(pairs_mask, pred_counts,   torch.zeros_like(pred_counts))
-
-    # Preserve legacy original/sparse behavior. The normalized formulation
-    # has well-defined smoothed ratios even for zero observed counts and must
-    # still apply the Poisson penalty to positive predictions, as JAX does.
-    # Skipping it here would make the objective depend on whether this sample
-    # shares a batch with a nonempty sample.
-    if junction_loss != "normalized" and not (target > 0).any():
-        return torch.tensor(0.0, device=device, dtype=pred_counts.dtype)
 
     sum_pred_d = pred.sum(dim=1)
     sum_tgt_d  = _soft_clip_counts(target.sum(dim=1))
@@ -528,14 +517,13 @@ def _compute_junction_loss(pos_pred, pos_target, pos_donor_pos, pos_accept_pos,
         has_a = (sum_tgt_a > 0) & pairs_mask.any(dim=2)  # (B, D, S) donors with outgoing reads
         ce_mask_d = pairs_mask & has_d.unsqueeze(1).expand_as(pairs_mask)
         ce_mask_a = pairs_mask & has_a.unsqueeze(2).expand_as(pairs_mask)
-        donor_ratios_loss    = cross_entropy_loss_pre_de264f5(y_true=target, y_pred=pred, mask=ce_mask_d, axis=1)
-        acceptor_ratios_loss = cross_entropy_loss_pre_de264f5(y_true=target, y_pred=pred, mask=ce_mask_a, axis=2)
+        donor_ratios_loss    = cross_entropy_loss(y_true=target, y_pred=pred, mask=ce_mask_d, axis=1)
+        acceptor_ratios_loss = cross_entropy_loss(y_true=target, y_pred=pred, mask=ce_mask_a, axis=2)
         donor_total_loss  = poisson_loss(y_true=sum_tgt_d, y_pred=sum_pred_d, mask=has_d)
         accept_total_loss = poisson_loss(y_true=sum_tgt_a, y_pred=sum_pred_a, mask=has_a)
     else:
-        _ce = cross_entropy_loss_normalized if junction_loss == "normalized" else cross_entropy_loss_pre_de264f5
-        donor_ratios_loss    = _ce(y_true=target, y_pred=pred, mask=pairs_mask, axis=1)
-        acceptor_ratios_loss = _ce(y_true=target, y_pred=pred, mask=pairs_mask, axis=2)
+        donor_ratios_loss    = cross_entropy_loss(y_true=target, y_pred=pred, mask=pairs_mask, axis=1)
+        acceptor_ratios_loss = cross_entropy_loss(y_true=target, y_pred=pred, mask=pairs_mask, axis=2)
         donor_total_loss  = poisson_loss(y_true=sum_tgt_d, y_pred=sum_pred_d, mask=pairs_mask.any(dim=1))
         accept_total_loss = poisson_loss(y_true=sum_tgt_a, y_pred=sum_pred_a, mask=pairs_mask.any(dim=2))
 
@@ -587,7 +575,7 @@ def _get_junction_targets(predictions, targets_dict, device):
 
 
 def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: int = 1,
-                         junction_loss: str = "original", min_alpha_juncs: int = 0):
+                         junction_loss: str = "normalized", min_alpha_juncs: int = 0):
     """Compute loss for any of the three splice head types.
 
     Args:
@@ -602,8 +590,8 @@ def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: 
             fewer splice sites relative to a global mean, since each partition
             contributes equally regardless of how many valid positions it contains.
             Defaults to 1 (standard global mean, unchanged behaviour).
-        junction_loss: Cross-entropy variant for the junction head. "original" matches
-            JAX pre-de264f5; "normalized" matches JAX post-de264f5 (ratio CE).
+        junction_loss: Junction-head loss variant: "normalized" (as JAX) or
+            "sparse" (restricted to donors/acceptors with observed reads).
         min_alpha_juncs: Minimum junction read depth (alpha) for a splice site to
             contribute to the SSU loss.  Positions with 0 < alpha < min_alpha_juncs
             are excluded to avoid training on low-confidence SSU estimates.
@@ -2267,7 +2255,7 @@ def train_epoch_multihead(
     organism_idx: int = 0,
     junction_top_k: int | None = None,
     splice_site_threshold: float = DEFAULT_SPLICE_SITE_THRESHOLD,
-    junction_loss: str = "original",
+    junction_loss: str = "normalized",
     sequence_parallel: Any | None = None,
     min_alpha_juncs: int = 0,
     handler: Any | None = None,
@@ -2820,7 +2808,7 @@ def validate_multihead(
     organism_idx: int = 0,
     junction_top_k: int | None = None,
     splice_site_threshold: float = DEFAULT_SPLICE_SITE_THRESHOLD,
-    junction_loss: str = "original",
+    junction_loss: str = "normalized",
     compute_per_sample: bool = False,
     min_alpha_juncs: int = 0,
     metrics_seed: int = 0,
@@ -3408,7 +3396,7 @@ def train_epoch_sequence_parallel(
     checkpoint_sync_group: Any | None = None,
     junction_top_k: int | None = None,
     splice_site_threshold: float = DEFAULT_SPLICE_SITE_THRESHOLD,
-    junction_loss: str = "original",
+    junction_loss: str = "normalized",
     gene_loss_weights: dict[str, float] | None = None,
     gene_cross_track_weight: float = 5.0,
     strand_channel_masks: dict[str, Tensor] | None = None,

@@ -582,17 +582,13 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
         "--junction-loss",
         type=str,
         default="normalized",
-        choices=["original", "normalized", "sparse"],
+        choices=["normalized", "sparse"],
         help=(
-            "Cross-entropy variant for the splice junction head loss (both strands "
-            "are always normalized jointly). "
-            "'normalized' (default) is the current alphagenome_research formula "
-            "(post-de264f5): targets and predictions are smoothed with eps and "
-            "normalized to ratios within masked positions before computing CE. "
-            "'original' is the pre-de264f5 formula, log(sum pred) - sum(p_true * "
-            "log pred), kept for ablation only; it can be negative. "
-            "'sparse' uses the 'original' formula restricted to donors/acceptors with "
-            "at least one observed junction count."
+            "Splice junction head loss (both strands are always normalized jointly). "
+            "'normalized' (default) is the alphagenome_research loss: cross-entropy "
+            "over eps-smoothed target and prediction ratios plus a Poisson term on "
+            "totals, over all valid donor/acceptor pairs. 'sparse' applies the same "
+            "loss only to donors/acceptors with at least one observed junction read."
         ),
     )
     train.add_argument("--num-workers", type=int, default=DEFAULTS["num_workers"])

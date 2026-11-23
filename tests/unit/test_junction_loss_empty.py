@@ -53,21 +53,17 @@ class TestEmptyJunctionLoss(unittest.TestCase):
                 loss.backward()
                 torch.testing.assert_close(pred.grad, torch.zeros_like(pred))
 
-    def test_legacy_modes_keep_zero_target_behavior(self):
-        for mode in ("original", "sparse"):
-            with self.subTest(mode=mode):
-                pred = torch.full((1, 4, 4, 4), .5, requires_grad=True)
-                loss = objective(pred, torch.zeros_like(pred), torch.arange(4).expand(1, 4, 4), mode)
-                self.assertEqual(loss.item(), 0)
-                self.assertFalse(loss.requires_grad)
+    def test_sparse_mode_zero_targets_is_finite_and_connected(self):
+        pred = torch.full((1, 4, 4, 4), .5, requires_grad=True)
+        loss = objective(pred, torch.zeros_like(pred), torch.arange(4).expand(1, 4, 4), "sparse")
+        self.assertEqual(loss.item(), 0)
+        self.assertTrue(loss.requires_grad)
 
-    def test_legacy_modes_keep_all_masked_behavior(self):
-        for mode in ("original", "sparse"):
-            with self.subTest(mode=mode):
-                pred = torch.ones(1, 4, 4, 4, requires_grad=True)
-                loss = objective(pred, torch.ones_like(pred), torch.full((1, 4, 4), -1), mode)
-                self.assertEqual(loss.item(), 0)
-                self.assertFalse(loss.requires_grad)
+    def test_sparse_mode_all_masked_is_zero(self):
+        pred = torch.ones(1, 4, 4, 4, requires_grad=True)
+        loss = objective(pred, torch.ones_like(pred), torch.full((1, 4, 4), -1), "sparse")
+        self.assertEqual(loss.item(), 0)
+        self.assertTrue(loss.requires_grad)
 
 
 if __name__ == '__main__':

@@ -345,7 +345,7 @@ class TestCrossEntropyLoss:
 
 @pytest.mark.unit
 class TestCrossEntropyLossSmoothingFix:
-    """Tests for cross_entropy_loss post-smoothing (B3.4 / upstream de264f5).
+    """Tests for cross_entropy_loss post-smoothing (as JAX alphagenome_research).
 
     Golden values produced by running the upstream JAX
     `cross_entropy_loss` on the same inputs
@@ -396,7 +396,7 @@ class TestCrossEntropyLossSmoothingFix:
 
         With y_true = y_pred = 0 and eps = 1e-7, after smoothing the per-axis
         distribution is uniform over the axis size (here 3), so the loss is
-        log(3) ≈ 1.0986123, as upstream JAX after de264f5. No inf from log(0).
+        log(3) ≈ 1.0986123, as in JAX. No inf from log(0).
         """
         y = torch.zeros((1, 2, 3))
         mask = torch.ones((1, 2, 3), dtype=torch.bool)
@@ -405,14 +405,6 @@ class TestCrossEntropyLossSmoothingFix:
         )
         assert torch.isfinite(loss)
         assert torch.isclose(loss, torch.tensor(1.0986123085021973), atol=1e-6)
-
-    def test_pre_de264f5_formula_kept_separately(self):
-        """The pre-fix formula (finetuning --junction-loss original) lives under its own name."""
-        y = torch.zeros((1, 2, 3))
-        mask = torch.ones((1, 2, 3), dtype=torch.bool)
-        legacy = losses.cross_entropy_loss_pre_de264f5(y_true=y, y_pred=y, mask=mask, axis=-1)
-        assert torch.isclose(legacy, torch.tensor(-15.019484), atol=1e-5)
-        assert losses.cross_entropy_loss_normalized is losses.cross_entropy_loss
 
     def test_smoothing_gradient_finite(self):
         """Zero-count predictions must yield finite gradient (no log(0))."""
