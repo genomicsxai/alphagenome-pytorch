@@ -99,6 +99,47 @@ def test_compute_metrics():
     assert "count_pearson_r_track_b" in metrics
 
 
+
+def test_compute_metrics_track_mask_matches_slicing():
+    from alphagenome_pytorch.metrics import compute_metrics
+
+    pred = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    true = pred.clone()
+    track_mask = torch.tensor([True, False, True, False])
+    pred[..., 1] = float("nan")
+    true[..., 3] = float("nan")
+    names = ["first", "padding", "third", "padding"]
+
+    actual = compute_metrics(pred, true, names, track_mask=track_mask)
+    expected = compute_metrics(
+        pred[..., track_mask], true[..., track_mask], ["first", "third"]
+    )
+    assert actual == expected
+
+
+def test_compute_metrics_all_tracks_masked():
+    from alphagenome_pytorch.metrics import compute_metrics
+
+    pred = torch.zeros(2, 3, 4)
+    assert compute_metrics(pred, pred, track_mask=torch.zeros(4, dtype=torch.bool)) == {}
+
+
+@pytest.mark.parametrize(
+    "track_mask, error",
+    [
+        (torch.ones(4), TypeError),
+        (torch.ones(3, dtype=torch.bool), ValueError),
+        (torch.ones(2, 4, dtype=torch.bool), ValueError),
+    ],
+)
+def test_compute_metrics_rejects_invalid_track_mask(track_mask, error):
+    from alphagenome_pytorch.metrics import compute_metrics
+
+    pred = torch.zeros(2, 3, 4)
+    with pytest.raises(error, match="track_mask"):
+        compute_metrics(pred, pred, track_mask=track_mask)
+
+
 def test_compute_metrics_single_sample():
     """Test compute_metrics with single sample (count Pearson R should be nan)."""
     from alphagenome_pytorch.metrics import compute_metrics
