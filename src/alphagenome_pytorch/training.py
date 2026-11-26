@@ -253,6 +253,10 @@ class AlphaGenomeLoss(nn.Module):
         if head == 'splice_site_usage':
             logits = output['logits']
             if mask is None:
+                # The head's per-organism track_mask excludes padding columns,
+                # as upstream SpliceSitesUsageHead._get_targets_mask does.
+                mask = output.get('track_mask')
+            if mask is None:
                 mask = torch.ones_like(target, dtype=torch.bool)
             return losses.binary_crossentropy_from_logits(
                 y_pred=logits,
