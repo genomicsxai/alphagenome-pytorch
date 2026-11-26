@@ -6,7 +6,7 @@ and metrics for training AlphaGenome models.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Any, Tuple
+from typing import Dict, List, Optional, Sequence, Any, Tuple, Union
 import math
 
 import torch
@@ -63,7 +63,6 @@ class AlphaGenomeTrainingConfig:
     eps: float = 1e-8
     
     # Loss configuration
-    multinomial_resolution: int = 128
     positional_weight: float = 5.0  # JAX production value (AG_MODEL.md line 321)
 
 
@@ -102,6 +101,8 @@ class AlphaGenomeLoss(nn.Module):
     (not the sum of weights). A weight of 0.2 therefore down-weights that
     head's contribution by exactly 0.2× relative to a weight-1.0 head with
     the same residual, matching upstream JAX `HeadConfig.loss_weight` semantics.
+    A head with outputs at several resolutions (`{1: ..., 128: ...}`) gets the
+    sum of its per-resolution losses, as in upstream `GenomeTracksHead.loss`.
 
     Args:
         model: AlphaGenome model instance. Required to access head modules for target scaling.
@@ -112,10 +113,12 @@ class AlphaGenomeLoss(nn.Module):
             heads it names and leaves the rest at their upstream defaults
             (1.0 for count and splice-site heads, 0.2 for splice junctions).
             Pass `None` to use the defaults unchanged.
-        multinomial_resolution: Resolution for multinomial loss computation. This is the
-            segment size used to divide the sequence for multinomial loss. For JAX parity,
-            use `seq_len` (full sequence as 1 segment) or `seq_len // 8` for 8 segments
-            matching the model specification in their supplemental.
+        multinomial_resolution: Segment size, in bins of the output, used to divide
+            the sequence for multinomial loss. If None (default), uses
+            `2**17 // resolution` for each resolution as upstream, i.e. 131,072 bp
+            segments at both 1bp and 128bp (capped at the sequence length for
+            shorter inputs). An int applies to every head and resolution; a dict
+            maps resolution to segment size.
         positional_weight: Weight for positional component of multinomial loss.
             JAX production uses 5.0 (default), matching Borzoi.
     """
@@ -125,7 +128,7 @@ class AlphaGenomeLoss(nn.Module):
         model: Optional[nn.Module] = None,
         heads: Optional[List[str]] = None,
         head_weights: Optional[Dict[str, float]] = None,
-        multinomial_resolution: int = 128,
+        multinomial_resolution: Optional[Union[int, Dict[int, int]]] = None,
         positional_weight: float = 5.0,  # JAX production value
         gene_loss_weights: Optional[Dict[str, float]] = None,
         gene_cross_track_weight: float = 5.0,
@@ -160,6 +163,18 @@ class AlphaGenomeLoss(nn.Module):
                 buffer_name = f"_strand_channel_mask__{head}"
                 self.register_buffer(buffer_name, _build_strand_channel_mask(strands))
                 self._strand_mask_heads.append(head)
+
+    def _get_multinomial_resolution(self, resolution: Optional[int], seq_len: int) -> int:
+        """Return the multinomial segment size for one resolution."""
+        if isinstance(self.multinomial_resolution, dict):
+            return self.multinomial_resolution[resolution]
+        if self.multinomial_resolution is not None:
+            return self.multinomial_resolution
+        if resolution is None:
+            raise ValueError(
+                "multinomial_resolution must be set when outputs are not keyed by resolution."
+            )
+        return min(2**17 // resolution, seq_len)
 
     def _get_strand_channel_mask(self, head: str) -> Optional[torch.Tensor]:
         """Return the `[2, 1, C]` strand-channel mask for a head, or None."""
@@ -253,6 +268,10 @@ class AlphaGenomeLoss(nn.Module):
         if head == 'splice_site_usage':
             logits = output['logits']
             if mask is None:
+                # The head's per-organism track_mask excludes padding columns,
+                # as upstream SpliceSitesUsageHead._get_targets_mask does.
+                mask = output.get('track_mask')
+            if mask is None:
                 mask = torch.ones_like(target, dtype=torch.bool)
             return losses.binary_crossentropy_from_logits(
                 y_pred=logits,
@@ -302,17 +321,42 @@ class AlphaGenomeLoss(nn.Module):
             
             return donor_ratios_loss + acceptor_ratios_loss + 0.2 * (accept_total_loss + donor_total_loss)
 
-        # Handle resolution dict outputs (e.g., {1: tensor, 128: tensor})
-        resolution = None
+        # Handle resolution dict outputs (e.g., {1: tensor, 128: tensor}).
+        # Sum the loss over every resolution present, as upstream
+        # GenomeTracksHead.loss does. A target given as a single tensor is
+        # taken to be at the finest resolution and sum-pooled for the others.
         if isinstance(output, dict):
-            # Use highest resolution available
-            res_keys = [k for k in output.keys() if isinstance(k, int)]
+            res_keys = sorted(k for k in output.keys() if isinstance(k, int))
             if res_keys:
-                resolution = min(res_keys)  # 1bp > 128bp
-                output = output[resolution]
-                if isinstance(target, dict):
-                    target = target[resolution]
+                head_loss = 0.0
+                for resolution in res_keys:
+                    head_loss = head_loss + self._compute_track_loss(
+                        head,
+                        output[resolution],
+                        target[resolution] if isinstance(target, dict) else target,
+                        mask[resolution] if isinstance(mask, dict) else mask,
+                        organism_index,
+                        resolution=resolution,
+                        gene_mask=gene_mask,
+                    )
+                return head_loss
 
+        return self._compute_track_loss(
+            head, output, target, mask, organism_index,
+            resolution=None, gene_mask=gene_mask,
+        )
+
+    def _compute_track_loss(
+        self,
+        head: str,
+        output: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        organism_index: torch.Tensor,
+        resolution: Optional[int],
+        gene_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute the loss of a genome track or contact map head at one resolution."""
         # Default mask if not provided
         # Loss functions expect mask to match data format
         if mask is None:
@@ -337,6 +381,12 @@ class AlphaGenomeLoss(nn.Module):
             # We need to determine channels_last for scale/multinomial_loss.
             is_channels_last = (mask.shape[-2] == 1)
 
+        # Sum-pool a finer-resolution target to this output's resolution
+        seq_axis = -2 if is_channels_last else -1
+        if resolution is not None and target.shape[seq_axis] != output.shape[seq_axis]:
+            factor = target.shape[seq_axis] // output.shape[seq_axis]
+            target = target.unflatten(seq_axis, (output.shape[seq_axis], factor)).sum(seq_axis)
+
         # Contact maps use MSE (no scaling needed)
         if head == 'contact_maps':
             return losses.mse(y_pred=output, y_true=target, mask=mask)
@@ -354,7 +404,9 @@ class AlphaGenomeLoss(nn.Module):
             y_true=scaled_target,  # Now scaled!
             y_pred=output,         # Already scaled from forward pass
             mask=mask,
-            multinomial_resolution=self.multinomial_resolution,
+            multinomial_resolution=self._get_multinomial_resolution(
+                resolution, output.shape[seq_axis]
+            ),
             positional_weight=self.positional_weight,
             channels_last=is_channels_last,
         )
